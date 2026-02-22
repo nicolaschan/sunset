@@ -1,0 +1,72 @@
+@external(javascript, "./libp2p.ffi.mjs", "init_libp2p")
+pub fn init_libp2p(_dispatch: fn(String) -> Nil) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "dial_multiaddr")
+pub fn dial_multiaddr(
+  _addr: String,
+  _on_ok: fn() -> Nil,
+  _on_error: fn(String) -> Nil,
+) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_multiaddrs")
+pub fn get_multiaddrs() -> List(String) {
+  []
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_connected_peers")
+pub fn get_connected_peers() -> List(String) {
+  []
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_connection_count")
+pub fn get_connection_count() -> Int {
+  0
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "set_timeout")
+pub fn set_timeout(_callback: fn() -> Nil, _ms: Int) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "register_chat_handler")
+pub fn register_chat_handler(_on_message: fn(String, String) -> Nil) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "broadcast_message")
+pub fn broadcast_message(
+  _text: String,
+  _on_ok: fn() -> Nil,
+  _on_error: fn(String) -> Nil,
+) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "register_signaling_handler")
+pub fn register_signaling_handler() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "start_audio")
+pub fn start_audio(_on_ok: fn() -> Nil, _on_error: fn(String) -> Nil) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "stop_audio")
+pub fn stop_audio() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "is_audio_active")
+pub fn is_audio_active() -> Bool {
+  False
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "is_receiving_audio")
+pub fn is_receiving_audio() -> Bool {
+  False
+}
