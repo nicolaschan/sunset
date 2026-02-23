@@ -28,6 +28,7 @@ body {
   align-items: center;
   justify-content: center;
   min-height: 100vh;
+  min-height: 100dvh;
   overflow: hidden;
   background: linear-gradient(180deg,
       #110b18 0%,
@@ -206,6 +207,7 @@ body {
 .room {
   display: flex;
   height: 100vh;
+  height: 100dvh;
   background: #1a1020;
 }
 
