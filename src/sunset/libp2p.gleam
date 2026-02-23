@@ -94,6 +94,11 @@ pub fn get_peer_remote_addrs() -> List(List(String)) {
   []
 }
 
+@external(javascript, "./libp2p.ffi.mjs", "get_peer_addrs")
+pub fn get_peer_addrs(_peer_id: String) -> List(List(String)) {
+  []
+}
+
 @external(javascript, "./libp2p.ffi.mjs", "dial_peer_addrs")
 pub fn dial_peer_addrs(
   _addrs: List(String),

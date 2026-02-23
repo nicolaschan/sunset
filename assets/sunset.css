@@ -408,6 +408,7 @@ body {
   gap: 0.6rem;
   padding: 0.4rem 1rem;
   transition: background 0.15s;
+  cursor: pointer;
 }
 
 .room-peer:hover {
@@ -697,4 +698,145 @@ body {
   textarea {
     font-size: 16px;
   }
+}
+
+/* ===== Peer detail modal ===== */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.modal-card {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 480px;
+  max-height: 80vh;
+  overflow-y: auto;
+  background: #1e1428;
+  border: 1px solid rgba(237, 228, 216, 0.12);
+  border-radius: 12px;
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.4),
+    0 0 0 1px rgba(237, 228, 216, 0.05);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid rgba(237, 228, 216, 0.08);
+}
+
+.modal-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.modal-title {
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: #ede4d8;
+}
+
+.modal-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(237, 228, 216, 0.1);
+  border-radius: 6px;
+  color: rgba(237, 228, 216, 0.5);
+  font-size: 1.2rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.modal-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #ede4d8;
+}
+
+.modal-section {
+  padding: 0.85rem 1.25rem;
+  border-bottom: 1px solid rgba(237, 228, 216, 0.06);
+}
+
+.modal-section:last-child {
+  border-bottom: none;
+}
+
+.modal-section-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(237, 228, 216, 0.35);
+  margin-bottom: 0.4rem;
+}
+
+.modal-mono {
+  font-size: 0.72rem;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: rgba(237, 228, 216, 0.55);
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.modal-empty {
+  font-size: 0.8rem;
+  font-style: italic;
+  color: rgba(237, 228, 216, 0.2);
+}
+
+.modal-addr-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.modal-addr-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.45rem 0.6rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(237, 228, 216, 0.06);
+  border-radius: 6px;
+}
+
+.modal-addr-transport {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: rgba(200, 120, 60, 0.6);
+}
+
+.modal-addr-value {
+  font-size: 0.65rem;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: rgba(237, 228, 216, 0.45);
+  word-break: break-all;
+  line-height: 1.35;
 }

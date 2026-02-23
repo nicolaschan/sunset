@@ -1,4 +1,5 @@
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/string
 import lustre
 import lustre/effect.{type Effect}
@@ -9,9 +10,10 @@ import sunset/model.{
   Model, PeerDialFailed, PeerDialSucceeded, PeerDiscovered, RelayConnected,
   RelayConnecting, RelayDialFailed, RelayDialSucceeded, RelayDisconnected, Room,
   RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedConnect,
-  UserClickedJoinRoom, UserClickedLeaveRoom, UserClickedSend,
-  UserClickedStartAudio, UserClickedStopAudio, UserToggledNodeInfo,
-  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
+  UserClickedJoinRoom, UserClickedLeaveRoom, UserClickedPeer, UserClickedSend,
+  UserClickedStartAudio, UserClickedStopAudio, UserClosedPeerModal,
+  UserToggledNodeInfo, UserUpdatedChatInput, UserUpdatedMultiaddr,
+  UserUpdatedRoomInput,
 }
 import sunset/nav
 import sunset/router
@@ -56,6 +58,7 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       audio_sending: False,
       audio_receiving: False,
       audio_error: "",
+      selected_peer: None,
     )
 
   #(
@@ -195,7 +198,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     Tick -> {
       let addrs = libp2p.get_multiaddrs()
       let peers = libp2p.get_connected_peers()
-      let count = libp2p.get_connection_count()
       let sending = libp2p.is_audio_active()
       let receiving = libp2p.is_receiving_audio()
       let relay_id = libp2p.get_relay_peer_id()
@@ -207,13 +209,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             _ -> Error(Nil)
           }
         })
+      let peer_count = list.count(peers, fn(pid) { pid != model.peer_id })
       #(
         Model(
           ..model,
           addresses: addrs,
           peers: peers,
           peer_addrs: peer_addrs,
-          connection_count: count,
+          connection_count: peer_count,
           audio_sending: sending,
           audio_receiving: receiving,
           relay_peer_id: relay_id,
@@ -288,6 +291,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // Discovery dial failures are expected (stale addresses, NAT issues).
       // Don't surface to the user.
       #(model, effect.none())
+    }
+
+    UserClickedPeer(peer_id) -> {
+      #(Model(..model, selected_peer: Some(peer_id)), effect.none())
+    }
+
+    UserClosedPeerModal -> {
+      #(Model(..model, selected_peer: None), effect.none())
     }
   }
 }

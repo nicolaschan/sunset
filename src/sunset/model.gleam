@@ -1,3 +1,5 @@
+import gleam/option.{type Option}
+
 pub type Route {
   Home
   Room(name: String)
@@ -36,6 +38,7 @@ pub type Model {
     audio_sending: Bool,
     audio_receiving: Bool,
     audio_error: String,
+    selected_peer: Option(String),
   )
 }
 
@@ -66,4 +69,6 @@ pub type Msg {
   PeerDiscovered(peer_id: String, addrs: List(String))
   PeerDialSucceeded
   PeerDialFailed(error: String)
+  UserClickedPeer(peer_id: String)
+  UserClosedPeerModal
 }

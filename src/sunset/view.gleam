@@ -1,5 +1,6 @@
 import gleam/int
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/string
 import lustre/attribute.{
   autofocus, class, classes, href, placeholder, title, type_, value,
@@ -9,12 +10,13 @@ import lustre/element/html.{
   a, button, div, form, h1, h2, hr, input, li, p, section, span, ul,
 }
 import lustre/event.{on_click, on_input, on_submit}
+import sunset/libp2p
 import sunset/model.{
   type Model, type Msg, Dev, Home, RelayConnected, RelayConnecting,
   RelayDisconnected, RelayFailed, Room, UserClickedConnect, UserClickedJoinRoom,
-  UserClickedLeaveRoom, UserClickedSend, UserClickedStartAudio,
-  UserClickedStopAudio, UserToggledNodeInfo, UserUpdatedChatInput,
-  UserUpdatedMultiaddr, UserUpdatedRoomInput,
+  UserClickedLeaveRoom, UserClickedPeer, UserClickedSend, UserClickedStartAudio,
+  UserClickedStopAudio, UserClosedPeerModal, UserToggledNodeInfo,
+  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
 }
 
 pub fn view(model: Model) -> Element(Msg) {
@@ -156,6 +158,7 @@ fn view_room(model: Model) -> Element(Msg) {
                         #("room-peer", True),
                         #("room-peer-relay", is_relay),
                       ]),
+                      on_click(UserClickedPeer(peer_id)),
                     ],
                     [
                       span(
@@ -281,6 +284,8 @@ fn view_room(model: Model) -> Element(Msg) {
         ]),
       ]),
     ]),
+    // Peer detail modal
+    view_peer_modal(model),
   ])
 }
 
@@ -519,5 +524,70 @@ fn peer_addr(model: Model, peer_id: String) -> String {
   case list.find(model.peer_addrs, fn(pair) { pair.0 == peer_id }) {
     Ok(#(_, addr)) -> addr
     Error(_) -> ""
+  }
+}
+
+fn view_peer_modal(model: Model) -> Element(Msg) {
+  case model.selected_peer {
+    None -> text("")
+    Some(peer_id) -> {
+      let is_relay = peer_id == model.relay_peer_id
+      let raw_addrs = libp2p.get_peer_addrs(peer_id)
+      let addrs =
+        list.filter_map(raw_addrs, fn(pair) {
+          case pair {
+            [transport, addr] -> Ok(#(transport, addr))
+            _ -> Error(Nil)
+          }
+        })
+      div([class("modal-overlay")], [
+        div([class("modal-backdrop"), on_click(UserClosedPeerModal)], []),
+        div([class("modal-card")], [
+          div([class("modal-header")], [
+            div([class("modal-title-row")], [
+              span(
+                [
+                  classes([
+                    #("room-peer-dot", True),
+                    #("room-peer-dot-relay", is_relay),
+                  ]),
+                ],
+                [],
+              ),
+              span([class("modal-title")], [text(short_peer_id(peer_id))]),
+              case is_relay {
+                True -> span([class("room-peer-badge")], [text("relay")])
+                False -> text("")
+              },
+            ]),
+            button([on_click(UserClosedPeerModal), class("modal-close")], [
+              text("\u{00D7}"),
+            ]),
+          ]),
+          div([class("modal-section")], [
+            div([class("modal-section-label")], [text("Peer ID")]),
+            div([class("modal-mono")], [text(peer_id)]),
+          ]),
+          div([class("modal-section")], [
+            div([class("modal-section-label")], [
+              text("Addresses (" <> int.to_string(list.length(addrs)) <> ")"),
+            ]),
+            case addrs {
+              [] -> div([class("modal-empty")], [text("No connections")])
+              _ ->
+                ul(
+                  [class("modal-addr-list")],
+                  list.map(addrs, fn(pair) {
+                    li([class("modal-addr-item")], [
+                      span([class("modal-addr-transport")], [text(pair.0)]),
+                      span([class("modal-addr-value")], [text(pair.1)]),
+                    ])
+                  }),
+                )
+            },
+          ]),
+        ]),
+      ])
+    }
   }
 }

@@ -582,6 +582,26 @@ export function get_peer_remote_addrs() {
   return toList(results);
 }
 
+// Get all connection addresses for a specific peer.
+// Returns a Gleam List of [transport, remote_addr] pairs (each a Gleam List of strings).
+export function get_peer_addrs(peer_id_str) {
+  if (!_libp2p) return toList([]);
+  const results = [];
+  for (const conn of _libp2p.getConnections()) {
+    if (conn.remotePeer.toString() !== peer_id_str) continue;
+    const ma = conn.remoteAddr;
+    let transport = "Other";
+    if (WebRTC.exactMatch(ma)) transport = "WebRTC";
+    else if (WebRTCDirect.exactMatch(ma)) transport = "WebRTC Direct";
+    else if (WebSocketsSecure.exactMatch(ma)) transport = "WebSockets (secure)";
+    else if (WebSockets.exactMatch(ma)) transport = "WebSockets";
+    else if (WebTransport.exactMatch(ma)) transport = "WebTransport";
+    else if (Circuit.exactMatch(ma)) transport = "Circuit Relay";
+    results.push(toList([transport, ma.toString()]));
+  }
+  return toList(results);
+}
+
 // Get the PeerId of the connected relay (first peer that has a non-WebRTC connection).
 function _getRelayPeerId() {
   if (!_libp2p) return null;
