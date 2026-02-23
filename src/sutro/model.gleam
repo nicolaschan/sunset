@@ -1,9 +1,15 @@
+pub type Route {
+  Home
+  Dev
+}
+
 pub type ChatMessage {
   ChatMessage(sender: String, body: String)
 }
 
 pub type Model {
   Model(
+    route: Route,
     peer_id: String,
     status: String,
     multiaddr_input: String,
@@ -20,6 +26,7 @@ pub type Model {
 }
 
 pub type Msg {
+  RouteChanged(route: Route)
   Libp2pInitialised(peer_id: String)
   UserUpdatedMultiaddr(value: String)
   UserClickedConnect

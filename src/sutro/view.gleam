@@ -1,20 +1,42 @@
 import gleam/int
 import gleam/list
-import lustre/attribute.{class, classes, placeholder, type_, value}
+import lustre/attribute.{class, classes, href, placeholder, type_, value}
 import lustre/element.{type Element, text}
 import lustre/element/html.{
-  button, div, h1, h2, hr, input, li, p, section, span, ul,
+  a, button, div, h1, h2, hr, input, li, p, section, span, ul,
 }
 import lustre/event.{on_click, on_input}
 import sutro/model.{
-  type Model, type Msg, UserClickedConnect, UserClickedSend,
+  type Model, type Msg, Dev, Home, UserClickedConnect, UserClickedSend,
   UserClickedStartAudio, UserClickedStopAudio, UserUpdatedChatInput,
   UserUpdatedMultiaddr,
 }
 
 pub fn view(model: Model) -> Element(Msg) {
+  case model.route {
+    Home -> view_home(model)
+    Dev -> view_dev(model)
+  }
+}
+
+// -- Home page (new index) --
+
+fn view_home(_model: Model) -> Element(Msg) {
   div([class("app-container")], [
-    h1([class("app-title")], [text("libp2p WebRTC Browser Connectivity")]),
+    h1([class("app-title")], [text("Sutro")]),
+    p([], [text("Welcome to Sutro -- a peer-to-peer chat app.")]),
+    p([], [
+      a([href("/dev")], [text("Dev dashboard")]),
+    ]),
+  ])
+}
+
+// -- Dev page (original index) --
+
+fn view_dev(model: Model) -> Element(Msg) {
+  div([class("app-container")], [
+    h1([class("app-title")], [text("Dev Dashboard")]),
+    p([], [a([href("/")], [text("Back to home")])]),
     // Node info section
     section([class("app-section")], [
       h2([class("section-title")], [text("Node")]),

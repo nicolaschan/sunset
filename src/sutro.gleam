@@ -5,10 +5,11 @@ import sutro/libp2p
 import sutro/model.{
   type Model, type Msg, AudioFailed, AudioStarted, ChatMessage,
   ChatMessageReceived, DialFailed, DialSucceeded, Libp2pInitialised, Model,
-  SendFailed, SendSucceeded, Tick, UserClickedConnect, UserClickedSend,
-  UserClickedStartAudio, UserClickedStopAudio, UserUpdatedChatInput,
-  UserUpdatedMultiaddr,
+  RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedConnect,
+  UserClickedSend, UserClickedStartAudio, UserClickedStopAudio,
+  UserUpdatedChatInput, UserUpdatedMultiaddr,
 }
+import sutro/router
 import sutro/view
 
 pub fn main() {
@@ -23,6 +24,7 @@ pub fn main() {
 fn init(_flags) -> #(Model, Effect(Msg)) {
   let model =
     Model(
+      route: router.init_route(),
       peer_id: "",
       status: "Initialising...",
       multiaddr_input: "",
@@ -37,13 +39,17 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       audio_error: "",
     )
 
-  #(model, init_libp2p_effect())
+  #(model, effect.batch([init_libp2p_effect(), router.init()]))
 }
 
 // -- UPDATE --
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
+    RouteChanged(route) -> {
+      #(Model(..model, route: route), effect.none())
+    }
+
     Libp2pInitialised(peer_id) -> {
       let new_model =
         Model(..model, peer_id: peer_id, status: "Online", error: "")
