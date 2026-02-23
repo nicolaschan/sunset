@@ -43,10 +43,12 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       peer_id: "",
       status: "Initialising...",
       relay_status: RelayDisconnected,
+      relay_peer_id: "",
       show_node_info: False,
       multiaddr_input: "",
       addresses: [],
       peers: [],
+      peer_addrs: [],
       connection_count: 0,
       error: "",
       chat_input: "",
@@ -196,14 +198,25 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let count = libp2p.get_connection_count()
       let sending = libp2p.is_audio_active()
       let receiving = libp2p.is_receiving_audio()
+      let relay_id = libp2p.get_relay_peer_id()
+      let raw_addrs = libp2p.get_peer_remote_addrs()
+      let peer_addrs =
+        list.filter_map(raw_addrs, fn(pair) {
+          case pair {
+            [pid, addr] -> Ok(#(pid, addr))
+            _ -> Error(Nil)
+          }
+        })
       #(
         Model(
           ..model,
           addresses: addrs,
           peers: peers,
+          peer_addrs: peer_addrs,
           connection_count: count,
           audio_sending: sending,
           audio_receiving: receiving,
+          relay_peer_id: relay_id,
         ),
         schedule_tick(),
       )

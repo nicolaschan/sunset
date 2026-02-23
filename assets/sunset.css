@@ -402,7 +402,7 @@ body {
 
 .room-peer {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.6rem;
   padding: 0.4rem 1rem;
   transition: background 0.15s;
@@ -418,6 +418,22 @@ body {
   border-radius: 50%;
   background: #4ade80;
   flex-shrink: 0;
+  margin-top: 0.45rem;
+}
+
+.room-peer-dot-relay {
+  background: #818cf8;
+}
+
+.room-peer-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.room-peer-name {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
 }
 
 .room-peer-id {
@@ -427,6 +443,33 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.room-peer-relay .room-peer-id {
+  color: rgba(237, 228, 216, 0.4);
+}
+
+.room-peer-badge {
+  font-size: 0.6rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(237, 228, 216, 0.35);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(237, 228, 216, 0.1);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  flex-shrink: 0;
+}
+
+.room-peer-addr {
+  font-size: 0.65rem;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: rgba(237, 228, 216, 0.3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 0.1rem;
 }
 
 /* Voice controls */
@@ -645,5 +688,11 @@ body {
   .room-main {
     flex: 1;
     min-height: 0;
+  }
+
+  /* Prevent mobile Safari from zooming on input focus */
+  input[type="text"],
+  textarea {
+    font-size: 16px;
   }
 }

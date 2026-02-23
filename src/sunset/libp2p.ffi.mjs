@@ -151,14 +151,16 @@ export function register_chat_handler(on_message) {
   });
 }
 
-// Broadcast a message to all connected peers.
+// Broadcast a message to all connected peers, excluding the relay.
 // Calls on_ok() when all sends are attempted, on_error(msg) on failure.
 export function broadcast_message(text, on_ok, on_error) {
   if (!_libp2p) {
     on_error("libp2p not initialised");
     return;
   }
-  const peers = _libp2p.getPeers();
+  const relayPeerId = _getRelayPeerId();
+  const relayStr = relayPeerId ? relayPeerId.toString() : null;
+  const peers = _libp2p.getPeers().filter((p) => p.toString() !== relayStr);
   if (peers.length === 0) {
     on_error("No peers connected");
     return;
@@ -552,6 +554,34 @@ async function _pollDiscovery() {
   }
 }
 
+// Get the relay peer ID as a string (or "" if not connected).
+export function get_relay_peer_id() {
+  const p = _getRelayPeerId();
+  return p ? p.toString() : "";
+}
+
+// Get the remote multiaddr for each connected peer.
+// When a peer has multiple connections, prefers the direct (non-circuit) one.
+// Returns a Gleam List of [peer_id, remote_addr] pairs (each a Gleam List of strings).
+export function get_peer_remote_addrs() {
+  if (!_libp2p) return toList([]);
+  const best = new Map(); // peer_id -> { addr, isCircuit }
+  for (const conn of _libp2p.getConnections()) {
+    const pid = conn.remotePeer.toString();
+    const addr = conn.remoteAddr.toString();
+    const isCircuit = Circuit.exactMatch(conn.remoteAddr);
+    const existing = best.get(pid);
+    if (!existing || (existing.isCircuit && !isCircuit)) {
+      best.set(pid, { addr, isCircuit });
+    }
+  }
+  const results = [];
+  for (const [pid, { addr }] of best) {
+    results.push(toList([pid, addr]));
+  }
+  return toList(results);
+}
+
 // Get the PeerId of the connected relay (first peer that has a non-WebRTC connection).
 function _getRelayPeerId() {
   if (!_libp2p) return null;
@@ -570,7 +600,8 @@ function _getRelayPeerId() {
 }
 
 // Dial a peer given a list of multiaddr strings. Tries each address
-// sequentially until one succeeds. Calls on_ok() on first success,
+// sequentially until one succeeds, preferring direct WebRTC addresses
+// over circuit relay. Calls on_ok() on first success,
 // on_error(msg) if all fail.
 export function dial_peer_addrs(addrs_list, on_ok, on_error) {
   if (!_libp2p) {
@@ -590,6 +621,14 @@ export function dial_peer_addrs(addrs_list, on_ok, on_error) {
     on_error("No addresses to dial");
     return;
   }
+
+  // Sort: prefer direct WebRTC over circuit relay
+  addrs.sort((a, b) => {
+    const aCircuit = a.includes("/p2p-circuit");
+    const bCircuit = b.includes("/p2p-circuit");
+    if (aCircuit === bCircuit) return 0;
+    return aCircuit ? 1 : -1;
+  });
 
   (async () => {
     const errors = [];

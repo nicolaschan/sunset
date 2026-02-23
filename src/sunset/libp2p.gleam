@@ -84,6 +84,16 @@ pub fn unsubscribe_from_room() -> Nil {
   Nil
 }
 
+@external(javascript, "./libp2p.ffi.mjs", "get_relay_peer_id")
+pub fn get_relay_peer_id() -> String {
+  ""
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_peer_remote_addrs")
+pub fn get_peer_remote_addrs() -> List(List(String)) {
+  []
+}
+
 @external(javascript, "./libp2p.ffi.mjs", "dial_peer_addrs")
 pub fn dial_peer_addrs(
   _addrs: List(String),

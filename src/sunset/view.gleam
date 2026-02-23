@@ -2,7 +2,7 @@ import gleam/int
 import gleam/list
 import gleam/string
 import lustre/attribute.{
-  autofocus, class, classes, href, placeholder, type_, value,
+  autofocus, class, classes, href, placeholder, title, type_, value,
 }
 import lustre/element.{type Element, text}
 import lustre/element/html.{
@@ -148,10 +148,44 @@ fn view_room(model: Model) -> Element(Msg) {
               ul(
                 [class("room-peers-list")],
                 list.map(peers, fn(peer_id) {
-                  li([class("room-peer")], [
-                    span([class("room-peer-dot")], []),
-                    span([class("room-peer-id")], [text(short_peer_id(peer_id))]),
-                  ])
+                  let is_relay = peer_id == model.relay_peer_id
+                  let addr = peer_addr(model, peer_id)
+                  li(
+                    [
+                      classes([
+                        #("room-peer", True),
+                        #("room-peer-relay", is_relay),
+                      ]),
+                    ],
+                    [
+                      span(
+                        [
+                          classes([
+                            #("room-peer-dot", True),
+                            #("room-peer-dot-relay", is_relay),
+                          ]),
+                        ],
+                        [],
+                      ),
+                      div([class("room-peer-info")], [
+                        div([class("room-peer-name")], [
+                          span([class("room-peer-id")], [
+                            text(short_peer_id(peer_id)),
+                          ]),
+                          case is_relay {
+                            True ->
+                              span([class("room-peer-badge")], [text("relay")])
+                            False -> text("")
+                          },
+                        ]),
+                        case addr {
+                          "" -> text("")
+                          a ->
+                            div([class("room-peer-addr"), title(a)], [text(a)])
+                        },
+                      ]),
+                    ],
+                  )
                 }),
               )
           },
@@ -374,7 +408,19 @@ fn view_peers(model: Model) -> Element(Msg) {
       ul(
         [class("peer-list")],
         list.map(peers, fn(peer_id) {
-          li([class("peer-item")], [text(peer_id)])
+          let is_relay = peer_id == model.relay_peer_id
+          let addr = peer_addr(model, peer_id)
+          li([class("peer-item")], [
+            text(peer_id),
+            case is_relay {
+              True -> span([class("room-peer-badge")], [text("relay")])
+              False -> text("")
+            },
+            case addr {
+              "" -> text("")
+              a -> div([class("room-peer-addr")], [text(a)])
+            },
+          ])
         }),
       )
   }
@@ -466,5 +512,12 @@ fn short_peer_id(peer_id: String) -> String {
     True ->
       string.slice(peer_id, 0, 6) <> ".." <> string.slice(peer_id, len - 4, 4)
     False -> peer_id
+  }
+}
+
+fn peer_addr(model: Model, peer_id: String) -> String {
+  case list.find(model.peer_addrs, fn(pair) { pair.0 == peer_id }) {
+    Ok(#(_, addr)) -> addr
+    Error(_) -> ""
   }
 }
