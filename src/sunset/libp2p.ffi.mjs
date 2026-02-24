@@ -67,7 +67,8 @@ export function init_libp2p(dispatch) {
       libp2p.addEventListener("peer:disconnect", (event) => {
         const remotePeerIdStr = event.detail.toString();
         console.log("peer:disconnect", remotePeerIdStr);
-        closeAudioPC(remotePeerIdStr);
+        // Audio PCs are independent of libp2p transport — don't close them here.
+        // They manage their own lifecycle via ICE (connectionstatechange → failed/closed).
       });
 
       dispatch(libp2p.peerId.toString());
