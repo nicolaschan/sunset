@@ -29,12 +29,13 @@ export function set_timeout(callback, ms) {
 export function init_libp2p(dispatch) {
   createLibp2p({
     addresses: {
-      listen: ["/p2p-circuit", "/webrtc"],
+      // listen: ["/p2p-circuit", "/webrtc"],
+      listen: ["/p2p-circuit"],
     },
     transports: [
       webSockets(),
       webTransport(),
-      webRTC(),
+      // webRTC(),
       circuitRelayTransport(),
     ],
     connectionEncrypters: [noise()],
@@ -148,7 +149,7 @@ export function register_chat_handler(on_message) {
     } catch (err) {
       console.error("Chat receive error:", err);
     }
-  });
+  }, { runOnLimitedConnection: true });
 }
 
 // Broadcast a message to all connected peers, excluding the relay.
@@ -168,8 +169,8 @@ export function broadcast_message(text, on_ok, on_error) {
   const encoded = new TextEncoder().encode(text);
   const sends = peers.map(async (peerId) => {
     try {
-      const stream = await _libp2p.dialProtocol(peerId, CHAT_PROTOCOL);
-      stream.send(encoded);
+      const stream = await _libp2p.dialProtocol(peerId, CHAT_PROTOCOL, { runOnLimitedConnection: true });
+      await stream.send(encoded);
       await stream.close();
     } catch (err) {
       console.warn(`Failed to send to ${peerId}:`, err);
