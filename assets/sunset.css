@@ -451,6 +451,30 @@ body {
   }
 }
 
+.room-peer-dot-disconnected {
+  background: #ef4444;
+  animation: disconnect-pulse 2s ease-in-out infinite;
+}
+
+@keyframes disconnect-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.room-peer-disconnected {
+  opacity: 0.55;
+}
+
+.room-peer-badge-disconnected {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
+  background: rgba(239, 68, 68, 0.08);
+}
+
 .room-peer-info {
   min-width: 0;
   flex: 1;

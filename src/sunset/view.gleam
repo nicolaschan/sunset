@@ -146,97 +146,31 @@ fn view_room(model: Model) -> Element(Msg) {
             text("Connected (" <> int.to_string(model.connection_count) <> ")"),
           ]),
           case model.peers {
-            [] -> div([class("room-peers-empty")], [text("No peers yet")])
+            [] ->
+              case model.disconnected_peers {
+                [] -> div([class("room-peers-empty")], [text("No peers yet")])
+                _ -> text("")
+              }
             peers ->
               ul(
                 [class("room-peers-list")],
                 list.map(peers, fn(peer_id) {
-                  let is_relay = peer_id == model.relay_peer_id
-                  let transport = peer_transport(model, peer_id)
-                  let is_circuit = transport == "Circuit Relay"
-                  let addr = peer_addr(model, peer_id)
-                  let #(audio_joined, audio_muted) =
-                    peer_audio_state(model, peer_id)
-                  let rtc_state = peer_audio_pc_state(model, peer_id)
-                  li(
-                    [
-                      classes([
-                        #("room-peer", True),
-                        #("room-peer-relay", is_relay),
-                      ]),
-                      on_click(UserClickedPeer(peer_id)),
-                    ],
-                    [
-                      span(
-                        [
-                          classes([
-                            #("room-peer-dot", True),
-                            #("room-peer-dot-relay", is_relay),
-                            #("room-peer-dot-circuit", is_circuit && !is_relay),
-                            #(
-                              "room-peer-dot-rtc-connected",
-                              rtc_state == "connected",
-                            ),
-                            #(
-                              "room-peer-dot-rtc-connecting",
-                              rtc_state == "new" || rtc_state == "connecting",
-                            ),
-                          ]),
-                        ],
-                        [],
-                      ),
-                      div([class("room-peer-info")], [
-                        div([class("room-peer-name")], [
-                          span([class("room-peer-id")], [
-                            case is_relay {
-                              True -> text(relay_display_name(addr))
-                              False -> text(short_peer_id(peer_id))
-                            },
-                          ]),
-                          case is_relay {
-                            True ->
-                              span([class("room-peer-badge")], [text("relay")])
-                            False -> text("")
-                          },
-                          // Audio presence indicator
-                          case is_relay, audio_joined {
-                            True, _ -> text("")
-                            _, False -> text("")
-                            _, True ->
-                              span(
-                                [
-                                  classes([
-                                    #("room-peer-audio", True),
-                                    #("room-peer-audio-muted", audio_muted),
-                                  ]),
-                                  title(case audio_muted {
-                                    True -> "In audio (muted)"
-                                    False -> "In audio"
-                                  }),
-                                ],
-                                [
-                                  text(case audio_muted {
-                                    True -> "\u{1F507}"
-                                    False -> "\u{1F3A4}"
-                                  }),
-                                ],
-                              )
-                          },
-                        ]),
-                        case is_relay {
-                          True -> text("")
-                          False ->
-                            case addr {
-                              "" -> text("")
-                              a ->
-                                div([class("room-peer-addr"), title(a)], [
-                                  text(a),
-                                ])
-                            }
-                        },
-                      ]),
-                    ],
-                  )
+                  view_peer_item(model, peer_id, False)
+                }),
+              )
+          },
+          // Recently-disconnected peers (shown with red dot)
+          case
+            list.filter(model.disconnected_peers, fn(pid) {
+              !list.contains(model.peers, pid)
+            })
+          {
+            [] -> text("")
+            disconnected ->
+              ul(
+                [class("room-peers-list room-peers-list-disconnected")],
+                list.map(disconnected, fn(peer_id) {
+                  view_peer_item(model, peer_id, True)
                 }),
               )
           },
@@ -598,6 +532,109 @@ fn view_audio(model: Model) -> Element(Msg) {
 }
 
 // -- Helpers --
+
+/// Render a single peer list item. `is_disconnected` controls whether
+/// this peer is shown with the red disconnected dot.
+fn view_peer_item(
+  model: Model,
+  peer_id: String,
+  is_disconnected: Bool,
+) -> Element(Msg) {
+  let is_relay = peer_id == model.relay_peer_id
+  let transport = peer_transport(model, peer_id)
+  let is_circuit = transport == "Circuit Relay"
+  let addr = peer_addr(model, peer_id)
+  let #(audio_joined, audio_muted) = peer_audio_state(model, peer_id)
+  let rtc_state = peer_audio_pc_state(model, peer_id)
+  li(
+    [
+      classes([
+        #("room-peer", True),
+        #("room-peer-relay", is_relay),
+        #("room-peer-disconnected", is_disconnected),
+      ]),
+      on_click(UserClickedPeer(peer_id)),
+    ],
+    [
+      span(
+        [
+          classes([
+            #("room-peer-dot", True),
+            #("room-peer-dot-relay", is_relay),
+            #("room-peer-dot-circuit", is_circuit && !is_relay),
+            #("room-peer-dot-disconnected", is_disconnected),
+            #(
+              "room-peer-dot-rtc-connected",
+              rtc_state == "connected" && !is_disconnected,
+            ),
+            #(
+              "room-peer-dot-rtc-connecting",
+              { rtc_state == "new" || rtc_state == "connecting" }
+                && !is_disconnected,
+            ),
+          ]),
+        ],
+        [],
+      ),
+      div([class("room-peer-info")], [
+        div([class("room-peer-name")], [
+          span([class("room-peer-id")], [
+            case is_relay {
+              True -> text(relay_display_name(addr))
+              False -> text(short_peer_id(peer_id))
+            },
+          ]),
+          case is_relay {
+            True -> span([class("room-peer-badge")], [text("relay")])
+            False -> text("")
+          },
+          case is_disconnected {
+            True ->
+              span([class("room-peer-badge room-peer-badge-disconnected")], [
+                text("reconnecting"),
+              ])
+            False -> text("")
+          },
+          // Audio presence indicator
+          case is_relay, audio_joined {
+            True, _ -> text("")
+            _, False -> text("")
+            _, True ->
+              span(
+                [
+                  classes([
+                    #("room-peer-audio", True),
+                    #("room-peer-audio-muted", audio_muted),
+                  ]),
+                  title(case audio_muted {
+                    True -> "In audio (muted)"
+                    False -> "In audio"
+                  }),
+                ],
+                [
+                  text(case audio_muted {
+                    True -> "\u{1F507}"
+                    False -> "\u{1F3A4}"
+                  }),
+                ],
+              )
+          },
+        ]),
+        case is_relay {
+          True -> text("")
+          False ->
+            case addr {
+              "" -> text("")
+              a ->
+                div([class("room-peer-addr"), title(a)], [
+                  text(a),
+                ])
+            }
+        },
+      ]),
+    ],
+  )
+}
 
 fn short_peer_id(peer_id: String) -> String {
   let len = string.length(peer_id)

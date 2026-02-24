@@ -62,6 +62,7 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       selected_peer: None,
       peer_audio_states: [],
       audio_pc_states: [],
+      disconnected_peers: [],
     )
 
   #(
@@ -231,6 +232,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             _ -> Error(Nil)
           }
         })
+      let disconnected_peers = libp2p.get_recently_disconnected_peers()
       let peer_count = list.count(peers, fn(pid) { pid != model.peer_id })
       // Broadcast our audio presence so peers stay in sync.
       libp2p.broadcast_audio_presence()
@@ -247,6 +249,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           relay_peer_id: relay_id,
           peer_audio_states: peer_audio_states,
           audio_pc_states: audio_pc_states,
+          disconnected_peers: disconnected_peers,
         ),
         schedule_tick(),
       )

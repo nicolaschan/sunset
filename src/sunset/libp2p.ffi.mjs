@@ -19,6 +19,14 @@ import { toList } from "../gleam.mjs";
 
 let _libp2p = null;
 
+// -- Recently-disconnected peer tracking --
+// When a peer disconnects from libp2p, we keep them in this map for a grace
+// period so the UI can show them with a "disconnected" indicator (red dot)
+// instead of instantly removing them. If they reconnect within the window
+// we remove them from this map.
+const _recentlyDisconnectedPeers = new Map(); // peer ID string -> { disconnectedAt: number }
+const PEER_DISCONNECT_GRACE_MS = 30_000; // keep showing for 30 seconds
+
 // setTimeout wrapper for Gleam FFI
 export function set_timeout(callback, ms) {
   setTimeout(callback, ms);
@@ -54,6 +62,8 @@ export function init_libp2p(dispatch) {
         const remotePeerId = event.detail;
         const remotePeerIdStr = remotePeerId.toString();
         console.log("peer:connect", remotePeerIdStr);
+        // Peer came back — remove from recently-disconnected
+        _recentlyDisconnectedPeers.delete(remotePeerIdStr);
         // If we have audio active, create a PC for the new peer
         if (_localStream && !_audioPCs.has(remotePeerIdStr)) {
           const relayPeerId = _getRelayPeerId();
@@ -67,8 +77,18 @@ export function init_libp2p(dispatch) {
       libp2p.addEventListener("peer:disconnect", (event) => {
         const remotePeerIdStr = event.detail.toString();
         console.log("peer:disconnect", remotePeerIdStr);
+        // Track as recently disconnected so the UI can show a red dot
+        // instead of instantly removing the peer from the list.
+        // Don't track the relay — it has its own status indicator.
+        const relayPeerId = _getRelayPeerId();
+        const relayStr = relayPeerId ? relayPeerId.toString() : null;
+        if (remotePeerIdStr !== relayStr) {
+          _recentlyDisconnectedPeers.set(remotePeerIdStr, {
+            disconnectedAt: Date.now(),
+          });
+        }
         // Audio PCs are independent of libp2p transport — don't close them here.
-        // They manage their own lifecycle via ICE (connectionstatechange → failed/closed).
+        // They manage their own lifecycle via ICE (connectionstatechange -> failed/closed).
       });
 
       dispatch(libp2p.peerId.toString());
@@ -221,6 +241,10 @@ const STUN_SERVERS = [
 ];
 
 const _audioPCs = new Map(); // peer ID string -> RTCPeerConnection
+const _audioReconnectTimers = new Map(); // peer ID string -> timeout ID
+const _audioReconnectCounts = new Map(); // peer ID string -> number of attempts so far
+const AUDIO_RECONNECT_MAX_ATTEMPTS = 5;
+const AUDIO_RECONNECT_BASE_DELAY_MS = 1000; // 1s, 2s, 4s, 8s, 16s
 
 // Send an audio signaling message to a peer via libp2p stream.
 // Fire-and-forget: one stream per message.
@@ -263,6 +287,14 @@ function createAudioPC(remotePeerId, shouldOffer) {
   const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
   _audioPCs.set(peerIdStr, pc);
 
+  _setupAudioPC(pc, remotePeerId, peerIdStr, shouldOffer);
+
+  return pc;
+}
+
+// Set up event handlers, add tracks, and optionally create an offer
+// for an RTCPeerConnection. Shared by createAudioPC and attemptAudioReconnect.
+function _setupAudioPC(pc, remotePeerId, peerIdStr, shouldOffer) {
   // ICE candidate trickling — send each candidate as it's discovered
   pc.addEventListener("icecandidate", (event) => {
     if (event.candidate) {
@@ -290,12 +322,40 @@ function createAudioPC(remotePeerId, shouldOffer) {
     }
   });
 
-  // Connection state logging + cleanup on failure
+  // Connection state logging + reconnection on failure.
+  // Only the offerer (higher peer ID) drives reconnection attempts.
+  // The answerer just cleans up its dead PC so that when the offerer
+  // sends a new offer, the signaling handler will create a fresh PC.
+  const isOfferer = shouldOffer;
   pc.addEventListener("connectionstatechange", () => {
     console.log(
       `[Audio ${peerIdStr.slice(-8)}] Connection: ${pc.connectionState}`,
     );
-    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+    if (pc.connectionState === "connected") {
+      // Connection succeeded — reset reconnect state
+      _audioReconnectCounts.delete(peerIdStr);
+      const timer = _audioReconnectTimers.get(peerIdStr);
+      if (timer) {
+        clearTimeout(timer);
+        _audioReconnectTimers.delete(peerIdStr);
+      }
+    } else if (pc.connectionState === "disconnected") {
+      // ICE disconnected — may recover on its own.
+      // Only the offerer schedules a reconnect as a backup.
+      if (isOfferer) {
+        scheduleAudioReconnect(peerIdStr);
+      }
+    } else if (pc.connectionState === "failed") {
+      // ICE failed — clean up this PC.
+      removeRemoteAudioFor(peerIdStr);
+      _audioPCs.delete(peerIdStr);
+      // Only the offerer drives reconnection. The answerer waits
+      // for a new offer to arrive via the signaling handler.
+      if (isOfferer) {
+        scheduleAudioReconnect(peerIdStr);
+      }
+    } else if (pc.connectionState === "closed") {
+      // Explicitly closed (e.g. bye) — clean up, no reconnect
       removeRemoteAudioFor(peerIdStr);
       _audioPCs.delete(peerIdStr);
     }
@@ -334,18 +394,120 @@ function createAudioPC(remotePeerId, shouldOffer) {
       }
     })();
   }
-
-  return pc;
 }
 
 // Close and remove an audio PC for a peer.
-function closeAudioPC(peerIdStr) {
+// If `resetReconnect` is true, also cancel any pending reconnect attempts.
+function closeAudioPC(peerIdStr, resetReconnect = true) {
+  if (resetReconnect) {
+    _audioReconnectCounts.delete(peerIdStr);
+    const timer = _audioReconnectTimers.get(peerIdStr);
+    if (timer) {
+      clearTimeout(timer);
+      _audioReconnectTimers.delete(peerIdStr);
+    }
+  }
   const pc = _audioPCs.get(peerIdStr);
   if (pc) {
     pc.close();
     _audioPCs.delete(peerIdStr);
     removeRemoteAudioFor(peerIdStr);
   }
+}
+
+// Schedule a reconnect attempt for a failed/disconnected audio PC.
+// Uses exponential backoff: 1s, 2s, 4s, 8s, 16s then gives up.
+function scheduleAudioReconnect(peerIdStr) {
+  // Don't reconnect if we're not in audio mode
+  if (!_audioJoined || !_localStream) return;
+
+  const prevAttempts = _audioReconnectCounts.get(peerIdStr) || 0;
+  const attempt = prevAttempts + 1;
+
+  // Clear any existing timer for this peer
+  const existingTimer = _audioReconnectTimers.get(peerIdStr);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+    _audioReconnectTimers.delete(peerIdStr);
+  }
+
+  if (attempt > AUDIO_RECONNECT_MAX_ATTEMPTS) {
+    console.warn(
+      `[Audio ${peerIdStr.slice(-8)}] Giving up reconnect after ${AUDIO_RECONNECT_MAX_ATTEMPTS} attempts`,
+    );
+    _audioReconnectCounts.delete(peerIdStr);
+    return;
+  }
+
+  _audioReconnectCounts.set(peerIdStr, attempt);
+
+  const delay = AUDIO_RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+  console.log(
+    `[Audio ${peerIdStr.slice(-8)}] Scheduling reconnect attempt ${attempt}/${AUDIO_RECONNECT_MAX_ATTEMPTS} in ${delay}ms`,
+  );
+
+  const timer = setTimeout(() => {
+    _audioReconnectTimers.delete(peerIdStr);
+    attemptAudioReconnect(peerIdStr);
+  }, delay);
+
+  _audioReconnectTimers.set(peerIdStr, timer);
+}
+
+// Cancel a pending audio reconnect for a peer (clears both timer and count).
+function cancelAudioReconnect(peerIdStr) {
+  _audioReconnectCounts.delete(peerIdStr);
+  const timer = _audioReconnectTimers.get(peerIdStr);
+  if (timer) {
+    clearTimeout(timer);
+    _audioReconnectTimers.delete(peerIdStr);
+  }
+}
+
+// Attempt to reconnect an audio PC to a peer.
+function attemptAudioReconnect(peerIdStr) {
+  // Bail out if we've left audio
+  if (!_audioJoined || !_localStream) return;
+
+  // Check if the peer is still reachable via libp2p
+  const remotePeerId = _findPeerId(peerIdStr);
+  if (!remotePeerId) {
+    console.log(
+      `[Audio ${peerIdStr.slice(-8)}] Reconnect skipped: peer not connected via libp2p`,
+    );
+    return;
+  }
+
+  // If there's already a healthy PC, skip
+  const existingPC = _audioPCs.get(peerIdStr);
+  if (existingPC && (existingPC.connectionState === "connected" || existingPC.connectionState === "connecting")) {
+    console.log(
+      `[Audio ${peerIdStr.slice(-8)}] Reconnect skipped: PC already ${existingPC.connectionState}`,
+    );
+    return;
+  }
+
+  console.log(`[Audio ${peerIdStr.slice(-8)}] Attempting audio reconnect`);
+
+  // Close the old PC without resetting reconnect counts so the backoff
+  // continues to increase if this attempt also fails.
+  const oldPC = _audioPCs.get(peerIdStr);
+  if (oldPC) {
+    oldPC.close();
+    _audioPCs.delete(peerIdStr);
+    removeRemoteAudioFor(peerIdStr);
+  }
+
+  const localId = _libp2p.peerId.toString();
+  const shouldOffer = localId > peerIdStr;
+
+  // Create fresh PC — use the internal constructor directly to avoid
+  // closeAudioPC resetting our reconnect counters.
+  const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+  _audioPCs.set(peerIdStr, pc);
+
+  // Re-use the same setup as createAudioPC
+  _setupAudioPC(pc, remotePeerId, peerIdStr, shouldOffer);
 }
 
 // Register the audio signaling protocol handler.
@@ -563,6 +725,13 @@ export function stop_audio() {
 // Full teardown: send bye to all audio peers, close all PCs, release mic.
 // Called when leaving audio entirely (not just muting).
 export function close_all_audio_pcs() {
+  // Cancel all pending reconnects
+  for (const timer of _audioReconnectTimers.values()) {
+    clearTimeout(timer);
+  }
+  _audioReconnectTimers.clear();
+  _audioReconnectCounts.clear();
+
   // Send bye to all audio peers and close PCs
   for (const [peerIdStr, pc] of _audioPCs) {
     const peerId = _findPeerId(peerIdStr);
@@ -684,16 +853,34 @@ export function broadcast_audio_presence() {
 // Return the audio presence states of all peers as a Gleam-friendly
 // List of [peer_id, joined_string, muted_string].
 export function get_peer_audio_states() {
-  // Clean up entries for peers that are no longer connected.
+  // Clean up entries for peers that are no longer connected
+  // (and not in the recently-disconnected grace period).
   if (_libp2p) {
     const connectedIds = new Set(_libp2p.getPeers().map((p) => p.toString()));
     for (const pid of _peerAudioStates.keys()) {
-      if (!connectedIds.has(pid)) _peerAudioStates.delete(pid);
+      if (!connectedIds.has(pid) && !_recentlyDisconnectedPeers.has(pid)) {
+        _peerAudioStates.delete(pid);
+      }
     }
   }
   const results = [];
   for (const [pid, state] of _peerAudioStates) {
     results.push(toList([pid, state.joined ? "true" : "false", state.muted ? "true" : "false"]));
+  }
+  return toList(results);
+}
+
+// Return peers that recently disconnected and are still within the grace
+// period. Prunes expired entries. Returns a Gleam List of peer ID strings.
+export function get_recently_disconnected_peers() {
+  const now = Date.now();
+  const results = [];
+  for (const [pid, entry] of _recentlyDisconnectedPeers) {
+    if (now - entry.disconnectedAt > PEER_DISCONNECT_GRACE_MS) {
+      _recentlyDisconnectedPeers.delete(pid);
+    } else {
+      results.push(pid);
+    }
   }
   return toList(results);
 }

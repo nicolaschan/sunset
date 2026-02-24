@@ -147,3 +147,8 @@ pub fn get_peer_audio_states() -> List(List(String)) {
 pub fn get_audio_pc_states() -> List(List(String)) {
   []
 }
+
+@external(javascript, "./libp2p.ffi.mjs", "get_recently_disconnected_peers")
+pub fn get_recently_disconnected_peers() -> List(String) {
+  []
+}
