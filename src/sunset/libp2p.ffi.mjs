@@ -217,6 +217,28 @@ function getWebRTCPeers() {
   return results;
 }
 
+// Find the RTCPeerConnection for a given PeerId by scanning all connections.
+// Returns null if the peer has no WebRTC connection (e.g. circuit relay only).
+function findPCForPeer(peerId) {
+  if (!_libp2p) return null;
+  const peerIdStr = peerId.toString();
+  for (const conn of _libp2p.getConnections()) {
+    if (conn.remotePeer.toString() !== peerIdStr) continue;
+    const pc = getPeerConnection(conn);
+    if (pc) return pc;
+  }
+  return null;
+}
+
+// Check whether a given RTCPeerConnection still backs a live libp2p connection.
+function isPCStillLive(pc) {
+  if (!_libp2p) return false;
+  for (const conn of _libp2p.getConnections()) {
+    if (getPeerConnection(conn) === pc) return true;
+  }
+  return false;
+}
+
 // When a new peer connects while we're already broadcasting audio, add our
 // audio track to their RTCPeerConnection.  The WebRTC transport upgrade may
 // not be complete when peer:connect fires, so we retry a few times.
@@ -301,10 +323,22 @@ function removeRemoteAudioFor(pc) {
 }
 
 // Read a full message from a libp2p v3 stream.
+// The async iterator may yield close/reset events instead of data when the
+// remote peer terminates the stream early — skip anything that isn't a
+// Uint8Array to avoid propagating event objects as errors.
 async function readStream(stream) {
   const chunks = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk.subarray());
+  try {
+    for await (const chunk of stream) {
+      // libp2p streams yield Uint8Array-like objects (BufferList slices).
+      // Skip anything that isn't actual data (e.g. close events).
+      if (chunk == null || typeof chunk.subarray !== "function") continue;
+      chunks.push(chunk.subarray());
+    }
+  } catch (err) {
+    // Stream may have been reset/closed mid-read.  If we already collected
+    // some data, try to use it.  Otherwise, re-throw.
+    if (chunks.length === 0) throw err;
   }
   const bytes = new Uint8Array(
     chunks.reduce((acc, c) => acc + c.length, 0),
@@ -318,11 +352,27 @@ async function readStream(stream) {
 }
 
 // Send a signaling message to a peer via the libp2p signaling protocol.
+// Retries up to 3 times with exponential back-off (1s, 2s, 4s) when the
+// underlying stream dial times out or fails transiently.
 async function sendSignalingMessage(peerId, message) {
-  const stream = await _libp2p.dialProtocol(peerId, SIGNALING_PROTOCOL);
   const encoded = new TextEncoder().encode(JSON.stringify(message));
-  stream.send(encoded);
-  await stream.close();
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const stream = await _libp2p.dialProtocol(peerId, SIGNALING_PROTOCOL);
+      stream.send(encoded);
+      await stream.close();
+      return;
+    } catch (err) {
+      if (attempt === maxAttempts) throw err;
+      const delayMs = 1000 * Math.pow(2, attempt - 1);
+      console.debug(
+        `sendSignalingMessage attempt ${attempt} failed, retrying in ${delayMs}ms:`,
+        err.message,
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
 }
 
 // Attach negotiationneeded + track listeners to a peer connection.
@@ -336,6 +386,16 @@ function attachPCHandlers(pc) {
     const peerId = _pcToPeer.get(pc);
     if (!peerId) {
       console.warn("negotiationneeded fired but no peer ID mapped for PC");
+      return;
+    }
+    // If this PC no longer backs a live libp2p connection (e.g. the
+    // connection was downgraded to circuit relay), skip the renegotiation
+    // — the offer would be sent over the relay and discarded.
+    if (!isPCStillLive(pc)) {
+      console.log(
+        "Skipping negotiationneeded — PC is no longer live for",
+        peerId.toString(),
+      );
       return;
     }
     // Skip if we're already mid-negotiation on this PC to avoid glare.
@@ -402,10 +462,16 @@ export function register_signaling_handler() {
       const remotePeerId = connection.remotePeer; // PeerId object
 
       // Find the RTCPeerConnection for this peer.
-      const pc = getPeerConnection(connection);
+      // First try the connection the message arrived on; if that's a relay
+      // connection (no PC), scan all connections for a WebRTC one to the
+      // same peer.
+      let pc = getPeerConnection(connection);
+      if (!pc) {
+        pc = findPCForPeer(remotePeerId);
+      }
       if (!pc) {
         console.warn(
-          "Signaling message from non-WebRTC peer:",
+          "Signaling message but no WebRTC connection for peer:",
           remotePeerId.toString(),
         );
         return;
