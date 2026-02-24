@@ -534,24 +534,38 @@ export function register_signaling_handler() {
             sdp: message.sdp,
           });
         } catch (err) {
-          // The remote offer may carry new ICE credentials that look like an
-          // ICE restart even though the offerer didn't intend one.  Roll back
-          // and retry — setRemoteDescription on a clean "stable" state is more
-          // permissive.
+          // The remote offer may carry new ICE credentials (ice-ufrag/ice-pwd)
+          // that look like an ICE restart.  Chrome/Firefox reject this with:
+          //   "Remote description indicates ICE restart but offer did not
+          //    request ICE restart"
+          // Fix: create a throwaway local offer with iceRestart:true to advance
+          // our local ICE generation, roll back to stable, then accept the
+          // remote offer — the credential mismatch disappears because our local
+          // ICE state now expects new credentials.
           if (
             err instanceof DOMException &&
-            err.message.includes("ICE restart")
+            (err.message.includes("ICE restart") ||
+             err.message.includes("ice-ufrag") ||
+             err.message.includes("ice-pwd"))
           ) {
             console.warn(
-              "ICE-restart mismatch — rolling back and retrying",
+              "ICE-restart mismatch — advancing local ICE generation and retrying",
             );
-            if (pc.signalingState !== "stable") {
+            try {
+              // 1. Create a local offer with ICE restart to bump our credentials
+              const localOffer = await pc.createOffer({ iceRestart: true });
+              await pc.setLocalDescription(localOffer);
+              // 2. Roll back so we're in "stable" state again
               await pc.setLocalDescription({ type: "rollback" });
+              // 3. Now accept the remote offer — credentials match
+              await pc.setRemoteDescription({
+                type: "offer",
+                sdp: message.sdp,
+              });
+            } catch (retryErr) {
+              console.error("ICE restart recovery failed:", retryErr);
+              throw retryErr;
             }
-            await pc.setRemoteDescription({
-              type: "offer",
-              sdp: message.sdp,
-            });
           } else {
             throw err;
           }
