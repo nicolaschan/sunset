@@ -740,7 +740,8 @@ export function register_signaling_handler() {
         // for a rolled-back offer whose SDP no longer matches.
         let answered = false;
 
-        if (pc.signalingState === "have-local-offer") {
+        if (pc.signalingState === "have-local-offer" &&
+            pc.connectionState !== "closed" && pc.connectionState !== "failed") {
           try {
             await pc.setRemoteDescription({
               type: "answer",
@@ -775,6 +776,7 @@ export function register_signaling_handler() {
           const allPCs = findAllPCsForPeer(remotePeerId);
           for (const otherPC of allPCs) {
             if (otherPC === pc) continue;
+            if (otherPC.connectionState === "closed" || otherPC.connectionState === "failed") continue;
             if (otherPC.signalingState === "have-local-offer") {
               try {
                 await otherPC.setRemoteDescription({
@@ -827,6 +829,16 @@ async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
   const ordered = [primaryPC, ...allPCs.filter((p) => p !== primaryPC)];
 
   for (const pc of ordered) {
+    // Skip PCs whose underlying transport is already dead.  This prevents
+    // wasted SDP negotiation on connections killed by libp2p's duplicate
+    // multiaddr abort (connected -> closed with no disconnected phase).
+    if (pc.connectionState === "closed" || pc.connectionState === "failed") {
+      console.debug(
+        `Skipping dead PC (${pc.connectionState}) in tryApplyOffer [${remotePeerId.toString().slice(-8)}]`,
+      );
+      continue;
+    }
+
     _pcToPeer.set(pc, remotePeerId);
     attachPCHandlers(pc);
 
