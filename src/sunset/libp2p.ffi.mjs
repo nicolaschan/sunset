@@ -283,6 +283,7 @@ let _senders = []; // { pc, sender, peerId } references for cleanup
 const _pcToPeer = new Map(); // RTCPeerConnection -> PeerId object
 const _attachedPCs = new Set(); // PCs we've already attached listeners to
 const _negotiationBusy = new WeakSet(); // PCs with an in-flight negotiation
+const POST_GLARE_COOLDOWN_MS = 2000; // Cooldown after glare resolution before re-offering
 let _audioJoined = false; // Whether user has opted in to hear remote audio
 
 // Get the RTCPeerConnection from a libp2p connection object.
@@ -349,6 +350,52 @@ function isPCStillLive(pc) {
     if (getPeerConnection(conn) === pc) return true;
   }
   return false;
+}
+
+// After a glare resolution (rollback + accept remote offer + send answer),
+// negotiationneeded fires immediately because the original addTrack still
+// needs SDP negotiation.  We keep _negotiationBusy held during a cooldown
+// period so the immediate re-fire is suppressed, then trigger a deferred
+// renegotiation once the signaling round-trip has settled.
+function schedulePostGlareRenegotiation(pc) {
+  // _negotiationBusy is already set by the caller — keep it held.
+  setTimeout(async () => {
+    _negotiationBusy.delete(pc);
+
+    const peerId = _pcToPeer.get(pc);
+    if (!peerId || !isPCStillLive(pc)) return;
+    if (pc.signalingState !== "stable") return;
+
+    // Only renegotiate if we have local senders on this PC that may need
+    // a new offer (i.e. the addTrack whose negotiation was rolled back).
+    const hasPendingTracks = _senders.some((s) => s.pc === pc);
+    if (!hasPendingTracks) return;
+
+    console.log(
+      `[PostGlare] Cooldown expired, triggering deferred renegotiation for ${peerId.toString().slice(-8)}`,
+    );
+    _negotiationBusy.add(pc);
+    try {
+      const iceState = pc.iceConnectionState;
+      const needsRestart =
+        iceState === "disconnected" ||
+        iceState === "failed" ||
+        iceState === "closed";
+      const offer = await pc.createOffer({ iceRestart: needsRestart });
+      await pc.setLocalDescription(offer);
+      await sendSignalingMessage(peerId, {
+        type: "offer",
+        sdp: pc.localDescription.sdp,
+      });
+      console.log(
+        `[PostGlare] Sent deferred renegotiation offer to ${peerId.toString().slice(-8)}`,
+      );
+    } catch (err) {
+      console.error("[PostGlare] Deferred renegotiation failed:", err);
+    } finally {
+      _negotiationBusy.delete(pc);
+    }
+  }, POST_GLARE_COOLDOWN_MS);
 }
 
 // When a new peer connects while we're already broadcasting audio, add our
@@ -655,15 +702,28 @@ export function register_signaling_handler() {
       } else if (message.type === "answer") {
         // Only apply the answer if we're actually expecting one.
         // Try the primary PC first, then others if it doesn't match.
+        // Wrap in try/catch: after glare resolution the answer may be
+        // for a rolled-back offer whose SDP no longer matches.
+        let answered = false;
+
         if (pc.signalingState === "have-local-offer") {
-          await pc.setRemoteDescription({
-            type: "answer",
-            sdp: message.sdp,
-          });
-        } else {
+          try {
+            await pc.setRemoteDescription({
+              type: "answer",
+              sdp: message.sdp,
+            });
+            answered = true;
+          } catch (err) {
+            console.warn(
+              `Failed to apply answer on primary PC for ${remotePeerId.toString().slice(-8)} (SDP mismatch?):`,
+              err.message,
+            );
+          }
+        }
+
+        if (!answered) {
           // The answer may be for a different PC (multi-connection case).
           const allPCs = findAllPCsForPeer(remotePeerId);
-          let answered = false;
           for (const otherPC of allPCs) {
             if (otherPC === pc) continue;
             if (otherPC.signalingState === "have-local-offer") {
@@ -679,12 +739,16 @@ export function register_signaling_handler() {
               }
             }
           }
-          if (!answered) {
-            console.warn(
-              "Ignoring answer — no PC in have-local-offer state for",
-              remotePeerId.toString(),
-            );
-          }
+        }
+
+        if (!answered) {
+          // This is expected after glare resolution — the answer is for
+          // the offer that was rolled back, and can be safely ignored.
+          console.debug(
+            "Ignoring stale answer — no PC in have-local-offer state for",
+            remotePeerId.toString(),
+            "(likely already handled by glare resolution)",
+          );
         }
       } else {
         console.warn("Unknown signaling message type:", message.type);
@@ -709,11 +773,13 @@ async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
 
     try {
       // If we're in the middle of our own offer (glare), roll back first.
+      let wasGlare = false;
       if (pc.signalingState === "have-local-offer") {
         console.log(
           `Rolling back local offer on PC to accept remote offer (glare) [${remotePeerId.toString().slice(-8)}]`,
         );
         await pc.setLocalDescription({ type: "rollback" });
+        wasGlare = true;
       }
 
       await pc.setRemoteDescription({ type: "offer", sdp });
@@ -724,6 +790,16 @@ async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
         type: "answer",
         sdp: pc.localDescription.sdp,
       });
+
+      // After glare resolution, the rolled-back addTrack still needs SDP
+      // negotiation, so negotiationneeded will fire immediately.  Hold the
+      // _negotiationBusy flag during a cooldown to suppress the immediate
+      // re-fire, then trigger a deferred renegotiation.
+      if (wasGlare) {
+        _negotiationBusy.add(pc);
+        schedulePostGlareRenegotiation(pc);
+      }
+
       return true;
     } catch (err) {
       const isIceRestart =
@@ -750,6 +826,12 @@ async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
           console.log(
             `Applied offer after ICE restart recovery [${remotePeerId.toString().slice(-8)}]`,
           );
+
+          // ICE restart recovery also involves a rollback — schedule
+          // cooldown if we had pending local tracks.
+          _negotiationBusy.add(pc);
+          schedulePostGlareRenegotiation(pc);
+
           return true;
         } catch (retryErr) {
           console.debug(
