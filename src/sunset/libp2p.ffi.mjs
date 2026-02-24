@@ -187,7 +187,7 @@ export function broadcast_message(text, on_ok, on_error) {
 const SIGNALING_PROTOCOL = "/sunset/signaling/1.0.0";
 
 let _localStream = null;
-let _remoteAudio = null;
+const _remoteAudios = new Map(); // RTCPeerConnection -> HTMLAudioElement
 let _senders = []; // { pc, sender, peerId } references for cleanup
 const _pcToPeer = new Map(); // RTCPeerConnection -> PeerId object
 const _attachedPCs = new Set(); // PCs we've already attached listeners to
@@ -277,16 +277,27 @@ function addTrackToNewPeer(remotePeerId) {
   }, intervalMs);
 }
 
-// Ensure we have a hidden <audio> element for remote playback.
-function ensureRemoteAudio() {
-  if (_remoteAudio) return _remoteAudio;
-  _remoteAudio = document.createElement("audio");
-  _remoteAudio.autoplay = true;
-  _remoteAudio.muted = !_audioJoined; // Start muted until user joins audio
-  _remoteAudio.id = "remote-audio";
-  _remoteAudio.style.display = "none";
-  document.body.appendChild(_remoteAudio);
-  return _remoteAudio;
+// Get or create a hidden <audio> element for a specific peer connection.
+function ensureRemoteAudioFor(pc) {
+  if (_remoteAudios.has(pc)) return _remoteAudios.get(pc);
+  const audio = document.createElement("audio");
+  audio.autoplay = true;
+  audio.muted = !_audioJoined;
+  audio.style.display = "none";
+  document.body.appendChild(audio);
+  _remoteAudios.set(pc, audio);
+  return audio;
+}
+
+// Remove the audio element for a peer connection that has closed.
+function removeRemoteAudioFor(pc) {
+  const audio = _remoteAudios.get(pc);
+  if (audio) {
+    audio.pause();
+    audio.srcObject = null;
+    audio.remove();
+    _remoteAudios.delete(pc);
+  }
 }
 
 // Read a full message from a libp2p v3 stream.
@@ -361,14 +372,21 @@ function attachPCHandlers(pc) {
     }
   });
 
-  // When a remote peer adds a track, play it.
+  // When a remote peer adds a track, play it on a per-peer audio element.
   pc.addEventListener("track", (event) => {
-    const audio = ensureRemoteAudio();
+    const audio = ensureRemoteAudioFor(pc);
     if (event.streams && event.streams.length > 0) {
       audio.srcObject = event.streams[0];
     } else {
       const stream = new MediaStream([event.track]);
       audio.srcObject = stream;
+    }
+  });
+
+  // Clean up the audio element when the peer connection closes.
+  pc.addEventListener("connectionstatechange", () => {
+    if (pc.connectionState === "closed" || pc.connectionState === "failed") {
+      removeRemoteAudioFor(pc);
     }
   });
 }
@@ -523,34 +541,36 @@ export function is_audio_active() {
   return _localStream != null;
 }
 
-// Returns true if we are receiving remote audio.
+// Returns true if we are receiving remote audio from any peer.
 export function is_receiving_audio() {
-  if (!_remoteAudio || !_remoteAudio.srcObject) return false;
-  const tracks = _remoteAudio.srcObject.getAudioTracks();
-  return tracks.some((t) => t.readyState === "live");
+  for (const audio of _remoteAudios.values()) {
+    if (!audio.srcObject) continue;
+    const tracks = audio.srcObject.getAudioTracks();
+    if (tracks.some((t) => t.readyState === "live")) return true;
+  }
+  return false;
 }
 
-// Join audio listening: unmute the remote audio element so the user
-// can hear incoming streams. The element is created on demand but
-// starts muted until the user explicitly joins.
+// Join audio listening: unmute all remote audio elements so the user
+// can hear incoming streams.
 export function join_audio_listening() {
-  const audio = ensureRemoteAudio();
-  audio.muted = false;
-  audio.autoplay = true;
-  // If the element already has a srcObject, force playback
-  if (audio.srcObject) {
-    audio.play().catch(() => {});
-  }
   _audioJoined = true;
+  for (const audio of _remoteAudios.values()) {
+    audio.muted = false;
+    audio.autoplay = true;
+    if (audio.srcObject) {
+      audio.play().catch(() => {});
+    }
+  }
 }
 
-// Leave audio listening: mute the remote audio element and pause playback.
+// Leave audio listening: mute all remote audio elements and pause playback.
 export function leave_audio_listening() {
-  if (_remoteAudio) {
-    _remoteAudio.muted = true;
-    _remoteAudio.pause();
-  }
   _audioJoined = false;
+  for (const audio of _remoteAudios.values()) {
+    audio.muted = true;
+    audio.pause();
+  }
 }
 
 // Returns true if the user has joined audio listening.
