@@ -411,7 +411,7 @@ export function is_receiving_audio() {
 // JSON codec, which frames messages as: <unsigned-varint-length><json-bytes>.
 
 const DISCOVERY_PROTOCOL = "/sunset/discovery/1.0.0";
-const DISCOVERY_POLL_MS = 10_000;
+const DISCOVERY_POLL_MS = 2_000;
 
 let _discoveryRoom = null;
 let _discoveryInterval = null;
