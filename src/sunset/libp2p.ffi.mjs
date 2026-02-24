@@ -752,6 +752,21 @@ export function register_signaling_handler() {
               `Failed to apply answer on primary PC for ${remotePeerId.toString().slice(-8)} (SDP mismatch?):`,
               err.message,
             );
+            // The PC is now stuck in have-local-offer with no valid answer
+            // coming.  Roll back to stable so it can accept new offers or
+            // create fresh ones via negotiationneeded.
+            try {
+              await pc.setLocalDescription({ type: "rollback" });
+              console.log(
+                `Rolled back stuck have-local-offer on primary PC [${remotePeerId.toString().slice(-8)}]`,
+              );
+              schedulePostGlareRenegotiation(pc);
+            } catch (rollbackErr) {
+              console.warn(
+                `Rollback after answer failure also failed [${remotePeerId.toString().slice(-8)}]:`,
+                rollbackErr.message,
+              );
+            }
           }
         }
 
@@ -768,8 +783,18 @@ export function register_signaling_handler() {
                 });
                 answered = true;
                 break;
-              } catch (_) {
-                // Try next PC
+              } catch (answerErr) {
+                // Answer didn't match this PC either — roll back so it
+                // doesn't stay stuck in have-local-offer.
+                try {
+                  await otherPC.setLocalDescription({ type: "rollback" });
+                  console.log(
+                    `Rolled back stuck have-local-offer on alt PC [${remotePeerId.toString().slice(-8)}]`,
+                  );
+                  schedulePostGlareRenegotiation(otherPC);
+                } catch (_) {
+                  // Best effort
+                }
               }
             }
           }
@@ -820,17 +845,24 @@ async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+
+      // IMPORTANT: Set _negotiationBusy BEFORE sendSignalingMessage.
+      // setLocalDescription(answer) can synchronously fire negotiationneeded
+      // (e.g. if addTrack still needs SDP negotiation after glare rollback).
+      // If we wait until after sendSignalingMessage, the negotiationneeded
+      // handler can run during the await and bypass the cooldown.
+      if (wasGlare) {
+        _negotiationBusy.add(pc);
+      }
+
       await sendSignalingMessage(remotePeerId, {
         type: "answer",
         sdp: pc.localDescription.sdp,
       });
 
-      // After glare resolution, the rolled-back addTrack still needs SDP
-      // negotiation, so negotiationneeded will fire immediately.  Hold the
-      // _negotiationBusy flag during a cooldown to suppress the immediate
-      // re-fire, then trigger a deferred renegotiation.
+      // After glare resolution, schedule a deferred renegotiation so the
+      // rolled-back addTrack gets a fresh offer after the cooldown.
       if (wasGlare) {
-        _negotiationBusy.add(pc);
         schedulePostGlareRenegotiation(pc);
       } else if (_negotiationBusy.has(pc)) {
         // We accepted a new offer while already in a post-glare cooldown.
@@ -858,6 +890,11 @@ async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
 
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
+
+          // Set _negotiationBusy BEFORE sendSignalingMessage (same race fix
+          // as the normal glare path above).
+          _negotiationBusy.add(pc);
+
           await sendSignalingMessage(remotePeerId, {
             type: "answer",
             sdp: pc.localDescription.sdp,
@@ -867,8 +904,7 @@ async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
           );
 
           // ICE restart recovery also involves a rollback — schedule
-          // cooldown if we had pending local tracks.
-          _negotiationBusy.add(pc);
+          // cooldown for pending local tracks.
           schedulePostGlareRenegotiation(pc);
 
           return true;
