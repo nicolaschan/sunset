@@ -9,11 +9,13 @@ import sunset/model.{
   ChatMessageReceived, DialFailed, DialSucceeded, HashChanged, Libp2pInitialised,
   Model, PeerDialFailed, PeerDialSucceeded, PeerDiscovered, RelayConnected,
   RelayConnecting, RelayDialFailed, RelayDialSucceeded, RelayDisconnected, Room,
-  RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedConnect,
-  UserClickedJoinAudio, UserClickedJoinRoom, UserClickedLeaveAudio,
-  UserClickedLeaveRoom, UserClickedPeer, UserClickedSend, UserClickedStartAudio,
+  RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedCancelEditName,
+  UserClickedConnect, UserClickedEditName, UserClickedJoinAudio,
+  UserClickedJoinRoom, UserClickedLeaveAudio, UserClickedLeaveRoom,
+  UserClickedPeer, UserClickedSaveName, UserClickedSend, UserClickedStartAudio,
   UserClickedStopAudio, UserClosedPeerModal, UserToggledNodeInfo,
-  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
+  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedNameInput,
+  UserUpdatedRoomInput,
 }
 import sunset/nav
 import sunset/router
@@ -32,7 +34,8 @@ pub fn main() {
 
 fn init(_flags) -> #(Model, Effect(Msg)) {
   let route = router.init_route()
-  let room_name = case route {
+  let saved_name = nav.get_saved_display_name()
+  let room = case route {
     Room(name) -> name
     _ -> ""
   }
@@ -41,7 +44,7 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
     Model(
       route: route,
       room_input: "",
-      room_name: room_name,
+      room_name: room,
       peer_id: "",
       status: "Initialising...",
       relay_status: RelayDisconnected,
@@ -63,7 +66,14 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       peer_audio_states: [],
       audio_pc_states: [],
       disconnected_peers: [],
+      display_name: saved_name,
+      editing_name: False,
+      name_input: "",
+      peer_names: [],
     )
+
+  // Push saved display name to JS so it's included in presence broadcasts
+  libp2p.set_display_name(saved_name)
 
   #(
     model,
@@ -233,6 +243,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         })
       let disconnected_peers = libp2p.get_recently_disconnected_peers()
+      let raw_peer_names = libp2p.get_peer_names()
+      let peer_names =
+        list.filter_map(raw_peer_names, fn(entry) {
+          case entry {
+            [pid, name] -> Ok(#(pid, name))
+            _ -> Error(Nil)
+          }
+        })
       let peer_count = list.count(peers, fn(pid) { pid != model.peer_id })
       // Broadcast our audio presence so peers stay in sync.
       libp2p.broadcast_audio_presence()
@@ -250,6 +268,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           peer_audio_states: peer_audio_states,
           audio_pc_states: audio_pc_states,
           disconnected_peers: disconnected_peers,
+          peer_names: peer_names,
         ),
         schedule_tick(),
       )
@@ -280,8 +299,13 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
 
     ChatMessageReceived(sender, body) -> {
-      let short_sender = short_peer_id(sender)
-      let message = ChatMessage(sender: short_sender, body: body)
+      let display_sender = case
+        list.find(model.peer_names, fn(entry) { entry.0 == sender })
+      {
+        Ok(#(_, name)) -> name
+        Error(_) -> short_peer_id(sender)
+      }
+      let message = ChatMessage(sender: display_sender, body: body)
       #(Model(..model, messages: [message, ..model.messages]), effect.none())
     }
 
@@ -354,6 +378,31 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     UserClosedPeerModal -> {
       #(Model(..model, selected_peer: None), effect.none())
+    }
+
+    UserClickedEditName -> {
+      #(
+        Model(..model, editing_name: True, name_input: model.display_name),
+        effect.none(),
+      )
+    }
+
+    UserUpdatedNameInput(val) -> {
+      #(Model(..model, name_input: val), effect.none())
+    }
+
+    UserClickedSaveName -> {
+      let name = string.trim(model.name_input)
+      nav.save_display_name(name)
+      libp2p.set_display_name(name)
+      #(
+        Model(..model, display_name: name, editing_name: False, name_input: ""),
+        effect.none(),
+      )
+    }
+
+    UserClickedCancelEditName -> {
+      #(Model(..model, editing_name: False, name_input: ""), effect.none())
     }
   }
 }

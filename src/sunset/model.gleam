@@ -43,6 +43,10 @@ pub type Model {
     peer_audio_states: List(#(String, Bool, Bool)),
     audio_pc_states: List(#(String, String)),
     disconnected_peers: List(String),
+    display_name: String,
+    editing_name: Bool,
+    name_input: String,
+    peer_names: List(#(String, String)),
   )
 }
 
@@ -77,4 +81,8 @@ pub type Msg {
   PeerDialFailed(error: String)
   UserClickedPeer(peer_id: String)
   UserClosedPeerModal
+  UserClickedEditName
+  UserUpdatedNameInput(value: String)
+  UserClickedSaveName
+  UserClickedCancelEditName
 }

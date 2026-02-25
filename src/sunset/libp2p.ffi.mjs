@@ -805,7 +805,13 @@ export function is_audio_joined() {
 // peers learn our state quickly.
 
 const AUDIO_PRESENCE_PROTOCOL = "/sunset/audio-presence/1.0.0";
-const _peerAudioStates = new Map(); // peer ID string -> { joined, muted }
+const _peerAudioStates = new Map(); // peer ID string -> { joined, muted, name }
+let _localDisplayName = ""; // Set from Gleam when user saves a display name
+
+// Set the local display name (called from Gleam).
+export function set_display_name(name) {
+  _localDisplayName = name || "";
+}
 
 // Register the handler that receives audio presence from remote peers.
 export function register_audio_presence_handler() {
@@ -818,6 +824,7 @@ export function register_audio_presence_handler() {
       _peerAudioStates.set(remotePeerId, {
         joined: !!message.joined,
         muted: !!message.muted,
+        name: message.name || "",
       });
     } catch (err) {
       console.debug("Audio presence handler error:", err.message);
@@ -832,6 +839,7 @@ export function broadcast_audio_presence() {
   const message = {
     joined: _audioJoined,
     muted: _audioJoined && !_localStream,
+    name: _localDisplayName,
   };
   const encoded = new TextEncoder().encode(JSON.stringify(message));
   const relayPeerId = _getRelayPeerId();
@@ -866,6 +874,18 @@ export function get_peer_audio_states() {
   const results = [];
   for (const [pid, state] of _peerAudioStates) {
     results.push(toList([pid, state.joined ? "true" : "false", state.muted ? "true" : "false"]));
+  }
+  return toList(results);
+}
+
+// Return display names received from peers as a Gleam-friendly
+// List of [peer_id, name] pairs. Only includes peers with a non-empty name.
+export function get_peer_names() {
+  const results = [];
+  for (const [pid, state] of _peerAudioStates) {
+    if (state.name) {
+      results.push(toList([pid, state.name]));
+    }
   }
   return toList(results);
 }

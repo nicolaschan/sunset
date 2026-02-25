@@ -18,3 +18,27 @@ export function on_hash_change(callback) {
     callback(get_hash());
   });
 }
+
+// -- localStorage --
+
+const DISPLAY_NAME_KEY = "sunset:displayName";
+
+export function get_saved_display_name() {
+  try {
+    return localStorage.getItem(DISPLAY_NAME_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function save_display_name(name) {
+  try {
+    if (name) {
+      localStorage.setItem(DISPLAY_NAME_KEY, name);
+    } else {
+      localStorage.removeItem(DISPLAY_NAME_KEY);
+    }
+  } catch {
+    // localStorage may be unavailable (private browsing, etc.)
+  }
+}

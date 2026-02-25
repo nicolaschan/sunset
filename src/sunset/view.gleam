@@ -13,11 +13,13 @@ import lustre/event.{on_click, on_input, on_submit}
 import sunset/libp2p
 import sunset/model.{
   type Model, type Msg, Dev, Home, RelayConnected, RelayConnecting,
-  RelayDisconnected, RelayFailed, Room, UserClickedConnect, UserClickedJoinAudio,
+  RelayDisconnected, RelayFailed, Room, UserClickedCancelEditName,
+  UserClickedConnect, UserClickedEditName, UserClickedJoinAudio,
   UserClickedJoinRoom, UserClickedLeaveAudio, UserClickedLeaveRoom,
-  UserClickedPeer, UserClickedSend, UserClickedStartAudio, UserClickedStopAudio,
-  UserClosedPeerModal, UserToggledNodeInfo, UserUpdatedChatInput,
-  UserUpdatedMultiaddr, UserUpdatedRoomInput,
+  UserClickedPeer, UserClickedSaveName, UserClickedSend, UserClickedStartAudio,
+  UserClickedStopAudio, UserClosedPeerModal, UserToggledNodeInfo,
+  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedNameInput,
+  UserUpdatedRoomInput,
 }
 
 pub fn view(model: Model) -> Element(Msg) {
@@ -142,8 +144,54 @@ fn view_room(model: Model) -> Element(Msg) {
         },
         // Peers list
         div([class("room-peers")], [
-          div([class("room-peers-title")], [
-            text("Connected (" <> int.to_string(model.connection_count) <> ")"),
+          div([class("room-peers-header")], [
+            div([class("room-peers-title")], [
+              text(
+                "Connected (" <> int.to_string(model.connection_count) <> ")",
+              ),
+            ]),
+            // Display name edit button / inline form
+            case model.editing_name {
+              False ->
+                button(
+                  [on_click(UserClickedEditName), class("room-name-edit-btn")],
+                  [
+                    text(case model.display_name {
+                      "" -> "Set name"
+                      name -> name
+                    }),
+                    span([class("room-name-edit-icon")], [text("\u{270E}")]),
+                  ],
+                )
+              True ->
+                form(
+                  [
+                    on_submit(fn(_) { UserClickedSaveName }),
+                    class("room-name-form"),
+                  ],
+                  [
+                    input([
+                      type_("text"),
+                      placeholder("Display name"),
+                      value(model.name_input),
+                      on_input(UserUpdatedNameInput),
+                      class("room-name-input"),
+                      autofocus(True),
+                    ]),
+                    button([type_("submit"), class("room-name-save-btn")], [
+                      text("\u{2713}"),
+                    ]),
+                    button(
+                      [
+                        type_("button"),
+                        on_click(UserClickedCancelEditName),
+                        class("room-name-cancel-btn"),
+                      ],
+                      [text("\u{00D7}")],
+                    ),
+                  ],
+                )
+            },
           ]),
           case model.peers {
             [] ->
@@ -581,7 +629,7 @@ fn view_peer_item(
           span([class("room-peer-id")], [
             case is_relay {
               True -> text(relay_display_name(addr))
-              False -> text(short_peer_id(peer_id))
+              False -> text(peer_display_name(model, peer_id))
             },
           ]),
           case is_relay {
@@ -634,6 +682,15 @@ fn view_peer_item(
       ]),
     ],
   )
+}
+
+/// Look up a peer's display name from the presence protocol.
+/// Returns the display name if set, otherwise falls back to short peer ID.
+fn peer_display_name(model: Model, peer_id: String) -> String {
+  case list.find(model.peer_names, fn(entry) { entry.0 == peer_id }) {
+    Ok(#(_, name)) -> name
+    Error(_) -> short_peer_id(peer_id)
+  }
 }
 
 fn short_peer_id(peer_id: String) -> String {
@@ -710,7 +767,9 @@ fn view_peer_modal(model: Model) -> Element(Msg) {
                 ],
                 [],
               ),
-              span([class("modal-title")], [text(short_peer_id(peer_id))]),
+              span([class("modal-title")], [
+                text(peer_display_name(model, peer_id)),
+              ]),
               case is_relay {
                 True -> span([class("room-peer-badge")], [text("relay")])
                 False -> text("")

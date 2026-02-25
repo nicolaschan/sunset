@@ -392,6 +392,109 @@ body {
   padding: 0 1rem 0.5rem;
 }
 
+/* Header row: title on left, name edit on right */
+.room-peers-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-right: 0.5rem;
+}
+
+.room-peers-header .room-peers-title {
+  padding-bottom: 0;
+}
+
+/* Display name edit button */
+.room-name-edit-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  background: none;
+  border: 1px solid rgba(237, 228, 216, 0.15);
+  border-radius: 0.4rem;
+  color: rgba(237, 228, 216, 0.55);
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-name-edit-btn:hover {
+  color: rgba(237, 228, 216, 0.85);
+  border-color: rgba(237, 228, 216, 0.35);
+}
+
+.room-name-edit-icon {
+  font-size: 0.65rem;
+  opacity: 0.6;
+}
+
+/* Inline name edit form */
+.room-name-form {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0;
+}
+
+.room-name-input {
+  width: 7rem;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid rgba(237, 228, 216, 0.25);
+  border-radius: 0.35rem;
+  background: rgba(0, 0, 0, 0.3);
+  color: #ede4d8;
+  font-size: 0.72rem;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.room-name-input:focus {
+  border-color: rgba(237, 228, 216, 0.5);
+}
+
+.room-name-input::placeholder {
+  color: rgba(237, 228, 216, 0.25);
+}
+
+.room-name-save-btn,
+.room-name-cancel-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  border: none;
+  border-radius: 0.3rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.room-name-save-btn {
+  background: rgba(100, 200, 130, 0.25);
+  color: #8fd4a0;
+}
+
+.room-name-save-btn:hover {
+  background: rgba(100, 200, 130, 0.4);
+}
+
+.room-name-cancel-btn {
+  background: rgba(200, 100, 100, 0.2);
+  color: rgba(237, 228, 216, 0.5);
+}
+
+.room-name-cancel-btn:hover {
+  background: rgba(200, 100, 100, 0.35);
+  color: rgba(237, 228, 216, 0.8);
+}
+
 .room-peers-empty {
   padding: 0.5rem 1rem;
   font-size: 0.8rem;

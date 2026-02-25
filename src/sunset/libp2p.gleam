@@ -152,3 +152,13 @@ pub fn get_audio_pc_states() -> List(List(String)) {
 pub fn get_recently_disconnected_peers() -> List(String) {
   []
 }
+
+@external(javascript, "./libp2p.ffi.mjs", "set_display_name")
+pub fn set_display_name(_name: String) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_peer_names")
+pub fn get_peer_names() -> List(List(String)) {
+  []
+}
