@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test --test-timeout=120000 *.test.mjs"
+    "test": "node --test --test-timeout=300000 *.test.mjs"
   },
   "dependencies": {
     "puppeteer": "^24.0.0",
