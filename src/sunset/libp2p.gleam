@@ -1,7 +1,27 @@
-@external(javascript, "./libp2p.ffi.mjs", "init_libp2p")
-pub fn init_libp2p(_dispatch: fn(String) -> Nil) -> Nil {
+// ── Timers ──────────────────────────────────────────────────────────
+
+@external(javascript, "./libp2p.ffi.mjs", "set_timeout")
+pub fn set_timeout(_callback: fn() -> Nil, _ms: Int) -> Nil {
   Nil
 }
+
+// ── libp2p lifecycle ────────────────────────────────────────────────
+
+@external(javascript, "./libp2p.ffi.mjs", "init_libp2p")
+pub fn init_libp2p(
+  _on_ready: fn(String) -> Nil,
+  _on_peer_connect: fn(String) -> Nil,
+  _on_peer_disconnect: fn(String) -> Nil,
+) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_local_peer_id")
+pub fn get_local_peer_id() -> String {
+  ""
+}
+
+// ── Dialling ────────────────────────────────────────────────────────
 
 @external(javascript, "./libp2p.ffi.mjs", "dial_multiaddr")
 pub fn dial_multiaddr(
@@ -11,6 +31,8 @@ pub fn dial_multiaddr(
 ) -> Nil {
   Nil
 }
+
+// ── Queries ─────────────────────────────────────────────────────────
 
 @external(javascript, "./libp2p.ffi.mjs", "get_multiaddrs")
 pub fn get_multiaddrs() -> List(String) {
@@ -22,37 +44,109 @@ pub fn get_connected_peers() -> List(String) {
   []
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "get_connection_count")
-pub fn get_connection_count() -> Int {
-  0
+/// Returns all connections as List(List(String)) where each inner list
+/// is [peer_id, remote_addr_string].
+@external(javascript, "./libp2p.ffi.mjs", "get_all_connections")
+pub fn get_all_connections() -> List(List(String)) {
+  []
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "set_timeout")
-pub fn set_timeout(_callback: fn() -> Nil, _ms: Int) -> Nil {
+// ── Protocol messaging ──────────────────────────────────────────────
+
+@external(javascript, "./libp2p.ffi.mjs", "register_protocol_handler")
+pub fn register_protocol_handler(
+  _protocol: String,
+  _on_message: fn(String, String) -> Nil,
+) -> Nil {
   Nil
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "register_chat_handler")
-pub fn register_chat_handler(_on_message: fn(String, String) -> Nil) -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "broadcast_message")
-pub fn broadcast_message(
-  _text: String,
+@external(javascript, "./libp2p.ffi.mjs", "send_protocol_message")
+pub fn send_protocol_message(
+  _peer_id: String,
+  _protocol: String,
+  _message: String,
   _on_ok: fn() -> Nil,
   _on_error: fn(String) -> Nil,
 ) -> Nil {
   Nil
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "start_audio")
-pub fn start_audio(_on_ok: fn() -> Nil, _on_error: fn(String) -> Nil) -> Nil {
+@external(javascript, "./libp2p.ffi.mjs", "send_protocol_message_fire")
+pub fn send_protocol_message_fire(
+  _peer_id: String,
+  _protocol: String,
+  _message: String,
+) -> Nil {
   Nil
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "stop_audio")
-pub fn stop_audio() -> Nil {
+// ── Audio: microphone ───────────────────────────────────────────────
+
+@external(javascript, "./libp2p.ffi.mjs", "acquire_microphone")
+pub fn acquire_microphone(
+  _on_ok: fn() -> Nil,
+  _on_error: fn(String) -> Nil,
+) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "mute_microphone")
+pub fn mute_microphone() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "release_microphone")
+pub fn release_microphone() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "is_microphone_active")
+pub fn is_microphone_active() -> Bool {
+  False
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "has_microphone")
+pub fn has_microphone() -> Bool {
+  False
+}
+
+// ── Audio: remote playback ──────────────────────────────────────────
+
+@external(javascript, "./libp2p.ffi.mjs", "unmute_remote_audio")
+pub fn unmute_remote_audio() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "mute_remote_audio")
+pub fn mute_remote_audio() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "is_receiving_audio")
+pub fn is_receiving_audio() -> Bool {
+  False
+}
+
+// ── Audio: WebRTC peer connections ──────────────────────────────────
+
+@external(javascript, "./libp2p.ffi.mjs", "create_audio_pc")
+pub fn create_audio_pc(
+  _peer_id: String,
+  _should_offer: Bool,
+  _audio_muted: Bool,
+  _on_state_change: fn(String, String) -> Nil,
+) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "close_audio_pc")
+pub fn close_audio_pc(_peer_id: String) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "send_audio_bye")
+pub fn send_audio_bye(_peer_id: String) -> Nil {
   Nil
 }
 
@@ -61,86 +155,13 @@ pub fn close_all_audio_pcs() -> Nil {
   Nil
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "is_audio_active")
-pub fn is_audio_active() -> Bool {
-  False
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "is_receiving_audio")
-pub fn is_receiving_audio() -> Bool {
-  False
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "join_audio_listening")
-pub fn join_audio_listening() -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "leave_audio_listening")
-pub fn leave_audio_listening() -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "is_audio_joined")
-pub fn is_audio_joined() -> Bool {
-  False
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "subscribe_to_room")
-pub fn subscribe_to_room(
-  _room: String,
-  _on_peer_discovered: fn(String, List(String)) -> Nil,
-) -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "unsubscribe_from_room")
-pub fn unsubscribe_from_room() -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "get_relay_peer_id")
-pub fn get_relay_peer_id() -> String {
-  ""
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "get_peer_remote_addrs")
-pub fn get_peer_remote_addrs() -> List(List(String)) {
-  []
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "get_peer_addrs")
-pub fn get_peer_addrs(_peer_id: String) -> List(List(String)) {
-  []
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "dial_peer_addrs")
-pub fn dial_peer_addrs(
-  _addrs: List(String),
-  _on_ok: fn() -> Nil,
-  _on_error: fn(String) -> Nil,
-) -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "register_audio_presence_handler")
-pub fn register_audio_presence_handler() -> Nil {
-  Nil
-}
-
 @external(javascript, "./libp2p.ffi.mjs", "register_audio_signaling_handler")
-pub fn register_audio_signaling_handler() -> Nil {
+pub fn register_audio_signaling_handler(
+  _audio_muted: Bool,
+  _on_state_change: fn(String, String) -> Nil,
+  _on_bye: fn(String) -> Nil,
+) -> Nil {
   Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "broadcast_audio_presence")
-pub fn broadcast_audio_presence() -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "get_peer_audio_states")
-pub fn get_peer_audio_states() -> List(List(String)) {
-  []
 }
 
 @external(javascript, "./libp2p.ffi.mjs", "get_audio_pc_states")
@@ -148,32 +169,18 @@ pub fn get_audio_pc_states() -> List(List(String)) {
   []
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "reconcile_audio_pcs")
-pub fn reconcile_audio_pcs() -> Nil {
+@external(javascript, "./libp2p.ffi.mjs", "has_audio_pc")
+pub fn has_audio_pc(_peer_id: String) -> Bool {
+  False
+}
+
+// ── Discovery ───────────────────────────────────────────────────────
+
+@external(javascript, "./libp2p.ffi.mjs", "poll_discovery")
+pub fn poll_discovery(
+  _relay_peer_id: String,
+  _room: String,
+  _on_response: fn(String) -> Nil,
+) -> Nil {
   Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "get_recently_disconnected_peers")
-pub fn get_recently_disconnected_peers() -> List(String) {
-  []
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "set_display_name")
-pub fn set_display_name(_name: String) -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "set_client_version")
-pub fn set_client_version(_version: String) -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "get_peer_names")
-pub fn get_peer_names() -> List(List(String)) {
-  []
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "get_peer_versions")
-pub fn get_peer_versions() -> List(List(String)) {
-  []
 }

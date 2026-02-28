@@ -10,7 +10,6 @@ import lustre/element/html.{
   a, button, div, form, h1, h2, hr, input, li, p, section, span, ul,
 }
 import lustre/event.{on_click, on_input, on_submit}
-import sunset/libp2p
 import sunset/model.{
   type Model, type Msg, Dev, Home, RelayConnected, RelayConnecting,
   RelayDisconnected, RelayFailed, Room, UserClickedCancelEditName,
@@ -19,7 +18,7 @@ import sunset/model.{
   UserClickedPeer, UserClickedSaveName, UserClickedSend, UserClickedStartAudio,
   UserClickedStopAudio, UserClosedPeerModal, UserToggledNodeInfo,
   UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedNameInput,
-  UserUpdatedRoomInput, client_version,
+  UserUpdatedRoomInput, classify_transport, client_version, peer_display_name,
 }
 
 pub fn view(model: Model) -> Element(Msg) {
@@ -153,7 +152,7 @@ fn view_room(model: Model) -> Element(Msg) {
           div([class("room-peers-header")], [
             div([class("room-peers-title")], [
               text(
-                "Connected (" <> int.to_string(model.connection_count) <> ")",
+                "Connected (" <> int.to_string(connection_count(model)) <> ")",
               ),
             ]),
             // Display name edit button / inline form
@@ -215,16 +214,16 @@ fn view_room(model: Model) -> Element(Msg) {
           },
           // Recently-disconnected peers (shown with red dot)
           case
-            list.filter(model.disconnected_peers, fn(pid) {
-              !list.contains(model.peers, pid)
+            list.filter(model.disconnected_peers, fn(entry) {
+              !list.contains(model.peers, entry.0)
             })
           {
             [] -> text("")
             disconnected ->
               ul(
                 [class("room-peers-list room-peers-list-disconnected")],
-                list.map(disconnected, fn(peer_id) {
-                  view_peer_item(model, peer_id, True)
+                list.map(disconnected, fn(entry) {
+                  view_peer_item(model, entry.0, True)
                 }),
               )
           },
@@ -372,7 +371,7 @@ fn view_dev(model: Model) -> Element(Msg) {
       section([class("app-section")], [
         h2([class("section-title")], [
           text(
-            "Connected Peers (" <> int.to_string(model.connection_count) <> ")",
+            "Connected Peers (" <> int.to_string(connection_count(model)) <> ")",
           ),
         ]),
         view_peers(model),
@@ -587,6 +586,15 @@ fn view_audio(model: Model) -> Element(Msg) {
 
 // -- Helpers --
 
+/// Count connected peers (excluding self and relay).
+fn connection_count(model: Model) -> Int {
+  list.length(
+    list.filter(model.peers, fn(pid) {
+      pid != model.peer_id && pid != model.relay_peer_id
+    }),
+  )
+}
+
 /// Render a single peer list item. `is_disconnected` controls whether
 /// this peer is shown with the red disconnected dot.
 fn view_peer_item(
@@ -690,24 +698,6 @@ fn view_peer_item(
   )
 }
 
-/// Look up a peer's display name from the presence protocol.
-/// Returns the display name if set, otherwise falls back to short peer ID.
-fn peer_display_name(model: Model, peer_id: String) -> String {
-  case list.find(model.peer_names, fn(entry) { entry.0 == peer_id }) {
-    Ok(#(_, name)) -> name
-    Error(_) -> short_peer_id(peer_id)
-  }
-}
-
-fn short_peer_id(peer_id: String) -> String {
-  let len = string.length(peer_id)
-  case len > 12 {
-    True ->
-      string.slice(peer_id, 0, 6) <> ".." <> string.slice(peer_id, len - 4, 4)
-    False -> peer_id
-  }
-}
-
 fn relay_display_name(addr: String) -> String {
   case string.split(addr, "/") {
     ["", "dns", hostname, ..] -> hostname
@@ -715,24 +705,27 @@ fn relay_display_name(addr: String) -> String {
   }
 }
 
+/// Look up the first address for a peer from the connections list.
 fn peer_addr(model: Model, peer_id: String) -> String {
-  case list.find(model.peer_addrs, fn(pair) { pair.0 == peer_id }) {
-    Ok(#(_, addr, _)) -> addr
+  case list.find(model.connections, fn(pair) { pair.0 == peer_id }) {
+    Ok(#(_, addr)) -> addr
     Error(_) -> ""
   }
 }
 
+/// Look up the transport type for a peer's connection.
 fn peer_transport(model: Model, peer_id: String) -> String {
-  case list.find(model.peer_addrs, fn(pair) { pair.0 == peer_id }) {
-    Ok(#(_, _, transport)) -> transport
+  case list.find(model.connections, fn(pair) { pair.0 == peer_id }) {
+    Ok(#(_, addr)) -> classify_transport(addr)
     Error(_) -> ""
   }
 }
 
-/// Look up a peer's audio presence.  Returns #(joined, muted).
+/// Look up a peer's audio presence from the presence protocol.
+/// Returns #(joined, muted).
 fn peer_audio_state(model: Model, peer_id: String) -> #(Bool, Bool) {
-  case list.find(model.peer_audio_states, fn(entry) { entry.0 == peer_id }) {
-    Ok(#(_, joined, muted)) -> #(joined, muted)
+  case list.find(model.peer_presence, fn(entry) { entry.0 == peer_id }) {
+    Ok(#(_, presence)) -> #(presence.joined, presence.muted)
     Error(_) -> #(False, False)
   }
 }
@@ -751,14 +744,25 @@ fn view_peer_modal(model: Model) -> Element(Msg) {
     None -> text("")
     Some(peer_id) -> {
       let is_relay = peer_id == model.relay_peer_id
-      let raw_addrs = libp2p.get_peer_addrs(peer_id)
+      // Get all connections for this peer and compute transport
       let addrs =
-        list.filter_map(raw_addrs, fn(pair) {
-          case pair {
-            [transport, addr] -> Ok(#(transport, addr))
-            _ -> Error(Nil)
+        list.filter_map(model.connections, fn(conn) {
+          case conn.0 == peer_id {
+            True -> Ok(#(classify_transport(conn.1), conn.1))
+            False -> Error(Nil)
           }
         })
+      // Look up version from peer presence
+      let version = case
+        list.find(model.peer_presence, fn(entry) { entry.0 == peer_id })
+      {
+        Ok(#(_, presence)) ->
+          case presence.version {
+            "" -> "unknown"
+            v -> v
+          }
+        Error(_) -> "unknown"
+      }
       div([class("modal-overlay")], [
         div([class("modal-backdrop"), on_click(UserClosedPeerModal)], []),
         div([class("modal-card")], [
@@ -791,18 +795,7 @@ fn view_peer_modal(model: Model) -> Element(Msg) {
           ]),
           div([class("modal-section")], [
             div([class("modal-section-label")], [text("Version")]),
-            div([class("modal-mono")], [
-              text(
-                case
-                  list.find(model.peer_versions, fn(entry) {
-                    entry.0 == peer_id
-                  })
-                {
-                  Ok(#(_, version)) -> version
-                  Error(_) -> "unknown"
-                },
-              ),
-            ]),
+            div([class("modal-mono")], [text(version)]),
           ]),
           div([class("modal-section")], [
             div([class("modal-section-label")], [
