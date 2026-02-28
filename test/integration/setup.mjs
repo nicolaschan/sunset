@@ -12,6 +12,11 @@ const ROOT = resolve(import.meta.dirname, "..", "..");
 // ── Build ──────────────────────────────────────────────────────────
 
 function buildApp() {
+  const distDir = join(ROOT, "dist");
+  if (existsSync(join(distDir, "index.html"))) {
+    console.log("[setup] App already built (dist/index.html exists), skipping.");
+    return;
+  }
   console.log("[setup] Building Gleam app...");
   execSync("gleam run -m lustre/dev build sunset --minify", {
     cwd: ROOT,
@@ -21,6 +26,11 @@ function buildApp() {
 }
 
 function buildRelay() {
+  if (process.env.RELAY_BIN) {
+    const relayBin = process.env.RELAY_BIN;
+    console.log(`[setup] Using pre-built relay binary: ${relayBin}`);
+    return relayBin;
+  }
   console.log("[setup] Building relay via nix...");
   const out = execSync("nix build ./relay#default --no-link --print-out-paths", {
     cwd: ROOT,

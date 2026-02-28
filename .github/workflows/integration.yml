@@ -34,6 +34,13 @@ jobs:
       - name: Download Gleam dependencies
         run: gleam deps download
 
+      - name: Build app
+        run: gleam run -m lustre/dev build sunset --minify
+
+      - name: Build relay
+        id: relay
+        run: echo "bin=$(nix build ./relay#default --no-link --print-out-paths)/bin/relay" >> "$GITHUB_OUTPUT"
+
       - name: Install integration test dependencies
         run: npm ci
         working-directory: test/integration
@@ -41,3 +48,5 @@ jobs:
       - name: Run integration tests
         run: npm test
         working-directory: test/integration
+        env:
+          RELAY_BIN: ${{ steps.relay.outputs.bin }}
