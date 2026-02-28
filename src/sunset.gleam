@@ -27,6 +27,13 @@ import sunset/view
 
 const default_relay = "/dns/relay.sunset.chat/tcp/443/wss/p2p/12D3KooWAvzBJHKbkWkn3qVH7DdhyJCNFLxQFUrpUFWYueVKzrNY"
 
+fn relay_addr() -> String {
+  case nav.get_query_param("relay") {
+    "" -> default_relay
+    addr -> addr
+  }
+}
+
 pub fn main() {
   let app = lustre.application(init, update, view.view)
   let assert Ok(_) = lustre.start(app, "#app", Nil)
@@ -188,7 +195,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     RelayDialSucceeded -> {
       // Extract relay peer ID from the known relay multiaddr
-      let relay_peer_id = extract_peer_id_from_multiaddr(default_relay)
+      let relay_peer_id = extract_peer_id_from_multiaddr(relay_addr())
       #(
         Model(
           ..model,
@@ -765,7 +772,7 @@ fn clear_hash_effect() -> Effect(Msg) {
 fn dial_relay_effect() -> Effect(Msg) {
   effect.from(fn(dispatch) {
     libp2p.dial_multiaddr(
-      default_relay,
+      relay_addr(),
       fn() { dispatch(RelayDialSucceeded) },
       fn(err) { dispatch(RelayDialFailed(err)) },
     )

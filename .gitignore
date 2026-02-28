@@ -10,3 +10,4 @@ result
 
 /.direnv
 /node_modules
+/test/integration/node_modules

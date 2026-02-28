@@ -19,6 +19,17 @@ export function on_hash_change(callback) {
   });
 }
 
+// -- Query parameters --
+
+export function get_query_param(name) {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get(name) || "";
+  } catch {
+    return "";
+  }
+}
+
 // -- localStorage --
 
 const DISPLAY_NAME_KEY = "sunset:displayName";

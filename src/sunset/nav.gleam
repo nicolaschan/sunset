@@ -18,6 +18,11 @@ pub fn on_hash_change(_callback: fn(String) -> Nil) -> Nil {
   Nil
 }
 
+@external(javascript, "./nav.ffi.mjs", "get_query_param")
+pub fn get_query_param(_name: String) -> String {
+  ""
+}
+
 @external(javascript, "./nav.ffi.mjs", "get_saved_display_name")
 pub fn get_saved_display_name() -> String {
   ""
