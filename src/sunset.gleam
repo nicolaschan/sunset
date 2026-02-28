@@ -15,7 +15,7 @@ import sunset/model.{
   UserClickedPeer, UserClickedSaveName, UserClickedSend, UserClickedStartAudio,
   UserClickedStopAudio, UserClosedPeerModal, UserToggledNodeInfo,
   UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedNameInput,
-  UserUpdatedRoomInput,
+  UserUpdatedRoomInput, client_version,
 }
 import sunset/nav
 import sunset/router
@@ -70,10 +70,13 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       editing_name: False,
       name_input: "",
       peer_names: [],
+      peer_versions: [],
     )
 
   // Push saved display name to JS so it's included in presence broadcasts
   libp2p.set_display_name(saved_name)
+  // Push client version to JS so it's included in presence broadcasts
+  libp2p.set_client_version(client_version)
 
   #(
     model,
@@ -251,6 +254,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             _ -> Error(Nil)
           }
         })
+      let raw_peer_versions = libp2p.get_peer_versions()
+      let peer_versions =
+        list.filter_map(raw_peer_versions, fn(entry) {
+          case entry {
+            [pid, version] -> Ok(#(pid, version))
+            _ -> Error(Nil)
+          }
+        })
       let peer_count = list.count(peers, fn(pid) { pid != model.peer_id })
       // Broadcast our audio presence so peers stay in sync.
       libp2p.broadcast_audio_presence()
@@ -271,6 +282,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           audio_pc_states: audio_pc_states,
           disconnected_peers: disconnected_peers,
           peer_names: peer_names,
+          peer_versions: peer_versions,
         ),
         schedule_tick(),
       )

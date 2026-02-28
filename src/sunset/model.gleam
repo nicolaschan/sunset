@@ -1,5 +1,7 @@
 import gleam/option.{type Option}
 
+pub const client_version = "0.1.0"
+
 pub type Route {
   Home
   Room(name: String)
@@ -47,6 +49,7 @@ pub type Model {
     editing_name: Bool,
     name_input: String,
     peer_names: List(#(String, String)),
+    peer_versions: List(#(String, String)),
   )
 }
 

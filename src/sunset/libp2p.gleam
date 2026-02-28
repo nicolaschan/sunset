@@ -163,7 +163,17 @@ pub fn set_display_name(_name: String) -> Nil {
   Nil
 }
 
+@external(javascript, "./libp2p.ffi.mjs", "set_client_version")
+pub fn set_client_version(_version: String) -> Nil {
+  Nil
+}
+
 @external(javascript, "./libp2p.ffi.mjs", "get_peer_names")
 pub fn get_peer_names() -> List(List(String)) {
+  []
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_peer_versions")
+pub fn get_peer_versions() -> List(List(String)) {
   []
 }

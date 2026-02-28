@@ -19,7 +19,7 @@ import sunset/model.{
   UserClickedPeer, UserClickedSaveName, UserClickedSend, UserClickedStartAudio,
   UserClickedStopAudio, UserClosedPeerModal, UserToggledNodeInfo,
   UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedNameInput,
-  UserUpdatedRoomInput,
+  UserUpdatedRoomInput, client_version,
 }
 
 pub fn view(model: Model) -> Element(Msg) {
@@ -116,6 +116,12 @@ fn view_room(model: Model) -> Element(Msg) {
                     "" -> "..."
                     pid -> pid
                   }),
+                ]),
+              ]),
+              div([class("room-node-info-row")], [
+                span([class("room-node-info-label")], [text("Version")]),
+                span([class("room-node-info-value")], [
+                  text(client_version),
                 ]),
               ]),
               div([class("room-node-info-row")], [
@@ -782,6 +788,21 @@ fn view_peer_modal(model: Model) -> Element(Msg) {
           div([class("modal-section")], [
             div([class("modal-section-label")], [text("Peer ID")]),
             div([class("modal-mono")], [text(peer_id)]),
+          ]),
+          div([class("modal-section")], [
+            div([class("modal-section-label")], [text("Version")]),
+            div([class("modal-mono")], [
+              text(
+                case
+                  list.find(model.peer_versions, fn(entry) {
+                    entry.0 == peer_id
+                  })
+                {
+                  Ok(#(_, version)) -> version
+                  Error(_) -> "unknown"
+                },
+              ),
+            ]),
           ]),
           div([class("modal-section")], [
             div([class("modal-section-label")], [
