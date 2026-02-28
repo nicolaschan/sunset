@@ -397,7 +397,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       libp2p.set_display_name(name)
       #(
         Model(..model, display_name: name, editing_name: False, name_input: ""),
-        effect.none(),
+        broadcast_audio_presence_effect(),
       )
     }
 
