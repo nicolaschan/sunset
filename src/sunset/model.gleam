@@ -1,6 +1,7 @@
 import gleam/list
 import gleam/option.{type Option}
 import gleam/string
+import sunset/webrtc/session
 
 pub const client_version = "0.1.1"
 
@@ -8,6 +9,8 @@ pub const client_version = "0.1.1"
 pub const chat_protocol = "/sunset/chat/1.0.0"
 
 pub const audio_presence_protocol = "/sunset/audio-presence/1.0.0"
+
+pub const audio_signaling_protocol = "/sunset/audio-signaling/1.0.0"
 
 // Reconnect backoff constants
 pub const reconnect_base_delay_ms = 1000
@@ -65,16 +68,12 @@ pub type Model {
     error: String,
     chat_input: String,
     messages: List(ChatMessage),
-    audio_sending: Bool,
-    audio_receiving: Bool,
     audio_joined: Bool,
     audio_error: String,
-    selected_peer: Option(String),
-    // Peer presence received from the presence protocol
-    // Map: peer_id -> PeerPresence
-    peer_presence: List(#(String, PeerPresence)),
-    // Audio PC states from JS: List of #(peer_id, connection_state)
+    audio_connections: List(#(String, session.Connection)),
     audio_pc_states: List(#(String, String)),
+    selected_peer: Option(String),
+    peer_presence: List(#(String, PeerPresence)),
     // Recently disconnected peers: List of #(peer_id, disconnect_timestamp_ms)
     disconnected_peers: List(#(String, Float)),
     display_name: String,
@@ -82,6 +81,8 @@ pub type Model {
     name_input: String,
     // Audio reconnect state: List of #(peer_id, attempt_count)
     reconnect_attempts: List(#(String, Int)),
+    // Peer IDs with in-progress connection attempts (not yet connected or failed)
+    audio_connecting: List(String),
   )
 }
 
@@ -107,12 +108,10 @@ pub type Msg {
   SendSucceeded
   SendFailed(error: String)
   ChatMessageReceived(sender: String, body: String)
-  UserClickedStartAudio
-  UserClickedStopAudio
   UserClickedJoinAudio
   UserClickedLeaveAudio
-  AudioStarted
-  AudioFailed(error: String)
+  AudioConnected(peer_id: String, connection: session.Connection)
+  AudioFailed(peer_id: String, error: String)
   PeerDiscovered(peer_id: String, addrs: List(String))
   PeerDialSucceeded
   PeerDialFailed(error: String)
@@ -124,8 +123,6 @@ pub type Msg {
   UserClickedCancelEditName
   PresenceReceived(peer_id: String, message: String)
   AudioPcStateChanged(peer_id: String, state: String)
-  AudioByeReceived(peer_id: String)
-  DiscoveryResponse(response: String)
   ScheduledReconnect(peer_id: String)
 }
 

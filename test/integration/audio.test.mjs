@@ -17,7 +17,7 @@ import {
   waitForActiveAudioStreams,
   waitForNonSilentAudio,
   isReceivingAudio,
-  isReceivingNonSilentAudio,
+  getNonSilentAudioCount,
   isAudioJoined,
   getActiveAudioStreamCount,
 } from "./helpers.mjs";
@@ -29,7 +29,7 @@ function uniqueRoom(prefix = "audio") {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-describe("Sunset Audio Integration Tests", { concurrency: true }, () => {
+describe("Sunset Audio Integration Tests", () => {
   before(async () => {
     env = await setup();
   });
@@ -100,16 +100,16 @@ describe("Sunset Audio Integration Tests", { concurrency: true }, () => {
 
       // Verify the received audio is not silent (actual tone data is flowing)
       await Promise.all([
-        waitForNonSilentAudio(pageA),
-        waitForNonSilentAudio(pageB),
+        waitForNonSilentAudio(pageA, 1),
+        waitForNonSilentAudio(pageB, 1),
       ]);
 
       const [nonSilentA, nonSilentB] = await Promise.all([
-        isReceivingNonSilentAudio(pageA),
-        isReceivingNonSilentAudio(pageB),
+        getNonSilentAudioCount(pageA),
+        getNonSilentAudioCount(pageB),
       ]);
-      assert.ok(nonSilentA, "Browser A should be receiving non-silent audio");
-      assert.ok(nonSilentB, "Browser B should be receiving non-silent audio");
+      assert.ok(nonSilentA >= 1, `Browser A should have 1 non-silent stream, got ${nonSilentA}`);
+      assert.ok(nonSilentB >= 1, `Browser B should have 1 non-silent stream, got ${nonSilentB}`);
     });
   });
 
@@ -179,16 +179,16 @@ describe("Sunset Audio Integration Tests", { concurrency: true }, () => {
 
       // Verify the audio is not silent after rejoin
       await Promise.all([
-        waitForNonSilentAudio(pageA),
-        waitForNonSilentAudio(pageB),
+        waitForNonSilentAudio(pageA, 1),
+        waitForNonSilentAudio(pageB, 1),
       ]);
 
       const [recvA, recvB] = await Promise.all([
-        isReceivingNonSilentAudio(pageA),
-        isReceivingNonSilentAudio(pageB),
+        getNonSilentAudioCount(pageA),
+        getNonSilentAudioCount(pageB),
       ]);
-      assert.ok(recvA, "Browser A should be receiving non-silent audio after rejoin");
-      assert.ok(recvB, "Browser B should be receiving non-silent audio after A rejoined");
+      assert.ok(recvA >= 1, `Browser A should have 1 non-silent stream after rejoin, got ${recvA}`);
+      assert.ok(recvB >= 1, `Browser B should have 1 non-silent stream after A rejoined, got ${recvB}`);
     });
   });
 
@@ -284,21 +284,21 @@ describe("Sunset Audio Integration Tests", { concurrency: true }, () => {
         `Browser C should receive audio from 2 peers, got ${countC}`
       );
 
-      // Verify the received audio is not silent
+      // Verify ALL received audio streams are not silent
       await Promise.all([
-        waitForNonSilentAudio(pageA),
-        waitForNonSilentAudio(pageB),
-        waitForNonSilentAudio(pageC),
+        waitForNonSilentAudio(pageA, 2),
+        waitForNonSilentAudio(pageB, 2),
+        waitForNonSilentAudio(pageC, 2),
       ]);
 
       const [nonSilentA, nonSilentB, nonSilentC] = await Promise.all([
-        isReceivingNonSilentAudio(pageA),
-        isReceivingNonSilentAudio(pageB),
-        isReceivingNonSilentAudio(pageC),
+        getNonSilentAudioCount(pageA),
+        getNonSilentAudioCount(pageB),
+        getNonSilentAudioCount(pageC),
       ]);
-      assert.ok(nonSilentA, "Browser A should receive non-silent audio");
-      assert.ok(nonSilentB, "Browser B should receive non-silent audio");
-      assert.ok(nonSilentC, "Browser C should receive non-silent audio");
+      assert.ok(nonSilentA >= 2, `Browser A should have 2 non-silent streams, got ${nonSilentA}`);
+      assert.ok(nonSilentB >= 2, `Browser B should have 2 non-silent streams, got ${nonSilentB}`);
+      assert.ok(nonSilentC >= 2, `Browser C should have 2 non-silent streams, got ${nonSilentC}`);
     });
   });
 });

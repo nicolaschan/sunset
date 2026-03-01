@@ -334,16 +334,13 @@ export async function isAudioJoined(page) {
 // ── Non-silent audio detection ─────────────────────────────────────
 
 /**
- * Check whether any received audio stream has non-silent content.
- * Uses the Web Audio API AnalyserNode to measure RMS energy and
- * returns true if the level exceeds a silence threshold.
- *
- * Waits briefly inside the browser for the analyser to accumulate
- * at least one buffer of real samples before reading.
+ * Count how many active audio streams have non-silent content.
+ * Uses the Web Audio API AnalyserNode to measure RMS energy.
  */
-export async function isReceivingNonSilentAudio(page) {
+export async function getNonSilentAudioCount(page) {
   return page.evaluate(async () => {
     const audios = document.querySelectorAll("audio");
+    let count = 0;
     for (const audio of audios) {
       if (!audio.srcObject) continue;
       const tracks = audio.srcObject.getAudioTracks();
@@ -371,22 +368,32 @@ export async function isReceivingNonSilentAudio(page) {
       ctx.close();
 
       // Threshold: anything above -60 dBFS (~0.001 RMS) is non-silent
-      if (rms > 0.001) return true;
+      if (rms > 0.001) count++;
     }
-    return false;
+    return count;
   });
 }
 
 /**
- * Wait until the page is receiving non-silent audio from at least one peer.
- * Polls periodically because the AnalyserNode needs time to accumulate data.
+ * Check whether any received audio stream has non-silent content.
  */
-export async function waitForNonSilentAudio(page, timeout = 60_000) {
+export async function isReceivingNonSilentAudio(page) {
+  return (await getNonSilentAudioCount(page)) > 0;
+}
+
+/**
+ * Wait until the page has at least `count` non-silent audio streams.
+ * Polls periodically because the AnalyserNode needs time to accumulate data.
+ * @param {number} count - minimum number of non-silent streams (default 1)
+ */
+export async function waitForNonSilentAudio(page, count = 1, timeout = 60_000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
-    const nonSilent = await isReceivingNonSilentAudio(page);
-    if (nonSilent) return;
+    const nonSilent = await getNonSilentAudioCount(page);
+    if (nonSilent >= count) return;
     await new Promise((r) => setTimeout(r, 500));
   }
-  throw new Error(`Timed out after ${timeout}ms waiting for non-silent audio`);
+  throw new Error(
+    `Timed out after ${timeout}ms waiting for ${count} non-silent audio stream(s)`
+  );
 }

@@ -1,0 +1,4 @@
+- Prefer writing Gleam instead of JavaScript. JavaScript should only provide a thin bridge to JavaScript specific APIs and should not include any logic that can be implemented in Gleam.
+- Split code into separate modular files instead of leaving comments with section separators. Do not use section separators.
+- Do not leave obvious comments. Make the code clearer instead.
+- Avoid branchy and indented code. Refactor to design the state space to cut away complexity using early returns and invariants.

@@ -1,8 +1,6 @@
 import gleam/int
 import gleam/list
-import lustre/attribute.{
-  autofocus, class, classes, placeholder, title, type_, value,
-}
+import lustre/attribute.{autofocus, class, classes, placeholder, type_, value}
 import lustre/element.{type Element, text}
 import lustre/element/html.{button, div, form, input, li, span, ul}
 import lustre/event.{on_click, on_input, on_submit}
@@ -10,8 +8,7 @@ import sunset/model.{
   type Model, type Msg, RelayConnected, RelayConnecting, RelayDisconnected,
   RelayFailed, UserClickedCancelEditName, UserClickedEditName,
   UserClickedJoinAudio, UserClickedLeaveAudio, UserClickedLeaveRoom,
-  UserClickedSaveName, UserClickedStartAudio, UserClickedStopAudio,
-  UserToggledNodeInfo, UserUpdatedNameInput, client_version,
+  UserClickedSaveName, UserToggledNodeInfo, UserUpdatedNameInput, client_version,
 }
 import sunset/view/chat
 import sunset/view/peers
@@ -218,30 +215,6 @@ fn view_voice(model: Model) -> Element(Msg) {
           button([on_click(UserClickedJoinAudio), class("room-voice-btn")], [
             text("Join audio"),
           ])
-      },
-      case model.audio_joined {
-        True ->
-          case model.audio_sending {
-            True ->
-              button(
-                [
-                  on_click(UserClickedStopAudio),
-                  class("room-voice-icon-btn room-voice-icon-btn-active"),
-                  title("Turn off mic"),
-                ],
-                [text("\u{1F3A4}")],
-              )
-            False ->
-              button(
-                [
-                  on_click(UserClickedStartAudio),
-                  class("room-voice-icon-btn"),
-                  title("Turn on mic"),
-                ],
-                [text("\u{1F507}")],
-              )
-          }
-        False -> text("")
       },
     ]),
     case model.audio_error {

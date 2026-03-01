@@ -8,8 +8,8 @@ import lustre/element/html.{
 import lustre/event.{on_click, on_input}
 import sunset/model.{
   type Model, type Msg, UserClickedConnect, UserClickedJoinAudio,
-  UserClickedLeaveAudio, UserClickedSend, UserClickedStartAudio,
-  UserClickedStopAudio, UserUpdatedChatInput, UserUpdatedMultiaddr,
+  UserClickedLeaveAudio, UserClickedSend, UserUpdatedChatInput,
+  UserUpdatedMultiaddr,
 }
 import sunset/view/peers
 
@@ -190,18 +190,6 @@ fn view_audio(model: Model) -> Element(Msg) {
           [text("Join Audio")],
         )
     },
-    case model.audio_sending {
-      True ->
-        button(
-          [on_click(UserClickedStopAudio), class("audio-button audio-stop")],
-          [text("Stop Mic")],
-        )
-      False ->
-        button(
-          [on_click(UserClickedStartAudio), class("audio-button audio-start")],
-          [text("Start Mic")],
-        )
-    },
     div([class("audio-status")], [
       span(
         [
@@ -212,36 +200,11 @@ fn view_audio(model: Model) -> Element(Msg) {
         ],
         [
           text(case model.audio_joined {
-            True -> "Listening"
-            False -> "Audio off"
-          }),
-        ],
-      ),
-      span(
-        [
-          classes([
-            #("audio-indicator", True),
-            #("audio-indicator-active", model.audio_sending),
-          ]),
-        ],
-        [
-          text(case model.audio_sending {
-            True -> "Sending"
-            False -> "Mic off"
-          }),
-        ],
-      ),
-      span(
-        [
-          classes([
-            #("audio-indicator", True),
-            #("audio-indicator-active", model.audio_receiving),
-          ]),
-        ],
-        [
-          text(case model.audio_receiving {
-            True -> "Receiving"
-            False -> "No incoming audio"
+            True ->
+              "Joined ("
+              <> int.to_string(list.length(model.audio_connections))
+              <> " connections)"
+            False -> "Not joined"
           }),
         ],
       ),

@@ -14,6 +14,9 @@ lustre_dev_tools = ">= 2.3.0 and < 3.0.0"
 [tools.lustre.build]
 no_html = true
 
+[tools.lustre.dev]
+host = "0.0.0.0"
+
 [tools.lustre.html]
 title = "Sunset"
 
