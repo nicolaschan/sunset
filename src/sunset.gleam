@@ -565,35 +565,73 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Ok(presence) -> {
           let peer_presence =
             list.key_set(model.peer_presence, peer_id, presence)
-          let should_connect =
-            model.audio_joined
-            && presence.joined
-            && !list.any(model.audio_connections, fn(e) { e.0 == peer_id })
-            && !list.contains(model.audio_connecting, peer_id)
-          case should_connect {
-            True ->
+          let has_connection =
+            list.any(model.audio_connections, fn(e) { e.0 == peer_id })
+          case !presence.joined && has_connection {
+            True -> {
               debug.log(
                 "app",
-                "PresenceReceived: auto-connecting to peer=" <> peer_id,
+                "PresenceReceived: peer left audio, tearing down peer="
+                  <> peer_id,
               )
-            False -> Nil
+              case list.key_find(model.audio_connections, peer_id) {
+                Ok(conn) -> call.hangup(conn)
+                Error(_) -> Nil
+              }
+              dispatch.remove_handler(peer_id)
+              #(
+                Model(
+                  ..model,
+                  peer_presence: peer_presence,
+                  audio_connections: list.filter(model.audio_connections, fn(e) {
+                    e.0 != peer_id
+                  }),
+                  audio_pc_states: list.filter(model.audio_pc_states, fn(e) {
+                    e.0 != peer_id
+                  }),
+                  reconnect_attempts: list.filter(
+                    model.reconnect_attempts,
+                    fn(e) { e.0 != peer_id },
+                  ),
+                  audio_connecting: list.filter(model.audio_connecting, fn(p) {
+                    p != peer_id
+                  }),
+                ),
+                effect.none(),
+              )
+            }
+            False -> {
+              let should_connect =
+                model.audio_joined
+                && presence.joined
+                && !has_connection
+                && !list.contains(model.audio_connecting, peer_id)
+              case should_connect {
+                True ->
+                  debug.log(
+                    "app",
+                    "PresenceReceived: auto-connecting to peer=" <> peer_id,
+                  )
+                False -> Nil
+              }
+              let connect_effect = case should_connect {
+                True -> connect_to_peer_effect(peer_id)
+                False -> effect.none()
+              }
+              let audio_connecting = case should_connect {
+                True -> [peer_id, ..model.audio_connecting]
+                False -> model.audio_connecting
+              }
+              #(
+                Model(
+                  ..model,
+                  peer_presence: peer_presence,
+                  audio_connecting: audio_connecting,
+                ),
+                connect_effect,
+              )
+            }
           }
-          let connect_effect = case should_connect {
-            True -> connect_to_peer_effect(peer_id)
-            False -> effect.none()
-          }
-          let audio_connecting = case should_connect {
-            True -> [peer_id, ..model.audio_connecting]
-            False -> model.audio_connecting
-          }
-          #(
-            Model(
-              ..model,
-              peer_presence: peer_presence,
-              audio_connecting: audio_connecting,
-            ),
-            connect_effect,
-          )
         }
         Error(_) -> #(model, effect.none())
       }

@@ -29,7 +29,7 @@ function uniqueRoom(prefix = "audio") {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-describe("Sunset Audio Integration Tests", () => {
+describe("Sunset Audio Integration Tests", { concurrency: true }, () => {
   before(async () => {
     env = await setup();
   });
@@ -64,7 +64,7 @@ describe("Sunset Audio Integration Tests", () => {
       await Promise.all([browserA?.close(), browserB?.close()]);
     });
 
-    it("should establish WebRTC audio connection when both join", async () => {
+    it("should establish WebRTC audio connection when both join", { timeout: 60_000 }, async () => {
       // Both peers join audio
       await joinAudio(pageA);
       await joinAudio(pageB);
@@ -84,7 +84,7 @@ describe("Sunset Audio Integration Tests", () => {
       assert.ok(joinedB, "Browser B should show audio as joined");
     });
 
-    it("should receive audio on both sides (bidirectional)", async () => {
+    it("should receive audio on both sides (bidirectional)", { timeout: 60_000 }, async () => {
       // Both should be receiving live audio from each other
       await Promise.all([
         waitForReceivingAudio(pageA),
@@ -139,7 +139,7 @@ describe("Sunset Audio Integration Tests", () => {
       await Promise.all([browserA?.close(), browserB?.close()]);
     });
 
-    it("should re-establish audio after one peer leaves and rejoins", async () => {
+    it("should re-establish audio after one peer leaves and rejoins", { timeout: 60_000 }, async () => {
       // Both join audio and verify connection
       await joinAudio(pageA);
       await joinAudio(pageB);
@@ -234,7 +234,7 @@ describe("Sunset Audio Integration Tests", () => {
       ]);
     });
 
-    it("should establish audio connections between all three peers", async () => {
+    it("should establish audio connections between all three peers", { timeout: 60_000 }, async () => {
       // All three join audio
       await joinAudio(pageA);
       await joinAudio(pageB);
@@ -258,7 +258,7 @@ describe("Sunset Audio Integration Tests", () => {
       assert.ok(joinedC, "Browser C should show audio as joined");
     });
 
-    it("all three peers should receive non-silent audio from both others", async () => {
+    it("all three peers should receive non-silent audio from both others", { timeout: 60_000 }, async () => {
       // Each peer should be receiving 2 live audio streams
       await Promise.all([
         waitForActiveAudioStreams(pageA, 2),

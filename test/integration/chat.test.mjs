@@ -192,7 +192,7 @@ describe("Sunset Integration Tests", { concurrency: true }, () => {
       await setDisplayName(pA, "Alice");
 
       // Wait a few ticks for presence to propagate
-      await new Promise((r) => setTimeout(r, 3000));
+      await new Promise((r) => setTimeout(r, 1000));
 
       // A sends a message
       await sendMessage(pA, "My name is Alice");
@@ -242,8 +242,8 @@ describe("Sunset Integration Tests", { concurrency: true }, () => {
       await sendMessage(pA, "Secret message in room X");
       await waitForMessage(pA, "Secret message in room X");
 
-      // Wait a few seconds to confirm B does NOT receive it
-      await new Promise((r) => setTimeout(r, 5000));
+      // Wait a couple seconds to confirm B does NOT receive it
+      await new Promise((r) => setTimeout(r, 2000));
       const msgsB = await getMessages(pB);
       const leaked = msgsB.find((m) => m.body.includes("Secret message in room X"));
       assert.equal(leaked, undefined, "Messages should not leak across rooms");

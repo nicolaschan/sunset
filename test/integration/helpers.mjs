@@ -75,7 +75,7 @@ export async function openApp(browser, appUrl, relayMultiaddr) {
     console.log(`[browser pageerror] ${err.message}`);
   });
 
-  const url = `${appUrl}/?relay=${encodeURIComponent(relayMultiaddr)}`;
+  const url = `${appUrl}/?relay=${encodeURIComponent(relayMultiaddr)}&ice_servers=none`;
   await page.goto(url, { waitUntil: "networkidle0", timeout: 30_000 });
   return page;
 }
@@ -106,7 +106,7 @@ export async function sendMessage(page, text) {
  * Wait until a chat message containing `text` appears in the message list.
  * Returns the matching element's full text content.
  */
-export async function waitForMessage(page, text, timeout = 60_000) {
+export async function waitForMessage(page, text, timeout = 30_000) {
   await page.waitForFunction(
     (searchText) => {
       const msgs = document.querySelectorAll(".room-msg-body");
@@ -121,7 +121,7 @@ export async function waitForMessage(page, text, timeout = 60_000) {
  * Wait for peers to show up in the Connected section.
  * @param {number} count - expected number of peers
  */
-export async function waitForPeers(page, count, timeout = 60_000) {
+export async function waitForPeers(page, count, timeout = 30_000) {
   await page.waitForFunction(
     (expectedCount) => {
       const header = document.querySelector(".room-peers-title");
@@ -137,7 +137,7 @@ export async function waitForPeers(page, count, timeout = 60_000) {
 /**
  * Wait for the relay to be connected (status text shows "Connected").
  */
-export async function waitForRelayConnected(page, timeout = 60_000) {
+export async function waitForRelayConnected(page, timeout = 30_000) {
   await page.waitForFunction(
     () => {
       const el = document.querySelector(".room-status-text");
@@ -221,7 +221,7 @@ export async function leaveAudio(page) {
  * (green dot with class room-peer-dot-rtc-connected) for at least
  * `count` peers.
  */
-export async function waitForAudioConnected(page, count, timeout = 60_000) {
+export async function waitForAudioConnected(page, count, timeout = 30_000) {
   await page.waitForFunction(
     (expectedCount) => {
       const dots = document.querySelectorAll(".room-peer-dot-rtc-connected");
@@ -251,7 +251,7 @@ export async function isReceivingAudio(page) {
 /**
  * Wait until the page is receiving live remote audio from at least one peer.
  */
-export async function waitForReceivingAudio(page, timeout = 60_000) {
+export async function waitForReceivingAudio(page, timeout = 30_000) {
   await page.waitForFunction(
     () => {
       const audios = document.querySelectorAll("audio");
@@ -305,7 +305,7 @@ export async function getActiveAudioStreamCount(page) {
  * Wait until the page has exactly `count` active audio streams
  * (hidden <audio> elements with live tracks).
  */
-export async function waitForActiveAudioStreams(page, count, timeout = 60_000) {
+export async function waitForActiveAudioStreams(page, count, timeout = 30_000) {
   await page.waitForFunction(
     (expectedCount) => {
       let actual = 0;
@@ -386,7 +386,7 @@ export async function isReceivingNonSilentAudio(page) {
  * Polls periodically because the AnalyserNode needs time to accumulate data.
  * @param {number} count - minimum number of non-silent streams (default 1)
  */
-export async function waitForNonSilentAudio(page, count = 1, timeout = 60_000) {
+export async function waitForNonSilentAudio(page, count = 1, timeout = 30_000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     const nonSilent = await getNonSilentAudioCount(page);

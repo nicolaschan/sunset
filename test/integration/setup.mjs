@@ -84,6 +84,7 @@ function startRelay(relayBin) {
         /Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/ws\/p2p\/\S+)/
       );
       if (match && !relayInfo) {
+        clearTimeout(timeoutId);
         relayInfo = {
           proc,
           multiaddr: match[1],
@@ -108,8 +109,7 @@ function startRelay(relayBin) {
       }
     });
 
-    // Timeout after 30s
-    setTimeout(() => {
+    const timeoutId = setTimeout(() => {
       if (!relayInfo) {
         proc.kill();
         reject(new Error(`Relay did not announce address within 30s.\nstderr: ${stderr}`));

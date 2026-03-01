@@ -13,6 +13,8 @@ pub type Connection {
   Connection(pc: PeerConnection, local_track: Track, local_stream: Stream)
 }
 
+const ice_gathering_timeout_ms = 2000
+
 fn try_async(
   invoke: fn(fn(Result(a, e)) -> Nil) -> Nil,
   on_error: fn(e) -> Nil,
@@ -54,7 +56,7 @@ pub fn offer(
   debug.log("session", "offer: creating sdp offer")
   use _ <- try_async(sdp.create_offer(conn, _), fail)
   debug.log("session", "offer: waiting for ice gathering")
-  use <- pc.wait_for_ice_gathering(conn)
+  use <- pc.wait_for_ice_gathering(conn, ice_gathering_timeout_ms)
   let sdp_json = query.get_local_description(conn)
   debug.log("session", "offer: complete")
   callback(Ok(#(Pending(conn, audio_track, audio_stream), sdp_json)))
@@ -99,7 +101,7 @@ pub fn answer(
   debug.log("session", "answer: creating sdp answer")
   use _ <- try_async(sdp.create_answer(conn, _), fail)
   debug.log("session", "answer: waiting for ice gathering")
-  use <- pc.wait_for_ice_gathering(conn)
+  use <- pc.wait_for_ice_gathering(conn, ice_gathering_timeout_ms)
   let sdp_json = query.get_local_description(conn)
   debug.log("session", "answer: complete")
   callback(Ok(#(Connection(conn, audio_track, audio_stream), sdp_json)))

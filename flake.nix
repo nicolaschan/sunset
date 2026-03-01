@@ -130,7 +130,7 @@
               export SUNSET_DIST_DIR="${sunsetDist}"
               export SUNSET_RELAY_BIN="${relayPkg}/bin/relay"
               cd ${integrationTestSrc}
-              exec ${pkgs.nodejs}/bin/node --test --test-reporter=spec --test-concurrency=2 --test-timeout=120000 "$@"
+              exec ${pkgs.nodejs}/bin/node --test --test-reporter=spec --test-concurrency=2 --test-timeout=90000 "$@"
             ''}";
             meta.description = "Run integration tests locally (no VM)";
           };
@@ -159,7 +159,7 @@
           name = "sunset-integration";
 
           nodes.machine = { pkgs, ... }: {
-            virtualisation = { memorySize = 8192; diskSize = 4096; cores = 4; };
+            virtualisation = { memorySize = 8192; diskSize = 4096; cores = 128; };
             environment.systemPackages = with pkgs; [ chromium nodejs curl ];
             networking.firewall.enable = false;
           };
@@ -172,7 +172,7 @@
               "SUNSET_DIST_DIR=${sunsetDist} "
               "SUNSET_RELAY_BIN=${relayPkg}/bin/relay "
               "PUPPETEER_EXECUTABLE_PATH=${pkgs.chromium}/bin/chromium "
-              "node --test --test-concurrency=1 --test-timeout=120000 *.test.mjs "
+              "node --test --test-concurrency=1 --test-timeout=90000 *.test.mjs "
               "2>&1 | tee /tmp/test-output.log"
             )
           '';

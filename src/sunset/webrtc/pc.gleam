@@ -26,6 +26,7 @@ pub fn close_pc(_pc: PeerConnection) -> Nil {
 @external(javascript, "./pc.ffi.mjs", "wait_for_ice_gathering")
 pub fn wait_for_ice_gathering(
   _pc: PeerConnection,
+  _timeout_ms: Int,
   _callback: fn() -> Nil,
 ) -> Nil {
   Nil
