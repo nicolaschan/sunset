@@ -10,6 +10,7 @@ use tokio_rusqlite::Connection;
 use crate::schema;
 use crate::subscription::SubscriptionList;
 
+// TODO(task-4): remove `allow(dead_code)` once the Store impl reads these fields.
 #[allow(dead_code)]
 pub struct FsStore {
     pub(crate) root: Arc<PathBuf>,
@@ -36,6 +37,8 @@ impl FsStore {
         let content_dir = root.join("content");
         let db_path = root.join("db.sqlite");
 
+        // Sync I/O: startup-only, single call. Adding tokio's `fs` feature is
+        // not worth the dependency cost for one mkdir at startup.
         std::fs::create_dir_all(&content_dir)
             .map_err(|e| Error::Backend(format!("create content dir: {e}")))?;
 
@@ -43,11 +46,9 @@ impl FsStore {
             .await
             .map_err(|e| Error::Backend(format!("open sqlite: {e}")))?;
 
-        conn.call(|c| {
-            schema::apply_schema(c).map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| Error::Backend(format!("apply schema: {e}")))?;
+        conn.call(|c| schema::apply_schema(c).map_err(tokio_rusqlite::Error::from))
+            .await
+            .map_err(|e| Error::Backend(format!("apply schema: {e}")))?;
 
         Ok(Self {
             root: Arc::new(root),
