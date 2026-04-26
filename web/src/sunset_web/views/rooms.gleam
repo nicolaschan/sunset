@@ -206,12 +206,25 @@ fn rooms_list(
   collapsed: Bool,
   sel: fn(RoomId) -> msg,
 ) -> Element(msg) {
+  let padding = case collapsed {
+    True -> "0 0 12px 0"
+    False -> "0 8px 12px 8px"
+  }
   html.div(
     [
       ui.css([
         #("flex", "1 1 auto"),
+        #("min-height", "0"),
+        // The vertical scrollbar can appear when the list overflows; in
+        // collapsed mode the rail is only 54px wide so a classic 15-ish
+        // pixel scrollbar would leave no room for the 38px mini-buttons.
+        // Force horizontal clipping so any spillover is hidden rather
+        // than scrolled, and use a thin scrollbar so the visible width
+        // doesn't shift much when content overflows.
+        #("overflow-x", "hidden"),
         #("overflow-y", "auto"),
-        #("padding", "0 8px 12px 8px"),
+        #("scrollbar-width", "thin"),
+        #("padding", padding),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("gap", "1px"),
@@ -268,48 +281,27 @@ fn room_full(
           ]),
         ],
         [
-          html.div(
+          html.span(
             [
               ui.css([
-                #("display", "flex"),
-                #("align-items", "baseline"),
-                #("justify-content", "space-between"),
-                #("gap", "8px"),
+                #("font-weight", case active {
+                  True -> "600"
+                  False -> "500"
+                }),
+                #("font-size", "16.25px"),
+                #("white-space", "nowrap"),
+                #("overflow", "hidden"),
+                #("text-overflow", "ellipsis"),
               ]),
             ],
-            [
-              html.span(
-                [
-                  ui.css([
-                    #("font-weight", case active {
-                      True -> "600"
-                      False -> "500"
-                    }),
-                    #("font-size", "16.25px"),
-                    #("white-space", "nowrap"),
-                    #("overflow", "hidden"),
-                    #("text-overflow", "ellipsis"),
-                  ]),
-                ],
-                [html.text(r.name)],
-              ),
-              html.span(
-                [
-                  ui.css([
-                    #("font-size", "13.125px"),
-                    #("color", p.text_faint),
-                    #("white-space", "nowrap"),
-                  ]),
-                ],
-                [html.text(r.last_active)],
-              ),
-            ],
+            [html.text(r.name)],
           ),
           html.div(
             [
               ui.css([
                 #("font-size", "14.375px"),
                 #("color", p.text_muted),
+                #("font-weight", "400"),
                 #("display", "flex"),
                 #("gap", "6px"),
                 #("flex-wrap", "wrap"),
@@ -328,8 +320,10 @@ fn room_full(
 }
 
 fn meta_line(p: Palette, r: Room) -> List(Element(msg)) {
+  // Every span in the meta line is regular weight: the room name above
+  // is the only bold element in this row.
   let online_total =
-    html.span([], [
+    html.span([ui.css([#("font-weight", "400")])], [
       html.text(
         int_to_string(r.online) <> "/" <> int_to_string(r.members) <> " online",
       ),
@@ -338,16 +332,20 @@ fn meta_line(p: Palette, r: Room) -> List(Element(msg)) {
   let in_call_part = case r.in_call {
     0 -> element.fragment([])
     n ->
-      html.span([ui.css([#("color", p.accent)])], [
+      html.span([ui.css([#("color", p.accent), #("font-weight", "400")])], [
         html.text("· " <> int_to_string(n) <> " in voice"),
       ])
   }
 
   let status_part = case r.status {
     Reconnecting ->
-      html.span([ui.css([#("color", p.warn)])], [html.text("· reconnecting")])
+      html.span([ui.css([#("color", p.warn), #("font-weight", "400")])], [
+        html.text("· reconnecting"),
+      ])
     Offline ->
-      html.span([ui.css([#("color", p.text_faint)])], [html.text("· offline")])
+      html.span([ui.css([#("color", p.text_faint), #("font-weight", "400")])], [
+        html.text("· offline"),
+      ])
     Connected -> element.fragment([])
   }
 
@@ -480,15 +478,29 @@ fn unread_pill(p: Palette, n: Int) -> Element(msg) {
 }
 
 fn you_row(p: Palette, collapsed: Bool) -> Element(msg) {
+  // Pinned at the bottom of the rooms rail. The fixed 64px height +
+  // border-top is shared by the channels-rail self-bar and the main
+  // panel composer so all three column-bottom rows visually align.
+  let padding = case collapsed {
+    True -> "0"
+    False -> "0 14px"
+  }
+  let justify = case collapsed {
+    True -> "center"
+    False -> "flex-start"
+  }
   html.div(
     [
       ui.css([
+        #("box-sizing", "border-box"),
+        #("height", "64px"),
+        #("flex-shrink", "0"),
         #("display", "flex"),
         #("align-items", "center"),
+        #("justify-content", justify),
         #("gap", "8px"),
-        #("padding", "10px 14px"),
+        #("padding", padding),
         #("border-top", "1px solid " <> p.border_soft),
-        #("min-height", "40px"),
       ]),
     ],
     [

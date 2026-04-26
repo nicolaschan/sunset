@@ -105,60 +105,40 @@ fn result_to_option(r: Result(a, b)) -> Option(a) {
 }
 
 fn room_header(p: Palette, r: Room) -> Element(msg) {
+  // Single-line title row, vertically centred in the 60px header. The
+  // "X online" subtitle was dropped — the same count is already visible
+  // in the members rail, and removing it gives the title room to breathe.
   html.div(
     [
       ui.css([
         #("box-sizing", "border-box"),
         #("height", "60px"),
         #("flex-shrink", "0"),
-        #("padding", "12px 16px"),
+        #("padding", "0 16px"),
         #("border-bottom", "1px solid " <> p.border_soft),
         #("display", "flex"),
-        #("flex-direction", "column"),
-        #("justify-content", "center"),
-        #("gap", "2px"),
+        #("align-items", "center"),
+        #("gap", "8px"),
+        #("min-width", "0"),
       ]),
     ],
     [
-      html.div(
+      html.span(
         [
           ui.css([
-            #("display", "flex"),
-            #("align-items", "center"),
-            #("gap", "8px"),
+            #("font-weight", "600"),
+            #("font-size", "18.75px"),
+            #("color", p.text),
+            #("white-space", "nowrap"),
+            #("overflow", "hidden"),
+            #("text-overflow", "ellipsis"),
+            #("flex", "1"),
             #("min-width", "0"),
           ]),
         ],
-        [
-          html.span(
-            [
-              ui.css([
-                #("font-weight", "600"),
-                #("font-size", "18.75px"),
-                #("color", p.text),
-                #("white-space", "nowrap"),
-                #("overflow", "hidden"),
-                #("text-overflow", "ellipsis"),
-                #("flex", "1"),
-                #("min-width", "0"),
-              ]),
-            ],
-            [html.text(r.name)],
-          ),
-          conn_icon(p, r.status),
-        ],
+        [html.text(r.name)],
       ),
-      html.div(
-        [
-          ui.css([
-            #("font-size", "14.375px"),
-            #("color", p.text_muted),
-          ]),
-        ],
-        [
-          html.text(int.to_string(r.online) <> " online"),
-        ],
-      ),
+      conn_icon(p, r.status),
     ],
   )
 }
@@ -496,16 +476,21 @@ fn you_tag(p: Palette) -> Element(msg) {
 /// leave) on the right. The leave button is the only red affordance and
 /// uses a phone-handset glyph instead of a text label.
 fn self_control_bar(p: Palette, channel_name: String) -> Element(msg) {
+  // Fixed 64px height with a 1px border-top so this row aligns visually
+  // with the rooms-rail you_row and the main-panel composer (their
+  // top borders sit on the same y-coordinate across the seam).
   html.div(
     [
       ui.css([
+        #("box-sizing", "border-box"),
+        #("height", "64px"),
+        #("flex-shrink", "0"),
         #("display", "flex"),
         #("align-items", "center"),
         #("gap", "8px"),
-        #("padding", "10px 12px"),
+        #("padding", "0 12px"),
         #("background", p.surface),
-        #("border-top", "1px solid " <> p.border),
-        #("flex-shrink", "0"),
+        #("border-top", "1px solid " <> p.border_soft),
       ]),
     ],
     [

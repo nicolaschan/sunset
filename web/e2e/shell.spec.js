@@ -187,3 +187,46 @@ test("channels and main column bottom borders line up", async ({ page }) => {
   // Allow 1px of sub-pixel slop.
   expect(Math.abs(offsets.channels - offsets.main)).toBeLessThanOrEqual(1);
 });
+
+test("column-bottom rows share a top y-coordinate", async ({ page }) => {
+  // Rooms rail's pinned 'you' row, channels rail's self-control bar, and
+  // main panel's composer all sit at the bottom of their column. Their
+  // top borders must align horizontally so the layout reads as a single
+  // bottom seam across the screen.
+  const tops = await page.evaluate(() => {
+    const rooms = document.querySelectorAll("aside")[0];
+    const channels = document.querySelectorAll("aside")[1];
+    const main = document.querySelector("main");
+    const lastChild = (parent) => parent.children[parent.children.length - 1];
+    return {
+      rooms: lastChild(rooms).getBoundingClientRect().top,
+      channels: lastChild(channels).getBoundingClientRect().top,
+      main: lastChild(main).getBoundingClientRect().top,
+    };
+  });
+  expect(Math.abs(tops.rooms - tops.channels)).toBeLessThanOrEqual(1);
+  expect(Math.abs(tops.channels - tops.main)).toBeLessThanOrEqual(1);
+});
+
+test("channels header has no online subtitle", async ({ page }) => {
+  // The 'X online' subtitle moved out of the channels-rail header in
+  // round-2 polish; the count still surfaces in the members rail. The
+  // header should only contain the room title + connection dot.
+  const headerText = await page.evaluate(() => {
+    const channels = document.querySelectorAll("aside")[1];
+    return channels.firstElementChild.textContent.trim();
+  });
+  expect(headerText).not.toMatch(/online/i);
+});
+
+test("rooms list does not render timestamps", async ({ page }) => {
+  // 'Last active' timestamps ('2m', 'now', '12m', etc.) were dropped
+  // from the rooms-list rows in round-2 polish.
+  const railText = await page
+    .getByTestId("rooms-rail")
+    .evaluate((el) => el.textContent);
+  // 'now' / '2m' / '12m' / '3d' / 'just now' would all match this.
+  expect(railText).not.toMatch(/\b\d+\s*(?:m|h|d)\b/);
+  expect(railText).not.toMatch(/\bjust now\b/i);
+  expect(railText).not.toMatch(/(?<!\w)now(?!\w)/);
+});
