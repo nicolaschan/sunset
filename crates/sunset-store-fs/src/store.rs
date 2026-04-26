@@ -3,15 +3,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sunset_store::{AcceptAllVerifier, Error, Result, SignatureVerifier};
+use async_trait::async_trait;
+use sunset_store::{
+    AcceptAllVerifier, ContentBlock, Cursor, EntryStream, Error, Event, EventStream, Filter, Hash,
+    Replay, Result, SignatureVerifier, SignedKvEntry, Store, VerifyingKey,
+};
 use tokio::sync::Mutex;
 use tokio_rusqlite::Connection;
 
 use crate::schema;
 use crate::subscription::SubscriptionList;
+use crate::{blobs, kv};
 
-// TODO(task-4): remove `allow(dead_code)` once the Store impl reads these fields.
-#[allow(dead_code)]
 pub struct FsStore {
     pub(crate) root: Arc<PathBuf>,
     pub(crate) conn: Connection,
@@ -60,6 +63,122 @@ impl FsStore {
     }
 }
 
+/// Convert `tokio_rusqlite::Error<sunset_store::Error>` back to our `Error`.
+fn unwrap_store_error(e: tokio_rusqlite::Error<Error>) -> Error {
+    match e {
+        tokio_rusqlite::Error::Error(store_err) => store_err,
+        other => Error::Backend(format!("sqlite: {other}")),
+    }
+}
+
+#[async_trait(?Send)]
+impl Store for FsStore {
+    async fn insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()> {
+        let _w = self.writer_mutex.lock().await;
+
+        if let Some(b) = &blob {
+            if entry.value_hash != b.hash() {
+                return Err(Error::HashMismatch);
+            }
+        }
+        self.verifier
+            .verify(&entry)
+            .map_err(|_| Error::SignatureInvalid)?;
+
+        // Persist the blob first (idempotent, content-addressed). Lazy refs are
+        // allowed by spec, so a subsequent SQLite failure leaves at most an
+        // orphaned blob, which gc_blobs reclaims later.
+        let blob_was_new = if let Some(b) = &blob {
+            blobs::write_blob_atomic(&self.root, b).await?
+        } else {
+            false
+        };
+
+        let entry_clone = entry.clone();
+        let outcome: kv::InsertOutcome = self
+            .conn
+            .call(move |c| -> std::result::Result<kv::InsertOutcome, Error> {
+                let txn = c
+                    .transaction()
+                    .map_err(|e| Error::Backend(format!("begin transaction: {e}")))?;
+                let outcome = kv::insert_lww(&txn, &entry_clone)?;
+                txn.commit()
+                    .map_err(|e| Error::Backend(format!("commit transaction: {e}")))?;
+                Ok(outcome)
+            })
+            .await
+            .map_err(unwrap_store_error)?;
+
+        // Broadcasts are sent under the writer_mutex by virtue of `_w` above —
+        // do not drop the guard before this block.
+        match outcome {
+            kv::InsertOutcome::Inserted { .. } => {
+                self.subscriptions.broadcast(&Event::Inserted(entry));
+            }
+            kv::InsertOutcome::Replaced { old, .. } => {
+                self.subscriptions
+                    .broadcast(&Event::Replaced { old, new: entry });
+            }
+        }
+        if blob_was_new {
+            if let Some(b) = blob {
+                self.subscriptions.broadcast(&Event::BlobAdded(b.hash()));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn put_content(&self, block: ContentBlock) -> Result<Hash> {
+        let _w = self.writer_mutex.lock().await;
+        let hash = block.hash();
+        if blobs::write_blob_atomic(&self.root, &block).await? {
+            self.subscriptions.broadcast(&Event::BlobAdded(hash));
+        }
+        Ok(hash)
+    }
+
+    async fn get_content(&self, hash: &Hash) -> Result<Option<ContentBlock>> {
+        blobs::read_blob(&self.root, hash).await
+    }
+
+    async fn get_entry(&self, vk: &VerifyingKey, name: &[u8]) -> Result<Option<SignedKvEntry>> {
+        let vk = vk.clone();
+        let name = name.to_vec();
+        self.conn
+            .call(move |c| kv::get_entry(c, &vk, &name))
+            .await
+            .map_err(|e| Error::Backend(format!("get_entry: {e}")))
+    }
+
+    async fn iter<'a>(&'a self, _filter: Filter) -> Result<EntryStream<'a>> {
+        // implemented in Task 5
+        unimplemented!("iter — implemented in Task 5")
+    }
+
+    async fn subscribe<'a>(&'a self, _filter: Filter, _replay: Replay) -> Result<EventStream<'a>> {
+        // implemented in Task 8
+        unimplemented!("subscribe — implemented in Task 8")
+    }
+
+    async fn delete_expired(&self, _now: u64) -> Result<usize> {
+        // implemented in Task 6
+        unimplemented!("delete_expired — implemented in Task 6")
+    }
+
+    async fn gc_blobs(&self) -> Result<usize> {
+        // implemented in Task 7
+        unimplemented!("gc_blobs — implemented in Task 7")
+    }
+
+    async fn current_cursor(&self) -> Result<Cursor> {
+        self.conn
+            .call(|c| kv::current_cursor(c))
+            .await
+            .map_err(|e| Error::Backend(format!("current_cursor: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +193,118 @@ mod tests {
         // Re-opening the same path must succeed (idempotent DDL).
         drop(store);
         let _store2 = FsStore::new(dir.path()).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod insert_tests {
+    use super::*;
+    use bytes::Bytes;
+    use sunset_store::{ContentBlock, SignedKvEntry, VerifyingKey};
+    use tempfile::TempDir;
+
+    fn vk(b: &[u8]) -> VerifyingKey {
+        VerifyingKey(Bytes::copy_from_slice(b))
+    }
+    fn block(d: &[u8]) -> ContentBlock {
+        ContentBlock {
+            data: Bytes::copy_from_slice(d),
+            references: vec![],
+        }
+    }
+    fn entry(vk_bytes: &[u8], name: &[u8], priority: u64, blob: &ContentBlock) -> SignedKvEntry {
+        SignedKvEntry {
+            verifying_key: vk(vk_bytes),
+            name: Bytes::copy_from_slice(name),
+            value_hash: blob.hash(),
+            priority,
+            expires_at: None,
+            signature: Bytes::copy_from_slice(b"sig"),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_then_get_entry() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        let b = block(b"v");
+        let e = entry(b"a", b"k", 1, &b);
+        store.insert(e.clone(), Some(b)).await.unwrap();
+        let got = store.get_entry(&vk(b"a"), b"k").await.unwrap().unwrap();
+        assert_eq!(got, e);
+    }
+
+    #[tokio::test]
+    async fn insert_lww_higher_priority_wins() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        let b1 = block(b"v1");
+        let b2 = block(b"v2");
+        store
+            .insert(entry(b"a", b"k", 1, &b1), Some(b1))
+            .await
+            .unwrap();
+        store
+            .insert(entry(b"a", b"k", 2, &b2.clone()), Some(b2.clone()))
+            .await
+            .unwrap();
+        let got = store.get_entry(&vk(b"a"), b"k").await.unwrap().unwrap();
+        assert_eq!(got.priority, 2);
+    }
+
+    #[tokio::test]
+    async fn insert_lww_equal_priority_is_stale() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        let b = block(b"v");
+        store
+            .insert(entry(b"a", b"k", 1, &b), Some(b.clone()))
+            .await
+            .unwrap();
+        let err = store
+            .insert(entry(b"a", b"k", 1, &b), Some(b))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Stale));
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_hash_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        let b1 = block(b"v1");
+        let b2 = block(b"v2");
+        let mut e = entry(b"a", b"k", 1, &b1);
+        e.value_hash = b1.hash();
+        // supply b2 (whose hash differs) — must be rejected.
+        let err = store.insert(e, Some(b2)).await.unwrap_err();
+        assert!(matches!(err, Error::HashMismatch));
+    }
+
+    #[tokio::test]
+    async fn current_cursor_advances_with_inserts() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        assert_eq!(store.current_cursor().await.unwrap(), Cursor(1));
+        let b = block(b"v");
+        store
+            .insert(entry(b"a", b"k", 1, &b), Some(b))
+            .await
+            .unwrap();
+        assert_eq!(store.current_cursor().await.unwrap(), Cursor(2));
+    }
+
+    #[tokio::test]
+    async fn entries_persist_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let b = block(b"v");
+        let e = entry(b"a", b"k", 1, &b);
+        {
+            let store = FsStore::new(dir.path()).await.unwrap();
+            store.insert(e.clone(), Some(b)).await.unwrap();
+        }
+        let store2 = FsStore::new(dir.path()).await.unwrap();
+        let got = store2.get_entry(&vk(b"a"), b"k").await.unwrap().unwrap();
+        assert_eq!(got, e);
     }
 }
