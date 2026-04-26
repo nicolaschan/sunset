@@ -47,12 +47,14 @@ fn channel_header(p: Palette, name: String) -> Element(msg) {
   html.div(
     [
       ui.css([
+        #("box-sizing", "border-box"),
+        #("height", "60px"),
+        #("flex-shrink", "0"),
         #("display", "flex"),
         #("align-items", "center"),
         #("gap", "8px"),
-        #("padding", "14px 20px"),
+        #("padding", "0 24px"),
         #("border-bottom", "1px solid " <> p.border_soft),
-        #("min-height", "48px"),
       ]),
     ],
     [
@@ -61,7 +63,7 @@ fn channel_header(p: Palette, name: String) -> Element(msg) {
         [
           ui.css([
             #("font-weight", "600"),
-            #("font-size", "17.5px"),
+            #("font-size", "18.75px"),
             #("color", p.text),
           ]),
         ],
