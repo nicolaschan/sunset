@@ -167,9 +167,76 @@ impl Store for FsStore {
         Ok(Box::pin(stream))
     }
 
-    async fn subscribe<'a>(&'a self, _filter: Filter, _replay: Replay) -> Result<EventStream<'a>> {
-        // implemented in Task 8
-        unimplemented!("subscribe — implemented in Task 8")
+    async fn subscribe<'a>(&'a self, filter: Filter, replay: Replay) -> Result<EventStream<'a>> {
+        use crate::subscription::Subscription;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event>>();
+        let sub = Arc::new(Subscription {
+            filter: filter.clone(),
+            tx,
+        });
+
+        // Take history snapshot AND register subscription under the writer mutex,
+        // so any concurrent insert is serialized and either lands in the snapshot
+        // or in the live channel — never both.
+        let _w = self.writer_mutex.lock().await;
+
+        let history: Vec<SignedKvEntry> = match &replay {
+            Replay::None => Vec::new(),
+            Replay::All => self
+                .conn
+                .call({
+                    let f = filter.clone();
+                    move |c| -> std::result::Result<Vec<SignedKvEntry>, Error> {
+                        kv::iter_with_filter(c, &f)
+                    }
+                })
+                .await
+                .map_err(unwrap_store_error)?,
+            Replay::Since(cursor) => {
+                let cursor = *cursor;
+                let f = filter.clone();
+                self.conn
+                    .call(move |c| -> std::result::Result<Vec<SignedKvEntry>, Error> {
+                        let mut stmt = c
+                            .prepare(
+                                "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+                                 FROM entries WHERE sequence >= ?1 ORDER BY sequence ASC",
+                            )
+                            .map_err(|e| Error::Backend(format!("prep replay: {e}")))?;
+                        let rows = stmt
+                            .query_map(
+                                tokio_rusqlite::rusqlite::params![cursor.0 as i64],
+                                |r| kv::row_to_entry(r).map(|(_, e)| e),
+                            )
+                            .map_err(|e| Error::Backend(format!("query replay: {e}")))?;
+                        let mut out = Vec::new();
+                        for r in rows {
+                            let e = r.map_err(|e| Error::Backend(format!("row replay: {e}")))?;
+                            if f.matches(&e.verifying_key, &e.name) {
+                                out.push(e);
+                            }
+                        }
+                        Ok(out)
+                    })
+                    .await
+                    .map_err(unwrap_store_error)?
+            }
+        };
+
+        self.subscriptions.add(&sub);
+        drop(_w);
+
+        let stream = async_stream::stream! {
+            for e in history {
+                yield Ok(Event::Inserted(e));
+            }
+            let _keep_alive = sub;
+            while let Some(item) = rx.recv().await {
+                yield item;
+            }
+        };
+        Ok(Box::pin(stream))
     }
 
     async fn delete_expired(&self, now: u64) -> Result<usize> {
@@ -416,6 +483,76 @@ mod insert_tests {
         let store2 = FsStore::new(dir.path()).await.unwrap();
         let got = store2.get_entry(&vk(b"a"), b"k").await.unwrap().unwrap();
         assert_eq!(got, e);
+    }
+}
+
+#[cfg(test)]
+mod subscribe_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use sunset_store::{ContentBlock, SignedKvEntry, VerifyingKey};
+    use tempfile::TempDir;
+
+    fn vk(b: &[u8]) -> VerifyingKey {
+        VerifyingKey(Bytes::copy_from_slice(b))
+    }
+    fn block(d: &[u8]) -> ContentBlock {
+        ContentBlock {
+            data: Bytes::copy_from_slice(d),
+            references: vec![],
+        }
+    }
+    fn entry(vk_bytes: &[u8], name: &[u8], priority: u64, blob: &ContentBlock) -> SignedKvEntry {
+        SignedKvEntry {
+            verifying_key: vk(vk_bytes),
+            name: Bytes::copy_from_slice(name),
+            value_hash: blob.hash(),
+            priority,
+            expires_at: None,
+            signature: Bytes::copy_from_slice(b"sig"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_replay_all_then_live() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        let b1 = block(b"v1");
+        store
+            .insert(entry(b"a", b"k1", 1, &b1), Some(b1))
+            .await
+            .unwrap();
+        let mut s = store
+            .subscribe(Filter::Keyspace(vk(b"a")), Replay::All)
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_millis(200), s.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, Event::Inserted(_)));
+
+        let b2 = block(b"v2");
+        store
+            .insert(entry(b"a", b"k2", 1, &b2.clone()), Some(b2))
+            .await
+            .unwrap();
+        // The next event the subscriber receives that is NOT BlobAdded should be Inserted for k2.
+        loop {
+            let evt = tokio::time::timeout(std::time::Duration::from_millis(200), s.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if matches!(evt, Event::Inserted(_)) {
+                if let Event::Inserted(e) = evt {
+                    assert_eq!(e.name.as_ref(), b"k2");
+                    break;
+                }
+            }
+        }
     }
 }
 
