@@ -113,7 +113,7 @@ fn room_header(p: Palette, r: Room) -> Element(msg) {
             [
               ui.css([
                 #("font-weight", "600"),
-                #("font-size", "14.5px"),
+                #("font-size", "18.125px"),
                 #("color", p.text),
                 #("white-space", "nowrap"),
                 #("overflow", "hidden"),
@@ -130,7 +130,7 @@ fn room_header(p: Palette, r: Room) -> Element(msg) {
       html.div(
         [
           ui.css([
-            #("font-size", "11.5px"),
+            #("font-size", "14.375px"),
             #("color", p.text_muted),
           ]),
         ],
@@ -161,7 +161,7 @@ fn section(p: Palette, title: String, rows: List(Element(msg))) -> Element(msg) 
         [
           ui.css([
             #("padding", "4px 12px 6px 12px"),
-            #("font-size", "10.5px"),
+            #("font-size", "13.125px"),
             #("font-weight", "600"),
             #("text-transform", "uppercase"),
             #("letter-spacing", "0.04em"),
@@ -204,7 +204,7 @@ fn text_channel_row(
         #("border-radius", "6px"),
         #("cursor", "pointer"),
         #("font-family", "inherit"),
-        #("font-size", "13px"),
+        #("font-size", "16.25px"),
         #("color", color),
         #("text-align", "left"),
       ]),
@@ -240,7 +240,7 @@ fn idle_voice_row(p: Palette, c: Channel) -> Element(msg) {
         #("align-items", "center"),
         #("gap", "8px"),
         #("padding", "6px 12px"),
-        #("font-size", "13px"),
+        #("font-size", "16.25px"),
         #("color", p.text),
         #("border-radius", "6px"),
       ]),
@@ -254,7 +254,7 @@ fn idle_voice_row(p: Palette, c: Channel) -> Element(msg) {
           html.span(
             [
               ui.css([
-                #("font-size", "11px"),
+                #("font-size", "13.75px"),
                 #("color", p.accent),
                 #("font-weight", "600"),
               ]),
@@ -283,7 +283,7 @@ fn live_voice_block(p: Palette, c: Channel, ms: List(Member)) -> Element(msg) {
             #("align-items", "center"),
             #("gap", "8px"),
             #("padding", "6px 12px"),
-            #("font-size", "13px"),
+            #("font-size", "16.25px"),
             #("font-weight", "600"),
             #("color", p.accent_deep),
           ]),
@@ -359,7 +359,7 @@ fn voice_member_row(p: Palette, m: Member) -> Element(msg) {
         #("gap", "8px"),
         #("padding", "4px 6px"),
         #("border-radius", "4px"),
-        #("font-size", "12.5px"),
+        #("font-size", "15.625px"),
       ]),
     ],
     [
@@ -402,7 +402,7 @@ fn voice_member_row(p: Palette, m: Member) -> Element(msg) {
           html.span(
             [
               ui.css([
-                #("font-size", "10.5px"),
+                #("font-size", "13.125px"),
                 #("color", p.text_faint),
                 #("font-style", "italic"),
               ]),
@@ -465,7 +465,7 @@ fn you_tag(p: Palette) -> Element(msg) {
         #("border-radius", "3px"),
         #("background", p.surface),
         #("color", p.text_faint),
-        #("font-size", "9.5px"),
+        #("font-size", "11.875px"),
         #("font-weight", "500"),
         #("letter-spacing", "0.02em"),
         #("text-transform", "uppercase"),
@@ -519,7 +519,7 @@ fn self_btn(p: Palette, label: String, danger: Bool) -> Element(msg) {
         #("color", color),
         #("border-radius", "4px"),
         #("cursor", "pointer"),
-        #("font-size", "11px"),
+        #("font-size", "13.75px"),
         #("font-family", "inherit"),
       ]),
     ],
@@ -541,7 +541,7 @@ fn leave_btn(p: Palette) -> Element(msg) {
         #("color", p.warn),
         #("border-radius", "4px"),
         #("cursor", "pointer"),
-        #("font-size", "11px"),
+        #("font-size", "13.75px"),
         #("font-family", "inherit"),
       ]),
     ],
@@ -561,7 +561,7 @@ fn bridge_channel_row(p: Palette, c: Channel) -> Element(msg) {
         #("align-items", "center"),
         #("gap", "8px"),
         #("padding", "6px 12px"),
-        #("font-size", "13px"),
+        #("font-size", "16.25px"),
         #("color", p.text_muted),
       ]),
     ],
@@ -605,7 +605,7 @@ fn unread_pill(p: Palette, n: Int) -> Element(msg) {
         #("border-radius", "999px"),
         #("background", p.accent),
         #("color", p.accent_ink),
-        #("font-size", "10.5px"),
+        #("font-size", "13.125px"),
         #("font-weight", "600"),
         #("display", "inline-flex"),
         #("align-items", "center"),

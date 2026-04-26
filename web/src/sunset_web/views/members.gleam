@@ -78,7 +78,7 @@ fn section_title(p: Palette, label: String) -> Element(msg) {
     [
       ui.css([
         #("padding", "4px 10px 8px 10px"),
-        #("font-size", "10.5px"),
+        #("font-size", "13.125px"),
         #("font-weight", "600"),
         #("text-transform", "uppercase"),
         #("letter-spacing", "0.04em"),
@@ -136,7 +136,7 @@ fn member_row(p: Palette, m: Member, dim: Bool) -> Element(msg) {
         html.span(
           [
             ui.css([
-              #("font-size", "13px"),
+              #("font-size", "16.25px"),
               #("font-weight", weight),
               #("color", color),
               #("flex", "1"),
@@ -165,7 +165,7 @@ fn bridge_tag(p: Palette) -> Element(msg) {
         #("border-radius", "3px"),
         #("background", p.accent_soft),
         #("color", p.accent_deep),
-        #("font-size", "10px"),
+        #("font-size", "12.5px"),
         #("font-weight", "500"),
       ]),
     ],
