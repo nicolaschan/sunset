@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/sunset-store", "crates/sunset-store-memory"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+async-trait = "0.1"
+blake3 = { version = "1", features = ["serde"] }
+bytes = { version = "1", features = ["serde"] }
+futures = "0.3"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+sunset-store = { path = "crates/sunset-store" }
+sunset-store-memory = { path = "crates/sunset-store-memory" }
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+enum_glob_use = "warn"
+needless_pass_by_value = "warn"
