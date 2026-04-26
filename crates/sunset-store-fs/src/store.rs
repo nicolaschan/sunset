@@ -195,8 +195,18 @@ impl Store for FsStore {
     }
 
     async fn gc_blobs(&self) -> Result<usize> {
-        // implemented in Task 7
-        unimplemented!("gc_blobs — implemented in Task 7")
+        let _w = self.writer_mutex.lock().await;
+        let roots = self
+            .conn
+            .call(|c| crate::gc::read_roots(c).map_err(tokio_rusqlite::Error::from))
+            .await
+            .map_err(|e| Error::Backend(format!("gc roots: {e}")))?;
+        let removed = crate::gc::mark_and_sweep(&self.root, roots).await?;
+        let count = removed.len();
+        for h in removed {
+            self.subscriptions.broadcast(&Event::BlobRemoved(h));
+        }
+        Ok(count)
     }
 
     async fn current_cursor(&self) -> Result<Cursor> {
@@ -406,5 +416,50 @@ mod insert_tests {
         let store2 = FsStore::new(dir.path()).await.unwrap();
         let got = store2.get_entry(&vk(b"a"), b"k").await.unwrap().unwrap();
         assert_eq!(got, e);
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+    use bytes::Bytes;
+    use sunset_store::{ContentBlock, SignedKvEntry, VerifyingKey};
+    use tempfile::TempDir;
+
+    fn vk(b: &[u8]) -> VerifyingKey {
+        VerifyingKey(Bytes::copy_from_slice(b))
+    }
+    fn block(d: &[u8]) -> ContentBlock {
+        ContentBlock {
+            data: Bytes::copy_from_slice(d),
+            references: vec![],
+        }
+    }
+    fn entry(vk_bytes: &[u8], name: &[u8], priority: u64, blob: &ContentBlock) -> SignedKvEntry {
+        SignedKvEntry {
+            verifying_key: vk(vk_bytes),
+            name: Bytes::copy_from_slice(name),
+            value_hash: blob.hash(),
+            priority,
+            expires_at: None,
+            signature: Bytes::copy_from_slice(b"sig"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_blobs_keeps_reachable_drops_orphans() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        let b_used = block(b"used");
+        let b_orphan = block(b"orphan");
+        store.put_content(b_orphan.clone()).await.unwrap();
+        store
+            .insert(entry(b"a", b"k", 1, &b_used), Some(b_used.clone()))
+            .await
+            .unwrap();
+        let n = store.gc_blobs().await.unwrap();
+        assert_eq!(n, 1);
+        assert!(store.get_content(&b_used.hash()).await.unwrap().is_some());
+        assert!(store.get_content(&b_orphan.hash()).await.unwrap().is_none());
     }
 }
