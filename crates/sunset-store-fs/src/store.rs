@@ -112,7 +112,7 @@ impl Store for FsStore {
         // Broadcasts are sent under the writer_mutex by virtue of `_w` above —
         // do not drop the guard before this block.
         match outcome {
-            kv::InsertOutcome::Inserted { .. } => {
+            kv::InsertOutcome::Inserted => {
                 self.subscriptions.broadcast(&Event::Inserted(entry));
             }
             kv::InsertOutcome::Replaced { old, .. } => {

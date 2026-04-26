@@ -53,10 +53,8 @@ pub fn get_entry(
 /// variant to broadcast.
 #[derive(Debug)]
 pub enum InsertOutcome {
-    #[allow(dead_code)] // sequence used in Tasks 5 + 8
-    Inserted { sequence: u64 },
-    #[allow(dead_code)] // sequence used in Tasks 5 + 8
-    Replaced { old: SignedKvEntry, sequence: u64 },
+    Inserted,
+    Replaced { old: SignedKvEntry },
 }
 
 /// Apply LWW + insert under an open transaction. Caller is responsible for
@@ -98,11 +96,9 @@ pub fn insert_lww(txn: &rusqlite::Transaction<'_>, entry: &SignedKvEntry) -> Res
     )
     .map_err(|e| Error::Backend(format!("insert entry: {e}")))?;
 
-    let sequence = txn.last_insert_rowid() as u64;
-
     Ok(match existing {
-        Some((_, old)) => InsertOutcome::Replaced { old, sequence },
-        None => InsertOutcome::Inserted { sequence },
+        Some((_, old)) => InsertOutcome::Replaced { old },
+        None => InsertOutcome::Inserted,
     })
 }
 

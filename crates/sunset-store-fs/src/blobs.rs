@@ -1,7 +1,5 @@
 //! Filesystem blob layer.
 
-#![allow(dead_code)] // Functions used by Tasks 4 (insert) and 7 (gc_blobs); remove when integrated.
-
 use std::path::{Path, PathBuf};
 
 use sunset_store::{ContentBlock, Error, Hash, Result};

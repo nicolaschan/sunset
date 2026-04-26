@@ -11,14 +11,12 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 async-stream.workspace = true
-blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
 postcard.workspace = true
 sunset-store.workspace = true
 tempfile.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tokio-rusqlite.workspace = true
 
