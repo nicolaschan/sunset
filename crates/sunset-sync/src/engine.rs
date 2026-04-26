@@ -249,9 +249,56 @@ where
     }
 
     async fn handle_peer_message(&self, from: PeerId, message: SyncMessage) {
-        // Tasks 12–15 fill this in. For now, all messages other than Hello
-        // (which never reaches here) are ignored.
-        let _ = (from, message);
+        match message {
+            SyncMessage::EventDelivery { entries, blobs } => {
+                self.handle_event_delivery(from, entries, blobs).await;
+            }
+            // Tasks 13–15 handle BlobRequest, BlobResponse, DigestExchange, Fetch.
+            _ => {}
+        }
+    }
+
+    async fn handle_event_delivery(
+        &self,
+        _from: PeerId,
+        entries: Vec<sunset_store::SignedKvEntry>,
+        blobs: Vec<sunset_store::ContentBlock>,
+    ) {
+        // Trust filter — discard entries from non-trusted writers before
+        // touching the store.
+        let trusted: Vec<_> = {
+            let state = self.state.lock().await;
+            entries
+                .into_iter()
+                .filter(|e| state.trust.contains(&e.verifying_key))
+                .collect()
+        };
+
+        // Index blobs by hash so we can look up each entry's blob in O(1).
+        let blobs_by_hash: HashMap<_, _> = blobs.into_iter().map(|b| (b.hash(), b)).collect();
+
+        for entry in trusted {
+            let blob = blobs_by_hash.get(&entry.value_hash).cloned();
+            // We pass the blob if we have it; if not, the entry inserts as a
+            // dangling ref and the engine will issue a BlobRequest later
+            // (Task 13).
+            match self.store.insert(entry.clone(), blob).await {
+                Ok(()) => {
+                    // Successful insert. The store will fire an event on our
+                    // local subscription, which will trigger push flow to
+                    // other peers (transitive delivery).
+                }
+                Err(sunset_store::Error::Stale) => {
+                    // Already have a higher-priority version; drop silently.
+                }
+                Err(e) => {
+                    eprintln!(
+                        "sunset-sync: insert failed for entry from {:?}: {}",
+                        entry.verifying_key, e
+                    );
+                }
+            }
+        }
     }
 
     async fn handle_local_store_event(&self, ev: Event) {
@@ -283,6 +330,13 @@ where
                 let _ = tx.send(msg.clone());
             }
         }
+    }
+
+    /// Test-only helper: bypass the command channel and update trust
+    /// directly. Used to set up state without spinning up `run()`.
+    #[cfg(test)]
+    pub(crate) async fn set_trust_direct(&self, trust: TrustSet) {
+        self.state.lock().await.trust = trust;
     }
 
     /// Real implementation of `publish_subscription`'s server side.
@@ -339,6 +393,92 @@ mod tests {
         );
         let store = Arc::new(MemoryStore::with_accept_all());
         SyncEngine::new(store, transport, SyncConfig::default(), local_peer)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_delivery_inserts_trusted_entries() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Arc::new(make_engine("alice", b"alice"));
+
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"hello"),
+                    references: vec![],
+                };
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"trusted-writer"),
+                    name: Bytes::from_static(b"chat/k1"),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+
+                // Default trust is All; deliver directly.
+                engine
+                    .handle_event_delivery(
+                        PeerId(vk(b"some-peer")),
+                        vec![entry.clone()],
+                        vec![block],
+                    )
+                    .await;
+
+                let stored = engine
+                    .store
+                    .get_entry(&vk(b"trusted-writer"), b"chat/k1")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored, entry);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_delivery_drops_untrusted_entries() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Arc::new(make_engine("alice", b"alice"));
+
+                let mut wl = std::collections::HashSet::new();
+                wl.insert(vk(b"trusted-writer"));
+                engine.set_trust_direct(TrustSet::Whitelist(wl)).await;
+
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"x"),
+                    references: vec![],
+                };
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"untrusted-writer"),
+                    name: Bytes::from_static(b"chat/k1"),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+
+                engine
+                    .handle_event_delivery(
+                        PeerId(vk(b"some-peer")),
+                        vec![entry],
+                        vec![block],
+                    )
+                    .await;
+
+                let result = engine
+                    .store
+                    .get_entry(&vk(b"untrusted-writer"), b"chat/k1")
+                    .await
+                    .unwrap();
+                assert!(result.is_none(), "untrusted entry should not be stored");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
