@@ -5,5 +5,5 @@ use sunset_store_memory::MemoryStore;
 
 #[tokio::test]
 async fn memory_store_passes_conformance_suite() {
-    run_conformance_suite(MemoryStore::with_accept_all).await;
+    run_conformance_suite(|| async { MemoryStore::with_accept_all() }).await;
 }
