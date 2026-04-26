@@ -684,6 +684,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunset-sync"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "futures",
+ "postcard",
+ "serde",
+ "sunset-store",
+ "sunset-store-memory",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
