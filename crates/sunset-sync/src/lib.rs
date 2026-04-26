@@ -1,0 +1,23 @@
+//! sunset-sync: peer-to-peer replication of sunset-store data over a pluggable
+//! transport.
+//!
+//! See `docs/superpowers/specs/2026-04-25-sunset-store-and-sync-design.md` for design.
+
+pub mod digest;
+pub mod engine;
+pub mod error;
+pub mod message;
+pub mod peer;
+pub mod reserved;
+pub mod subscription_registry;
+pub mod transport;
+pub mod types;
+
+#[cfg(feature = "test-helpers")]
+pub mod test_transport;
+
+pub use engine::SyncEngine;
+pub use error::{Error, Result};
+pub use message::{DigestRange, SyncMessage};
+pub use transport::{Transport, TransportConnection};
+pub use types::{PeerAddr, PeerId, SyncConfig, TrustSet};
