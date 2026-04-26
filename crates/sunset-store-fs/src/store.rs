@@ -447,6 +447,40 @@ mod gc_tests {
     }
 
     #[tokio::test]
+    async fn gc_blobs_continues_past_corrupt_reachable_blob() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        // Insert a normal blob + entry referencing it (the "good root").
+        let b_good = block(b"good");
+        store
+            .insert(entry(b"a", b"k", 1, &b_good), Some(b_good.clone()))
+            .await
+            .unwrap();
+        // Insert a second blob that's a root, then corrupt it on disk.
+        let b_corrupt = block(b"to-be-corrupted");
+        store
+            .insert(entry(b"a", b"k2", 1, &b_corrupt), Some(b_corrupt.clone()))
+            .await
+            .unwrap();
+        // Corrupt the on-disk blob (overwrite with garbage).
+        let hex = b_corrupt.hash().to_hex();
+        let corrupt_path = dir.path().join("content").join(&hex[0..2]).join(&hex[2..]);
+        std::fs::write(&corrupt_path, b"garbage-not-a-valid-postcard").unwrap();
+        // Add an unrelated orphan blob.
+        let b_orphan = block(b"orphan");
+        store.put_content(b_orphan.clone()).await.unwrap();
+        // GC should NOT abort due to the corrupt blob; it should still sweep the orphan.
+        let n = store.gc_blobs().await.unwrap();
+        assert_eq!(
+            n, 1,
+            "orphan must be reclaimed despite corrupt reachable blob"
+        );
+        assert!(store.get_content(&b_orphan.hash()).await.unwrap().is_none());
+        // The good blob remains (it was a leaf with no references; not corrupted).
+        assert!(store.get_content(&b_good.hash()).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn gc_blobs_keeps_reachable_drops_orphans() {
         let dir = TempDir::new().unwrap();
         let store = FsStore::new(dir.path()).await.unwrap();
