@@ -4,10 +4,12 @@
 
 pub mod error;
 pub mod filter;
+pub mod store;
 pub mod types;
 pub mod verifier;
 
 pub use error::{Error, Result};
 pub use filter::{Event, Filter, Replay};
+pub use store::{EntryStream, EventStream, Store};
 pub use types::{ContentBlock, Cursor, Hash, SignedKvEntry, VerifyingKey};
 pub use verifier::{AcceptAllVerifier, SignatureVerifier};
