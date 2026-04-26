@@ -9,15 +9,14 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import lustre
 import lustre/element.{type Element}
-import lustre/element/html
 import sunset_web/domain.{
   type ChannelId, type Room, type RoomId, ChannelId, RoomId,
 }
 import sunset_web/fixture
-import sunset_web/theme.{type Mode, type Palette, Dark, Light}
-import sunset_web/ui
+import sunset_web/theme.{type Mode, Dark, Light}
 import sunset_web/views/channels
 import sunset_web/views/main_panel
+import sunset_web/views/members
 import sunset_web/views/rooms
 import sunset_web/views/shell
 
@@ -111,7 +110,7 @@ fn view(model: Model) -> Element(Msg) {
       draft: model.draft,
       on_draft: UpdateDraft,
     ),
-    placeholder_panel(palette, "members"),
+    members.view(palette: palette, members: fixture.members()),
   )
 }
 
@@ -120,17 +119,3 @@ fn current_room(rs: List(Room), id: RoomId) -> Option(Room) {
   |> option.from_result
 }
 
-fn placeholder_panel(palette: Palette, label: String) -> Element(Msg) {
-  html.div(
-    [
-      ui.css([
-        #("border-right", "1px solid " <> palette.border),
-        #("padding", "16px"),
-        #("color", palette.text_faint),
-        #("background", palette.surface_alt),
-        #("overflow", "auto"),
-      ]),
-    ],
-    [html.text(label)],
-  )
-}
