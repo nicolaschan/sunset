@@ -62,7 +62,10 @@ pub trait Store {
     /// Returns the current monotonic cursor: the next-to-be-assigned sequence
     /// number. Passing the returned cursor to `subscribe(..., Replay::Since(c))`
     /// replays entries written at or after the moment this method observed the
-    /// store (the `Since` predicate is `sequence >= c.0`). A cursor captured
-    /// before any insert is `Cursor(0)`.
+    /// store (the `Since` predicate is `sequence >= c.0`). The absolute starting
+    /// value is backend-specific (memory backends may start at 0; SQLite-backed
+    /// stores start at 1 due to AUTOINCREMENT semantics) — only the *relative*
+    /// ordering is guaranteed: a cursor captured later is strictly greater than
+    /// one captured earlier (assuming intervening inserts).
     async fn current_cursor(&self) -> Result<Cursor>;
 }

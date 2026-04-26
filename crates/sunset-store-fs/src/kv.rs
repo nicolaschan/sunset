@@ -78,6 +78,11 @@ pub fn insert_lww(txn: &rusqlite::Transaction<'_>, entry: &SignedKvEntry) -> Res
         }
     }
 
+    debug_assert!(
+        entry.priority <= i64::MAX as u64,
+        "priority {} exceeds i64::MAX; SQLite stores INTEGER as i64 and would silently wrap",
+        entry.priority,
+    );
     txn.execute(
         "INSERT OR REPLACE INTO entries
             (verifying_key, name, value_hash, priority, expires_at, signature)
