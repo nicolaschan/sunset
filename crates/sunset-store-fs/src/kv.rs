@@ -1,7 +1,7 @@
 //! SQLite KV index layer.
 
 use bytes::Bytes;
-use sunset_store::{Cursor, Error, Result, SignedKvEntry, VerifyingKey};
+use sunset_store::{Cursor, Error, Filter, Result, SignedKvEntry, VerifyingKey};
 use tokio_rusqlite::rusqlite::{self, OptionalExtension, Row, params};
 
 /// Row → SignedKvEntry. The `sequence` column is also returned so callers can
@@ -116,4 +116,80 @@ pub fn current_cursor(conn: &rusqlite::Connection) -> rusqlite::Result<Cursor> {
         )
         .optional()?;
     Ok(Cursor(last.unwrap_or(0) as u64 + 1))
+}
+
+/// Collect all entries matching `filter` into a `Vec`. Ordered by
+/// `sequence ASC` within each sub-query for determinism in tests.
+pub fn iter_with_filter(
+    conn: &rusqlite::Connection,
+    filter: &Filter,
+) -> Result<Vec<SignedKvEntry>> {
+    let mut out = Vec::new();
+    match filter {
+        Filter::Specific(vk, name) => {
+            if let Some(e) = get_entry(conn, vk, name.as_ref())
+                .map_err(|e| Error::Backend(format!("specific: {e}")))?
+            {
+                out.push(e);
+            }
+        }
+        Filter::Keyspace(vk) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+                     FROM entries WHERE verifying_key = ?1 ORDER BY sequence ASC",
+                )
+                .map_err(|e| Error::Backend(format!("prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![vk.as_bytes()], |r| row_to_entry(r).map(|(_, e)| e))
+                .map_err(|e| Error::Backend(format!("query: {e}")))?;
+            for r in rows {
+                out.push(r.map_err(|e| Error::Backend(format!("row: {e}")))?);
+            }
+        }
+        Filter::Namespace(name) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+                     FROM entries WHERE name = ?1 ORDER BY sequence ASC",
+                )
+                .map_err(|e| Error::Backend(format!("prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![name.as_ref()], |r| row_to_entry(r).map(|(_, e)| e))
+                .map_err(|e| Error::Backend(format!("query: {e}")))?;
+            for r in rows {
+                out.push(r.map_err(|e| Error::Backend(format!("row: {e}")))?);
+            }
+        }
+        Filter::NamePrefix(prefix) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+                     FROM entries
+                     WHERE substr(name, 1, ?2) = ?1
+                     ORDER BY sequence ASC",
+                )
+                .map_err(|e| Error::Backend(format!("prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![prefix.as_ref(), prefix.len() as i64], |r| {
+                    row_to_entry(r).map(|(_, e)| e)
+                })
+                .map_err(|e| Error::Backend(format!("query: {e}")))?;
+            for r in rows {
+                out.push(r.map_err(|e| Error::Backend(format!("row: {e}")))?);
+            }
+        }
+        Filter::Union(filters) => {
+            let mut seen = std::collections::HashSet::<(Vec<u8>, Vec<u8>)>::new();
+            for f in filters {
+                for e in iter_with_filter(conn, f)? {
+                    let key = (e.verifying_key.as_bytes().to_vec(), e.name.to_vec());
+                    if seen.insert(key) {
+                        out.push(e);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }

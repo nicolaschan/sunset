@@ -151,9 +151,20 @@ impl Store for FsStore {
             .map_err(|e| Error::Backend(format!("get_entry: {e}")))
     }
 
-    async fn iter<'a>(&'a self, _filter: Filter) -> Result<EntryStream<'a>> {
-        // implemented in Task 5
-        unimplemented!("iter — implemented in Task 5")
+    async fn iter<'a>(&'a self, filter: Filter) -> Result<EntryStream<'a>> {
+        let entries = self
+            .conn
+            .call(move |c| -> std::result::Result<Vec<SignedKvEntry>, Error> {
+                kv::iter_with_filter(c, &filter)
+            })
+            .await
+            .map_err(unwrap_store_error)?;
+        let stream = async_stream::stream! {
+            for e in entries {
+                yield Ok(e);
+            }
+        };
+        Ok(Box::pin(stream))
     }
 
     async fn subscribe<'a>(&'a self, _filter: Filter, _replay: Replay) -> Result<EventStream<'a>> {
@@ -193,6 +204,65 @@ mod tests {
         // Re-opening the same path must succeed (idempotent DDL).
         drop(store);
         let _store2 = FsStore::new(dir.path()).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod iter_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use sunset_store::{ContentBlock, SignedKvEntry, VerifyingKey};
+    use tempfile::TempDir;
+
+    fn vk(b: &[u8]) -> VerifyingKey {
+        VerifyingKey(Bytes::copy_from_slice(b))
+    }
+    fn block(d: &[u8]) -> ContentBlock {
+        ContentBlock {
+            data: Bytes::copy_from_slice(d),
+            references: vec![],
+        }
+    }
+    fn entry(vk_bytes: &[u8], name: &[u8], priority: u64, blob: &ContentBlock) -> SignedKvEntry {
+        SignedKvEntry {
+            verifying_key: vk(vk_bytes),
+            name: Bytes::copy_from_slice(name),
+            value_hash: blob.hash(),
+            priority,
+            expires_at: None,
+            signature: Bytes::copy_from_slice(b"sig"),
+        }
+    }
+
+    #[tokio::test]
+    async fn iter_keyspace_returns_only_matching_writer() {
+        let dir = TempDir::new().unwrap();
+        let store = FsStore::new(dir.path()).await.unwrap();
+        let b = block(b"v");
+        store
+            .insert(entry(b"a", b"k1", 1, &b), Some(b.clone()))
+            .await
+            .unwrap();
+        store
+            .insert(entry(b"a", b"k2", 1, &b), Some(b.clone()))
+            .await
+            .unwrap();
+        store
+            .insert(entry(b"b", b"k1", 1, &b), Some(b))
+            .await
+            .unwrap();
+        let got: Vec<_> = store
+            .iter(Filter::Keyspace(vk(b"a")))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|e| e.verifying_key == vk(b"a")));
     }
 }
 
