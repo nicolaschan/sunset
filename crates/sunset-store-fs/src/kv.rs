@@ -1,0 +1,217 @@
+//! SQLite KV index layer.
+
+use bytes::Bytes;
+use sunset_store::{Cursor, Error, Filter, Result, SignedKvEntry, VerifyingKey};
+use tokio_rusqlite::rusqlite::{self, OptionalExtension, Row, params};
+
+/// Row → SignedKvEntry. The `sequence` column is also returned so callers can
+/// use it for cursors / events.
+pub fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<(u64, SignedKvEntry)> {
+    let sequence: i64 = row.get("sequence")?;
+    let verifying_key: Vec<u8> = row.get("verifying_key")?;
+    let name: Vec<u8> = row.get("name")?;
+    let value_hash: Vec<u8> = row.get("value_hash")?;
+    let priority: i64 = row.get("priority")?;
+    let expires_at: Option<i64> = row.get("expires_at")?;
+    let signature: Vec<u8> = row.get("signature")?;
+    let mut hash_bytes = [0u8; 32];
+    if value_hash.len() != 32 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            value_hash.len(),
+            rusqlite::types::Type::Blob,
+            Box::<dyn std::error::Error + Send + Sync>::from("value_hash not 32 bytes"),
+        ));
+    }
+    hash_bytes.copy_from_slice(&value_hash);
+    let entry = SignedKvEntry {
+        verifying_key: VerifyingKey(Bytes::from(verifying_key)),
+        name: Bytes::from(name),
+        value_hash: sunset_store::Hash::from(hash_bytes),
+        priority: priority as u64,
+        expires_at: expires_at.map(|x| x as u64),
+        signature: Bytes::from(signature),
+    };
+    Ok((sequence as u64, entry))
+}
+
+/// Get the entry for `(vk, name)` if present.
+pub fn get_entry(
+    conn: &rusqlite::Connection,
+    vk: &VerifyingKey,
+    name: &[u8],
+) -> rusqlite::Result<Option<SignedKvEntry>> {
+    conn.query_row(
+        "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+         FROM entries WHERE verifying_key = ?1 AND name = ?2",
+        params![vk.as_bytes(), name],
+        |row| row_to_entry(row).map(|(_, e)| e),
+    )
+    .optional()
+}
+
+/// Outcome of an attempted insert. The caller uses it to decide which event
+/// variant to broadcast.
+#[derive(Debug)]
+pub enum InsertOutcome {
+    Inserted,
+    Replaced { old: SignedKvEntry },
+}
+
+/// Apply LWW + insert under an open transaction. Caller is responsible for
+/// running this inside `conn.call(|c| { let txn = c.transaction()?; ... txn.commit()?; })`.
+pub fn insert_lww(txn: &rusqlite::Transaction<'_>, entry: &SignedKvEntry) -> Result<InsertOutcome> {
+    let existing = txn
+        .query_row(
+            "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+             FROM entries WHERE verifying_key = ?1 AND name = ?2",
+            params![entry.verifying_key.as_bytes(), entry.name.as_ref()],
+            row_to_entry,
+        )
+        .optional()
+        .map_err(|e| Error::Backend(format!("select existing: {e}")))?;
+
+    if let Some((_, ref old)) = existing {
+        if old.priority >= entry.priority {
+            return Err(Error::Stale);
+        }
+    }
+
+    debug_assert!(
+        entry.priority <= i64::MAX as u64,
+        "priority {} exceeds i64::MAX; SQLite stores INTEGER as i64 and would silently wrap",
+        entry.priority,
+    );
+    txn.execute(
+        "INSERT OR REPLACE INTO entries
+            (verifying_key, name, value_hash, priority, expires_at, signature)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            entry.verifying_key.as_bytes(),
+            entry.name.as_ref(),
+            entry.value_hash.as_bytes(),
+            entry.priority as i64,
+            entry.expires_at.map(|x| x as i64),
+            entry.signature.as_ref(),
+        ],
+    )
+    .map_err(|e| Error::Backend(format!("insert entry: {e}")))?;
+
+    Ok(match existing {
+        Some((_, old)) => InsertOutcome::Replaced { old },
+        None => InsertOutcome::Inserted,
+    })
+}
+
+/// Delete all entries with `expires_at <= now`. Returns the deleted entries
+/// (so the caller can broadcast `Event::Expired` for each).
+pub fn delete_expired(txn: &rusqlite::Transaction<'_>, now: u64) -> Result<Vec<SignedKvEntry>> {
+    let mut victims = Vec::new();
+    {
+        let mut stmt = txn
+            .prepare(
+                "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+                 FROM entries WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            )
+            .map_err(|e| Error::Backend(format!("prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![now as i64], |r| row_to_entry(r).map(|(_, e)| e))
+            .map_err(|e| Error::Backend(format!("query: {e}")))?;
+        for r in rows {
+            victims.push(r.map_err(|e| Error::Backend(format!("row: {e}")))?);
+        }
+    }
+    txn.execute(
+        "DELETE FROM entries WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        params![now as i64],
+    )
+    .map_err(|e| Error::Backend(format!("delete: {e}")))?;
+    Ok(victims)
+}
+
+/// Cursor query: next-to-be-assigned sequence.
+pub fn current_cursor(conn: &rusqlite::Connection) -> rusqlite::Result<Cursor> {
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'entries'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(Cursor(last.unwrap_or(0) as u64 + 1))
+}
+
+/// Collect all entries matching `filter` into a `Vec`. Ordered by
+/// `sequence ASC` within each sub-query for determinism in tests.
+pub fn iter_with_filter(
+    conn: &rusqlite::Connection,
+    filter: &Filter,
+) -> Result<Vec<SignedKvEntry>> {
+    let mut out = Vec::new();
+    match filter {
+        Filter::Specific(vk, name) => {
+            if let Some(e) = get_entry(conn, vk, name.as_ref())
+                .map_err(|e| Error::Backend(format!("specific: {e}")))?
+            {
+                out.push(e);
+            }
+        }
+        Filter::Keyspace(vk) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+                     FROM entries WHERE verifying_key = ?1 ORDER BY sequence ASC",
+                )
+                .map_err(|e| Error::Backend(format!("prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![vk.as_bytes()], |r| row_to_entry(r).map(|(_, e)| e))
+                .map_err(|e| Error::Backend(format!("query: {e}")))?;
+            for r in rows {
+                out.push(r.map_err(|e| Error::Backend(format!("row: {e}")))?);
+            }
+        }
+        Filter::Namespace(name) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+                     FROM entries WHERE name = ?1 ORDER BY sequence ASC",
+                )
+                .map_err(|e| Error::Backend(format!("prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![name.as_ref()], |r| row_to_entry(r).map(|(_, e)| e))
+                .map_err(|e| Error::Backend(format!("query: {e}")))?;
+            for r in rows {
+                out.push(r.map_err(|e| Error::Backend(format!("row: {e}")))?);
+            }
+        }
+        Filter::NamePrefix(prefix) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
+                     FROM entries
+                     WHERE substr(name, 1, ?2) = ?1
+                     ORDER BY sequence ASC",
+                )
+                .map_err(|e| Error::Backend(format!("prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![prefix.as_ref(), prefix.len() as i64], |r| {
+                    row_to_entry(r).map(|(_, e)| e)
+                })
+                .map_err(|e| Error::Backend(format!("query: {e}")))?;
+            for r in rows {
+                out.push(r.map_err(|e| Error::Backend(format!("row: {e}")))?);
+            }
+        }
+        Filter::Union(filters) => {
+            let mut seen = std::collections::HashSet::<(Vec<u8>, Vec<u8>)>::new();
+            for f in filters {
+                for e in iter_with_filter(conn, f)? {
+                    let key = (e.verifying_key.as_bytes().to_vec(), e.name.to_vec());
+                    if seen.insert(key) {
+                        out.push(e);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}

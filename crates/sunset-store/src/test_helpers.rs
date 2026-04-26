@@ -85,25 +85,26 @@ where
 
 /// Run the full conformance suite against `store_factory`. The factory is
 /// called once per test case to create a fresh store.
-pub async fn run_conformance_suite<S, F>(store_factory: F)
+pub async fn run_conformance_suite<S, F, Fut>(store_factory: F)
 where
     S: Store,
-    F: Fn() -> S,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = S>,
 {
-    insert_get_roundtrip(&store_factory()).await;
-    lww_supersession(&store_factory()).await;
-    stale_rejection(&store_factory()).await;
-    hash_mismatch_rejection(&store_factory()).await;
-    lazy_dangling_ref(&store_factory()).await;
-    ttl_pruning(&store_factory()).await;
-    blob_gc_reachability(&store_factory()).await;
-    iter_filters(&store_factory()).await;
-    subscribe_replay_modes(&store_factory()).await;
-    subscribe_replay_since_cursor(&store_factory()).await;
-    subscribe_emits_replaced_event(&store_factory()).await;
-    subscribe_emits_expired_event(&store_factory()).await;
-    subscribe_emits_blob_added_event(&store_factory()).await;
-    subscribe_emits_blob_removed_event(&store_factory()).await;
+    insert_get_roundtrip(&store_factory().await).await;
+    lww_supersession(&store_factory().await).await;
+    stale_rejection(&store_factory().await).await;
+    hash_mismatch_rejection(&store_factory().await).await;
+    lazy_dangling_ref(&store_factory().await).await;
+    ttl_pruning(&store_factory().await).await;
+    blob_gc_reachability(&store_factory().await).await;
+    iter_filters(&store_factory().await).await;
+    subscribe_replay_modes(&store_factory().await).await;
+    subscribe_replay_since_cursor(&store_factory().await).await;
+    subscribe_emits_replaced_event(&store_factory().await).await;
+    subscribe_emits_expired_event(&store_factory().await).await;
+    subscribe_emits_blob_added_event(&store_factory().await).await;
+    subscribe_emits_blob_removed_event(&store_factory().await).await;
 }
 
 /// Test: insert + get_entry roundtrip.
