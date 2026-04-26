@@ -125,8 +125,20 @@ impl Store for MemoryStore {
     async fn subscribe<'a>(&'a self, _filter: sunset_store::Filter, _replay: sunset_store::Replay) -> Result<sunset_store::EventStream<'a>> {
         Err(Error::Backend("not implemented".into()))
     }
-    async fn delete_expired(&self, _now: u64) -> Result<usize> {
-        Err(Error::Backend("not implemented".into()))
+    async fn delete_expired(&self, now: u64) -> Result<usize> {
+        let mut inner = self.inner.lock().await;
+        // Collect keys to remove first; we mutate after.
+        let to_remove: Vec<KvKey> = inner
+            .entries
+            .iter()
+            .filter(|(_, stored)| stored.entry.expires_at.is_some_and(|e| e <= now))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = to_remove.len();
+        for key in to_remove {
+            inner.entries.remove(&key);
+        }
+        Ok(count)
     }
     async fn gc_blobs(&self) -> Result<usize> {
         Err(Error::Backend("not implemented".into()))
@@ -358,5 +370,40 @@ mod tests {
         ]);
         let results = collect_iter(&store, f).await;
         assert_eq!(results.len(), 2);
+    }
+
+    fn entry_with_expiry(block: &ContentBlock, vk_bytes: &'static [u8], name: &'static [u8], priority: u64, expires_at: u64) -> SignedKvEntry {
+        SignedKvEntry {
+            verifying_key: vk(vk_bytes),
+            name:          n(name),
+            value_hash:    block.hash(),
+            priority,
+            expires_at:    Some(expires_at),
+            signature:     bytes::Bytes::from_static(b"sig"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_expired_removes_only_past_entries() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        store.insert(entry_with_expiry(&block, b"a", b"old", 1, 100), Some(block.clone())).await.unwrap();
+        store.insert(entry_with_expiry(&block, b"a", b"future", 1, 1000), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"a", b"forever", 1), Some(block.clone())).await.unwrap();
+
+        let removed = store.delete_expired(500).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(store.get_entry(&vk(b"a"), b"old").await.unwrap().is_none());
+        assert!(store.get_entry(&vk(b"a"), b"future").await.unwrap().is_some());
+        assert!(store.get_entry(&vk(b"a"), b"forever").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_expired_at_boundary_includes_equal() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        store.insert(entry_with_expiry(&block, b"a", b"x", 1, 100), Some(block.clone())).await.unwrap();
+        let removed = store.delete_expired(100).await.unwrap();
+        assert_eq!(removed, 1);
     }
 }
