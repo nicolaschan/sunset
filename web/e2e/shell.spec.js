@@ -100,9 +100,90 @@ test("no body-level scrollbar appears", async ({ page }) => {
   );
   expect(overflowY).toBe("hidden");
 
-  const docOverflows = await page.evaluate(() => {
+  const overflows = await page.evaluate(() => {
     const root = document.documentElement;
-    return root.scrollHeight > root.clientHeight + 1;
+    return {
+      vertical: root.scrollHeight > root.clientHeight + 1,
+      horizontal: root.scrollWidth > root.clientWidth + 1,
+    };
   });
-  expect(docOverflows).toBe(false);
+  expect(overflows.vertical).toBe(false);
+  expect(overflows.horizontal).toBe(false);
+});
+
+test("collapsed rail hides the logo and never overflows horizontally", async ({
+  page,
+}) => {
+  const rail = page.getByTestId("rooms-rail");
+
+  await page.getByRole("button", { name: /Collapse rooms/i }).click();
+  await expect(
+    page.getByRole("button", { name: /Expand rooms/i }),
+  ).toBeVisible();
+
+  // The CSS width transition is 220ms; wait for the rail to actually finish
+  // shrinking before we measure layout-derived geometry (the "is the chevron
+  // centered" check below relies on the rail being its target 54px wide).
+  await expect
+    .poll(async () => await rail.evaluate((el) => el.getBoundingClientRect().width))
+    .toBeLessThan(56);
+
+  // No horizontal scroll on the document during/after collapse.
+  const horizontal = await page.evaluate(() => {
+    const r = document.documentElement;
+    return r.scrollWidth > r.clientWidth + 1;
+  });
+  expect(horizontal).toBe(false);
+
+  // The 28x28 logo SVG should not be rendered inside the collapsed rail.
+  const logoCount = await rail
+    .locator("svg")
+    .evaluateAll((els) =>
+      els.filter((e) => e.getAttribute("viewBox") === "0 0 28 28").length,
+    );
+  expect(logoCount).toBe(0);
+
+  // The chevron should be visually centred in the 54px rail. Compare the
+  // chevron's bounding-rect centre against the rail's centre with a small
+  // tolerance for sub-pixel rounding.
+  const offsets = await rail.evaluate((railEl) => {
+    const expand = railEl.querySelector('button[title*="Expand"]');
+    const railRect = railEl.getBoundingClientRect();
+    const btnRect = expand.getBoundingClientRect();
+    return {
+      railCenter: railRect.left + railRect.width / 2,
+      btnCenter: btnRect.left + btnRect.width / 2,
+    };
+  });
+  expect(Math.abs(offsets.btnCenter - offsets.railCenter)).toBeLessThanOrEqual(1);
+
+  await page.screenshot({
+    path: "test-results/shell-collapsed.png",
+    fullPage: true,
+  });
+});
+
+test("favicon link points at favicon.svg", async ({ page }) => {
+  const href = await page.evaluate(
+    () => document.querySelector('link[rel="icon"]')?.getAttribute("href"),
+  );
+  expect(href).toMatch(/favicon\.svg$/);
+});
+
+test("channels and main column bottom borders line up", async ({ page }) => {
+  // Channels rail is the second <aside>; main column is <main>.
+  const offsets = await page.evaluate(() => {
+    const channelsHeader = document.querySelectorAll("aside")[1].firstElementChild;
+    const mainHeader = document.querySelector("main").firstElementChild;
+    return {
+      channels:
+        channelsHeader.getBoundingClientRect().bottom -
+        document.documentElement.getBoundingClientRect().top,
+      main:
+        mainHeader.getBoundingClientRect().bottom -
+        document.documentElement.getBoundingClientRect().top,
+    };
+  });
+  // Allow 1px of sub-pixel slop.
+  expect(Math.abs(offsets.channels - offsets.main)).toBeLessThanOrEqual(1);
 });
