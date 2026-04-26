@@ -4,9 +4,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use sunset_store::{
-    ContentBlock, Cursor, Hash, SignedKvEntry, SignatureVerifier, VerifyingKey,
+    ContentBlock, Cursor, Event, Hash, SignedKvEntry, SignatureVerifier, VerifyingKey,
 };
 use tokio::sync::Mutex;
+
+use crate::subscription::{Subscription, SubscriptionList};
+use std::sync::Arc as StdArc;
 
 /// Composite key: `(verifying_key, name)`.
 type KvKey = (VerifyingKey, bytes::Bytes);
@@ -34,8 +37,9 @@ impl Inner {
 
 /// In-memory `Store` implementation.
 pub struct MemoryStore {
-    pub(crate) verifier: Arc<dyn SignatureVerifier>,
-    pub(crate) inner:    Arc<Mutex<Inner>>,
+    pub(crate) verifier:      Arc<dyn SignatureVerifier>,
+    pub(crate) inner:         Arc<Mutex<Inner>>,
+    pub(crate) subscriptions: Arc<SubscriptionList>,
 }
 
 impl MemoryStore {
@@ -43,7 +47,8 @@ impl MemoryStore {
     pub fn new(verifier: Arc<dyn SignatureVerifier>) -> Self {
         Self {
             verifier,
-            inner: Arc::new(Mutex::new(Inner::default())),
+            inner:         Arc::new(Mutex::new(Inner::default())),
+            subscriptions: Arc::new(SubscriptionList::default()),
         }
     }
 
@@ -77,28 +82,41 @@ impl Store for MemoryStore {
     }
 
     async fn insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()> {
-        // 1. Hash-match check.
         if let Some(b) = &blob {
             if b.hash() != entry.value_hash {
                 return Err(Error::HashMismatch);
             }
         }
-        // 2. Signature verification.
         self.verifier.verify(&entry)?;
-        // 3. LWW + atomic insert.
-        let mut inner = self.inner.lock().await;
-        let key: KvKey = (entry.verifying_key.clone(), entry.name.clone());
-        if let Some(existing) = inner.entries.get(&key) {
-            if existing.entry.priority >= entry.priority {
-                return Err(Error::Stale);
+        let event = {
+            let mut inner = self.inner.lock().await;
+            let key: KvKey = (entry.verifying_key.clone(), entry.name.clone());
+            let prev = inner.entries.get(&key).map(|s| s.entry.clone());
+            if let Some(existing) = &prev {
+                if existing.priority >= entry.priority {
+                    return Err(Error::Stale);
+                }
             }
+            let blob_added_hash = if let Some(b) = blob {
+                let already = inner.blobs.contains_key(&entry.value_hash);
+                inner.blobs.entry(entry.value_hash).or_insert(b);
+                if already { None } else { Some(entry.value_hash) }
+            } else {
+                None
+            };
+            let sequence = inner.assign_sequence();
+            inner.entries.insert(key, StoredEntry { entry: entry.clone(), sequence });
+            (prev, blob_added_hash)
+        };
+        let (prev, blob_added) = event;
+        if let Some(old) = prev {
+            self.subscriptions.broadcast(Event::Replaced { old, new: entry });
+        } else {
+            self.subscriptions.broadcast(Event::Inserted(entry));
         }
-        // Atomic: insert blob first (idempotent), then KV row.
-        if let Some(b) = blob {
-            inner.blobs.entry(entry.value_hash).or_insert(b);
+        if let Some(h) = blob_added {
+            self.subscriptions.broadcast(Event::BlobAdded(h));
         }
-        let sequence = inner.assign_sequence();
-        inner.entries.insert(key, StoredEntry { entry, sequence });
         Ok(())
     }
 
@@ -121,58 +139,82 @@ impl Store for MemoryStore {
         let stream = futures::stream::iter(matching.into_iter().map(Ok));
         Ok(Box::pin(stream))
     }
-    // ===== to be filled in subsequent tasks =====
-    async fn subscribe<'a>(&'a self, _filter: sunset_store::Filter, _replay: sunset_store::Replay) -> Result<sunset_store::EventStream<'a>> {
-        Err(Error::Backend("not implemented".into()))
+    async fn subscribe<'a>(&'a self, filter: sunset_store::Filter, replay: sunset_store::Replay) -> Result<sunset_store::EventStream<'a>> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sub = StdArc::new(Subscription { filter: filter.clone(), tx });
+        self.subscriptions.add(sub.clone());
+
+        // Build the historical replay portion (snapshot under the lock).
+        let historical: Vec<sunset_store::Result<Event>> = {
+            let inner = self.inner.lock().await;
+            let mut out: Vec<(u64, Event)> = inner
+                .entries
+                .iter()
+                .filter(|((vk, name), _)| filter.matches(vk, name.as_ref()))
+                .filter(|(_, stored)| match replay {
+                    sunset_store::Replay::None => false,
+                    sunset_store::Replay::All => true,
+                    sunset_store::Replay::Since(c) => stored.sequence >= c.0,
+                })
+                .map(|(_, stored)| (stored.sequence, Event::Inserted(stored.entry.clone())))
+                .collect();
+            out.sort_by_key(|(s, _)| *s);
+            out.into_iter().map(|(_, e)| Ok(e)).collect()
+        };
+
+        // Stream historical, then transition to live events from the channel.
+        // Hold sub-Arc inside the stream so the weak pointer stays alive.
+        let live = async_stream::stream! {
+            // (sub kept alive by being moved into closure below; see explicit move)
+            let _hold = sub;
+            for h in historical { yield h; }
+            while let Some(item) = rx.recv().await { yield item; }
+        };
+        Ok(Box::pin(live))
     }
     async fn delete_expired(&self, now: u64) -> Result<usize> {
-        let mut inner = self.inner.lock().await;
-        // Collect keys to remove first; we mutate after.
-        let to_remove: Vec<KvKey> = inner
-            .entries
-            .iter()
-            .filter(|(_, stored)| stored.entry.expires_at.is_some_and(|e| e <= now))
-            .map(|(k, _)| k.clone())
-            .collect();
-        let count = to_remove.len();
-        for key in to_remove {
-            inner.entries.remove(&key);
+        let removed: Vec<SignedKvEntry> = {
+            let mut inner = self.inner.lock().await;
+            let to_remove: Vec<KvKey> = inner
+                .entries
+                .iter()
+                .filter(|(_, s)| s.entry.expires_at.is_some_and(|e| e <= now))
+                .map(|(k, _)| k.clone())
+                .collect();
+            to_remove
+                .into_iter()
+                .filter_map(|k| inner.entries.remove(&k).map(|s| s.entry))
+                .collect()
+        };
+        let count = removed.len();
+        for e in removed {
+            self.subscriptions.broadcast(Event::Expired(e));
         }
         Ok(count)
     }
     async fn gc_blobs(&self) -> Result<usize> {
         use std::collections::HashSet;
-        let mut inner = self.inner.lock().await;
-
-        // Mark phase: every live KV entry's value_hash is a root; walk references transitively.
-        let mut reachable: HashSet<Hash> = HashSet::new();
-        let mut frontier: Vec<Hash> = inner
-            .entries
-            .values()
-            .map(|s| s.entry.value_hash)
-            .collect();
-
-        while let Some(h) = frontier.pop() {
-            if !reachable.insert(h) { continue; }
-            if let Some(block) = inner.blobs.get(&h) {
-                for r in &block.references {
-                    if !reachable.contains(r) {
-                        frontier.push(*r);
+        let removed: Vec<Hash> = {
+            let mut inner = self.inner.lock().await;
+            let mut reachable: HashSet<Hash> = HashSet::new();
+            let mut frontier: Vec<Hash> = inner.entries.values().map(|s| s.entry.value_hash).collect();
+            while let Some(h) = frontier.pop() {
+                if !reachable.insert(h) { continue; }
+                if let Some(block) = inner.blobs.get(&h) {
+                    for r in &block.references {
+                        if !reachable.contains(r) { frontier.push(*r); }
                     }
                 }
             }
-        }
-
-        // Sweep phase: drop unreachable.
-        let to_remove: Vec<Hash> = inner
-            .blobs
-            .keys()
-            .filter(|h| !reachable.contains(h))
-            .copied()
-            .collect();
-        let count = to_remove.len();
-        for h in to_remove {
-            inner.blobs.remove(&h);
+            let to_remove: Vec<Hash> = inner.blobs.keys().filter(|h| !reachable.contains(h)).copied().collect();
+            for h in &to_remove {
+                inner.blobs.remove(h);
+            }
+            to_remove
+        };
+        let count = removed.len();
+        for h in removed {
+            self.subscriptions.broadcast(Event::BlobRemoved(h));
         }
         Ok(count)
     }
@@ -473,5 +515,56 @@ mod tests {
         store.insert(entry, None).await.unwrap();   // no blob yet
         let reclaimed = store.gc_blobs().await.unwrap();
         assert_eq!(reclaimed, 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_replay_none_only_emits_future_events() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        // Pre-existing entry — should NOT replay.
+        store.insert(entry_pointing_to(&block, b"a", b"r", 1), Some(block.clone())).await.unwrap();
+
+        let mut sub = store.subscribe(Filter::Keyspace(vk(b"a")), Replay::None).await.unwrap();
+
+        // Future event — should arrive.
+        store.insert(entry_pointing_to(&block, b"a", b"r2", 1), Some(block.clone())).await.unwrap();
+        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.unwrap().unwrap().unwrap();
+        match evt { Event::Inserted(e) => assert_eq!(e.name.as_ref(), b"r2"), _ => panic!("unexpected event {:?}", evt) }
+    }
+
+    #[tokio::test]
+    async fn subscribe_replay_all_emits_history_then_live() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        store.insert(entry_pointing_to(&block, b"a", b"r1", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"a", b"r2", 1), Some(block.clone())).await.unwrap();
+
+        let mut sub = store.subscribe(Filter::Keyspace(vk(b"a")), Replay::All).await.unwrap();
+        // Two historical.
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.unwrap().unwrap().unwrap();
+        }
+        // One live.
+        store.insert(entry_pointing_to(&block, b"a", b"r3", 1), Some(block.clone())).await.unwrap();
+        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.unwrap().unwrap().unwrap();
+        match evt { Event::Inserted(e) => assert_eq!(e.name.as_ref(), b"r3"), _ => panic!() }
+    }
+
+    #[tokio::test]
+    async fn subscribe_replaced_event_on_higher_priority_overwrite() {
+        let store = MemoryStore::with_accept_all();
+        let b1 = small_block(b"v1");
+        let b2 = small_block(b"v2");
+        store.insert(entry_pointing_to(&b1, b"a", b"r", 1), Some(b1.clone())).await.unwrap();
+        let mut sub = store.subscribe(Filter::Keyspace(vk(b"a")), Replay::None).await.unwrap();
+        store.insert(entry_pointing_to(&b2, b"a", b"r", 2), Some(b2.clone())).await.unwrap();
+        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.unwrap().unwrap().unwrap();
+        match evt {
+            Event::Replaced { old, new } => {
+                assert_eq!(old.priority, 1);
+                assert_eq!(new.priority, 2);
+            }
+            other => panic!("expected Replaced, got {:?}", other),
+        }
     }
 }
