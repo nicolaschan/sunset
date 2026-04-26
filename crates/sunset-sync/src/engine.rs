@@ -255,25 +255,20 @@ where
             .peer_outbound
             .insert(peer_id, out_tx);
 
-        tokio::task::spawn_local(run_peer(
-            conn,
-            local_peer,
-            proto,
-            out_rx,
-            inbound_tx,
-        ));
+        tokio::task::spawn_local(run_peer(conn, local_peer, proto, out_rx, inbound_tx));
     }
 
     async fn handle_inbound_event(&self, event: InboundEvent) {
         match event {
-            InboundEvent::PeerHello { peer_id, .. } => {
+            InboundEvent::PeerHello { peer_id } => {
                 // Fire bootstrap digest exchange on the subscribe namespace.
                 self.send_bootstrap_digest(&peer_id).await;
             }
             InboundEvent::Message { from, message } => {
                 self.handle_peer_message(from, message).await;
             }
-            InboundEvent::Disconnected { peer_id, .. } => {
+            InboundEvent::Disconnected { peer_id, reason } => {
+                eprintln!("sunset-sync: peer {peer_id:?} disconnected: {reason}");
                 self.state.lock().await.peer_outbound.remove(&peer_id);
             }
         }
@@ -319,7 +314,8 @@ where
                 range,
                 bloom,
             } => {
-                self.handle_digest_exchange(from, filter, range, bloom).await;
+                self.handle_digest_exchange(from, filter, range, bloom)
+                    .await;
             }
             SyncMessage::Fetch { .. } => {
                 // v1: Fetch is a future-extension when DigestRange grows
@@ -338,15 +334,15 @@ where
         _range: DigestRange,
         bloom: Bytes,
     ) {
-        let remote_bloom = BloomFilter::from_bytes(bloom, self.config.bloom_hash_fns);
-        let missing =
-            match entries_missing_from_remote(&*self.store, &filter, &remote_bloom).await {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("sunset-sync: digest scan failed: {e}");
-                    return;
-                }
-            };
+        let remote_bloom = BloomFilter::from_bytes(&bloom, self.config.bloom_hash_fns);
+        let missing = match entries_missing_from_remote(&*self.store, &filter, &remote_bloom).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("sunset-sync: digest scan failed: {e}");
+                return;
+            }
+        };
         if missing.is_empty() {
             return;
         }
@@ -504,7 +500,12 @@ where
     /// only with the `test-helpers` feature.
     #[cfg(feature = "test-helpers")]
     pub async fn knows_peer_subscription(&self, vk: &sunset_store::VerifyingKey) -> bool {
-        self.state.lock().await.registry.iter().any(|(k, _)| k == vk)
+        self.state
+            .lock()
+            .await
+            .registry
+            .iter()
+            .any(|(k, _)| k == vk)
     }
 
     /// Real implementation of `publish_subscription`'s server side.
@@ -570,7 +571,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let engine = Arc::new(make_engine("alice", b"alice"));
+                let engine = Rc::new(make_engine("alice", b"alice"));
 
                 let block = ContentBlock {
                     data: Bytes::from_static(b"hello"),
@@ -612,7 +613,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let engine = Arc::new(make_engine("alice", b"alice"));
+                let engine = Rc::new(make_engine("alice", b"alice"));
 
                 let mut wl = std::collections::HashSet::new();
                 wl.insert(vk(b"trusted-writer"));
@@ -632,11 +633,7 @@ mod tests {
                 };
 
                 engine
-                    .handle_event_delivery(
-                        PeerId(vk(b"some-peer")),
-                        vec![entry],
-                        vec![block],
-                    )
+                    .handle_event_delivery(PeerId(vk(b"some-peer")), vec![entry], vec![block])
                     .await;
 
                 let result = engine
@@ -656,7 +653,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let engine = Arc::new(make_engine("alice", b"alice"));
+                let engine = Rc::new(make_engine("alice", b"alice"));
                 let block = ContentBlock {
                     data: Bytes::from_static(b"data"),
                     references: vec![],
@@ -693,7 +690,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let engine = Arc::new(make_engine("alice", b"alice"));
+                let engine = Rc::new(make_engine("alice", b"alice"));
                 let block = ContentBlock {
                     data: Bytes::from_static(b"data"),
                     references: vec![],
@@ -713,7 +710,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let engine = Arc::new(make_engine("alice", b"alice"));
+                let engine = Rc::new(make_engine("alice", b"alice"));
 
                 let block = ContentBlock {
                     data: Bytes::from_static(b"x"),
@@ -771,7 +768,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let engine = Arc::new(make_engine("alice", b"alice"));
+                let engine = Rc::new(make_engine("alice", b"alice"));
                 engine.tick_anti_entropy().await;
             })
             .await;
@@ -782,7 +779,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let engine = Arc::new(make_engine("alice", b"alice"));
+                let engine = Rc::new(make_engine("alice", b"alice"));
                 let h = tokio::task::spawn_local({
                     let engine = engine.clone();
                     async move { engine.run().await }

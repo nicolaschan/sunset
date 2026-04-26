@@ -1,5 +1,6 @@
 //! Two-peer end-to-end integration test for sunset-sync.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,13 +31,13 @@ async fn alice_writes_bob_receives() {
             let alice_store = Arc::new(MemoryStore::with_accept_all());
             let bob_store = Arc::new(MemoryStore::with_accept_all());
 
-            let alice_engine = Arc::new(SyncEngine::new(
+            let alice_engine = Rc::new(SyncEngine::new(
                 alice_store.clone(),
                 alice_transport,
                 SyncConfig::default(),
                 alice_id.clone(),
             ));
-            let bob_engine = Arc::new(SyncEngine::new(
+            let bob_engine = Rc::new(SyncEngine::new(
                 bob_store.clone(),
                 bob_transport,
                 SyncConfig::default(),

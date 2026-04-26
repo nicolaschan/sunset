@@ -32,7 +32,7 @@ impl BloomFilter {
         }
     }
 
-    pub fn from_bytes(bytes: Bytes, num_hashes: u32) -> Self {
+    pub fn from_bytes(bytes: &[u8], num_hashes: u32) -> Self {
         let num_bits = bytes.len() * 8;
         Self {
             bits: bytes.to_vec(),
@@ -166,7 +166,7 @@ mod tests {
         b.insert(b"alice");
         b.insert(b"bob");
         let bytes = b.to_bytes();
-        let b2 = BloomFilter::from_bytes(bytes, 4);
+        let b2 = BloomFilter::from_bytes(&bytes, 4);
         assert!(b2.contains(b"alice"));
         assert!(b2.contains(b"bob"));
         assert!(!b2.contains(b"carol"));

@@ -14,20 +14,12 @@ use crate::types::PeerId;
 #[derive(Debug)]
 pub(crate) enum InboundEvent {
     /// Hello received; the peer's identity is now known.
-    PeerHello {
-        peer_id: PeerId,
-        protocol_version: u32,
-    },
+    /// Protocol-version validation has already happened in the per-peer task.
+    PeerHello { peer_id: PeerId },
     /// A SyncMessage arrived (other than Hello).
-    Message {
-        from: PeerId,
-        message: SyncMessage,
-    },
+    Message { from: PeerId, message: SyncMessage },
     /// The peer's connection closed (graceful or error).
-    Disconnected {
-        peer_id: PeerId,
-        reason: String,
-    },
+    Disconnected { peer_id: PeerId, reason: String },
 }
 
 /// Drive a single peer's connection.
@@ -81,7 +73,6 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             }
             let _ = inbound_tx.send(InboundEvent::PeerHello {
                 peer_id: peer_id.clone(),
-                protocol_version,
             });
             peer_id
         }
@@ -156,10 +147,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     tokio::join!(recv_task, send_task);
 }
 
-async fn send_message<C: TransportConnection + ?Sized>(
-    conn: &C,
-    msg: &SyncMessage,
-) -> Result<()> {
+async fn send_message<C: TransportConnection + ?Sized>(conn: &C, msg: &SyncMessage) -> Result<()> {
     let bytes = msg.encode()?;
     conn.send_reliable(bytes).await
 }
@@ -221,22 +209,14 @@ mod tests {
 
                 // Each side observes the other's Hello.
                 match a_in_rx.recv().await.unwrap() {
-                    InboundEvent::PeerHello {
-                        peer_id,
-                        protocol_version,
-                    } => {
+                    InboundEvent::PeerHello { peer_id } => {
                         assert_eq!(peer_id, PeerId(vk(b"bob")));
-                        assert_eq!(protocol_version, 1);
                     }
                     other => panic!("expected Hello, got {other:?}"),
                 }
                 match b_in_rx.recv().await.unwrap() {
-                    InboundEvent::PeerHello {
-                        peer_id,
-                        protocol_version,
-                    } => {
+                    InboundEvent::PeerHello { peer_id } => {
                         assert_eq!(peer_id, PeerId(vk(b"alice")));
-                        assert_eq!(protocol_version, 1);
                     }
                     other => panic!("expected Hello, got {other:?}"),
                 }
