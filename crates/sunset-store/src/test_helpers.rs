@@ -376,6 +376,7 @@ pub async fn subscribe_replay_since_cursor<S: Store>(store: &S) {
 
 /// Test: a higher-priority insert emits `Event::Replaced` to active subscribers.
 pub async fn subscribe_emits_replaced_event<S: Store>(store: &S) {
+    use futures::StreamExt;
     let b1 = block(b"v1");
     let b2 = block(b"v2");
     store
@@ -392,13 +393,40 @@ pub async fn subscribe_emits_replaced_event<S: Store>(store: &S) {
         .await
         .unwrap();
 
-    // The subscriber may receive Replaced and possibly BlobAdded; we look for Replaced.
+    // The subscriber will receive Replaced and BlobAdded (the replacement
+    // points at a fresh blob); we look for Replaced.
     let evt = next_matching(&mut s, |e| matches!(e, Event::Replaced { .. })).await;
-    if let Event::Replaced { old, new } = evt {
+    let (replaced_vk, replaced_name) = if let Event::Replaced { old, new } = evt {
         assert_eq!(old.priority, 1, "old entry priority");
         assert_eq!(new.priority, 2, "new entry priority");
+        (new.verifying_key.clone(), new.name.clone())
     } else {
         unreachable!()
+    };
+
+    // Negative assertion: a buggy backend that emitted a phantom Inserted for
+    // the replaced key after Replaced would still satisfy the predicate above,
+    // so drain the stream briefly and assert no such event appears.
+    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= drain_deadline {
+            break;
+        }
+        match tokio::time::timeout(drain_deadline - now, s.next()).await {
+            Ok(Some(Ok(Event::Inserted(e))))
+                if e.verifying_key == replaced_vk && e.name == replaced_name =>
+            {
+                panic!(
+                    "phantom Inserted for replaced key {:?}/{:?}",
+                    e.verifying_key, e.name
+                );
+            }
+            Ok(Some(Ok(_))) => continue, // unrelated events (e.g. BlobAdded) are fine
+            Ok(Some(Err(err))) => panic!("stream error during drain: {:?}", err),
+            Ok(None) => break,
+            Err(_) => break, // timeout: drain window elapsed
+        }
     }
 }
 
@@ -425,11 +453,16 @@ pub async fn subscribe_emits_expired_event<S: Store>(store: &S) {
 }
 
 /// Test: a successful insert with a new blob emits `Event::BlobAdded` to all subscribers.
+///
+/// The subscriber filter intentionally does NOT match the writer's verifying
+/// key; this pins down the contract that BlobAdded is delivered regardless
+/// of subscription filter (a buggy backend that filtered BlobAdded by
+/// keyspace would fail this test).
 pub async fn subscribe_emits_blob_added_event<S: Store>(store: &S) {
     let b = block(b"new-blob");
 
     let mut s = store
-        .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
+        .subscribe(Filter::Keyspace(vk(b"unrelated-watcher")), Replay::None)
         .await
         .unwrap();
     store
@@ -446,12 +479,16 @@ pub async fn subscribe_emits_blob_added_event<S: Store>(store: &S) {
 }
 
 /// Test: `gc_blobs()` emits `Event::BlobRemoved` to all subscribers for each reclaimed blob.
+///
+/// Like the BlobAdded test, the subscriber filter intentionally does NOT
+/// match anything in the store; this pins down the contract that
+/// BlobRemoved is delivered regardless of subscription filter.
 pub async fn subscribe_emits_blob_removed_event<S: Store>(store: &S) {
     let orphan = block(b"orphan");
     store.put_content(orphan.clone()).await.unwrap();
 
     let mut s = store
-        .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
+        .subscribe(Filter::Keyspace(vk(b"unrelated-watcher")), Replay::None)
         .await
         .unwrap();
     let reclaimed = store.gc_blobs().await.unwrap();

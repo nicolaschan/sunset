@@ -9,6 +9,9 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub(crate) struct Subscription {
     pub filter: Filter,
+    /// MUST stay unbounded: `broadcast` runs while holding the inner Tokio
+    /// mutex, so a bounded channel would let one slow subscriber stall every
+    /// writer in the store.
     pub tx: mpsc::UnboundedSender<sunset_store::Result<Event>>,
 }
 
@@ -18,9 +21,14 @@ pub(crate) struct Subscription {
 /// The internal `Mutex` is `std::sync::Mutex` (not `tokio::sync::Mutex`)
 /// because the critical section is bounded and synchronous. The
 /// `.unwrap()`s on `lock()` rely on the invariant that nothing inside the
-/// critical section can panic — `Arc::downgrade` and `mpsc::send` are
-/// infallible and `Vec::retain` over a non-allocating predicate cannot
-/// panic. Lock poisoning is therefore unreachable in production.
+/// critical section panics: `Arc::downgrade` cannot panic,
+/// `UnboundedSender::send` is non-panicking (it returns
+/// `Result<(), SendError<T>>`, which we discard), and `Vec::retain` itself
+/// cannot panic. This invariant additionally depends on `Filter::matches`
+/// and `Event::clone` (both invoked inside the retain predicate) staying
+/// panic-free — if either type grows panic paths in the future, this
+/// reasoning must be revisited. Barring an allocator panic, no recoverable
+/// panic is reachable, so lock poisoning will not occur in production.
 #[derive(Debug, Default)]
 pub(crate) struct SubscriptionList {
     pub entries: Mutex<Vec<Weak<Subscription>>>,
