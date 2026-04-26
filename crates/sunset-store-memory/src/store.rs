@@ -108,10 +108,20 @@ impl Store for MemoryStore {
         Ok(inner.entries.get(&key).map(|s| s.entry.clone()))
     }
 
-    // ===== to be filled in subsequent tasks =====
-    async fn iter<'a>(&'a self, _filter: sunset_store::Filter) -> Result<sunset_store::EntryStream<'a>> {
-        Err(Error::Backend("not implemented".into()))
+    async fn iter<'a>(&'a self, filter: sunset_store::Filter) -> Result<sunset_store::EntryStream<'a>> {
+        // Snapshot current matching entries to avoid holding the lock during streaming.
+        let inner = self.inner.lock().await;
+        let matching: Vec<SignedKvEntry> = inner
+            .entries
+            .iter()
+            .filter(|((vk, name), _)| filter.matches(vk, name.as_ref()))
+            .map(|(_, stored)| stored.entry.clone())
+            .collect();
+        drop(inner);
+        let stream = futures::stream::iter(matching.into_iter().map(Ok));
+        Ok(Box::pin(stream))
     }
+    // ===== to be filled in subsequent tasks =====
     async fn subscribe<'a>(&'a self, _filter: sunset_store::Filter, _replay: sunset_store::Replay) -> Result<sunset_store::EventStream<'a>> {
         Err(Error::Backend("not implemented".into()))
     }
@@ -272,5 +282,81 @@ mod tests {
             store.insert(entry, Some(block)).await,
             Err(Error::SignatureInvalid)
         ));
+    }
+
+    use futures::StreamExt;
+
+    async fn collect_iter(store: &MemoryStore, filter: Filter) -> Vec<SignedKvEntry> {
+        let mut s = store.iter(filter).await.unwrap();
+        let mut out = vec![];
+        while let Some(item) = s.next().await {
+            out.push(item.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn iter_keyspace_returns_only_matching_writer() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        store.insert(entry_pointing_to(&block, b"alice", b"a", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"alice", b"b", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"bob",   b"a", 1), Some(block.clone())).await.unwrap();
+
+        let results = collect_iter(&store, Filter::Keyspace(vk(b"alice"))).await;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|e| e.verifying_key == vk(b"alice")));
+    }
+
+    #[tokio::test]
+    async fn iter_namespace_returns_all_writers_at_name() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        store.insert(entry_pointing_to(&block, b"alice", b"room/g", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"bob",   b"room/g", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"alice", b"room/h", 1), Some(block.clone())).await.unwrap();
+
+        let results = collect_iter(&store, Filter::Namespace(n(b"room/g"))).await;
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn iter_name_prefix_matches_prefix() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        store.insert(entry_pointing_to(&block, b"a", b"room/g", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"a", b"room/h", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"a", b"presence/x", 1), Some(block.clone())).await.unwrap();
+
+        let results = collect_iter(&store, Filter::NamePrefix(n(b"room/"))).await;
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn iter_specific_returns_at_most_one() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        store.insert(entry_pointing_to(&block, b"a", b"x", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"b", b"x", 1), Some(block.clone())).await.unwrap();
+
+        let results = collect_iter(&store, Filter::Specific(vk(b"a"), n(b"x"))).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].verifying_key, vk(b"a"));
+    }
+
+    #[tokio::test]
+    async fn iter_union_is_or() {
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"x");
+        store.insert(entry_pointing_to(&block, b"a", b"room/g", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"b", b"presence/x", 1), Some(block.clone())).await.unwrap();
+        store.insert(entry_pointing_to(&block, b"c", b"unrelated", 1), Some(block.clone())).await.unwrap();
+
+        let f = Filter::Union(vec![
+            Filter::NamePrefix(n(b"room/")),
+            Filter::NamePrefix(n(b"presence/")),
+        ]);
+        let results = collect_iter(&store, f).await;
+        assert_eq!(results.len(), 2);
     }
 }
