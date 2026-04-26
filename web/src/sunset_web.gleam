@@ -17,6 +17,7 @@ import sunset_web/fixture
 import sunset_web/theme.{type Mode, type Palette, Dark, Light}
 import sunset_web/ui
 import sunset_web/views/channels
+import sunset_web/views/main_panel
 import sunset_web/views/rooms
 import sunset_web/views/shell
 
@@ -103,7 +104,13 @@ fn view(model: Model) -> Element(Msg) {
       current_channel: model.current_channel,
       on_select_channel: SelectChannel,
     ),
-    placeholder_panel(palette, "main"),
+    main_panel.view(
+      palette: palette,
+      current_channel: model.current_channel,
+      messages: fixture.messages(),
+      draft: model.draft,
+      on_draft: UpdateDraft,
+    ),
     placeholder_panel(palette, "members"),
   )
 }
