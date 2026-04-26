@@ -87,44 +87,41 @@ impl Store for MemoryStore {
             }
         }
         self.verifier.verify(&entry)?;
-        let event = {
-            let mut inner = self.inner.lock().await;
-            let key: KvKey = (entry.verifying_key.clone(), entry.name.clone());
-            let prev = inner.entries.get(&key).map(|s| s.entry.clone());
-            if let Some(existing) = &prev {
-                if existing.priority >= entry.priority {
-                    return Err(Error::Stale);
-                }
+        let mut inner = self.inner.lock().await;
+        let key: KvKey = (entry.verifying_key.clone(), entry.name.clone());
+        let prev = inner.entries.get(&key).map(|s| s.entry.clone());
+        if let Some(existing) = &prev {
+            if existing.priority >= entry.priority {
+                return Err(Error::Stale);
             }
-            let blob_added_hash = if let Some(b) = blob {
-                let already = inner.blobs.contains_key(&entry.value_hash);
-                inner.blobs.entry(entry.value_hash).or_insert(b);
-                if already {
-                    None
-                } else {
-                    Some(entry.value_hash)
-                }
-            } else {
+        }
+        let blob_added_hash = if let Some(b) = blob {
+            let already = inner.blobs.contains_key(&entry.value_hash);
+            inner.blobs.entry(entry.value_hash).or_insert(b);
+            if already {
                 None
-            };
-            let sequence = inner.assign_sequence();
-            inner.entries.insert(
-                key,
-                StoredEntry {
-                    entry: entry.clone(),
-                    sequence,
-                },
-            );
-            (prev, blob_added_hash)
+            } else {
+                Some(entry.value_hash)
+            }
+        } else {
+            None
         };
-        let (prev, blob_added) = event;
+        let sequence = inner.assign_sequence();
+        inner.entries.insert(
+            key,
+            StoredEntry {
+                entry: entry.clone(),
+                sequence,
+            },
+        );
+        // Broadcast WHILE holding the inner lock to serialize with subscribe.
         if let Some(old) = prev {
             self.subscriptions
                 .broadcast(&Event::Replaced { old, new: entry });
         } else {
             self.subscriptions.broadcast(&Event::Inserted(entry));
         }
-        if let Some(h) = blob_added {
+        if let Some(h) = blob_added_hash {
             self.subscriptions.broadcast(&Event::BlobAdded(h));
         }
         Ok(())
@@ -162,11 +159,15 @@ impl Store for MemoryStore {
             filter: filter.clone(),
             tx,
         });
-        self.subscriptions.add(&sub);
 
-        // Build the historical replay portion (snapshot under the lock).
+        // Build the historical replay portion (snapshot under the lock). Register
+        // the subscription INSIDE the inner lock so it serializes with broadcasts
+        // from insert/delete_expired/gc_blobs (which now happen while the inner
+        // lock is held). This prevents a race where an event is delivered both
+        // via history replay and via the live channel.
         let historical: Vec<sunset_store::Result<Event>> = {
             let inner = self.inner.lock().await;
+            self.subscriptions.add(&sub);
             let mut out: Vec<(u64, Event)> = inner
                 .entries
                 .iter()
@@ -193,57 +194,48 @@ impl Store for MemoryStore {
         Ok(Box::pin(live))
     }
     async fn delete_expired(&self, now: u64) -> Result<usize> {
-        let removed: Vec<SignedKvEntry> = {
-            let mut inner = self.inner.lock().await;
-            let to_remove: Vec<KvKey> = inner
-                .entries
-                .iter()
-                .filter(|(_, s)| s.entry.expires_at.is_some_and(|e| e <= now))
-                .map(|(k, _)| k.clone())
-                .collect();
-            to_remove
-                .into_iter()
-                .filter_map(|k| inner.entries.remove(&k).map(|s| s.entry))
-                .collect()
-        };
-        let count = removed.len();
-        for e in removed {
-            self.subscriptions.broadcast(&Event::Expired(e));
+        let mut inner = self.inner.lock().await;
+        let to_remove: Vec<KvKey> = inner
+            .entries
+            .iter()
+            .filter(|(_, s)| s.entry.expires_at.is_some_and(|e| e <= now))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut count = 0;
+        for k in to_remove {
+            if let Some(s) = inner.entries.remove(&k) {
+                self.subscriptions.broadcast(&Event::Expired(s.entry));
+                count += 1;
+            }
         }
         Ok(count)
     }
     async fn gc_blobs(&self) -> Result<usize> {
         use std::collections::HashSet;
-        let removed: Vec<Hash> = {
-            let mut inner = self.inner.lock().await;
-            let mut reachable: HashSet<Hash> = HashSet::new();
-            let mut frontier: Vec<Hash> =
-                inner.entries.values().map(|s| s.entry.value_hash).collect();
-            while let Some(h) = frontier.pop() {
-                if !reachable.insert(h) {
-                    continue;
-                }
-                if let Some(block) = inner.blobs.get(&h) {
-                    for r in &block.references {
-                        if !reachable.contains(r) {
-                            frontier.push(*r);
-                        }
+        let mut inner = self.inner.lock().await;
+        let mut reachable: HashSet<Hash> = HashSet::new();
+        let mut frontier: Vec<Hash> = inner.entries.values().map(|s| s.entry.value_hash).collect();
+        while let Some(h) = frontier.pop() {
+            if !reachable.insert(h) {
+                continue;
+            }
+            if let Some(block) = inner.blobs.get(&h) {
+                for r in &block.references {
+                    if !reachable.contains(r) {
+                        frontier.push(*r);
                     }
                 }
             }
-            let to_remove: Vec<Hash> = inner
-                .blobs
-                .keys()
-                .filter(|h| !reachable.contains(h))
-                .copied()
-                .collect();
-            for h in &to_remove {
-                inner.blobs.remove(h);
-            }
-            to_remove
-        };
-        let count = removed.len();
-        for h in removed {
+        }
+        let to_remove: Vec<Hash> = inner
+            .blobs
+            .keys()
+            .filter(|h| !reachable.contains(h))
+            .copied()
+            .collect();
+        let count = to_remove.len();
+        for h in to_remove {
+            inner.blobs.remove(&h);
             self.subscriptions.broadcast(&Event::BlobRemoved(h));
         }
         Ok(count)

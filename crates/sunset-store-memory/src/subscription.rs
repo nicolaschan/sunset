@@ -12,6 +12,15 @@ pub(crate) struct Subscription {
     pub tx: mpsc::UnboundedSender<sunset_store::Result<Event>>,
 }
 
+/// Subscriptions registered with this store; weak references so dropped
+/// streams are reclaimed lazily.
+///
+/// The internal `Mutex` is `std::sync::Mutex` (not `tokio::sync::Mutex`)
+/// because the critical section is bounded and synchronous. The
+/// `.unwrap()`s on `lock()` rely on the invariant that nothing inside the
+/// critical section can panic — `Arc::downgrade` and `mpsc::send` are
+/// infallible and `Vec::retain` over a non-allocating predicate cannot
+/// panic. Lock poisoning is therefore unreachable in production.
 #[derive(Debug, Default)]
 pub(crate) struct SubscriptionList {
     pub entries: Mutex<Vec<Weak<Subscription>>>,

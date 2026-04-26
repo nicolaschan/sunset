@@ -56,6 +56,33 @@ impl SignatureVerifier for CountingVerifier {
     }
 }
 
+/// Drain a subscription stream until an event matching `predicate` is found.
+/// Times out after a short duration. The conformance suite uses this so tests
+/// don't get tripped up by interleaved BlobAdded events.
+async fn next_matching<P>(
+    stream: &mut futures::stream::LocalBoxStream<'_, Result<Event>>,
+    predicate: P,
+) -> Event
+where
+    P: Fn(&Event) -> bool,
+{
+    use futures::StreamExt;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            panic!("timed out waiting for matching event");
+        }
+        match tokio::time::timeout(deadline - now, stream.next()).await {
+            Ok(Some(Ok(e))) if predicate(&e) => return e,
+            Ok(Some(Ok(_))) => continue, // not what we want; skip
+            Ok(Some(Err(err))) => panic!("stream error: {:?}", err),
+            Ok(None) => panic!("stream ended unexpectedly"),
+            Err(_) => panic!("timed out waiting for matching event"),
+        }
+    }
+}
+
 /// Run the full conformance suite against `store_factory`. The factory is
 /// called once per test case to create a fresh store.
 pub async fn run_conformance_suite<S, F>(store_factory: F)
@@ -73,6 +100,10 @@ where
     iter_filters(&store_factory()).await;
     subscribe_replay_modes(&store_factory()).await;
     subscribe_replay_since_cursor(&store_factory()).await;
+    subscribe_emits_replaced_event(&store_factory()).await;
+    subscribe_emits_expired_event(&store_factory()).await;
+    subscribe_emits_blob_added_event(&store_factory()).await;
+    subscribe_emits_blob_removed_event(&store_factory()).await;
 }
 
 /// Test: insert + get_entry roundtrip.
@@ -341,4 +372,95 @@ pub async fn subscribe_replay_since_cursor<S: Store>(store: &S) {
         }
     }
     assert_eq!(names, vec![n(b"r3"), n(b"r4")]);
+}
+
+/// Test: a higher-priority insert emits `Event::Replaced` to active subscribers.
+pub async fn subscribe_emits_replaced_event<S: Store>(store: &S) {
+    let b1 = block(b"v1");
+    let b2 = block(b"v2");
+    store
+        .insert(entry(&b1, b"a", b"r", 1), Some(b1))
+        .await
+        .unwrap();
+
+    let mut s = store
+        .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
+        .await
+        .unwrap();
+    store
+        .insert(entry(&b2, b"a", b"r", 2), Some(b2))
+        .await
+        .unwrap();
+
+    // The subscriber may receive Replaced and possibly BlobAdded; we look for Replaced.
+    let evt = next_matching(&mut s, |e| matches!(e, Event::Replaced { .. })).await;
+    if let Event::Replaced { old, new } = evt {
+        assert_eq!(old.priority, 1, "old entry priority");
+        assert_eq!(new.priority, 2, "new entry priority");
+    } else {
+        unreachable!()
+    }
+}
+
+/// Test: `delete_expired(now)` emits `Event::Expired` to active subscribers for each removed entry.
+pub async fn subscribe_emits_expired_event<S: Store>(store: &S) {
+    let b = block(b"x");
+    let mut e = entry(&b, b"a", b"will-expire", 1);
+    e.expires_at = Some(100);
+    store.insert(e.clone(), Some(b)).await.unwrap();
+
+    let mut s = store
+        .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
+        .await
+        .unwrap();
+    let removed = store.delete_expired(100).await.unwrap();
+    assert_eq!(removed, 1);
+
+    let evt = next_matching(&mut s, |evt| matches!(evt, Event::Expired(_))).await;
+    if let Event::Expired(expired) = evt {
+        assert_eq!(expired.name.as_ref(), b"will-expire");
+    } else {
+        unreachable!()
+    }
+}
+
+/// Test: a successful insert with a new blob emits `Event::BlobAdded` to all subscribers.
+pub async fn subscribe_emits_blob_added_event<S: Store>(store: &S) {
+    let b = block(b"new-blob");
+
+    let mut s = store
+        .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
+        .await
+        .unwrap();
+    store
+        .insert(entry(&b, b"a", b"r", 1), Some(b.clone()))
+        .await
+        .unwrap();
+
+    let evt = next_matching(&mut s, |e| matches!(e, Event::BlobAdded(_))).await;
+    if let Event::BlobAdded(h) = evt {
+        assert_eq!(h, b.hash());
+    } else {
+        unreachable!()
+    }
+}
+
+/// Test: `gc_blobs()` emits `Event::BlobRemoved` to all subscribers for each reclaimed blob.
+pub async fn subscribe_emits_blob_removed_event<S: Store>(store: &S) {
+    let orphan = block(b"orphan");
+    store.put_content(orphan.clone()).await.unwrap();
+
+    let mut s = store
+        .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
+        .await
+        .unwrap();
+    let reclaimed = store.gc_blobs().await.unwrap();
+    assert_eq!(reclaimed, 1);
+
+    let evt = next_matching(&mut s, |e| matches!(e, Event::BlobRemoved(_))).await;
+    if let Event::BlobRemoved(h) = evt {
+        assert_eq!(h, orphan.hash());
+    } else {
+        unreachable!()
+    }
 }
