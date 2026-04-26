@@ -134,14 +134,14 @@ where
         // Channel for per-peer tasks to talk back to us.
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
 
-        // Local store subscription. Initially a `Filter::Namespace(_sunset-sync/subscribe)`;
-        // refreshed whenever the registry changes (Task 14 expands the union).
+        // Local store subscription. Match every entry (an empty NamePrefix
+        // matches all names): the engine needs to see both subscribe-
+        // namespace entries (to maintain the registry) and any application
+        // entry that might match a peer's filter (for push routing). Per-
+        // peer fanout is filtered downstream in `handle_local_store_event`.
         let mut local_sub = self
             .store
-            .subscribe(
-                Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME)),
-                Replay::None,
-            )
+            .subscribe(Filter::NamePrefix(Bytes::new()), Replay::None)
             .await?;
 
         let mut anti_entropy = tokio::time::interval(self.config.anti_entropy_interval);
@@ -497,6 +497,14 @@ where
     #[cfg(test)]
     pub(crate) async fn set_trust_direct(&self, trust: TrustSet) {
         self.state.lock().await.trust = trust;
+    }
+
+    /// Test-only: true if this engine has learned the given peer's
+    /// subscription filter via the bootstrap digest exchange. Available
+    /// only with the `test-helpers` feature.
+    #[cfg(feature = "test-helpers")]
+    pub async fn knows_peer_subscription(&self, vk: &sunset_store::VerifyingKey) -> bool {
+        self.state.lock().await.registry.iter().any(|(k, _)| k == vk)
     }
 
     /// Real implementation of `publish_subscription`'s server side.
