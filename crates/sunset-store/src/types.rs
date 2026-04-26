@@ -22,7 +22,7 @@ impl From<Hash> for blake3::Hash {
 /// A writer's verifying (public) key. Opaque bytes — sunset-store does not
 /// know about specific signature schemes; the application's `SignatureVerifier`
 /// interprets these bytes.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VerifyingKey(pub bytes::Bytes);
 
 impl VerifyingKey {
