@@ -195,7 +195,7 @@ pub async fn subscribe_replay_modes<S: Store>(store: &S) {
     store.insert(entry(&b, b"a", b"r3", 1), Some(b.clone())).await.unwrap();
     let evt = tokio::time::timeout(std::time::Duration::from_millis(500), s.next()).await
         .expect("subscribe should deliver new event").unwrap().unwrap();
-    matches!(evt, Event::Inserted(e) if e.name.as_ref() == b"r3");
+    assert!(matches!(evt, Event::Inserted(e) if e.name.as_ref() == b"r3"));
 
     // Replay::All — historical first, then live.
     let mut s = store.subscribe(Filter::Keyspace(vk(b"a")), Replay::All).await.unwrap();
@@ -206,7 +206,7 @@ pub async fn subscribe_replay_modes<S: Store>(store: &S) {
     store.insert(entry(&b, b"a", b"r4", 1), Some(b.clone())).await.unwrap();
     let evt = tokio::time::timeout(std::time::Duration::from_millis(500), s.next()).await
         .expect("subscribe should deliver new event after replay").unwrap().unwrap();
-    matches!(evt, Event::Inserted(e) if e.name.as_ref() == b"r4");
+    assert!(matches!(evt, Event::Inserted(e) if e.name.as_ref() == b"r4"));
 }
 
 /// Test: `Replay::Since(cursor)` emits only entries written after the cursor.
