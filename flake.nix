@@ -74,6 +74,11 @@
             runHook preInstall
             mkdir -p $out
             cp -r dist/* $out/
+            # Static assets (favicon, etc.) ship from web/priv. Lustre's dev
+            # build doesn't copy them automatically; we do it here.
+            if [ -d priv ]; then
+              cp -r priv/. $out/
+            fi
             # Lustre emits an absolute `/sunset_web.js` script src which only
             # works at site root. Rewrite to a relative path so the artefact
             # serves correctly under any GitHub Pages sub-path.
