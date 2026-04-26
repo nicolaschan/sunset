@@ -1,0 +1,569 @@
+//// Rooms rail (left column) — full and collapsed variants.
+
+import gleam/int
+import gleam/list
+import gleam/string
+import lustre/attribute
+import lustre/element.{type Element}
+import lustre/element/html
+import lustre/event
+import sunset_web/domain.{
+  type ConnStatus, type Room, type RoomId, Connected, Offline, Reconnecting,
+}
+import sunset_web/theme.{type Palette}
+import sunset_web/ui
+
+pub fn view(
+  palette p: Palette,
+  rooms rs: List(Room),
+  current_room cur: RoomId,
+  collapsed col: Bool,
+  on_select_room sel: fn(RoomId) -> msg,
+  toggle toggle: msg,
+) -> Element(msg) {
+  let width = case col {
+    True -> "54px"
+    False -> "260px"
+  }
+  html.aside(
+    [
+      ui.css([
+        #("width", width),
+        #("min-width", width),
+        #("height", "100vh"),
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("background", p.surface),
+        #("border-right", "1px solid " <> p.border),
+        #("transition", "width 220ms ease"),
+      ]),
+    ],
+    [
+      brand_row(p, col, toggle),
+      case col {
+        True -> element.fragment([])
+        False -> search(p)
+      },
+      rooms_list(p, rs, cur, col, sel),
+      you_row(p, col),
+    ],
+  )
+}
+
+fn brand_row(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
+  let inner = case collapsed {
+    True ->
+      html.div(
+        [
+          ui.css([
+            #("flex", "1"),
+            #("display", "flex"),
+            #("justify-content", "center"),
+            #("color", p.accent),
+          ]),
+        ],
+        [logo(22)],
+      )
+    False ->
+      html.div(
+        [
+          ui.css([
+            #("flex", "1"),
+            #("display", "flex"),
+            #("align-items", "center"),
+            #("gap", "10px"),
+          ]),
+        ],
+        [
+          html.span([ui.css([#("color", p.accent), #("display", "inline-flex")])], [
+            logo(22),
+          ]),
+          html.span(
+            [
+              ui.css([
+                #("font-weight", "600"),
+                #("font-size", "15px"),
+                #("letter-spacing", "-0.01em"),
+                #("color", p.text),
+              ]),
+            ],
+            [html.text("sunset")],
+          ),
+        ],
+      )
+  }
+
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("padding", "14px 12px 10px 14px"),
+        #("gap", "8px"),
+        #("min-height", "48px"),
+      ]),
+    ],
+    [
+      inner,
+      collapse_button(p, collapsed, toggle),
+    ],
+  )
+}
+
+fn collapse_button(
+  p: Palette,
+  collapsed: Bool,
+  toggle: msg,
+) -> Element(msg) {
+  let path = case collapsed {
+    True -> "M5 3l4 4-4 4"
+    False -> "M9 3L5 7l4 4"
+  }
+  html.button(
+    [
+      ui.css([
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+        #("width", "22px"),
+        #("height", "22px"),
+        #("border", "none"),
+        #("background", "transparent"),
+        #("color", p.text_faint),
+        #("cursor", "pointer"),
+        #("border-radius", "4px"),
+        #("padding", "0"),
+      ]),
+      event.on_click(toggle),
+      attribute.title(case collapsed {
+        True -> "Expand rooms"
+        False -> "Collapse rooms"
+      }),
+    ],
+    [
+      element.namespaced("http://www.w3.org/2000/svg", "svg", [
+        attribute.attribute("width", "14"),
+        attribute.attribute("height", "14"),
+        attribute.attribute("viewBox", "0 0 14 14"),
+        attribute.attribute("fill", "none"),
+      ], [
+        element.namespaced("http://www.w3.org/2000/svg", "path", [
+          attribute.attribute("d", path),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.5"),
+          attribute.attribute("stroke-linecap", "round"),
+          attribute.attribute("stroke-linejoin", "round"),
+        ], []),
+      ]),
+    ],
+  )
+}
+
+fn search(p: Palette) -> Element(msg) {
+  html.div(
+    [ui.css([#("padding", "0 12px 8px 12px")])],
+    [
+      html.input([
+        attribute.placeholder("Search rooms…"),
+        ui.css([
+          #("width", "100%"),
+          #("box-sizing", "border-box"),
+          #("background", p.surface_alt),
+          #("border", "1px solid " <> p.border_soft),
+          #("border-radius", "6px"),
+          #("padding", "6px 10px"),
+          #("font-family", "inherit"),
+          #("font-size", "12.5px"),
+          #("color", p.text),
+          #("outline", "none"),
+        ]),
+      ]),
+    ],
+  )
+}
+
+fn rooms_list(
+  p: Palette,
+  rs: List(Room),
+  cur: RoomId,
+  collapsed: Bool,
+  sel: fn(RoomId) -> msg,
+) -> Element(msg) {
+  html.div(
+    [
+      ui.css([
+        #("flex", "1 1 auto"),
+        #("overflow-y", "auto"),
+        #("padding", "0 8px 12px 8px"),
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("gap", "1px"),
+      ]),
+    ],
+    list.map(rs, fn(r) {
+      case collapsed {
+        True -> room_mini(p, r, cur, sel)
+        False -> room_full(p, r, cur, sel)
+      }
+    }),
+  )
+}
+
+fn room_full(
+  p: Palette,
+  r: Room,
+  cur: RoomId,
+  sel: fn(RoomId) -> msg,
+) -> Element(msg) {
+  let active = r.id == cur
+  let bg = case active {
+    True -> p.accent_soft
+    False -> "transparent"
+  }
+  html.button(
+    [
+      event.on_click(sel(r.id)),
+      ui.css([
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("gap", "10px"),
+        #("padding", "8px 10px"),
+        #("border", "none"),
+        #("background", bg),
+        #("border-radius", "6px"),
+        #("cursor", "pointer"),
+        #("text-align", "left"),
+        #("font-family", "inherit"),
+        #("color", p.text),
+        #("min-width", "0"),
+      ]),
+    ],
+    [
+      conn_dot(p, r.status),
+      html.div(
+        [
+          ui.css([
+            #("flex", "1"),
+            #("min-width", "0"),
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "2px"),
+          ]),
+        ],
+        [
+          html.div(
+            [
+              ui.css([
+                #("display", "flex"),
+                #("align-items", "baseline"),
+                #("justify-content", "space-between"),
+                #("gap", "8px"),
+              ]),
+            ],
+            [
+              html.span(
+                [
+                  ui.css([
+                    #("font-weight", case active {
+                      True -> "600"
+                      False -> "500"
+                    }),
+                    #("font-size", "13px"),
+                    #("white-space", "nowrap"),
+                    #("overflow", "hidden"),
+                    #("text-overflow", "ellipsis"),
+                  ]),
+                ],
+                [html.text(r.name)],
+              ),
+              html.span(
+                [
+                  ui.css([
+                    #("font-size", "10.5px"),
+                    #("color", p.text_faint),
+                    #("white-space", "nowrap"),
+                  ]),
+                ],
+                [html.text(r.last_active)],
+              ),
+            ],
+          ),
+          html.div(
+            [
+              ui.css([
+                #("font-size", "11.5px"),
+                #("color", p.text_muted),
+                #("display", "flex"),
+                #("gap", "6px"),
+                #("flex-wrap", "wrap"),
+              ]),
+            ],
+            meta_line(p, r),
+          ),
+        ],
+      ),
+      case r.unread {
+        0 -> element.fragment([])
+        n -> unread_pill(p, n)
+      },
+    ],
+  )
+}
+
+fn meta_line(p: Palette, r: Room) -> List(Element(msg)) {
+  let online_total =
+    html.span([], [
+      html.text(
+        int_to_string(r.online) <> "/" <> int_to_string(r.members) <> " online",
+      ),
+    ])
+
+  let in_call_part = case r.in_call {
+    0 -> element.fragment([])
+    n ->
+      html.span(
+        [ui.css([#("color", p.accent)])],
+        [html.text("· " <> int_to_string(n) <> " in voice")],
+      )
+  }
+
+  let status_part = case r.status {
+    Reconnecting ->
+      html.span([ui.css([#("color", p.warn)])], [html.text("· reconnecting")])
+    Offline ->
+      html.span([ui.css([#("color", p.text_faint)])], [html.text("· offline")])
+    Connected -> element.fragment([])
+  }
+
+  [online_total, in_call_part, status_part]
+}
+
+fn room_mini(
+  p: Palette,
+  r: Room,
+  cur: RoomId,
+  sel: fn(RoomId) -> msg,
+) -> Element(msg) {
+  let active = r.id == cur
+  let bg = case active {
+    True -> p.accent_soft
+    False -> "transparent"
+  }
+  let dot = case r.status {
+    Connected -> p.live
+    Reconnecting -> p.warn
+    Offline -> p.text_faint
+  }
+  html.button(
+    [
+      event.on_click(sel(r.id)),
+      attribute.title(r.name),
+      ui.css([
+        #("position", "relative"),
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+        #("width", "38px"),
+        #("height", "38px"),
+        #("margin", "0 auto"),
+        #("border", "none"),
+        #("background", bg),
+        #("border-radius", "8px"),
+        #("cursor", "pointer"),
+        #("color", p.text),
+        #("font-family", "inherit"),
+        #("font-weight", "600"),
+        #("font-size", "13px"),
+      ]),
+    ],
+    [
+      html.span(
+        [
+          ui.css([
+            #("position", "absolute"),
+            #("top", "2px"),
+            #("right", "2px"),
+            #("width", "7px"),
+            #("height", "7px"),
+            #("border-radius", "999px"),
+            #("background", dot),
+          ]),
+        ],
+        [],
+      ),
+      html.span([], [html.text(string.uppercase(string.slice(r.name, 0, 1)))]),
+      case r.unread {
+        0 -> element.fragment([])
+        n ->
+          html.span(
+            [
+              ui.css([
+                #("position", "absolute"),
+                #("bottom", "-2px"),
+                #("right", "-2px"),
+                #("min-width", "16px"),
+                #("height", "16px"),
+                #("padding", "0 4px"),
+                #("border-radius", "999px"),
+                #("background", p.accent),
+                #("color", p.accent_ink),
+                #("font-size", "10px"),
+                #("font-weight", "600"),
+                #("display", "inline-flex"),
+                #("align-items", "center"),
+                #("justify-content", "center"),
+              ]),
+            ],
+            [html.text(int_to_string(n))],
+          )
+      },
+    ],
+  )
+}
+
+fn conn_dot(p: Palette, s: ConnStatus) -> Element(msg) {
+  let c = case s {
+    Connected -> p.live
+    Reconnecting -> p.warn
+    Offline -> p.text_faint
+  }
+  html.span(
+    [
+      ui.css([
+        #("width", "7px"),
+        #("height", "7px"),
+        #("border-radius", "999px"),
+        #("background", c),
+        #("display", "inline-block"),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [],
+  )
+}
+
+fn unread_pill(p: Palette, n: Int) -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("min-width", "18px"),
+        #("padding", "0 6px"),
+        #("height", "18px"),
+        #("border-radius", "999px"),
+        #("background", p.accent),
+        #("color", p.accent_ink),
+        #("font-size", "10.5px"),
+        #("font-weight", "600"),
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+      ]),
+    ],
+    [html.text(int_to_string(n))],
+  )
+}
+
+fn you_row(p: Palette, collapsed: Bool) -> Element(msg) {
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("gap", "8px"),
+        #("padding", "10px 14px"),
+        #("border-top", "1px solid " <> p.border_soft),
+        #("min-height", "40px"),
+      ]),
+    ],
+    [
+      html.span(
+        [
+          ui.css([
+            #("color", p.live),
+            #("font-size", "8px"),
+            #("line-height", "1"),
+          ]),
+        ],
+        [html.text("●")],
+      ),
+      case collapsed {
+        True -> element.fragment([])
+        False ->
+          html.span(
+            [
+              ui.css([
+                #("flex", "1"),
+                #("display", "flex"),
+                #("align-items", "baseline"),
+                #("gap", "6px"),
+                #("min-width", "0"),
+              ]),
+            ],
+            [
+              html.span(
+                [ui.css([#("font-weight", "500"), #("color", p.text)])],
+                [html.text("you")],
+              ),
+              html.span(
+                [
+                  ui.css([
+                    #("font-family", theme.font_mono),
+                    #("font-size", "10.5px"),
+                    #("color", p.text_faint),
+                  ]),
+                ],
+                [html.text("8f3c…a2")],
+              ),
+            ],
+          )
+      },
+    ],
+  )
+}
+
+fn logo(size: Int) -> Element(msg) {
+  let s = int_to_string(size)
+  element.namespaced("http://www.w3.org/2000/svg", "svg", [
+    attribute.attribute("width", s),
+    attribute.attribute("height", s),
+    attribute.attribute("viewBox", "0 0 28 28"),
+    attribute.attribute("fill", "none"),
+  ], [
+    element.namespaced("http://www.w3.org/2000/svg", "circle", [
+      attribute.attribute("cx", "14"),
+      attribute.attribute("cy", "14"),
+      attribute.attribute("r", "6.5"),
+      attribute.attribute("fill", "currentColor"),
+      attribute.attribute("opacity", "0.28"),
+    ], []),
+    element.namespaced("http://www.w3.org/2000/svg", "circle", [
+      attribute.attribute("cx", "14"),
+      attribute.attribute("cy", "14"),
+      attribute.attribute("r", "3.6"),
+      attribute.attribute("fill", "currentColor"),
+    ], []),
+    element.namespaced("http://www.w3.org/2000/svg", "line", [
+      attribute.attribute("x1", "3"),
+      attribute.attribute("y1", "20.5"),
+      attribute.attribute("x2", "25"),
+      attribute.attribute("y2", "20.5"),
+      attribute.attribute("stroke", "currentColor"),
+      attribute.attribute("stroke-width", "1.6"),
+      attribute.attribute("stroke-linecap", "round"),
+    ], []),
+    element.namespaced("http://www.w3.org/2000/svg", "line", [
+      attribute.attribute("x1", "6"),
+      attribute.attribute("y1", "24"),
+      attribute.attribute("x2", "22"),
+      attribute.attribute("y2", "24"),
+      attribute.attribute("stroke", "currentColor"),
+      attribute.attribute("stroke-width", "1.6"),
+      attribute.attribute("stroke-linecap", "round"),
+      attribute.attribute("opacity", "0.5"),
+    ], []),
+  ])
+}
+
+fn int_to_string(n: Int) -> String {
+  int.to_string(n)
+}

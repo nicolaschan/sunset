@@ -12,6 +12,7 @@ import sunset_web/domain.{type ChannelId, type RoomId, ChannelId, RoomId}
 import sunset_web/fixture
 import sunset_web/theme.{type Mode, type Palette, Dark, Light}
 import sunset_web/ui
+import sunset_web/views/rooms
 import sunset_web/views/shell
 
 pub type Model {
@@ -71,7 +72,14 @@ fn view(model: Model) -> Element(Msg) {
     palette,
     model.rooms_collapsed,
     ToggleMode,
-    placeholder_panel(palette, "rooms"),
+    rooms.view(
+      palette: palette,
+      rooms: fixture.rooms(),
+      current_room: model.current_room,
+      collapsed: model.rooms_collapsed,
+      on_select_room: SelectRoom,
+      toggle: ToggleRoomsRail,
+    ),
     placeholder_panel(palette, "channels"),
     placeholder_panel(palette, "main"),
     placeholder_panel(palette, "members"),
