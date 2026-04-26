@@ -253,14 +253,37 @@ where
             SyncMessage::EventDelivery { entries, blobs } => {
                 self.handle_event_delivery(from, entries, blobs).await;
             }
-            // Tasks 13–15 handle BlobRequest, BlobResponse, DigestExchange, Fetch.
+            SyncMessage::BlobRequest { hash } => {
+                self.handle_blob_request(from, hash).await;
+            }
+            SyncMessage::BlobResponse { block } => {
+                self.handle_blob_response(block).await;
+            }
+            // Tasks 14–15 handle DigestExchange, Fetch.
             _ => {}
         }
     }
 
+    async fn handle_blob_request(&self, from: PeerId, hash: sunset_store::Hash) {
+        let block = match self.store.get_content(&hash).await {
+            Ok(Some(b)) => b,
+            // We don't have it (or I/O failed); drop silently in v1.
+            _ => return,
+        };
+        let state = self.state.lock().await;
+        if let Some(tx) = state.peer_outbound.get(&from) {
+            let _ = tx.send(SyncMessage::BlobResponse { block });
+        }
+    }
+
+    async fn handle_blob_response(&self, block: sunset_store::ContentBlock) {
+        // Idempotent insert; if we already have it, no-op.
+        let _ = self.store.put_content(block).await;
+    }
+
     async fn handle_event_delivery(
         &self,
-        _from: PeerId,
+        from: PeerId,
         entries: Vec<sunset_store::SignedKvEntry>,
         blobs: Vec<sunset_store::ContentBlock>,
     ) {
@@ -279,9 +302,10 @@ where
 
         for entry in trusted {
             let blob = blobs_by_hash.get(&entry.value_hash).cloned();
+            let blob_was_supplied = blob.is_some();
+
             // We pass the blob if we have it; if not, the entry inserts as a
-            // dangling ref and the engine will issue a BlobRequest later
-            // (Task 13).
+            // dangling ref and the engine issues a BlobRequest below.
             match self.store.insert(entry.clone(), blob).await {
                 Ok(()) => {
                     // Successful insert. The store will fire an event on our
@@ -296,6 +320,26 @@ where
                         "sunset-sync: insert failed for entry from {:?}: {}",
                         entry.verifying_key, e
                     );
+                    continue;
+                }
+            }
+
+            if !blob_was_supplied {
+                // Check if we already have it (e.g., from an earlier round).
+                let have = self
+                    .store
+                    .get_content(&entry.value_hash)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !have {
+                    let state = self.state.lock().await;
+                    if let Some(tx) = state.peer_outbound.get(&from) {
+                        let _ = tx.send(SyncMessage::BlobRequest {
+                            hash: entry.value_hash,
+                        });
+                    }
                 }
             }
         }
@@ -477,6 +521,63 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(result.is_none(), "untrusted entry should not be stored");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_request_returns_existing_block() {
+        use sunset_store::{ContentBlock, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Arc::new(make_engine("alice", b"alice"));
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"data"),
+                    references: vec![],
+                };
+                let hash = block.hash();
+                engine.store.put_content(block.clone()).await.unwrap();
+
+                // Pre-register a fake outbound channel so handle_blob_request has somewhere to send.
+                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
+                engine
+                    .state
+                    .lock()
+                    .await
+                    .peer_outbound
+                    .insert(PeerId(vk(b"requester")), tx);
+
+                engine
+                    .handle_blob_request(PeerId(vk(b"requester")), hash)
+                    .await;
+
+                let response = rx.recv().await.unwrap();
+                match response {
+                    SyncMessage::BlobResponse { block: got } => assert_eq!(got, block),
+                    other => panic!("expected BlobResponse, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_response_stores_block() {
+        use sunset_store::{ContentBlock, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Arc::new(make_engine("alice", b"alice"));
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"data"),
+                    references: vec![],
+                };
+                let hash = block.hash();
+                engine.handle_blob_response(block.clone()).await;
+                let got = engine.store.get_content(&hash).await.unwrap();
+                assert_eq!(got, Some(block));
             })
             .await;
     }
