@@ -144,6 +144,11 @@ where
             )
             .await?;
 
+        let mut anti_entropy = tokio::time::interval(self.config.anti_entropy_interval);
+        // First tick fires immediately; skip it so the bootstrap exchange
+        // isn't duplicated immediately after PeerHello.
+        anti_entropy.tick().await;
+
         loop {
             tokio::select! {
                 maybe_conn = self.transport.accept() => {
@@ -164,7 +169,34 @@ where
                         Err(e) => return Err(Error::Store(e)),
                     }
                 }
+                _ = anti_entropy.tick() => {
+                    self.tick_anti_entropy().await;
+                }
             }
+        }
+    }
+
+    async fn tick_anti_entropy(&self) {
+        let bloom = match build_digest(
+            &*self.store,
+            &self.config.bootstrap_filter,
+            &DigestRange::All,
+            self.config.bloom_size_bits,
+            self.config.bloom_hash_fns,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let msg = SyncMessage::DigestExchange {
+            filter: self.config.bootstrap_filter.clone(),
+            range: DigestRange::All,
+            bloom: bloom.to_bytes(),
+        };
+        let state = self.state.lock().await;
+        for tx in state.peer_outbound.values() {
+            let _ = tx.send(msg.clone());
         }
     }
 
@@ -722,6 +754,17 @@ mod tests {
                     }
                     other => panic!("expected EventDelivery, got {other:?}"),
                 }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_anti_entropy_with_no_peers_is_noop() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Arc::new(make_engine("alice", b"alice"));
+                engine.tick_anti_entropy().await;
             })
             .await;
     }
