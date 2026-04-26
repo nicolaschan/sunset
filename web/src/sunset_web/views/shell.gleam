@@ -102,6 +102,7 @@ fn theme_toggle(mode: Mode, palette: Palette, toggle_mode: msg) -> Element(msg) 
       ]),
       event.on_click(toggle_mode),
       attribute.title("Toggle light/dark"),
+      attribute.attribute("data-testid", "theme-toggle"),
     ],
     [
       icon_for_mode(mode),

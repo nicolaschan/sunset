@@ -27,6 +27,7 @@ pub fn view(
   }
   html.aside(
     [
+      attribute.attribute("data-testid", "rooms-rail"),
       ui.css([
         #("width", width),
         #("min-width", width),

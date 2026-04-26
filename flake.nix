@@ -35,7 +35,7 @@
           if builtins.pathExists ./web/package-lock.json
           then pkgs.fetchNpmDeps {
             src = webNpmSrc + "/web";
-            hash = "sha256-Yr6CvoX2itiyXOVgZQyPTB9cUwRP+AnQ+bvQO77juWM=";
+            hash = "sha256-WkIJ90tJkCnbqafS1gTN2nnTzqSPZVF0TCZbmTFI9iU=";
           }
           else null;
 
