@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs"]
+members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync"]
 resolver = "2"
 
 [workspace.package]
@@ -24,6 +24,7 @@ tokio-rusqlite = { version = "0.6", features = ["bundled"] }
 sunset-store = { path = "crates/sunset-store" }
 sunset-store-fs = { path = "crates/sunset-store-fs" }
 sunset-store-memory = { path = "crates/sunset-store-memory" }
+sunset-sync = { path = "crates/sunset-sync" }
 
 [workspace.lints.rust]
 unused_must_use = "deny"
