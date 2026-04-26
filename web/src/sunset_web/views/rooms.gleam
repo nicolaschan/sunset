@@ -37,6 +37,12 @@ pub fn view(
         #("background", p.surface),
         #("border-right", "1px solid " <> p.border),
         #("transition", "width 220ms ease"),
+        // Children sometimes have absolute-positioned bits (unread badges)
+        // that hang outside their bounding box, plus the inline list rows
+        // are sized for the expanded state — clip everything that doesn't
+        // fit so the collapsed 54px rail never spawns a horizontal scroll.
+        #("overflow", "hidden"),
+        #("min-width", "0"),
       ]),
     ],
     [
@@ -52,66 +58,70 @@ pub fn view(
 }
 
 fn brand_row(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
-  let inner = case collapsed {
+  case collapsed {
     True ->
+      // Collapsed: just the chevron, centered in the 54px rail. No logo.
       html.div(
         [
           ui.css([
-            #("flex", "1"),
-            #("display", "flex"),
-            #("justify-content", "center"),
-            #("color", p.accent),
-          ]),
-        ],
-        [logo(22)],
-      )
-    False ->
-      html.div(
-        [
-          ui.css([
-            #("flex", "1"),
+            #("box-sizing", "border-box"),
+            #("height", "60px"),
+            #("flex-shrink", "0"),
             #("display", "flex"),
             #("align-items", "center"),
-            #("gap", "10px"),
+            #("justify-content", "center"),
+            #("padding", "0"),
+          ]),
+        ],
+        [collapse_button(p, collapsed, toggle)],
+      )
+    False ->
+      // Expanded: logo + brand text on the left, chevron on the right.
+      html.div(
+        [
+          ui.css([
+            #("box-sizing", "border-box"),
+            #("height", "60px"),
+            #("flex-shrink", "0"),
+            #("display", "flex"),
+            #("align-items", "center"),
+            #("padding", "0 12px 0 14px"),
+            #("gap", "8px"),
           ]),
         ],
         [
-          html.span(
-            [ui.css([#("color", p.accent), #("display", "inline-flex")])],
-            [
-              logo(22),
-            ],
-          ),
-          html.span(
+          html.div(
             [
               ui.css([
-                #("font-weight", "600"),
-                #("font-size", "15px"),
-                #("letter-spacing", "-0.01em"),
-                #("color", p.text),
+                #("flex", "1"),
+                #("display", "flex"),
+                #("align-items", "center"),
+                #("gap", "10px"),
+                #("min-width", "0"),
               ]),
             ],
-            [html.text("sunset")],
+            [
+              html.span(
+                [ui.css([#("color", p.accent), #("display", "inline-flex")])],
+                [logo(22)],
+              ),
+              html.span(
+                [
+                  ui.css([
+                    #("font-weight", "600"),
+                    #("font-size", "18.75px"),
+                    #("letter-spacing", "-0.01em"),
+                    #("color", p.text),
+                  ]),
+                ],
+                [html.text("sunset")],
+              ),
+            ],
           ),
+          collapse_button(p, collapsed, toggle),
         ],
       )
   }
-
-  html.div(
-    [
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("padding", "14px 12px 10px 14px"),
-        #("gap", "8px"),
-        #("min-height", "48px"),
-      ]),
-    ],
-    [
-      inner,
-      collapse_button(p, collapsed, toggle),
-    ],
-  )
 }
 
 fn collapse_button(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
@@ -181,7 +191,7 @@ fn search(p: Palette) -> Element(msg) {
         #("border-radius", "6px"),
         #("padding", "6px 10px"),
         #("font-family", "inherit"),
-        #("font-size", "12.5px"),
+        #("font-size", "15.625px"),
         #("color", p.text),
         #("outline", "none"),
       ]),
@@ -275,7 +285,7 @@ fn room_full(
                       True -> "600"
                       False -> "500"
                     }),
-                    #("font-size", "13px"),
+                    #("font-size", "16.25px"),
                     #("white-space", "nowrap"),
                     #("overflow", "hidden"),
                     #("text-overflow", "ellipsis"),
@@ -286,7 +296,7 @@ fn room_full(
               html.span(
                 [
                   ui.css([
-                    #("font-size", "10.5px"),
+                    #("font-size", "13.125px"),
                     #("color", p.text_faint),
                     #("white-space", "nowrap"),
                   ]),
@@ -298,7 +308,7 @@ fn room_full(
           html.div(
             [
               ui.css([
-                #("font-size", "11.5px"),
+                #("font-size", "14.375px"),
                 #("color", p.text_muted),
                 #("display", "flex"),
                 #("gap", "6px"),
@@ -379,7 +389,7 @@ fn room_mini(
         #("color", p.text),
         #("font-family", "inherit"),
         #("font-weight", "600"),
-        #("font-size", "13px"),
+        #("font-size", "16.25px"),
       ]),
     ],
     [
@@ -413,7 +423,7 @@ fn room_mini(
                 #("border-radius", "999px"),
                 #("background", p.accent),
                 #("color", p.accent_ink),
-                #("font-size", "10px"),
+                #("font-size", "12.5px"),
                 #("font-weight", "600"),
                 #("display", "inline-flex"),
                 #("align-items", "center"),
@@ -458,7 +468,7 @@ fn unread_pill(p: Palette, n: Int) -> Element(msg) {
         #("border-radius", "999px"),
         #("background", p.accent),
         #("color", p.accent_ink),
-        #("font-size", "10.5px"),
+        #("font-size", "13.125px"),
         #("font-weight", "600"),
         #("display", "inline-flex"),
         #("align-items", "center"),
@@ -486,7 +496,7 @@ fn you_row(p: Palette, collapsed: Bool) -> Element(msg) {
         [
           ui.css([
             #("color", p.live),
-            #("font-size", "8px"),
+            #("font-size", "12.5px"),
             #("line-height", "1"),
           ]),
         ],
@@ -514,7 +524,7 @@ fn you_row(p: Palette, collapsed: Bool) -> Element(msg) {
                 [
                   ui.css([
                     #("font-family", theme.font_mono),
-                    #("font-size", "10.5px"),
+                    #("font-size", "13.125px"),
                     #("color", p.text_faint),
                   ]),
                 ],

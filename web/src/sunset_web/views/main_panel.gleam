@@ -47,12 +47,14 @@ fn channel_header(p: Palette, name: String) -> Element(msg) {
   html.div(
     [
       ui.css([
+        #("box-sizing", "border-box"),
+        #("height", "60px"),
+        #("flex-shrink", "0"),
         #("display", "flex"),
         #("align-items", "center"),
         #("gap", "8px"),
-        #("padding", "14px 20px"),
+        #("padding", "0 24px"),
         #("border-bottom", "1px solid " <> p.border_soft),
-        #("min-height", "48px"),
       ]),
     ],
     [
@@ -61,7 +63,7 @@ fn channel_header(p: Palette, name: String) -> Element(msg) {
         [
           ui.css([
             #("font-weight", "600"),
-            #("font-size", "14px"),
+            #("font-size", "18.75px"),
             #("color", p.text),
           ]),
         ],
@@ -139,7 +141,7 @@ fn message_view(
         html.div(
           [
             ui.css([
-              #("font-size", "13.5px"),
+              #("font-size", "16.875px"),
               #("color", p.text),
               #("white-space", "pre-wrap"),
               #("word-break", "break-word"),
@@ -176,7 +178,7 @@ fn message_header(p: Palette, m: Message) -> Element(msg) {
           [
             ui.css([
               #("font-weight", "600"),
-              #("font-size", "13px"),
+              #("font-size", "16.25px"),
               #("color", p.text),
               #("cursor", "default"),
             ]),
@@ -196,7 +198,7 @@ fn message_header(p: Palette, m: Message) -> Element(msg) {
         html.span(
           [
             ui.css([
-              #("font-size", "10.5px"),
+              #("font-size", "13.125px"),
               #("color", p.text_faint),
               #("white-space", "nowrap"),
             ]),
@@ -209,7 +211,7 @@ fn message_header(p: Palette, m: Message) -> Element(msg) {
           html.span(
             [
               ui.css([
-                #("font-size", "10.5px"),
+                #("font-size", "13.125px"),
                 #("color", p.warn),
                 #("font-style", "italic"),
               ]),
@@ -261,7 +263,7 @@ fn reaction_pill(p: Palette, r: Reaction) -> Element(msg) {
         #("background", bg),
         #("color", color),
         #("border", "1px solid " <> border),
-        #("font-size", "11px"),
+        #("font-size", "13.75px"),
       ]),
     ],
     [
@@ -287,7 +289,7 @@ fn read_marker(p: Palette, seen_by: Int) -> Element(msg) {
             #("align-items", "center"),
             #("gap", "10px"),
             #("padding", "6px 8px"),
-            #("font-size", "10.5px"),
+            #("font-size", "13.125px"),
             #("color", p.text_faint),
           ]),
         ],
@@ -323,7 +325,7 @@ fn typing_indicator(p: Palette) -> Element(msg) {
     [
       ui.css([
         #("padding", "8px 8px 0 8px"),
-        #("font-size", "11.5px"),
+        #("font-size", "14.375px"),
         #("color", p.text_faint),
         #("font-style", "italic"),
       ]),
@@ -369,7 +371,7 @@ fn composer(
               #("border", "none"),
               #("background", "transparent"),
               #("font-family", "inherit"),
-              #("font-size", "13px"),
+              #("font-size", "16.25px"),
               #("color", p.text),
               #("outline", "none"),
             ]),
@@ -378,7 +380,7 @@ fn composer(
             [
               ui.css([
                 #("font-family", theme.font_mono),
-                #("font-size", "10.5px"),
+                #("font-size", "13.125px"),
                 #("color", p.text_faint),
               ]),
             ],
@@ -469,7 +471,7 @@ fn bridge_tag(p: Palette, label: String) -> Element(msg) {
         #("border-radius", "3px"),
         #("background", p.accent_soft),
         #("color", p.accent_deep),
-        #("font-size", "10.5px"),
+        #("font-size", "13.125px"),
         #("font-weight", "500"),
       ]),
     ],
@@ -485,7 +487,7 @@ fn you_tag(p: Palette) -> Element(msg) {
         #("border-radius", "3px"),
         #("background", p.surface_alt),
         #("color", p.text_faint),
-        #("font-size", "9.5px"),
+        #("font-size", "11.875px"),
         #("font-weight", "500"),
         #("letter-spacing", "0.02em"),
         #("text-transform", "uppercase"),

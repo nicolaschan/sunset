@@ -18,6 +18,11 @@ host = "0.0.0.0"
 title = "sunset.chat"
 
 [[tools.lustre.html.links]]
+rel = "icon"
+href = "favicon.svg"
+type = "image/svg+xml"
+
+[[tools.lustre.html.links]]
 rel = "preconnect"
 href = "https://fonts.googleapis.com"
 
