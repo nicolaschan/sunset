@@ -5,13 +5,18 @@
 //// rendered as static state. Eventually swapped for live `sunset-store`
 //// data over WASM FFI.
 
+import gleam/list
+import gleam/option.{type Option, None, Some}
 import lustre
 import lustre/element.{type Element}
 import lustre/element/html
-import sunset_web/domain.{type ChannelId, type RoomId, ChannelId, RoomId}
+import sunset_web/domain.{
+  type ChannelId, type Room, type RoomId, ChannelId, RoomId,
+}
 import sunset_web/fixture
 import sunset_web/theme.{type Mode, type Palette, Dark, Light}
 import sunset_web/ui
+import sunset_web/views/channels
 import sunset_web/views/rooms
 import sunset_web/views/shell
 
@@ -66,6 +71,16 @@ fn update(model: Model, msg: Msg) -> Model {
 
 fn view(model: Model) -> Element(Msg) {
   let palette = theme.palette_for(model.mode)
+  let rs = fixture.rooms()
+  let room = case current_room(rs, model.current_room) {
+    Some(r) -> r
+    None -> {
+      // Fixture has at least one room; this branch is unreachable but
+      // gives the compiler a fallback so the view stays total.
+      let assert [first, ..] = rs
+      first
+    }
+  }
 
   shell.view(
     model.mode,
@@ -74,16 +89,28 @@ fn view(model: Model) -> Element(Msg) {
     ToggleMode,
     rooms.view(
       palette: palette,
-      rooms: fixture.rooms(),
+      rooms: rs,
       current_room: model.current_room,
       collapsed: model.rooms_collapsed,
       on_select_room: SelectRoom,
       toggle: ToggleRoomsRail,
     ),
-    placeholder_panel(palette, "channels"),
+    channels.view(
+      palette: palette,
+      room: room,
+      channels: fixture.channels(),
+      members: fixture.members(),
+      current_channel: model.current_channel,
+      on_select_channel: SelectChannel,
+    ),
     placeholder_panel(palette, "main"),
     placeholder_panel(palette, "members"),
   )
+}
+
+fn current_room(rs: List(Room), id: RoomId) -> Option(Room) {
+  list.find(rs, fn(r) { r.id == id })
+  |> option.from_result
 }
 
 fn placeholder_panel(palette: Palette, label: String) -> Element(Msg) {
