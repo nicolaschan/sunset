@@ -37,6 +37,15 @@
             runHook preInstall
             mkdir -p $out
             cp -r dist/* $out/
+            # Lustre emits an absolute `/sunset_web.js` script src which only
+            # works at site root. Rewrite to a relative path so the artefact
+            # serves correctly under any GitHub Pages sub-path.
+            ${pkgs.gnused}/bin/sed -i \
+              's|src="/sunset_web\.js"|src="sunset_web.js"|' \
+              $out/index.html
+            # Pages serves /<repo>/index.html for root; tell Jekyll not to
+            # touch the artefact (no underscores to start with, but defensive).
+            touch $out/.nojekyll
             runHook postInstall
           '';
         };
