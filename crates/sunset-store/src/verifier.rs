@@ -23,7 +23,9 @@ pub trait SignatureVerifier: Send + Sync {
 pub struct AcceptAllVerifier;
 
 impl SignatureVerifier for AcceptAllVerifier {
-    fn verify(&self, _entry: &SignedKvEntry) -> Result<()> { Ok(()) }
+    fn verify(&self, _entry: &SignedKvEntry) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -34,11 +36,11 @@ mod tests {
     fn dummy_entry() -> SignedKvEntry {
         SignedKvEntry {
             verifying_key: VerifyingKey::new(bytes::Bytes::from_static(b"k")),
-            name:          bytes::Bytes::from_static(b"n"),
-            value_hash:    Hash::from_bytes([0u8; 32]),
-            priority:      0,
-            expires_at:    None,
-            signature:     bytes::Bytes::from_static(b"s"),
+            name: bytes::Bytes::from_static(b"n"),
+            value_hash: Hash::from_bytes([0u8; 32]),
+            priority: 0,
+            expires_at: None,
+            signature: bytes::Bytes::from_static(b"s"),
         }
     }
 

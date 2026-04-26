@@ -55,7 +55,10 @@ pub enum Event {
     /// A new entry was inserted (no previous entry existed for this key).
     Inserted(SignedKvEntry),
     /// An existing entry was replaced by a higher-priority one.
-    Replaced { old: SignedKvEntry, new: SignedKvEntry },
+    Replaced {
+        old: SignedKvEntry,
+        new: SignedKvEntry,
+    },
     /// An entry was removed by TTL expiration.
     Expired(SignedKvEntry),
     /// A new ContentBlock arrived.
@@ -68,8 +71,12 @@ pub enum Event {
 mod tests {
     use super::*;
 
-    fn vk(b: &'static [u8]) -> VerifyingKey { VerifyingKey::new(bytes::Bytes::from_static(b)) }
-    fn n(b: &'static [u8]) -> bytes::Bytes { bytes::Bytes::from_static(b) }
+    fn vk(b: &'static [u8]) -> VerifyingKey {
+        VerifyingKey::new(bytes::Bytes::from_static(b))
+    }
+    fn n(b: &'static [u8]) -> bytes::Bytes {
+        bytes::Bytes::from_static(b)
+    }
 
     #[test]
     fn filter_specific_matches_exact() {

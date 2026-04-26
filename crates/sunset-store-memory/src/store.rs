@@ -3,27 +3,28 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use sunset_store::{
-    ContentBlock, Cursor, Event, Hash, SignedKvEntry, SignatureVerifier, VerifyingKey,
+    ContentBlock, Cursor, Error, Event, Hash, Result, SignatureVerifier, SignedKvEntry, Store,
+    VerifyingKey,
 };
 use tokio::sync::Mutex;
 
 use crate::subscription::{Subscription, SubscriptionList};
-use std::sync::Arc as StdArc;
 
 /// Composite key: `(verifying_key, name)`.
 type KvKey = (VerifyingKey, bytes::Bytes);
 
 #[derive(Debug)]
 pub(crate) struct StoredEntry {
-    pub entry:    SignedKvEntry,
+    pub entry: SignedKvEntry,
     pub sequence: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Inner {
-    pub entries:      BTreeMap<KvKey, StoredEntry>,
-    pub blobs:        HashMap<Hash, ContentBlock>,
+    pub entries: BTreeMap<KvKey, StoredEntry>,
+    pub blobs: HashMap<Hash, ContentBlock>,
     pub next_sequence: u64,
 }
 
@@ -37,8 +38,8 @@ impl Inner {
 
 /// In-memory `Store` implementation.
 pub struct MemoryStore {
-    pub(crate) verifier:      Arc<dyn SignatureVerifier>,
-    pub(crate) inner:         Arc<Mutex<Inner>>,
+    pub(crate) verifier: Arc<dyn SignatureVerifier>,
+    pub(crate) inner: Arc<Mutex<Inner>>,
     pub(crate) subscriptions: Arc<SubscriptionList>,
 }
 
@@ -47,7 +48,7 @@ impl MemoryStore {
     pub fn new(verifier: Arc<dyn SignatureVerifier>) -> Self {
         Self {
             verifier,
-            inner:         Arc::new(Mutex::new(Inner::default())),
+            inner: Arc::new(Mutex::new(Inner::default())),
             subscriptions: Arc::new(SubscriptionList::default()),
         }
     }
@@ -64,9 +65,6 @@ impl MemoryStore {
         Cursor(inner.next_sequence)
     }
 }
-
-use async_trait::async_trait;
-use sunset_store::{Error, Result, Store};
 
 #[async_trait(?Send)]
 impl Store for MemoryStore {
@@ -101,22 +99,33 @@ impl Store for MemoryStore {
             let blob_added_hash = if let Some(b) = blob {
                 let already = inner.blobs.contains_key(&entry.value_hash);
                 inner.blobs.entry(entry.value_hash).or_insert(b);
-                if already { None } else { Some(entry.value_hash) }
+                if already {
+                    None
+                } else {
+                    Some(entry.value_hash)
+                }
             } else {
                 None
             };
             let sequence = inner.assign_sequence();
-            inner.entries.insert(key, StoredEntry { entry: entry.clone(), sequence });
+            inner.entries.insert(
+                key,
+                StoredEntry {
+                    entry: entry.clone(),
+                    sequence,
+                },
+            );
             (prev, blob_added_hash)
         };
         let (prev, blob_added) = event;
         if let Some(old) = prev {
-            self.subscriptions.broadcast(Event::Replaced { old, new: entry });
+            self.subscriptions
+                .broadcast(&Event::Replaced { old, new: entry });
         } else {
-            self.subscriptions.broadcast(Event::Inserted(entry));
+            self.subscriptions.broadcast(&Event::Inserted(entry));
         }
         if let Some(h) = blob_added {
-            self.subscriptions.broadcast(Event::BlobAdded(h));
+            self.subscriptions.broadcast(&Event::BlobAdded(h));
         }
         Ok(())
     }
@@ -127,7 +136,10 @@ impl Store for MemoryStore {
         Ok(inner.entries.get(&key).map(|s| s.entry.clone()))
     }
 
-    async fn iter<'a>(&'a self, filter: sunset_store::Filter) -> Result<sunset_store::EntryStream<'a>> {
+    async fn iter<'a>(
+        &'a self,
+        filter: sunset_store::Filter,
+    ) -> Result<sunset_store::EntryStream<'a>> {
         // Snapshot current matching entries to avoid holding the lock during streaming.
         let inner = self.inner.lock().await;
         let matching: Vec<SignedKvEntry> = inner
@@ -140,10 +152,17 @@ impl Store for MemoryStore {
         let stream = futures::stream::iter(matching.into_iter().map(Ok));
         Ok(Box::pin(stream))
     }
-    async fn subscribe<'a>(&'a self, filter: sunset_store::Filter, replay: sunset_store::Replay) -> Result<sunset_store::EventStream<'a>> {
+    async fn subscribe<'a>(
+        &'a self,
+        filter: sunset_store::Filter,
+        replay: sunset_store::Replay,
+    ) -> Result<sunset_store::EventStream<'a>> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let sub = StdArc::new(Subscription { filter: filter.clone(), tx });
-        self.subscriptions.add(sub.clone());
+        let sub = Arc::new(Subscription {
+            filter: filter.clone(),
+            tx,
+        });
+        self.subscriptions.add(&sub);
 
         // Build the historical replay portion (snapshot under the lock).
         let historical: Vec<sunset_store::Result<Event>> = {
@@ -189,7 +208,7 @@ impl Store for MemoryStore {
         };
         let count = removed.len();
         for e in removed {
-            self.subscriptions.broadcast(Event::Expired(e));
+            self.subscriptions.broadcast(&Event::Expired(e));
         }
         Ok(count)
     }
@@ -198,16 +217,26 @@ impl Store for MemoryStore {
         let removed: Vec<Hash> = {
             let mut inner = self.inner.lock().await;
             let mut reachable: HashSet<Hash> = HashSet::new();
-            let mut frontier: Vec<Hash> = inner.entries.values().map(|s| s.entry.value_hash).collect();
+            let mut frontier: Vec<Hash> =
+                inner.entries.values().map(|s| s.entry.value_hash).collect();
             while let Some(h) = frontier.pop() {
-                if !reachable.insert(h) { continue; }
+                if !reachable.insert(h) {
+                    continue;
+                }
                 if let Some(block) = inner.blobs.get(&h) {
                     for r in &block.references {
-                        if !reachable.contains(r) { frontier.push(*r); }
+                        if !reachable.contains(r) {
+                            frontier.push(*r);
+                        }
                     }
                 }
             }
-            let to_remove: Vec<Hash> = inner.blobs.keys().filter(|h| !reachable.contains(h)).copied().collect();
+            let to_remove: Vec<Hash> = inner
+                .blobs
+                .keys()
+                .filter(|h| !reachable.contains(h))
+                .copied()
+                .collect();
             for h in &to_remove {
                 inner.blobs.remove(h);
             }
@@ -215,7 +244,7 @@ impl Store for MemoryStore {
         };
         let count = removed.len();
         for h in removed {
-            self.subscriptions.broadcast(Event::BlobRemoved(h));
+            self.subscriptions.broadcast(&Event::BlobRemoved(h));
         }
         Ok(count)
     }
@@ -267,24 +296,36 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
-    use sunset_store::{AcceptAllVerifier, Filter, Replay};
+    use sunset_store::{Filter, Replay};
 
-    fn vk(b: &'static [u8]) -> VerifyingKey { VerifyingKey::new(bytes::Bytes::from_static(b)) }
-    fn n(b: &'static [u8]) -> bytes::Bytes { bytes::Bytes::from_static(b) }
+    fn vk(b: &'static [u8]) -> VerifyingKey {
+        VerifyingKey::new(bytes::Bytes::from_static(b))
+    }
+    fn n(b: &'static [u8]) -> bytes::Bytes {
+        bytes::Bytes::from_static(b)
+    }
 
-    fn entry_pointing_to(block: &ContentBlock, vk_bytes: &'static [u8], name: &'static [u8], priority: u64) -> SignedKvEntry {
+    fn entry_pointing_to(
+        block: &ContentBlock,
+        vk_bytes: &'static [u8],
+        name: &'static [u8],
+        priority: u64,
+    ) -> SignedKvEntry {
         SignedKvEntry {
             verifying_key: vk(vk_bytes),
-            name:          n(name),
-            value_hash:    block.hash(),
+            name: n(name),
+            value_hash: block.hash(),
             priority,
-            expires_at:    None,
-            signature:     bytes::Bytes::from_static(b"sig"),
+            expires_at: None,
+            signature: bytes::Bytes::from_static(b"sig"),
         }
     }
 
     fn small_block(payload: &'static [u8]) -> ContentBlock {
-        ContentBlock { data: bytes::Bytes::from_static(payload), references: vec![] }
+        ContentBlock {
+            data: bytes::Bytes::from_static(payload),
+            references: vec![],
+        }
     }
 
     #[tokio::test]
@@ -293,7 +334,11 @@ mod tests {
         let block = small_block(b"hello");
         let entry = entry_pointing_to(&block, b"alice", b"room/x", 1);
         store.insert(entry.clone(), Some(block)).await.unwrap();
-        let back = store.get_entry(&vk(b"alice"), b"room/x").await.unwrap().unwrap();
+        let back = store
+            .get_entry(&vk(b"alice"), b"room/x")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(back, entry);
     }
 
@@ -315,15 +360,24 @@ mod tests {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
         let first = entry_pointing_to(&block, b"alice", b"r", 5);
-        store.insert(first.clone(), Some(block.clone())).await.unwrap();
+        store
+            .insert(first.clone(), Some(block.clone()))
+            .await
+            .unwrap();
 
         // Equal priority -> Stale.
         let same = entry_pointing_to(&block, b"alice", b"r", 5);
-        assert!(matches!(store.insert(same, Some(block.clone())).await, Err(Error::Stale)));
+        assert!(matches!(
+            store.insert(same, Some(block.clone())).await,
+            Err(Error::Stale)
+        ));
 
         // Lower priority -> Stale.
         let lower = entry_pointing_to(&block, b"alice", b"r", 4);
-        assert!(matches!(store.insert(lower, Some(block.clone())).await, Err(Error::Stale)));
+        assert!(matches!(
+            store.insert(lower, Some(block.clone())).await,
+            Err(Error::Stale)
+        ));
     }
 
     #[tokio::test]
@@ -335,7 +389,10 @@ mod tests {
         let v1 = entry_pointing_to(&block_v1, b"alice", b"r", 1);
         let v2 = entry_pointing_to(&block_v2, b"alice", b"r", 2);
         store.insert(v1, Some(block_v1)).await.unwrap();
-        store.insert(v2.clone(), Some(block_v2.clone())).await.unwrap();
+        store
+            .insert(v2.clone(), Some(block_v2.clone()))
+            .await
+            .unwrap();
 
         let current = store.get_entry(&vk(b"alice"), b"r").await.unwrap().unwrap();
         assert_eq!(current, v2);
@@ -387,9 +444,27 @@ mod tests {
     async fn iter_keyspace_returns_only_matching_writer() {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
-        store.insert(entry_pointing_to(&block, b"alice", b"a", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"alice", b"b", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"bob",   b"a", 1), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"alice", b"a", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"alice", b"b", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"bob", b"a", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
 
         let results = collect_iter(&store, Filter::Keyspace(vk(b"alice"))).await;
         assert_eq!(results.len(), 2);
@@ -400,9 +475,27 @@ mod tests {
     async fn iter_namespace_returns_all_writers_at_name() {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
-        store.insert(entry_pointing_to(&block, b"alice", b"room/g", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"bob",   b"room/g", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"alice", b"room/h", 1), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"alice", b"room/g", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"bob", b"room/g", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"alice", b"room/h", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
 
         let results = collect_iter(&store, Filter::Namespace(n(b"room/g"))).await;
         assert_eq!(results.len(), 2);
@@ -412,9 +505,27 @@ mod tests {
     async fn iter_name_prefix_matches_prefix() {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
-        store.insert(entry_pointing_to(&block, b"a", b"room/g", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"a", b"room/h", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"a", b"presence/x", 1), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"room/g", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"room/h", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"presence/x", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
 
         let results = collect_iter(&store, Filter::NamePrefix(n(b"room/"))).await;
         assert_eq!(results.len(), 2);
@@ -424,8 +535,20 @@ mod tests {
     async fn iter_specific_returns_at_most_one() {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
-        store.insert(entry_pointing_to(&block, b"a", b"x", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"b", b"x", 1), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"x", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"b", b"x", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
 
         let results = collect_iter(&store, Filter::Specific(vk(b"a"), n(b"x"))).await;
         assert_eq!(results.len(), 1);
@@ -436,9 +559,27 @@ mod tests {
     async fn iter_union_is_or() {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
-        store.insert(entry_pointing_to(&block, b"a", b"room/g", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"b", b"presence/x", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"c", b"unrelated", 1), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"room/g", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"b", b"presence/x", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"c", b"unrelated", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
 
         let f = Filter::Union(vec![
             Filter::NamePrefix(n(b"room/")),
@@ -448,14 +589,20 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    fn entry_with_expiry(block: &ContentBlock, vk_bytes: &'static [u8], name: &'static [u8], priority: u64, expires_at: u64) -> SignedKvEntry {
+    fn entry_with_expiry(
+        block: &ContentBlock,
+        vk_bytes: &'static [u8],
+        name: &'static [u8],
+        priority: u64,
+        expires_at: u64,
+    ) -> SignedKvEntry {
         SignedKvEntry {
             verifying_key: vk(vk_bytes),
-            name:          n(name),
-            value_hash:    block.hash(),
+            name: n(name),
+            value_hash: block.hash(),
             priority,
-            expires_at:    Some(expires_at),
-            signature:     bytes::Bytes::from_static(b"sig"),
+            expires_at: Some(expires_at),
+            signature: bytes::Bytes::from_static(b"sig"),
         }
     }
 
@@ -463,22 +610,58 @@ mod tests {
     async fn delete_expired_removes_only_past_entries() {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
-        store.insert(entry_with_expiry(&block, b"a", b"old", 1, 100), Some(block.clone())).await.unwrap();
-        store.insert(entry_with_expiry(&block, b"a", b"future", 1, 1000), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"a", b"forever", 1), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_with_expiry(&block, b"a", b"old", 1, 100),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_with_expiry(&block, b"a", b"future", 1, 1000),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"forever", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
 
         let removed = store.delete_expired(500).await.unwrap();
         assert_eq!(removed, 1);
         assert!(store.get_entry(&vk(b"a"), b"old").await.unwrap().is_none());
-        assert!(store.get_entry(&vk(b"a"), b"future").await.unwrap().is_some());
-        assert!(store.get_entry(&vk(b"a"), b"forever").await.unwrap().is_some());
+        assert!(
+            store
+                .get_entry(&vk(b"a"), b"future")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_entry(&vk(b"a"), b"forever")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn delete_expired_at_boundary_includes_equal() {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
-        store.insert(entry_with_expiry(&block, b"a", b"x", 1, 100), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_with_expiry(&block, b"a", b"x", 1, 100),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
         let removed = store.delete_expired(100).await.unwrap();
         assert_eq!(removed, 1);
     }
@@ -513,7 +696,7 @@ mod tests {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"future");
         let entry = entry_pointing_to(&block, b"a", b"x", 1);
-        store.insert(entry, None).await.unwrap();   // no blob yet
+        store.insert(entry, None).await.unwrap(); // no blob yet
         let reclaimed = store.gc_blobs().await.unwrap();
         assert_eq!(reclaimed, 0);
     }
@@ -523,32 +706,86 @@ mod tests {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
         // Pre-existing entry — should NOT replay.
-        store.insert(entry_pointing_to(&block, b"a", b"r", 1), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"r", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
 
-        let mut sub = store.subscribe(Filter::Keyspace(vk(b"a")), Replay::None).await.unwrap();
+        let mut sub = store
+            .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
+            .await
+            .unwrap();
 
         // Future event — should arrive.
-        store.insert(entry_pointing_to(&block, b"a", b"r2", 1), Some(block.clone())).await.unwrap();
-        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.unwrap().unwrap().unwrap();
-        match evt { Event::Inserted(e) => assert_eq!(e.name.as_ref(), b"r2"), _ => panic!("unexpected event {:?}", evt) }
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"r2", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match evt {
+            Event::Inserted(e) => assert_eq!(e.name.as_ref(), b"r2"),
+            _ => panic!("unexpected event {:?}", evt),
+        }
     }
 
     #[tokio::test]
     async fn subscribe_replay_all_emits_history_then_live() {
         let store = MemoryStore::with_accept_all();
         let block = small_block(b"x");
-        store.insert(entry_pointing_to(&block, b"a", b"r1", 1), Some(block.clone())).await.unwrap();
-        store.insert(entry_pointing_to(&block, b"a", b"r2", 1), Some(block.clone())).await.unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"r1", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"r2", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
 
-        let mut sub = store.subscribe(Filter::Keyspace(vk(b"a")), Replay::All).await.unwrap();
+        let mut sub = store
+            .subscribe(Filter::Keyspace(vk(b"a")), Replay::All)
+            .await
+            .unwrap();
         // Two historical.
         for _ in 0..2 {
-            tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.unwrap().unwrap().unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(200), sub.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
         }
         // One live.
-        store.insert(entry_pointing_to(&block, b"a", b"r3", 1), Some(block.clone())).await.unwrap();
-        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.unwrap().unwrap().unwrap();
-        match evt { Event::Inserted(e) => assert_eq!(e.name.as_ref(), b"r3"), _ => panic!() }
+        store
+            .insert(
+                entry_pointing_to(&block, b"a", b"r3", 1),
+                Some(block.clone()),
+            )
+            .await
+            .unwrap();
+        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match evt {
+            Event::Inserted(e) => assert_eq!(e.name.as_ref(), b"r3"),
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
@@ -556,10 +793,23 @@ mod tests {
         let store = MemoryStore::with_accept_all();
         let b1 = small_block(b"v1");
         let b2 = small_block(b"v2");
-        store.insert(entry_pointing_to(&b1, b"a", b"r", 1), Some(b1.clone())).await.unwrap();
-        let mut sub = store.subscribe(Filter::Keyspace(vk(b"a")), Replay::None).await.unwrap();
-        store.insert(entry_pointing_to(&b2, b"a", b"r", 2), Some(b2.clone())).await.unwrap();
-        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.unwrap().unwrap().unwrap();
+        store
+            .insert(entry_pointing_to(&b1, b"a", b"r", 1), Some(b1.clone()))
+            .await
+            .unwrap();
+        let mut sub = store
+            .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
+            .await
+            .unwrap();
+        store
+            .insert(entry_pointing_to(&b2, b"a", b"r", 2), Some(b2.clone()))
+            .await
+            .unwrap();
+        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         match evt {
             Event::Replaced { old, new } => {
                 assert_eq!(old.priority, 1);

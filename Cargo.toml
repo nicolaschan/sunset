@@ -19,3 +19,11 @@ thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 sunset-store = { path = "crates/sunset-store" }
 sunset-store-memory = { path = "crates/sunset-store-memory" }
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+enum_glob_use = "warn"
+needless_pass_by_value = "warn"

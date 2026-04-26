@@ -7,16 +7,37 @@ use serde::{Deserialize, Serialize};
 pub struct Hash([u8; 32]);
 
 impl Hash {
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self { Self(bytes) }
-    pub const fn as_bytes(&self) -> &[u8; 32] { &self.0 }
-    pub fn to_hex(&self) -> String { blake3::Hash::from_bytes(self.0).to_hex().to_string() }
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+    pub fn to_hex(&self) -> String {
+        blake3::Hash::from_bytes(self.0).to_hex().to_string()
+    }
 }
 
 impl From<blake3::Hash> for Hash {
-    fn from(h: blake3::Hash) -> Self { Self(*h.as_bytes()) }
+    fn from(h: blake3::Hash) -> Self {
+        Self(*h.as_bytes())
+    }
 }
 impl From<Hash> for blake3::Hash {
-    fn from(h: Hash) -> Self { blake3::Hash::from_bytes(h.0) }
+    fn from(h: Hash) -> Self {
+        blake3::Hash::from_bytes(h.0)
+    }
+}
+impl From<[u8; 32]> for Hash {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Display for Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
 }
 
 /// A writer's verifying (public) key. Opaque bytes — sunset-store does not
@@ -26,8 +47,12 @@ impl From<Hash> for blake3::Hash {
 pub struct VerifyingKey(pub bytes::Bytes);
 
 impl VerifyingKey {
-    pub fn new(bytes: impl Into<bytes::Bytes>) -> Self { Self(bytes.into()) }
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub fn new(bytes: impl Into<bytes::Bytes>) -> Self {
+        Self(bytes.into())
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Opaque cursor; backends maintain a per-store monotonic sequence number.
@@ -43,18 +68,18 @@ pub struct Cursor(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedKvEntry {
     pub verifying_key: VerifyingKey,
-    pub name:          bytes::Bytes,
-    pub value_hash:    Hash,
-    pub priority:      u64,
-    pub expires_at:    Option<u64>,
-    pub signature:     bytes::Bytes,
+    pub name: bytes::Bytes,
+    pub value_hash: Hash,
+    pub priority: u64,
+    pub expires_at: Option<u64>,
+    pub signature: bytes::Bytes,
 }
 
 /// Content-addressed blob. `references` form a DAG over content blocks;
 /// `hash(self) = blake3(postcard::to_stdvec(self))`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentBlock {
-    pub data:       bytes::Bytes,
+    pub data: bytes::Bytes,
     pub references: Vec<Hash>,
 }
 
@@ -120,11 +145,11 @@ mod tests {
     fn signed_kv_entry_postcard_roundtrip() {
         let entry = SignedKvEntry {
             verifying_key: VerifyingKey::new(bytes::Bytes::from_static(b"vk")),
-            name:          bytes::Bytes::from_static(b"room/general"),
-            value_hash:    Hash::from_bytes([3u8; 32]),
-            priority:      42,
-            expires_at:    Some(99),
-            signature:     bytes::Bytes::from_static(b"sig"),
+            name: bytes::Bytes::from_static(b"room/general"),
+            value_hash: Hash::from_bytes([3u8; 32]),
+            priority: 42,
+            expires_at: Some(99),
+            signature: bytes::Bytes::from_static(b"sig"),
         };
         let bytes = postcard::to_stdvec(&entry).unwrap();
         let back: SignedKvEntry = postcard::from_bytes(&bytes).unwrap();
@@ -134,7 +159,7 @@ mod tests {
     #[test]
     fn content_block_hash_is_deterministic() {
         let block = ContentBlock {
-            data:       bytes::Bytes::from_static(b"hello"),
+            data: bytes::Bytes::from_static(b"hello"),
             references: vec![Hash::from_bytes([1u8; 32])],
         };
         let h1 = block.hash();
@@ -144,14 +169,23 @@ mod tests {
 
     #[test]
     fn content_block_hash_distinguishes_data() {
-        let a = ContentBlock { data: bytes::Bytes::from_static(b"a"), references: vec![] };
-        let b = ContentBlock { data: bytes::Bytes::from_static(b"b"), references: vec![] };
+        let a = ContentBlock {
+            data: bytes::Bytes::from_static(b"a"),
+            references: vec![],
+        };
+        let b = ContentBlock {
+            data: bytes::Bytes::from_static(b"b"),
+            references: vec![],
+        };
         assert_ne!(a.hash(), b.hash());
     }
 
     #[test]
     fn content_block_hash_distinguishes_refs() {
-        let a = ContentBlock { data: bytes::Bytes::from_static(b"x"), references: vec![] };
+        let a = ContentBlock {
+            data: bytes::Bytes::from_static(b"x"),
+            references: vec![],
+        };
         let b = ContentBlock {
             data: bytes::Bytes::from_static(b"x"),
             references: vec![Hash::from_bytes([0u8; 32])],
@@ -166,11 +200,8 @@ mod tests {
     #[test]
     fn content_block_hash_frozen_vector() {
         let block = ContentBlock {
-            data:       bytes::Bytes::from_static(b"sunset.chat frozen v1"),
-            references: vec![
-                Hash::from_bytes([0u8; 32]),
-                Hash::from_bytes([1u8; 32]),
-            ],
+            data: bytes::Bytes::from_static(b"sunset.chat frozen v1"),
+            references: vec![Hash::from_bytes([0u8; 32]), Hash::from_bytes([1u8; 32])],
         };
         assert_eq!(
             block.hash().to_hex(),

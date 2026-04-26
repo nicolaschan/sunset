@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum Error {
     /// Wrapped backend-specific failure (rusqlite, IndexedDB DOM exception, etc.).
     #[error("backend error: {0}")]
