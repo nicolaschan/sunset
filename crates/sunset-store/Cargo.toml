@@ -1,0 +1,21 @@
+[package]
+name = "sunset-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+futures.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+test-helpers = []

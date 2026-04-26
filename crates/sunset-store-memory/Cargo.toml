@@ -1,0 +1,18 @@
+[package]
+name = "sunset-store-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+futures.workspace = true
+sunset-store.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+sunset-store = { workspace = true, features = ["test-helpers"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
