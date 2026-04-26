@@ -340,10 +340,18 @@ fn composer(
   draft: String,
   on_draft: fn(String) -> msg,
 ) -> Element(msg) {
+  // Fixed 64px height with a 1px border-top — the rooms-rail you_row
+  // and channels-rail self-bar share the same shape so the three
+  // column-bottom rows align on the same horizontal seam.
   html.div(
     [
       ui.css([
-        #("padding", "12px 20px 16px 20px"),
+        #("box-sizing", "border-box"),
+        #("height", "64px"),
+        #("flex-shrink", "0"),
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("padding", "0 20px"),
         #("border-top", "1px solid " <> p.border_soft),
       ]),
     ],
@@ -355,6 +363,7 @@ fn composer(
             #("align-items", "center"),
             #("gap", "8px"),
             #("padding", "8px 10px"),
+            #("flex", "1"),
             #("background", p.surface_alt),
             #("border", "1px solid " <> p.border),
             #("border-radius", "8px"),
