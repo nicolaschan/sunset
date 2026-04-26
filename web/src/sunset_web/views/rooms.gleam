@@ -37,6 +37,12 @@ pub fn view(
         #("background", p.surface),
         #("border-right", "1px solid " <> p.border),
         #("transition", "width 220ms ease"),
+        // Children sometimes have absolute-positioned bits (unread badges)
+        // that hang outside their bounding box, plus the inline list rows
+        // are sized for the expanded state — clip everything that doesn't
+        // fit so the collapsed 54px rail never spawns a horizontal scroll.
+        #("overflow", "hidden"),
+        #("min-width", "0"),
       ]),
     ],
     [
@@ -52,66 +58,70 @@ pub fn view(
 }
 
 fn brand_row(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
-  let inner = case collapsed {
+  case collapsed {
     True ->
+      // Collapsed: just the chevron, centered in the 54px rail. No logo.
       html.div(
         [
           ui.css([
-            #("flex", "1"),
-            #("display", "flex"),
-            #("justify-content", "center"),
-            #("color", p.accent),
-          ]),
-        ],
-        [logo(22)],
-      )
-    False ->
-      html.div(
-        [
-          ui.css([
-            #("flex", "1"),
+            #("box-sizing", "border-box"),
+            #("height", "60px"),
+            #("flex-shrink", "0"),
             #("display", "flex"),
             #("align-items", "center"),
-            #("gap", "10px"),
+            #("justify-content", "center"),
+            #("padding", "0"),
+          ]),
+        ],
+        [collapse_button(p, collapsed, toggle)],
+      )
+    False ->
+      // Expanded: logo + brand text on the left, chevron on the right.
+      html.div(
+        [
+          ui.css([
+            #("box-sizing", "border-box"),
+            #("height", "60px"),
+            #("flex-shrink", "0"),
+            #("display", "flex"),
+            #("align-items", "center"),
+            #("padding", "0 12px 0 14px"),
+            #("gap", "8px"),
           ]),
         ],
         [
-          html.span(
-            [ui.css([#("color", p.accent), #("display", "inline-flex")])],
-            [
-              logo(22),
-            ],
-          ),
-          html.span(
+          html.div(
             [
               ui.css([
-                #("font-weight", "600"),
-                #("font-size", "18.75px"),
-                #("letter-spacing", "-0.01em"),
-                #("color", p.text),
+                #("flex", "1"),
+                #("display", "flex"),
+                #("align-items", "center"),
+                #("gap", "10px"),
+                #("min-width", "0"),
               ]),
             ],
-            [html.text("sunset")],
+            [
+              html.span(
+                [ui.css([#("color", p.accent), #("display", "inline-flex")])],
+                [logo(22)],
+              ),
+              html.span(
+                [
+                  ui.css([
+                    #("font-weight", "600"),
+                    #("font-size", "18.75px"),
+                    #("letter-spacing", "-0.01em"),
+                    #("color", p.text),
+                  ]),
+                ],
+                [html.text("sunset")],
+              ),
+            ],
           ),
+          collapse_button(p, collapsed, toggle),
         ],
       )
   }
-
-  html.div(
-    [
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("padding", "14px 12px 10px 14px"),
-        #("gap", "8px"),
-        #("min-height", "48px"),
-      ]),
-    ],
-    [
-      inner,
-      collapse_button(p, collapsed, toggle),
-    ],
-  )
 }
 
 fn collapse_button(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
