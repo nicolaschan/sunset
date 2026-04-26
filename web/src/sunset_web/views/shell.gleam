@@ -29,22 +29,26 @@ pub fn view(
   html.div(
     [
       ui.css([
-        #("min-height", "100vh"),
+        #("position", "fixed"),
+        #("inset", "0"),
         #("background", palette.bg),
         #("color", palette.text),
         #("font-family", theme.font_sans),
         #("font-size", "13.5px"),
         #("line-height", "1.45"),
+        #("overflow", "hidden"),
       ]),
     ],
     [
+      global_reset(),
       html.div(
         [
           ui.css([
             #("display", "grid"),
             #("grid-template-columns", grid_template),
             #("grid-template-rows", "100vh"),
-            #("min-height", "100vh"),
+            #("height", "100vh"),
+            #("overflow", "hidden"),
             #("transition", "grid-template-columns 220ms ease"),
           ]),
         ],
@@ -57,6 +61,20 @@ pub fn view(
       ),
       theme_toggle(mode, palette, toggle_mode),
     ],
+  )
+}
+
+/// Inline browser-default reset. Lustre dev tools' generated HTML doesn't
+/// include `body { margin: 0 }`, and our shell uses `position: fixed; inset:
+/// 0` to claim the full viewport, so the default 8px body margin would
+/// otherwise show up as a window-wide gap (and a vertical scrollbar where
+/// the viewport overflows).
+fn global_reset() -> Element(msg) {
+  html.style(
+    [],
+    "html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+     #app { height: 100%; }
+     *, *::before, *::after { box-sizing: border-box; }",
   )
 }
 
