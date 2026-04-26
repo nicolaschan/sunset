@@ -2,5 +2,8 @@
   "name": "sunset-web",
   "version": "0.1.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "1.58.2"
+  }
 }
