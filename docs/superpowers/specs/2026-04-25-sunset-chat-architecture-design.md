@@ -16,7 +16,7 @@ sunset.chat is a peer-to-peer end-to-end encrypted chat application with first-c
 
 Reliable communication (chat ops, member-list ops, identity delegations, handshakes, presence) routes through a content-addressed CRDT store. Real-time voice rides a separate unreliable transport, direct peer-to-peer when possible and relay-forwarded when not. Both channels are end-to-end encrypted; nothing is ever sent in plaintext.
 
-The store is inspired by [`baybridge`](https://github.com/nicolaschan/baybridge); the room-name-as-shared-secret model is inspired by [`insanity`](https://github.com/nicolaschan/insanity); the future custom transport is the successor to [`udpp`](https://github.com/nicolaschan/udpp).
+The store is inspired by [`baybridge`](https://github.com/nicolaschan/baybridge); the room-name-as-shared-secret model is inspired by [`insanity`](https://github.com/nicolaschan/insanity); the future custom transport draws inspiration from [`udpp`](https://github.com/nicolaschan/udpp). All three are reimplemented from scratch within sunset.chat with cleaner abstractions; none are pulled in as dependencies.
 
 ## Goals and non-goals
 
@@ -349,9 +349,9 @@ WebRTC is the v1 implementation across all hosts:
 
 Uniform behavior across all hosts means a single transport stack to debug, well-understood NAT traversal via ICE/STUN/TURN, and battle-tested codepaths.
 
-### Future transport: udpp
+### Future transport: custom UDP-based protocol
 
-The trait abstraction exists from day one because the transport stack is expected to evolve. The next planned transport is a custom UDP-based protocol descended from `udpp` (sessions, AEAD-on-UDP, congestion detection). It will drop in via the same trait surface with no upper-layer rewrite. Voice frames will likely move to udpp first because the unreliable channel is where udpp's design is strongest.
+The trait abstraction exists from day one because the transport stack is expected to evolve. The next planned transport is a custom UDP-based protocol, reimplemented from scratch with design inspiration from `udpp` (sessions, AEAD-on-UDP, congestion detection). It will drop in via the same trait surface with no upper-layer rewrite. Voice frames will likely move to it first because the unreliable channel is where the design is strongest.
 
 ### Relay role
 
@@ -574,8 +574,8 @@ Each of the items below gets its own brainstorm → spec → plan → implement 
 
 ## References
 
-- [`baybridge`](https://github.com/nicolaschan/baybridge) — the inspiration for the store layer's CRDT KV plus content-addressed blob model.
-- [`insanity`](https://github.com/nicolaschan/insanity) — the inspiration for the room-name-as-shared-secret model and store-mediated peer rendezvous.
-- [`udpp`](https://github.com/nicolaschan/udpp) — the planned successor transport for the v2 native path.
+- [`baybridge`](https://github.com/nicolaschan/baybridge) — design inspiration for the store layer's CRDT KV plus content-addressed blob model. Reimplemented from scratch within sunset.chat.
+- [`insanity`](https://github.com/nicolaschan/insanity) — design inspiration for the room-name-as-shared-secret model and store-mediated peer rendezvous. Reimplemented from scratch within sunset.chat.
+- [`udpp`](https://github.com/nicolaschan/udpp) — design inspiration for the future custom v2 transport. Reimplemented from scratch within sunset.chat.
 - The Noise Protocol Framework (`https://noiseprotocol.org`).
 - ML-KEM (FIPS 203) and ML-DSA (FIPS 204) — the families the hybrid PQC suites will be drawn from.
