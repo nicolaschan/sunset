@@ -1,16 +1,20 @@
 //! `SyncEngine` — the top-level coordinator.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use sunset_store::{Filter, Store};
+use futures::StreamExt;
+use sunset_store::{Event, Filter, Replay, Store};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::error::{Error, Result};
+use crate::message::SyncMessage;
+use crate::peer::{InboundEvent, run_peer};
 use crate::reserved;
 use crate::subscription_registry::SubscriptionRegistry;
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportConnection};
 use crate::types::{PeerAddr, PeerId, SyncConfig, TrustSet};
 
 /// A command sent from the public API into the running engine.
@@ -36,7 +40,7 @@ pub(crate) struct EngineState {
     pub trust: TrustSet,
     pub registry: SubscriptionRegistry,
     /// Per-peer outbound message senders.
-    pub peer_outbound: HashMap<PeerId, mpsc::UnboundedSender<crate::message::SyncMessage>>,
+    pub peer_outbound: HashMap<PeerId, mpsc::UnboundedSender<SyncMessage>>,
 }
 
 pub struct SyncEngine<S: Store, T: Transport> {
@@ -53,7 +57,10 @@ pub struct SyncEngine<S: Store, T: Transport> {
     pub(crate) cmd_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<EngineCommand>>>>,
 }
 
-impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T> {
+impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T>
+where
+    T::Connection: 'static,
+{
     pub fn new(store: Arc<S>, transport: T, config: SyncConfig, local_peer: PeerId) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         Self {
@@ -123,21 +130,52 @@ impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T> {
         // twice, the second call observes None and returns Error::Closed.
         let mut cmd_rx = self.cmd_rx.lock().await.take().ok_or(Error::Closed)?;
 
-        // Tasks 11–15 fill in the loop body. For now, drain commands until
-        // the channel closes.
-        while let Some(cmd) = cmd_rx.recv().await {
-            self.handle_command(cmd).await;
+        // Channel for per-peer tasks to talk back to us.
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
+
+        // Local store subscription. Initially a `Filter::Namespace(_sunset-sync/subscribe)`;
+        // refreshed whenever the registry changes (Task 14 expands the union).
+        let mut local_sub = self
+            .store
+            .subscribe(
+                Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME)),
+                Replay::None,
+            )
+            .await?;
+
+        loop {
+            tokio::select! {
+                maybe_conn = self.transport.accept() => {
+                    match maybe_conn {
+                        Ok(conn) => self.spawn_peer(conn, inbound_tx.clone()).await,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Some(cmd) = cmd_rx.recv() => {
+                    self.handle_command(cmd, &inbound_tx).await;
+                }
+                Some(event) = inbound_rx.recv() => {
+                    self.handle_inbound_event(event).await;
+                }
+                Some(item) = local_sub.next() => {
+                    match item {
+                        Ok(ev) => self.handle_local_store_event(ev).await,
+                        Err(e) => return Err(Error::Store(e)),
+                    }
+                }
+            }
         }
-        Ok(())
     }
 
-    /// Stub command handler — replaced fully in Tasks 11–15.
-    pub(crate) async fn handle_command(&self, cmd: EngineCommand) {
+    pub(crate) async fn handle_command(
+        &self,
+        cmd: EngineCommand,
+        inbound_tx: &mpsc::UnboundedSender<InboundEvent>,
+    ) {
         match cmd {
-            EngineCommand::AddPeer { ack, .. } => {
-                let _ = ack.send(Err(Error::Protocol(
-                    "add_peer not implemented (Task 13)".into(),
-                )));
+            EngineCommand::AddPeer { addr, ack } => {
+                let r = self.do_add_peer(addr, inbound_tx.clone()).await;
+                let _ = ack.send(r);
             }
             EngineCommand::PublishSubscription { filter, ttl, ack } => {
                 let r = self.do_publish_subscription(filter, ttl).await;
@@ -146,6 +184,103 @@ impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T> {
             EngineCommand::SetTrust { trust, ack } => {
                 self.state.lock().await.trust = trust;
                 let _ = ack.send(Ok(()));
+            }
+        }
+    }
+
+    async fn do_add_peer(
+        &self,
+        addr: PeerAddr,
+        inbound_tx: mpsc::UnboundedSender<InboundEvent>,
+    ) -> Result<()> {
+        let conn = self.transport.connect(addr).await?;
+        self.spawn_peer(conn, inbound_tx).await;
+        Ok(())
+    }
+
+    async fn spawn_peer(
+        &self,
+        conn: T::Connection,
+        inbound_tx: mpsc::UnboundedSender<InboundEvent>,
+    ) {
+        let conn = Rc::new(conn);
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+        let local_peer = self.local_peer.clone();
+        let proto = self.config.protocol_version;
+
+        // Register the outbound sender under the connection's peer_id. For
+        // the TestTransport this is the peer's actual identity (the network
+        // tracks addr -> peer_id). For production transports that don't
+        // surface peer_id until after a handshake, the connection should
+        // either delay TransportConnection::peer_id() until it's authoritative
+        // or accept a re-key on PeerHello — handle that when those transports
+        // are added.
+        let peer_id = conn.peer_id();
+        self.state
+            .lock()
+            .await
+            .peer_outbound
+            .insert(peer_id, out_tx);
+
+        tokio::task::spawn_local(run_peer(
+            conn,
+            local_peer,
+            proto,
+            out_rx,
+            inbound_tx,
+        ));
+    }
+
+    async fn handle_inbound_event(&self, event: InboundEvent) {
+        match event {
+            InboundEvent::PeerHello { .. } => {
+                // The outbound channel was already registered under the
+                // connection's peer_id in spawn_peer. PeerHello is just a
+                // signal that the handshake completed; bootstrap fires from
+                // here in Task 14.
+            }
+            InboundEvent::Message { from, message } => {
+                self.handle_peer_message(from, message).await;
+            }
+            InboundEvent::Disconnected { peer_id, .. } => {
+                self.state.lock().await.peer_outbound.remove(&peer_id);
+            }
+        }
+    }
+
+    async fn handle_peer_message(&self, from: PeerId, message: SyncMessage) {
+        // Tasks 12–15 fill this in. For now, all messages other than Hello
+        // (which never reaches here) are ignored.
+        let _ = (from, message);
+    }
+
+    async fn handle_local_store_event(&self, ev: Event) {
+        // Push flow: route to peers whose filter matches.
+        let entry = match ev {
+            Event::Inserted(e) => e,
+            Event::Replaced { new, .. } => new,
+            // Expired / BlobAdded / BlobRemoved: not pushed in v1.
+            _ => return,
+        };
+        // Look up the corresponding blob (best-effort).
+        let blob = self
+            .store
+            .get_content(&entry.value_hash)
+            .await
+            .ok()
+            .flatten();
+        let msg = SyncMessage::EventDelivery {
+            entries: vec![entry.clone()],
+            blobs: blob.into_iter().collect(),
+        };
+        // Find matching peers and forward.
+        let state = self.state.lock().await;
+        for peer in state
+            .registry
+            .peers_matching(&entry.verifying_key, &entry.name)
+        {
+            if let Some(tx) = state.peer_outbound.get(&peer) {
+                let _ = tx.send(msg.clone());
             }
         }
     }
@@ -207,33 +342,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn set_trust_updates_state() {
-        let engine = make_engine("alice", b"alice");
+    async fn run_drains_set_trust_command() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                let engine = Arc::new(make_engine("alice", b"alice"));
                 let h = tokio::task::spawn_local({
-                    let cmd_rx = engine.cmd_rx.clone();
-                    let state = engine.state.clone();
-                    async move {
-                        let mut rx = cmd_rx.lock().await.take().unwrap();
-                        while let Some(cmd) = rx.recv().await {
-                            if let EngineCommand::SetTrust { trust, ack } = cmd {
-                                state.lock().await.trust = trust;
-                                let _ = ack.send(Ok(()));
-                            }
-                        }
-                    }
+                    let engine = engine.clone();
+                    async move { engine.run().await }
                 });
-                let mut whitelist = std::collections::HashSet::new();
-                whitelist.insert(vk(b"trusted"));
+                let mut wl = std::collections::HashSet::new();
+                wl.insert(vk(b"trusted"));
                 engine
-                    .set_trust(TrustSet::Whitelist(whitelist.clone()))
+                    .set_trust(TrustSet::Whitelist(wl.clone()))
                     .await
                     .unwrap();
                 let s = engine.state.lock().await;
-                assert_eq!(s.trust, TrustSet::Whitelist(whitelist));
+                assert_eq!(s.trust, TrustSet::Whitelist(wl));
                 drop(s);
+                // The engine holds the only cmd_tx; we can't drop it from
+                // outside. Abort the task to terminate run().
                 h.abort();
                 let _ = h.await;
             })
