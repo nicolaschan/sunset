@@ -1,0 +1,53 @@
+name: Deploy web to GitHub Pages
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Build web bundle
+        run: nix build .#web
+
+      # `nix build` produces a read-only result/ symlink into /nix/store; the
+      # Pages upload action needs a regular directory it can read.
+      - name: Stage artefact
+        run: |
+          mkdir -p web-dist
+          cp -rL result/. web-dist/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web-dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

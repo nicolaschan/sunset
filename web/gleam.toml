@@ -1,0 +1,31 @@
+name = "sunset_web"
+version = "0.1.0"
+target = "javascript"
+
+[dependencies]
+gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+lustre = ">= 5.6.0 and < 6.0.0"
+modem = ">= 2.1.2 and < 3.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
+lustre_dev_tools = ">= 2.3.0 and < 3.0.0"
+
+[tools.lustre.dev]
+host = "0.0.0.0"
+
+[tools.lustre.html]
+title = "sunset.chat"
+
+[[tools.lustre.html.links]]
+rel = "preconnect"
+href = "https://fonts.googleapis.com"
+
+[[tools.lustre.html.links]]
+rel = "preconnect"
+href = "https://fonts.gstatic.com"
+crossorigin = ""
+
+[[tools.lustre.html.links]]
+rel = "stylesheet"
+href = "https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap"
