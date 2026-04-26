@@ -39,7 +39,13 @@ pub enum Replay {
     None,
     /// All historical matching entries first, then live updates.
     All,
-    /// Events with sequence > `cursor`, then live updates.
+    /// Events with sequence `>= cursor`, then live updates.
+    ///
+    /// Cursors are "next-to-be-assigned" sequence numbers (see
+    /// `Store::current_cursor`). A cursor captured at time T thus represents
+    /// the boundary just after every entry written before T; replaying with
+    /// `Since(c)` therefore re-emits entries whose sequence is `>= c.0`,
+    /// which in practice means everything written at or after T.
     Since(Cursor),
 }
 

@@ -57,7 +57,8 @@ impl MemoryStore {
         Self::new(Arc::new(sunset_store::AcceptAllVerifier))
     }
 
-    /// Returns the current cursor (last assigned sequence).
+    /// Returns the current cursor (the next-to-be-assigned sequence number;
+    /// `Cursor(0)` on a fresh store).
     pub async fn current_cursor_now(&self) -> Cursor {
         let inner = self.inner.lock().await;
         Cursor(inner.next_sequence)

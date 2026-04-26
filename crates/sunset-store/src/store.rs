@@ -59,6 +59,10 @@ pub trait Store {
     /// Returns the count reclaimed.
     async fn gc_blobs(&self) -> Result<usize>;
 
-    /// Returns the current monotonic cursor (inclusive of the last commit).
+    /// Returns the current monotonic cursor: the next-to-be-assigned sequence
+    /// number. Passing the returned cursor to `subscribe(..., Replay::Since(c))`
+    /// replays entries written at or after the moment this method observed the
+    /// store (the `Since` predicate is `sequence >= c.0`). A cursor captured
+    /// before any insert is `Cursor(0)`.
     async fn current_cursor(&self) -> Result<Cursor>;
 }
