@@ -141,7 +141,40 @@ impl Store for MemoryStore {
         Ok(count)
     }
     async fn gc_blobs(&self) -> Result<usize> {
-        Err(Error::Backend("not implemented".into()))
+        use std::collections::HashSet;
+        let mut inner = self.inner.lock().await;
+
+        // Mark phase: every live KV entry's value_hash is a root; walk references transitively.
+        let mut reachable: HashSet<Hash> = HashSet::new();
+        let mut frontier: Vec<Hash> = inner
+            .entries
+            .values()
+            .map(|s| s.entry.value_hash)
+            .collect();
+
+        while let Some(h) = frontier.pop() {
+            if !reachable.insert(h) { continue; }
+            if let Some(block) = inner.blobs.get(&h) {
+                for r in &block.references {
+                    if !reachable.contains(r) {
+                        frontier.push(*r);
+                    }
+                }
+            }
+        }
+
+        // Sweep phase: drop unreachable.
+        let to_remove: Vec<Hash> = inner
+            .blobs
+            .keys()
+            .filter(|h| !reachable.contains(h))
+            .copied()
+            .collect();
+        let count = to_remove.len();
+        for h in to_remove {
+            inner.blobs.remove(&h);
+        }
+        Ok(count)
     }
     async fn current_cursor(&self) -> Result<Cursor> {
         Ok(self.current_cursor_now().await)
@@ -405,5 +438,40 @@ mod tests {
         store.insert(entry_with_expiry(&block, b"a", b"x", 1, 100), Some(block.clone())).await.unwrap();
         let removed = store.delete_expired(100).await.unwrap();
         assert_eq!(removed, 1);
+    }
+
+    #[tokio::test]
+    async fn gc_blobs_keeps_reachable_drops_orphans() {
+        let store = MemoryStore::with_accept_all();
+        // A live entry pointing at a block with a transitive reference.
+        let leaf = small_block(b"leaf");
+        let head = ContentBlock {
+            data: bytes::Bytes::from_static(b"head"),
+            references: vec![leaf.hash()],
+        };
+        let entry = entry_pointing_to(&head, b"a", b"x", 1);
+        store.put_content(leaf.clone()).await.unwrap();
+        store.insert(entry, Some(head.clone())).await.unwrap();
+
+        // An orphan block, unreferenced.
+        let orphan = small_block(b"orphan");
+        store.put_content(orphan.clone()).await.unwrap();
+
+        let reclaimed = store.gc_blobs().await.unwrap();
+        assert_eq!(reclaimed, 1);
+        assert!(store.get_content(&head.hash()).await.unwrap().is_some());
+        assert!(store.get_content(&leaf.hash()).await.unwrap().is_some());
+        assert!(store.get_content(&orphan.hash()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn gc_blobs_handles_dangling_value_hash() {
+        // KV entry references a blob we don't have locally (lazy ref); GC must not crash.
+        let store = MemoryStore::with_accept_all();
+        let block = small_block(b"future");
+        let entry = entry_pointing_to(&block, b"a", b"x", 1);
+        store.insert(entry, None).await.unwrap();   // no blob yet
+        let reclaimed = store.gc_blobs().await.unwrap();
+        assert_eq!(reclaimed, 0);
     }
 }
