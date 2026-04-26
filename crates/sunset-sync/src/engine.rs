@@ -9,11 +9,12 @@ use futures::StreamExt;
 use sunset_store::{Event, Filter, Replay, Store};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use crate::digest::{BloomFilter, build_digest, entries_missing_from_remote};
 use crate::error::{Error, Result};
-use crate::message::SyncMessage;
+use crate::message::{DigestRange, SyncMessage};
 use crate::peer::{InboundEvent, run_peer};
 use crate::reserved;
-use crate::subscription_registry::SubscriptionRegistry;
+use crate::subscription_registry::{SubscriptionRegistry, parse_subscription_entry};
 use crate::transport::{Transport, TransportConnection};
 use crate::types::{PeerAddr, PeerId, SyncConfig, TrustSet};
 
@@ -233,11 +234,9 @@ where
 
     async fn handle_inbound_event(&self, event: InboundEvent) {
         match event {
-            InboundEvent::PeerHello { .. } => {
-                // The outbound channel was already registered under the
-                // connection's peer_id in spawn_peer. PeerHello is just a
-                // signal that the handshake completed; bootstrap fires from
-                // here in Task 14.
+            InboundEvent::PeerHello { peer_id, .. } => {
+                // Fire bootstrap digest exchange on the subscribe namespace.
+                self.send_bootstrap_digest(&peer_id).await;
             }
             InboundEvent::Message { from, message } => {
                 self.handle_peer_message(from, message).await;
@@ -245,6 +244,30 @@ where
             InboundEvent::Disconnected { peer_id, .. } => {
                 self.state.lock().await.peer_outbound.remove(&peer_id);
             }
+        }
+    }
+
+    async fn send_bootstrap_digest(&self, to: &PeerId) {
+        let bloom = match build_digest(
+            &*self.store,
+            &self.config.bootstrap_filter,
+            &DigestRange::All,
+            self.config.bloom_size_bits,
+            self.config.bloom_hash_fns,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let msg = SyncMessage::DigestExchange {
+            filter: self.config.bootstrap_filter.clone(),
+            range: DigestRange::All,
+            bloom: bloom.to_bytes(),
+        };
+        let state = self.state.lock().await;
+        if let Some(tx) = state.peer_outbound.get(to) {
+            let _ = tx.send(msg);
         }
     }
 
@@ -259,8 +282,56 @@ where
             SyncMessage::BlobResponse { block } => {
                 self.handle_blob_response(block).await;
             }
-            // Tasks 14–15 handle DigestExchange, Fetch.
-            _ => {}
+            SyncMessage::DigestExchange {
+                filter,
+                range,
+                bloom,
+            } => {
+                self.handle_digest_exchange(from, filter, range, bloom).await;
+            }
+            SyncMessage::Fetch { .. } => {
+                // v1: Fetch is a future-extension when DigestRange grows
+                // beyond All; nothing to do today.
+            }
+            SyncMessage::Hello { .. } | SyncMessage::Goodbye { .. } => {
+                // Handled by the per-peer task; engine ignores.
+            }
+        }
+    }
+
+    async fn handle_digest_exchange(
+        &self,
+        from: PeerId,
+        filter: Filter,
+        _range: DigestRange,
+        bloom: Bytes,
+    ) {
+        let remote_bloom = BloomFilter::from_bytes(bloom, self.config.bloom_hash_fns);
+        let missing =
+            match entries_missing_from_remote(&*self.store, &filter, &remote_bloom).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("sunset-sync: digest scan failed: {e}");
+                    return;
+                }
+            };
+        if missing.is_empty() {
+            return;
+        }
+        // Look up corresponding blobs (best-effort).
+        let mut blobs = Vec::with_capacity(missing.len());
+        for entry in &missing {
+            if let Ok(Some(b)) = self.store.get_content(&entry.value_hash).await {
+                blobs.push(b);
+            }
+        }
+        let msg = SyncMessage::EventDelivery {
+            entries: missing,
+            blobs,
+        };
+        let state = self.state.lock().await;
+        if let Some(tx) = state.peer_outbound.get(&from) {
+            let _ = tx.send(msg);
         }
     }
 
@@ -346,14 +417,28 @@ where
     }
 
     async fn handle_local_store_event(&self, ev: Event) {
-        // Push flow: route to peers whose filter matches.
         let entry = match ev {
             Event::Inserted(e) => e,
             Event::Replaced { new, .. } => new,
             // Expired / BlobAdded / BlobRemoved: not pushed in v1.
             _ => return,
         };
-        // Look up the corresponding blob (best-effort).
+
+        // If this is a subscription announcement, update the registry so
+        // future push routing knows about the peer's interests.
+        if entry.name.as_ref() == reserved::SUBSCRIBE_NAME {
+            if let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await {
+                if let Ok(filter) = parse_subscription_entry(&entry, &block) {
+                    self.state
+                        .lock()
+                        .await
+                        .registry
+                        .insert(entry.verifying_key.clone(), filter);
+                }
+            }
+        }
+
+        // Push flow: route to peers whose filter matches.
         let blob = self
             .store
             .get_content(&entry.value_hash)
@@ -364,7 +449,6 @@ where
             entries: vec![entry.clone()],
             blobs: blob.into_iter().collect(),
         };
-        // Find matching peers and forward.
         let state = self.state.lock().await;
         for peer in state
             .registry
@@ -578,6 +662,66 @@ mod tests {
                 engine.handle_blob_response(block.clone()).await;
                 let got = engine.store.get_content(&hash).await.unwrap();
                 assert_eq!(got, Some(block));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn digest_exchange_pushes_missing_entries_to_remote() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Arc::new(make_engine("alice", b"alice"));
+
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"x"),
+                    references: vec![],
+                };
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"writer"),
+                    name: Bytes::from_static(b"chat/k"),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine
+                    .store
+                    .insert(entry.clone(), Some(block.clone()))
+                    .await
+                    .unwrap();
+
+                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
+                engine
+                    .state
+                    .lock()
+                    .await
+                    .peer_outbound
+                    .insert(PeerId(vk(b"remote")), tx);
+
+                // Remote sends an empty bloom over a filter that matches the entry.
+                let empty = BloomFilter::new(4096, 4);
+                engine
+                    .handle_digest_exchange(
+                        PeerId(vk(b"remote")),
+                        Filter::Keyspace(vk(b"writer")),
+                        DigestRange::All,
+                        empty.to_bytes(),
+                    )
+                    .await;
+
+                let msg = rx.recv().await.unwrap();
+                match msg {
+                    SyncMessage::EventDelivery { entries, blobs } => {
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0], entry);
+                        assert_eq!(blobs.len(), 1);
+                        assert_eq!(blobs[0], block);
+                    }
+                    other => panic!("expected EventDelivery, got {other:?}"),
+                }
             })
             .await;
     }

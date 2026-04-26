@@ -2,6 +2,11 @@
 
 use bytes::Bytes;
 
+use sunset_store::{Filter, SignedKvEntry, Store};
+
+use crate::error::Result;
+use crate::message::DigestRange;
+
 /// A simple bloom filter backed by a fixed-size byte vector.
 ///
 /// `num_bits` MUST be a multiple of 8 (the byte vector's length is
@@ -78,6 +83,64 @@ impl BloomFilter {
         idx.copy_from_slice(&bytes[..8]);
         (u64::from_le_bytes(idx) as usize) % self.num_bits
     }
+}
+
+/// Build a bloom filter over `(verifying_key, name, priority)` triples for
+/// every entry in `store` matching `filter` within `range` (v1: All).
+pub async fn build_digest<S: Store>(
+    store: &S,
+    filter: &Filter,
+    _range: &DigestRange,
+    bloom_size_bits: usize,
+    bloom_hash_fns: u32,
+) -> Result<BloomFilter> {
+    use futures::StreamExt;
+    let mut bloom = BloomFilter::new(bloom_size_bits, bloom_hash_fns);
+    let mut iter = store.iter(filter.clone()).await?;
+    while let Some(item) = iter.next().await {
+        let entry = item?;
+        bloom.insert(&digest_key(&entry));
+    }
+    Ok(bloom)
+}
+
+/// Canonical bytes used for bloom hashing of a `SignedKvEntry`. Includes
+/// `(verifying_key, name, priority)` — sufficient to distinguish LWW
+/// versions of the same key.
+pub fn digest_key(entry: &SignedKvEntry) -> Bytes {
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct Key<'a> {
+        vk: &'a sunset_store::VerifyingKey,
+        name: &'a [u8],
+        priority: u64,
+    }
+    let key = Key {
+        vk: &entry.verifying_key,
+        name: &entry.name,
+        priority: entry.priority,
+    };
+    Bytes::from(postcard::to_stdvec(&key).expect("digest_key encodes infallibly"))
+}
+
+/// Walk the local store matching `filter` and return the entries whose
+/// `digest_key` is NOT in `remote_bloom` — these are entries the remote is
+/// missing.
+pub async fn entries_missing_from_remote<S: Store>(
+    store: &S,
+    filter: &Filter,
+    remote_bloom: &BloomFilter,
+) -> Result<Vec<SignedKvEntry>> {
+    use futures::StreamExt;
+    let mut out = Vec::new();
+    let mut iter = store.iter(filter.clone()).await?;
+    while let Some(item) = iter.next().await {
+        let entry = item?;
+        if !remote_bloom.contains(&digest_key(&entry)) {
+            out.push(entry);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
