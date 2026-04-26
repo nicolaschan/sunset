@@ -1,5 +1,5 @@
 [package]
-name = "sunset-store-memory"
+name = "sunset-store-fs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,9 +14,15 @@ async-stream.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
+hex.workspace = true
+postcard.workspace = true
 sunset-store.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tokio-rusqlite.workspace = true
 
 [dev-dependencies]
 sunset-store = { workspace = true, features = ["test-helpers"] }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

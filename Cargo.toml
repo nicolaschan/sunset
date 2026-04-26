@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunset-store", "crates/sunset-store-memory"]
+members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs"]
 resolver = "2"
 
 [workspace.package]
@@ -10,14 +10,19 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 async-trait = "0.1"
+async-stream = "0.3"
 blake3 = { version = "1", features = ["serde"] }
 bytes = { version = "1", features = ["serde"] }
 futures = "0.3"
+hex = "0.4"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio-rusqlite = { version = "0.6", features = ["bundled"] }
 sunset-store = { path = "crates/sunset-store" }
+sunset-store-fs = { path = "crates/sunset-store-fs" }
 sunset-store-memory = { path = "crates/sunset-store-memory" }
 
 [workspace.lints.rust]
