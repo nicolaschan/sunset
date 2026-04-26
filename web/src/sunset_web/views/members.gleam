@@ -11,12 +11,8 @@ import sunset_web/domain.{
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
-pub fn view(
-  palette p: Palette,
-  members ms: List(Member),
-) -> Element(msg) {
-  let in_call_others =
-    ms |> list.filter(fn(m) { m.in_call && !m.you })
+pub fn view(palette p: Palette, members ms: List(Member)) -> Element(msg) {
+  let in_call_others = ms |> list.filter(fn(m) { m.in_call && !m.you })
   let online_not_in_call =
     ms
     |> list.filter(fn(m) {
@@ -68,10 +64,7 @@ pub fn view(
                 ],
                 [],
               ),
-              section_title(
-                p,
-                "Offline — " <> int.to_string(offline_count),
-              ),
+              section_title(p, "Offline — " <> int.to_string(offline_count)),
             ],
             list.map(offline_members, fn(m) { member_row(p, m, True) }),
           ])

@@ -124,43 +124,40 @@ fn message_view(
     False -> message_header(p, m)
   }
 
-  html.div(
-    [],
-    [
-      html.div(
-        [
-          ui.css([
-            #("padding", "2px 8px"),
-            #("border-radius", "6px"),
-            #("opacity", opacity),
-            #("margin-top", margin_top),
-          ]),
-        ],
-        [
-          header,
-          html.div(
-            [
-              ui.css([
-                #("font-size", "13.5px"),
-                #("color", p.text),
-                #("white-space", "pre-wrap"),
-                #("word-break", "break-word"),
-              ]),
-            ],
-            [html.text(m.body)],
-          ),
-          case m.reactions {
-            [] -> element.fragment([])
-            rs -> reactions_row(p, rs)
-          },
-        ],
-      ),
-      case show_read_marker {
-        True -> read_marker(p, m.seen_by)
-        False -> element.fragment([])
-      },
-    ],
-  )
+  html.div([], [
+    html.div(
+      [
+        ui.css([
+          #("padding", "2px 8px"),
+          #("border-radius", "6px"),
+          #("opacity", opacity),
+          #("margin-top", margin_top),
+        ]),
+      ],
+      [
+        header,
+        html.div(
+          [
+            ui.css([
+              #("font-size", "13.5px"),
+              #("color", p.text),
+              #("white-space", "pre-wrap"),
+              #("word-break", "break-word"),
+            ]),
+          ],
+          [html.text(m.body)],
+        ),
+        case m.reactions {
+          [] -> element.fragment([])
+          rs -> reactions_row(p, rs)
+        },
+      ],
+    ),
+    case show_read_marker {
+      True -> read_marker(p, m.seen_by)
+      False -> element.fragment([])
+    },
+  ])
 }
 
 fn message_header(p: Palette, m: Message) -> Element(msg) {
@@ -412,34 +409,54 @@ fn attach_button(p: Palette) -> Element(msg) {
       ]),
     ],
     [
-      element.namespaced("http://www.w3.org/2000/svg", "svg", [
-        attribute.attribute("width", "16"),
-        attribute.attribute("height", "16"),
-        attribute.attribute("viewBox", "0 0 16 16"),
-        attribute.attribute("fill", "none"),
-      ], [
-        element.namespaced("http://www.w3.org/2000/svg", "rect", [
-          attribute.attribute("x", "2.5"),
-          attribute.attribute("y", "3"),
-          attribute.attribute("width", "11"),
-          attribute.attribute("height", "10"),
-          attribute.attribute("rx", "1.5"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.3"),
-        ], []),
-        element.namespaced("http://www.w3.org/2000/svg", "circle", [
-          attribute.attribute("cx", "6"),
-          attribute.attribute("cy", "7"),
-          attribute.attribute("r", "1.2"),
-          attribute.attribute("fill", "currentColor"),
-        ], []),
-        element.namespaced("http://www.w3.org/2000/svg", "path", [
-          attribute.attribute("d", "M3 11l3-3 4 4 3-2"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.3"),
-          attribute.attribute("stroke-linejoin", "round"),
-        ], []),
-      ]),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "svg",
+        [
+          attribute.attribute("width", "16"),
+          attribute.attribute("height", "16"),
+          attribute.attribute("viewBox", "0 0 16 16"),
+          attribute.attribute("fill", "none"),
+        ],
+        [
+          element.namespaced(
+            "http://www.w3.org/2000/svg",
+            "rect",
+            [
+              attribute.attribute("x", "2.5"),
+              attribute.attribute("y", "3"),
+              attribute.attribute("width", "11"),
+              attribute.attribute("height", "10"),
+              attribute.attribute("rx", "1.5"),
+              attribute.attribute("stroke", "currentColor"),
+              attribute.attribute("stroke-width", "1.3"),
+            ],
+            [],
+          ),
+          element.namespaced(
+            "http://www.w3.org/2000/svg",
+            "circle",
+            [
+              attribute.attribute("cx", "6"),
+              attribute.attribute("cy", "7"),
+              attribute.attribute("r", "1.2"),
+              attribute.attribute("fill", "currentColor"),
+            ],
+            [],
+          ),
+          element.namespaced(
+            "http://www.w3.org/2000/svg",
+            "path",
+            [
+              attribute.attribute("d", "M3 11l3-3 4 4 3-2"),
+              attribute.attribute("stroke", "currentColor"),
+              attribute.attribute("stroke-width", "1.3"),
+              attribute.attribute("stroke-linejoin", "round"),
+            ],
+            [],
+          ),
+        ],
+      ),
     ],
   )
 }

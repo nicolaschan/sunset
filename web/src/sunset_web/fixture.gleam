@@ -4,11 +4,11 @@
 //// these factories become decoders over `Store` events / blob payloads.
 
 import sunset_web/domain.{
-  type Channel, type Member, type Message, type Room, Away,
-  Bridge, BridgeRelay, Channel, ChannelId, Connected, Direct, HasBridge,
-  HasRole, Member, MemberId, Message, Minecraft, MutedP, NoBridge, NoRelay,
-  NoRole, Offline, OneHop, Online, Reaction, Reconnecting, Room, RoomId,
-  SelfRelay, Speaking, TextChannel, TwoHop, Voice,
+  type Channel, type Member, type Message, type Room, Away, Bridge, BridgeRelay,
+  Channel, ChannelId, Connected, Direct, HasBridge, HasRole, Member, MemberId,
+  Message, Minecraft, MutedP, NoBridge, NoRelay, NoRole, Offline, OneHop, Online,
+  Reaction, Reconnecting, Room, RoomId, SelfRelay, Speaking, TextChannel, TwoHop,
+  Voice,
 }
 
 pub fn rooms() -> List(Room) {

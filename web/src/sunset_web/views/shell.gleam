@@ -60,11 +60,7 @@ pub fn view(
   )
 }
 
-fn theme_toggle(
-  mode: Mode,
-  palette: Palette,
-  toggle_mode: msg,
-) -> Element(msg) {
+fn theme_toggle(mode: Mode, palette: Palette, toggle_mode: msg) -> Element(msg) {
   html.button(
     [
       ui.css([
@@ -109,43 +105,68 @@ fn icon_for_mode(mode: Mode) -> Element(msg) {
 }
 
 fn sun_icon() -> Element(msg) {
-  element.namespaced("http://www.w3.org/2000/svg", "svg", [
-    attribute.attribute("width", "12"),
-    attribute.attribute("height", "12"),
-    attribute.attribute("viewBox", "0 0 16 16"),
-    attribute.attribute("fill", "none"),
-  ], [
-    element.namespaced("http://www.w3.org/2000/svg", "circle", [
-      attribute.attribute("cx", "8"),
-      attribute.attribute("cy", "8"),
-      attribute.attribute("r", "3"),
-      attribute.attribute("stroke", "currentColor"),
-      attribute.attribute("stroke-width", "1.4"),
-    ], []),
-    element.namespaced("http://www.w3.org/2000/svg", "path", [
-      attribute.attribute("d", "M8 1.5v1.6M8 12.9v1.6M14.5 8h-1.6M3.1 8H1.5M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1M12.6 12.6l-1.1-1.1M4.5 4.5L3.4 3.4"),
-      attribute.attribute("stroke", "currentColor"),
-      attribute.attribute("stroke-width", "1.4"),
-      attribute.attribute("stroke-linecap", "round"),
-    ], []),
-  ])
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "12"),
+      attribute.attribute("height", "12"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "circle",
+        [
+          attribute.attribute("cx", "8"),
+          attribute.attribute("cy", "8"),
+          attribute.attribute("r", "3"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute(
+            "d",
+            "M8 1.5v1.6M8 12.9v1.6M14.5 8h-1.6M3.1 8H1.5M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1M12.6 12.6l-1.1-1.1M4.5 4.5L3.4 3.4",
+          ),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
+    ],
+  )
 }
 
 fn moon_icon() -> Element(msg) {
-  element.namespaced("http://www.w3.org/2000/svg", "svg", [
-    attribute.attribute("width", "12"),
-    attribute.attribute("height", "12"),
-    attribute.attribute("viewBox", "0 0 16 16"),
-    attribute.attribute("fill", "none"),
-  ], [
-    element.namespaced("http://www.w3.org/2000/svg", "path", [
-      attribute.attribute(
-        "d",
-        "M13.5 9.5A6 6 0 016.5 2.5a6 6 0 107 7z",
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "12"),
+      attribute.attribute("height", "12"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute("d", "M13.5 9.5A6 6 0 016.5 2.5a6 6 0 107 7z"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+          attribute.attribute("stroke-linejoin", "round"),
+        ],
+        [],
       ),
-      attribute.attribute("stroke", "currentColor"),
-      attribute.attribute("stroke-width", "1.4"),
-      attribute.attribute("stroke-linejoin", "round"),
-    ], []),
-  ])
+    ],
+  )
 }

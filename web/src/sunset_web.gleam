@@ -63,8 +63,7 @@ fn update(model: Model, msg: Msg) -> Model {
       })
     SelectRoom(id) -> Model(..model, current_room: id)
     SelectChannel(id) -> Model(..model, current_channel: id)
-    ToggleRoomsRail ->
-      Model(..model, rooms_collapsed: !model.rooms_collapsed)
+    ToggleRoomsRail -> Model(..model, rooms_collapsed: !model.rooms_collapsed)
     UpdateDraft(s) -> Model(..model, draft: s)
   }
 }
@@ -118,4 +117,3 @@ fn current_room(rs: List(Room), id: RoomId) -> Option(Room) {
   list.find(rs, fn(r) { r.id == id })
   |> option.from_result
 }
-

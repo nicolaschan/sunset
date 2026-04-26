@@ -9,9 +9,9 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Channel, type ChannelId, type ConnStatus, type Member, type Room,
-  Bridge, Connected, Minecraft, MutedP, Offline, Reconnecting, Speaking,
-  TextChannel, Voice,
+  type Channel, type ChannelId, type ConnStatus, type Member, type Room, Bridge,
+  Connected, Minecraft, MutedP, Offline, Reconnecting, Speaking, TextChannel,
+  Voice,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -59,20 +59,26 @@ pub fn view(
           ]),
         ],
         [
-          section(p, "Channels", list.map(text_channels, fn(c) {
-            text_channel_row(p, c, cur, sel)
-          })),
-          section(p, "Voice", list.flatten([
-            list.map(voice_channels, fn(c) {
-              voice_block(p, c, in_call)
-            }),
-          ])),
+          section(
+            p,
+            "Channels",
+            list.map(text_channels, fn(c) { text_channel_row(p, c, cur, sel) }),
+          ),
+          section(
+            p,
+            "Voice",
+            list.flatten([
+              list.map(voice_channels, fn(c) { voice_block(p, c, in_call) }),
+            ]),
+          ),
           case bridge_channels {
             [] -> element.fragment([])
             _ ->
-              section(p, "Bridges", list.map(bridge_channels, fn(c) {
-                bridge_channel_row(p, c)
-              }))
+              section(
+                p,
+                "Bridges",
+                list.map(bridge_channels, fn(c) { bridge_channel_row(p, c) }),
+              )
           },
         ],
       ),
@@ -141,11 +147,7 @@ fn room_header(p: Palette, r: Room) -> Element(msg) {
   )
 }
 
-fn section(
-  p: Palette,
-  title: String,
-  rows: List(Element(msg)),
-) -> Element(msg) {
+fn section(p: Palette, title: String, rows: List(Element(msg))) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -264,11 +266,7 @@ fn idle_voice_row(p: Palette, c: Channel) -> Element(msg) {
   )
 }
 
-fn live_voice_block(
-  p: Palette,
-  c: Channel,
-  ms: List(Member),
-) -> Element(msg) {
+fn live_voice_block(p: Palette, c: Channel, ms: List(Member)) -> Element(msg) {
   html.div(
     [
       ui.css([

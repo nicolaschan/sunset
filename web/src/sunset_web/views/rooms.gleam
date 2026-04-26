@@ -75,9 +75,12 @@ fn brand_row(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
           ]),
         ],
         [
-          html.span([ui.css([#("color", p.accent), #("display", "inline-flex")])], [
-            logo(22),
-          ]),
+          html.span(
+            [ui.css([#("color", p.accent), #("display", "inline-flex")])],
+            [
+              logo(22),
+            ],
+          ),
           html.span(
             [
               ui.css([
@@ -110,11 +113,7 @@ fn brand_row(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
   )
 }
 
-fn collapse_button(
-  p: Palette,
-  collapsed: Bool,
-  toggle: msg,
-) -> Element(msg) {
+fn collapse_button(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
   let path = case collapsed {
     True -> "M5 3l4 4-4 4"
     False -> "M9 3L5 7l4 4"
@@ -141,45 +140,52 @@ fn collapse_button(
       }),
     ],
     [
-      element.namespaced("http://www.w3.org/2000/svg", "svg", [
-        attribute.attribute("width", "14"),
-        attribute.attribute("height", "14"),
-        attribute.attribute("viewBox", "0 0 14 14"),
-        attribute.attribute("fill", "none"),
-      ], [
-        element.namespaced("http://www.w3.org/2000/svg", "path", [
-          attribute.attribute("d", path),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.5"),
-          attribute.attribute("stroke-linecap", "round"),
-          attribute.attribute("stroke-linejoin", "round"),
-        ], []),
-      ]),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "svg",
+        [
+          attribute.attribute("width", "14"),
+          attribute.attribute("height", "14"),
+          attribute.attribute("viewBox", "0 0 14 14"),
+          attribute.attribute("fill", "none"),
+        ],
+        [
+          element.namespaced(
+            "http://www.w3.org/2000/svg",
+            "path",
+            [
+              attribute.attribute("d", path),
+              attribute.attribute("stroke", "currentColor"),
+              attribute.attribute("stroke-width", "1.5"),
+              attribute.attribute("stroke-linecap", "round"),
+              attribute.attribute("stroke-linejoin", "round"),
+            ],
+            [],
+          ),
+        ],
+      ),
     ],
   )
 }
 
 fn search(p: Palette) -> Element(msg) {
-  html.div(
-    [ui.css([#("padding", "0 12px 8px 12px")])],
-    [
-      html.input([
-        attribute.placeholder("Search rooms…"),
-        ui.css([
-          #("width", "100%"),
-          #("box-sizing", "border-box"),
-          #("background", p.surface_alt),
-          #("border", "1px solid " <> p.border_soft),
-          #("border-radius", "6px"),
-          #("padding", "6px 10px"),
-          #("font-family", "inherit"),
-          #("font-size", "12.5px"),
-          #("color", p.text),
-          #("outline", "none"),
-        ]),
+  html.div([ui.css([#("padding", "0 12px 8px 12px")])], [
+    html.input([
+      attribute.placeholder("Search rooms…"),
+      ui.css([
+        #("width", "100%"),
+        #("box-sizing", "border-box"),
+        #("background", p.surface_alt),
+        #("border", "1px solid " <> p.border_soft),
+        #("border-radius", "6px"),
+        #("padding", "6px 10px"),
+        #("font-family", "inherit"),
+        #("font-size", "12.5px"),
+        #("color", p.text),
+        #("outline", "none"),
       ]),
-    ],
-  )
+    ]),
+  ])
 }
 
 fn rooms_list(
@@ -321,10 +327,9 @@ fn meta_line(p: Palette, r: Room) -> List(Element(msg)) {
   let in_call_part = case r.in_call {
     0 -> element.fragment([])
     n ->
-      html.span(
-        [ui.css([#("color", p.accent)])],
-        [html.text("· " <> int_to_string(n) <> " in voice")],
-      )
+      html.span([ui.css([#("color", p.accent)])], [
+        html.text("· " <> int_to_string(n) <> " in voice"),
+      ])
   }
 
   let status_part = case r.status {
@@ -523,45 +528,70 @@ fn you_row(p: Palette, collapsed: Bool) -> Element(msg) {
 
 fn logo(size: Int) -> Element(msg) {
   let s = int_to_string(size)
-  element.namespaced("http://www.w3.org/2000/svg", "svg", [
-    attribute.attribute("width", s),
-    attribute.attribute("height", s),
-    attribute.attribute("viewBox", "0 0 28 28"),
-    attribute.attribute("fill", "none"),
-  ], [
-    element.namespaced("http://www.w3.org/2000/svg", "circle", [
-      attribute.attribute("cx", "14"),
-      attribute.attribute("cy", "14"),
-      attribute.attribute("r", "6.5"),
-      attribute.attribute("fill", "currentColor"),
-      attribute.attribute("opacity", "0.28"),
-    ], []),
-    element.namespaced("http://www.w3.org/2000/svg", "circle", [
-      attribute.attribute("cx", "14"),
-      attribute.attribute("cy", "14"),
-      attribute.attribute("r", "3.6"),
-      attribute.attribute("fill", "currentColor"),
-    ], []),
-    element.namespaced("http://www.w3.org/2000/svg", "line", [
-      attribute.attribute("x1", "3"),
-      attribute.attribute("y1", "20.5"),
-      attribute.attribute("x2", "25"),
-      attribute.attribute("y2", "20.5"),
-      attribute.attribute("stroke", "currentColor"),
-      attribute.attribute("stroke-width", "1.6"),
-      attribute.attribute("stroke-linecap", "round"),
-    ], []),
-    element.namespaced("http://www.w3.org/2000/svg", "line", [
-      attribute.attribute("x1", "6"),
-      attribute.attribute("y1", "24"),
-      attribute.attribute("x2", "22"),
-      attribute.attribute("y2", "24"),
-      attribute.attribute("stroke", "currentColor"),
-      attribute.attribute("stroke-width", "1.6"),
-      attribute.attribute("stroke-linecap", "round"),
-      attribute.attribute("opacity", "0.5"),
-    ], []),
-  ])
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", s),
+      attribute.attribute("height", s),
+      attribute.attribute("viewBox", "0 0 28 28"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "circle",
+        [
+          attribute.attribute("cx", "14"),
+          attribute.attribute("cy", "14"),
+          attribute.attribute("r", "6.5"),
+          attribute.attribute("fill", "currentColor"),
+          attribute.attribute("opacity", "0.28"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "circle",
+        [
+          attribute.attribute("cx", "14"),
+          attribute.attribute("cy", "14"),
+          attribute.attribute("r", "3.6"),
+          attribute.attribute("fill", "currentColor"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "line",
+        [
+          attribute.attribute("x1", "3"),
+          attribute.attribute("y1", "20.5"),
+          attribute.attribute("x2", "25"),
+          attribute.attribute("y2", "20.5"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.6"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "line",
+        [
+          attribute.attribute("x1", "6"),
+          attribute.attribute("y1", "24"),
+          attribute.attribute("x2", "22"),
+          attribute.attribute("y2", "24"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.6"),
+          attribute.attribute("stroke-linecap", "round"),
+          attribute.attribute("opacity", "0.5"),
+        ],
+        [],
+      ),
+    ],
+  )
 }
 
 fn int_to_string(n: Int) -> String {
