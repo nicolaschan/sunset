@@ -60,6 +60,17 @@ pub struct ContentBlock {
 
 impl ContentBlock {
     /// Compute the canonical hash of this content block.
+    ///
+    /// The hash is `blake3(postcard::to_stdvec(self))`, evaluated against the
+    /// frozen v1 wire format. Two `ContentBlock` values with equal canonical
+    /// bytes hash identically across all peers.
+    ///
+    /// # Panics
+    ///
+    /// Cannot fail in practice: postcard serialization of `bytes::Bytes` and
+    /// `Vec<Hash>` is infallible. The `expect` is present only because
+    /// `postcard::to_stdvec` returns `Result`. Any code change that makes this
+    /// panic reachable is a bug — the canonical encoding must remain pure.
     pub fn hash(&self) -> Hash {
         let bytes = postcard::to_stdvec(self).expect("ContentBlock must serialize");
         blake3::hash(&bytes).into()
@@ -146,5 +157,25 @@ mod tests {
             references: vec![Hash::from_bytes([0u8; 32])],
         };
         assert_ne!(a.hash(), b.hash());
+    }
+
+    /// Frozen test vector. If this fails, the canonical wire format has changed.
+    /// Updating the expected hash without changing the wire-format version
+    /// constitutes a backward-incompatible change to content addressing and
+    /// must be rejected.
+    #[test]
+    fn content_block_hash_frozen_vector() {
+        let block = ContentBlock {
+            data:       bytes::Bytes::from_static(b"sunset.chat frozen v1"),
+            references: vec![
+                Hash::from_bytes([0u8; 32]),
+                Hash::from_bytes([1u8; 32]),
+            ],
+        };
+        assert_eq!(
+            block.hash().to_hex(),
+            "ca24b1d5ebf7c3024cfe5ed5b62cd0097c176de517c6f55c0ada94660f9e104a",
+            "If this fails, the canonical encoding has changed — DO NOT update this hex without bumping the wire-format version.",
+        );
     }
 }
