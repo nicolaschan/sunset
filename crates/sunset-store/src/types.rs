@@ -35,6 +35,37 @@ impl VerifyingKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Cursor(pub u64);
 
+/// A signed KV entry. Last-write-wins by `priority` for a given
+/// `(verifying_key, name)` pair. `value_hash` points into the content store.
+///
+/// `signature` covers the canonical postcard encoding of all other fields.
+/// Verification is performed by the host-supplied `SignatureVerifier` on insert.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedKvEntry {
+    pub verifying_key: VerifyingKey,
+    pub name:          bytes::Bytes,
+    pub value_hash:    Hash,
+    pub priority:      u64,
+    pub expires_at:    Option<u64>,
+    pub signature:     bytes::Bytes,
+}
+
+/// Content-addressed blob. `references` form a DAG over content blocks;
+/// `hash(self) = blake3(postcard::to_stdvec(self))`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentBlock {
+    pub data:       bytes::Bytes,
+    pub references: Vec<Hash>,
+}
+
+impl ContentBlock {
+    /// Compute the canonical hash of this content block.
+    pub fn hash(&self) -> Hash {
+        let bytes = postcard::to_stdvec(self).expect("ContentBlock must serialize");
+        blake3::hash(&bytes).into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +103,48 @@ mod tests {
         let bytes = postcard::to_stdvec(&b).unwrap();
         let back: Cursor = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(b, back);
+    }
+
+    #[test]
+    fn signed_kv_entry_postcard_roundtrip() {
+        let entry = SignedKvEntry {
+            verifying_key: VerifyingKey::new(bytes::Bytes::from_static(b"vk")),
+            name:          bytes::Bytes::from_static(b"room/general"),
+            value_hash:    Hash::from_bytes([3u8; 32]),
+            priority:      42,
+            expires_at:    Some(99),
+            signature:     bytes::Bytes::from_static(b"sig"),
+        };
+        let bytes = postcard::to_stdvec(&entry).unwrap();
+        let back: SignedKvEntry = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn content_block_hash_is_deterministic() {
+        let block = ContentBlock {
+            data:       bytes::Bytes::from_static(b"hello"),
+            references: vec![Hash::from_bytes([1u8; 32])],
+        };
+        let h1 = block.hash();
+        let h2 = block.hash();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn content_block_hash_distinguishes_data() {
+        let a = ContentBlock { data: bytes::Bytes::from_static(b"a"), references: vec![] };
+        let b = ContentBlock { data: bytes::Bytes::from_static(b"b"), references: vec![] };
+        assert_ne!(a.hash(), b.hash());
+    }
+
+    #[test]
+    fn content_block_hash_distinguishes_refs() {
+        let a = ContentBlock { data: bytes::Bytes::from_static(b"x"), references: vec![] };
+        let b = ContentBlock {
+            data: bytes::Bytes::from_static(b"x"),
+            references: vec![Hash::from_bytes([0u8; 32])],
+        };
+        assert_ne!(a.hash(), b.hash());
     }
 }

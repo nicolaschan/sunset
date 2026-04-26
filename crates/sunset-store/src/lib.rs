@@ -4,4 +4,4 @@
 
 pub mod types;
 
-pub use types::{Cursor, Hash, VerifyingKey};
+pub use types::{ContentBlock, Cursor, Hash, SignedKvEntry, VerifyingKey};
