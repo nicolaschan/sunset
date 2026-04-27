@@ -186,6 +186,20 @@ test.describe("landing + routing", () => {
     await page.getByTestId("rooms-search").fill("gamma");
     await page.getByTestId("rooms-search").press("Enter");
 
+    const railOrder = async () =>
+      page
+        .getByTestId("rooms-rail")
+        .locator(".room-row")
+        .evaluateAll((rows) =>
+          rows.map((r) => r.getAttribute("data-room-name") || ""),
+        );
+
+    // The third Enter dispatches JoinRoom and resets the search, but
+    // Lustre's render runs in a microtask after press() resolves. Poll
+    // until all three rooms are mounted before we reach in to fire the
+    // raw drag events — otherwise map.alpha can be undefined.
+    await expect.poll(railOrder).toEqual(["gamma", "beta", "alpha"]);
+
     // HTML5 drag events aren't reliably synthesised by the WebDriver
     // protocol; dispatch them manually so the test exercises the
     // app's own dragstart / dragover / drop handlers.
@@ -206,14 +220,6 @@ test.describe("landing + routing", () => {
       fire(map.gamma, "drop");
       fire(map.alpha, "dragend");
     });
-
-    const railOrder = async () =>
-      page
-        .getByTestId("rooms-rail")
-        .locator(".room-row")
-        .evaluateAll((rows) =>
-          rows.map((r) => r.getAttribute("data-room-name") || ""),
-        );
 
     await expect.poll(railOrder).toEqual(["alpha", "gamma", "beta"]);
 
