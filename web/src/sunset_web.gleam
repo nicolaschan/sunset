@@ -83,6 +83,16 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   let stored_rooms = storage.read_joined_rooms()
   let last_used = storage.read_last_used()
   let initial_hash = storage.read_hash()
+  let initial_mode = case storage.read_saved_theme() {
+    "dark" -> Dark
+    "light" -> Light
+    // No explicit choice yet: follow the OS / browser preference.
+    _ ->
+      case storage.prefers_dark() {
+        True -> Dark
+        False -> Light
+      }
+  }
 
   // Resolve the initial view + rooms list:
   //   * URL fragment wins if present.
@@ -105,7 +115,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
 
   let model =
     Model(
-      mode: Light,
+      mode: initial_mode,
       view: initial_view,
       joined_rooms: joined,
       rooms_collapsed: False,
@@ -175,7 +185,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Light -> Dark
         Dark -> Light
       }
-      #(Model(..model, mode: next_mode), effect.none())
+      let label = case next_mode {
+        Light -> "light"
+        Dark -> "dark"
+      }
+      #(
+        Model(..model, mode: next_mode),
+        effect.from(fn(_) {
+          storage.write_saved_theme(label)
+          Nil
+        }),
+      )
     }
     HashChanged(hash) -> {
       let new_view = case hash {

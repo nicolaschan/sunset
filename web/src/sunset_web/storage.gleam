@@ -21,3 +21,17 @@ pub fn set_hash(name: String) -> Nil
 /// Register a callback that fires every time the URL hash changes.
 @external(javascript, "./storage.ffi.mjs", "onHashChange")
 pub fn on_hash_change(callback: fn(String) -> Nil) -> Nil
+
+/// "" when the user has never picked a theme (in which case we follow
+/// `prefers_dark` instead). "light" or "dark" once they've toggled.
+@external(javascript, "./storage.ffi.mjs", "readSavedTheme")
+pub fn read_saved_theme() -> String
+
+@external(javascript, "./storage.ffi.mjs", "writeSavedTheme")
+pub fn write_saved_theme(value: String) -> Nil
+
+/// True when the OS / browser is currently advertising a dark colour
+/// scheme via prefers-color-scheme. Used as the fallback when the
+/// user hasn't toggled the theme yet.
+@external(javascript, "./storage.ffi.mjs", "prefersDark")
+pub fn prefers_dark() -> Bool
