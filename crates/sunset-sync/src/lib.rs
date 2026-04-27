@@ -21,5 +21,5 @@ pub use engine::SyncEngine;
 pub use error::{Error, Result};
 pub use message::{DigestRange, SyncMessage};
 pub use signer::Signer;
-pub use transport::{Transport, TransportConnection};
+pub use transport::{RawConnection, RawTransport, Transport, TransportConnection};
 pub use types::{PeerAddr, PeerId, SyncConfig, TrustSet};
