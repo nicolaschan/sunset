@@ -1,50 +1,69 @@
-//// sunset.chat — Gleam + Lustre frontend (D1 visual shell).
+//// sunset.chat — Gleam + Lustre frontend.
 ////
-//// Static fixture data; no backend wiring yet. Voice popovers,
-//// attachments, and read-up-to-here details panel are rendered as
-//// static state. Eventually swapped for live `sunset-store` data over
-//// WASM FFI.
+//// Two top-level views:
+////   * `LandingView` — empty state shown at root `/`. The user types a
+////     room name and submits; we add it to their joined-rooms list and
+////     navigate.
+////   * `RoomView(name)` — the existing 4-column chat shell rendering
+////     fixture data for the named room.
+////
+//// Routing is anchor-based: the URL fragment (`/#dusk-collective`) is
+//// the source of truth for which room is active. A storage FFI shim
+//// persists the joined-rooms list + last-used room to localStorage
+//// so a refresh restores the user's state.
 
 import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import lustre
+import lustre/effect.{type Effect}
 import lustre/element.{type Element}
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, type Room, type RoomId, ChannelId,
-  Reaction, RoomId,
+  type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
+  NoRelay, Reaction, Reconnecting, Room, RoomId,
 }
 import sunset_web/fixture
+import sunset_web/storage
 import sunset_web/theme.{type Mode, Dark, Light}
 import sunset_web/views/channels
 import sunset_web/views/details_panel
+import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
 import sunset_web/views/rooms
 import sunset_web/views/shell
 
+pub type View {
+  LandingView
+  RoomView(name: String)
+}
+
 pub type Model {
   Model(
     mode: Mode,
-    current_room: RoomId,
-    current_channel: ChannelId,
+    view: View,
+    joined_rooms: List(String),
     rooms_collapsed: Bool,
+    landing_input: String,
+    sidebar_search: String,
+    current_channel: ChannelId,
     draft: String,
-    /// Message id whose quick-react picker is currently open. None when
-    /// no picker is showing.
     reacting_to: Option(String),
-    /// Message id whose details panel is currently open. None means the
-    /// right column shows the regular members rail instead.
     detail_msg_id: Option(String),
-    /// Mutable reactions per message id, seeded from the fixture and
-    /// mutated by AddReaction / RemoveReaction.
     reactions: Dict(String, List(Reaction)),
   )
 }
 
 pub type Msg {
+  NoOp
   ToggleMode
-  SelectRoom(RoomId)
+  HashChanged(String)
+  UpdateLandingInput(String)
+  UpdateSidebarSearch(String)
+  JoinRoom(String)
+  DeleteRoom(String)
+  GoToLanding
   SelectChannel(ChannelId)
   ToggleRoomsRail
   UpdateDraft(String)
@@ -55,44 +74,217 @@ pub type Msg {
 }
 
 pub fn main() {
-  let app = lustre.simple(init, update, view)
+  let app = lustre.application(init, update, view)
   let assert Ok(_) = lustre.start(app, "#app", Nil)
   Nil
 }
 
-fn init(_flags: Nil) -> Model {
-  let initial_reactions =
-    fixture.messages()
-    |> list.fold(dict.new(), fn(d, m) { dict.insert(d, m.id, m.reactions) })
-  Model(
-    mode: Light,
-    current_room: RoomId(fixture.initial_room_id),
-    current_channel: ChannelId(fixture.initial_channel_id),
-    rooms_collapsed: False,
-    draft: "",
-    reacting_to: None,
-    detail_msg_id: None,
-    reactions: initial_reactions,
-  )
+fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
+  let stored_rooms = storage.read_joined_rooms()
+  let last_used = storage.read_last_used()
+  let initial_hash = storage.read_hash()
+
+  // Resolve the initial view + rooms list:
+  //   * URL fragment wins if present.
+  //   * Otherwise fall back to the persisted last-used room.
+  //   * Otherwise show the landing page.
+  // Direct-navigation to a room not yet in the joined list auto-joins
+  // it (so a shared link adds the room rather than dropping the user
+  // back to landing).
+  let initial_view = case initial_hash, last_used, stored_rooms {
+    "", "", _ -> LandingView
+    "", _, [] if last_used == "" -> LandingView
+    "", remembered, _ if remembered != "" -> RoomView(remembered)
+    name, _, _ -> RoomView(name)
+  }
+
+  let joined = case initial_view {
+    LandingView -> stored_rooms
+    RoomView(name) -> ensure_joined(stored_rooms, name)
+  }
+
+  let model =
+    Model(
+      mode: Light,
+      view: initial_view,
+      joined_rooms: joined,
+      rooms_collapsed: False,
+      landing_input: "",
+      sidebar_search: "",
+      current_channel: ChannelId(fixture.initial_channel_id),
+      draft: "",
+      reacting_to: None,
+      detail_msg_id: None,
+      reactions: seed_reactions(),
+    )
+
+  let subscribe_hash =
+    effect.from(fn(dispatch) {
+      storage.on_hash_change(fn(hash) { dispatch(HashChanged(hash)) })
+    })
+
+  let initial_persist = case joined == stored_rooms {
+    True -> effect.none()
+    False ->
+      effect.from(fn(_) {
+        storage.write_joined_rooms(joined)
+        Nil
+      })
+  }
+
+  let initial_hash_sync = case initial_view, initial_hash {
+    RoomView(name), "" ->
+      effect.from(fn(_) {
+        storage.set_hash(name)
+        storage.write_last_used(name)
+        Nil
+      })
+    RoomView(name), _ ->
+      effect.from(fn(_) {
+        storage.write_last_used(name)
+        Nil
+      })
+    LandingView, _ -> effect.none()
+  }
+
+  #(model, effect.batch([subscribe_hash, initial_persist, initial_hash_sync]))
 }
 
-fn update(model: Model, msg: Msg) -> Model {
+fn seed_reactions() -> Dict(String, List(Reaction)) {
+  fixture.messages()
+  |> list.fold(dict.new(), fn(d, m) { dict.insert(d, m.id, m.reactions) })
+}
+
+/// Move `name` to the head of `existing`, prepending if it isn't there
+/// yet. Used to keep "most-recently-active" semantics on an explicit
+/// join while preserving the rest of the order.
+fn ensure_joined(existing: List(String), name: String) -> List(String) {
+  let rest = list.filter(existing, fn(r) { r != name })
+  [name, ..rest]
+}
+
+fn sanitize(raw: String) -> String {
+  string.trim(raw)
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
-    ToggleMode ->
-      Model(..model, mode: case model.mode {
+    NoOp -> #(model, effect.none())
+    ToggleMode -> {
+      let next_mode = case model.mode {
         Light -> Dark
         Dark -> Light
-      })
-    SelectRoom(id) -> Model(..model, current_room: id)
-    SelectChannel(id) -> Model(..model, current_channel: id)
-    ToggleRoomsRail -> Model(..model, rooms_collapsed: !model.rooms_collapsed)
-    UpdateDraft(s) -> Model(..model, draft: s)
+      }
+      #(Model(..model, mode: next_mode), effect.none())
+    }
+    HashChanged(hash) -> {
+      let new_view = case hash {
+        "" -> LandingView
+        name -> RoomView(name)
+      }
+      let new_rooms = case new_view {
+        LandingView -> model.joined_rooms
+        RoomView(name) -> ensure_joined(model.joined_rooms, name)
+      }
+      let persisted = case new_rooms == model.joined_rooms {
+        True -> effect.none()
+        False ->
+          effect.from(fn(_) {
+            storage.write_joined_rooms(new_rooms)
+            Nil
+          })
+      }
+      let last_used_eff = case new_view {
+        RoomView(name) ->
+          effect.from(fn(_) {
+            storage.write_last_used(name)
+            Nil
+          })
+        LandingView -> effect.none()
+      }
+      #(
+        Model(..model, view: new_view, joined_rooms: new_rooms),
+        effect.batch([persisted, last_used_eff]),
+      )
+    }
+    UpdateLandingInput(s) -> #(Model(..model, landing_input: s), effect.none())
+    UpdateSidebarSearch(s) -> #(
+      Model(..model, sidebar_search: s),
+      effect.none(),
+    )
+    JoinRoom(raw) -> {
+      let name = sanitize(raw)
+      case name {
+        "" -> #(model, effect.none())
+        _ -> {
+          let new_rooms = ensure_joined(model.joined_rooms, name)
+          let new_model =
+            Model(
+              ..model,
+              joined_rooms: new_rooms,
+              view: RoomView(name),
+              landing_input: "",
+              sidebar_search: "",
+            )
+          #(
+            new_model,
+            effect.from(fn(_) {
+              storage.write_joined_rooms(new_rooms)
+              storage.write_last_used(name)
+              storage.set_hash(name)
+              Nil
+            }),
+          )
+        }
+      }
+    }
+    DeleteRoom(name) -> {
+      let new_rooms = list.filter(model.joined_rooms, fn(r) { r != name })
+      let active_was_deleted = case model.view {
+        RoomView(active) -> active == name
+        LandingView -> False
+      }
+      let new_view = case active_was_deleted, new_rooms {
+        True, [next, ..] -> RoomView(next)
+        True, [] -> LandingView
+        False, _ -> model.view
+      }
+      let new_last_used = case new_view {
+        RoomView(n) -> n
+        LandingView -> ""
+      }
+      let persist =
+        effect.from(fn(_) {
+          storage.write_joined_rooms(new_rooms)
+          storage.write_last_used(new_last_used)
+          case new_view {
+            RoomView(n) -> storage.set_hash(n)
+            LandingView -> storage.set_hash("")
+          }
+          Nil
+        })
+      #(Model(..model, joined_rooms: new_rooms, view: new_view), persist)
+    }
+    GoToLanding -> {
+      let persist =
+        effect.from(fn(_) {
+          storage.set_hash("")
+          Nil
+        })
+      #(Model(..model, view: LandingView), persist)
+    }
+    SelectChannel(id) -> #(Model(..model, current_channel: id), effect.none())
+    ToggleRoomsRail -> #(
+      Model(..model, rooms_collapsed: !model.rooms_collapsed),
+      effect.none(),
+    )
+    UpdateDraft(s) -> #(Model(..model, draft: s), effect.none())
     ToggleReactionPicker(id) -> {
       let next = case model.reacting_to {
         Some(open) if open == id -> None
         _ -> Some(id)
       }
-      Model(..model, reacting_to: next)
+      #(Model(..model, reacting_to: next), effect.none())
     }
     AddReaction(id, emoji) -> {
       let current = case dict.get(model.reactions, id) {
@@ -100,14 +292,19 @@ fn update(model: Model, msg: Msg) -> Model {
         Error(_) -> []
       }
       let next = toggle_reaction(current, emoji)
-      Model(
-        ..model,
-        reactions: dict.insert(model.reactions, id, next),
-        reacting_to: None,
-      )
+      let new_model =
+        Model(
+          ..model,
+          reactions: dict.insert(model.reactions, id, next),
+          reacting_to: None,
+        )
+      #(new_model, effect.none())
     }
-    OpenDetail(id) -> Model(..model, detail_msg_id: Some(id), reacting_to: None)
-    CloseDetail -> Model(..model, detail_msg_id: None)
+    OpenDetail(id) -> #(
+      Model(..model, detail_msg_id: Some(id), reacting_to: None),
+      effect.none(),
+    )
+    CloseDetail -> #(Model(..model, detail_msg_id: None), effect.none())
   }
 }
 
@@ -151,16 +348,26 @@ fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
 
 fn view(model: Model) -> Element(Msg) {
   let palette = theme.palette_for(model.mode)
-  let rs = fixture.rooms()
-  let room = case current_room(rs, model.current_room) {
-    Some(r) -> r
-    None -> {
-      // Fixture has at least one room; this branch is unreachable but
-      // gives the compiler a fallback so the view stays total.
-      let assert [first, ..] = rs
-      first
-    }
+  case model.view {
+    LandingView ->
+      landing.view(
+        palette: palette,
+        mode: model.mode,
+        input: model.landing_input,
+        noop: NoOp,
+        on_input: UpdateLandingInput,
+        on_join: JoinRoom,
+        on_toggle_mode: ToggleMode,
+      )
+    RoomView(name) -> room_view(model, palette, name)
   }
+}
+
+fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
+  let displayed_rooms = resolve_rooms(model.joined_rooms)
+  let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
+  let active_room = lookup_room(displayed_rooms, current_name)
+
   let raw_messages = fixture.messages()
   let messages_with_live_reactions =
     list.map(raw_messages, fn(m) {
@@ -183,15 +390,23 @@ fn view(model: Model) -> Element(Msg) {
     ToggleMode,
     rooms.view(
       palette: palette,
-      rooms: rs,
-      current_room: model.current_room,
+      rooms: filtered,
+      current_room: RoomId(current_name),
       collapsed: model.rooms_collapsed,
-      on_select_room: SelectRoom,
+      search: model.sidebar_search,
+      noop: NoOp,
+      on_select_room: fn(id) {
+        let RoomId(name) = id
+        JoinRoom(name)
+      },
+      on_search_change: UpdateSidebarSearch,
+      on_join: JoinRoom,
+      on_delete: DeleteRoom,
       toggle: ToggleRoomsRail,
     ),
     channels.view(
       palette: palette,
-      room: room,
+      room: active_room,
       channels: fixture.channels(),
       members: fixture.members(),
       current_channel: model.current_channel,
@@ -217,9 +432,53 @@ fn view(model: Model) -> Element(Msg) {
   )
 }
 
-fn current_room(rs: List(Room), id: RoomId) -> Option(Room) {
-  list.find(rs, fn(r) { r.id == id })
-  |> option.from_result
+fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
+  let needle = string.lowercase(string.trim(search))
+  case needle {
+    "" -> rs
+    _ ->
+      list.filter(rs, fn(r) {
+        string.contains(does: string.lowercase(r.name), contain: needle)
+      })
+  }
+}
+
+/// Resolve a list of joined room names to rich Room records. Names
+/// that match a fixture room reuse its mock data; anything else falls
+/// back to a synthetic Room so the rail still renders something useful.
+fn resolve_rooms(names: List(String)) -> List(Room) {
+  let fixture_rooms = fixture.rooms()
+  list.map(names, fn(name) {
+    case list.find(fixture_rooms, fn(r) { r.name == name }) {
+      Ok(r) -> Room(..r, id: RoomId(name))
+      Error(_) -> synthetic_room(name)
+    }
+  })
+}
+
+fn lookup_room(rs: List(Room), name: String) -> Room {
+  case list.find(rs, fn(r) { r.name == name }) {
+    Ok(r) -> r
+    Error(_) -> synthetic_room(name)
+  }
+}
+
+/// Default Room record for a name we have no fixture entry for. Reads
+/// like a freshly-joined room with no observed activity yet.
+fn synthetic_room(name: String) -> Room {
+  let _ = NoRelay
+  let _ = Reconnecting
+  Room(
+    id: RoomId(name),
+    name: name,
+    members: 1,
+    online: 1,
+    in_call: 0,
+    status: domain.Connected,
+    last_active: "now",
+    unread: 0,
+    bridge: NoBridge,
+  )
 }
 
 fn find_message(ms: List(Message), id: String) -> Option(Message) {

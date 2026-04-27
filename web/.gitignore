@@ -3,3 +3,7 @@ dist/
 node_modules/
 playwright-report/
 test-results/
+
+#Added automatically by Lustre Dev Tools
+/.lustre
+/dist

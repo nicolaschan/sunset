@@ -93,6 +93,16 @@ fn global_reset() -> Element(msg) {
      .msg-row.is-active .msg-actions {
        opacity: 1;
        pointer-events: auto;
+     }
+     .room-row .room-delete {
+       opacity: 0;
+       pointer-events: none;
+       transition: opacity 120ms ease;
+     }
+     .room-row:hover .room-delete,
+     .room-row:focus-within .room-delete {
+       opacity: 1;
+       pointer-events: auto;
      }",
   )
 }
