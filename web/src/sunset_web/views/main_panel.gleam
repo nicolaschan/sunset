@@ -559,6 +559,7 @@ fn reactions_row(p: Palette, rs: List(Reaction)) -> Element(msg) {
         #("flex-wrap", "wrap"),
         #("gap", "4px"),
         #("margin-top", "4px"),
+        #("margin-bottom", "4px"),
       ]),
     ],
     list.map(rs, fn(r) { reaction_pill(p, r) }),
