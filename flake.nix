@@ -126,6 +126,8 @@
             pkgs.nodejs
             pkgs.bun
             pkgs.static-web-server
+            pkgs.wasm-bindgen-cli
+            pkgs.wasm-pack
           ];
           shellHook = ''
             ${if webHexDeps != null
