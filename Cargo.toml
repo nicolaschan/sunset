@@ -28,7 +28,8 @@ futures = "0.3"
 hex = "0.4"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
-snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-curve25519", "use-blake2", "use-chacha20poly1305"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-curve25519", "use-blake2", "use-chacha20poly1305", "use-xchacha20poly1305", "use-getrandom"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
