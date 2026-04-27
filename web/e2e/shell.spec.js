@@ -87,6 +87,44 @@ test("theme toggle flips light to dark", async ({ page }) => {
   });
 });
 
+test("theme choice persists across reloads", async ({ page }) => {
+  const toggle = page.getByTestId("theme-toggle");
+  // Start in light mode (the default for this beforeEach setup).
+  await expect(toggle).toHaveAttribute("title", /dark/i);
+
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("title", /light/i);
+
+  // Reload — saved theme should be restored.
+  await page.reload();
+  await expect(page.getByTestId("theme-toggle")).toHaveAttribute(
+    "title",
+    /light/i,
+  );
+});
+
+test.describe("system theme default", () => {
+  test.use({ colorScheme: "dark" });
+
+  test("with no saved choice, the OS dark preference wins", async ({
+    page,
+  }) => {
+    // Use a dedicated emulated colorScheme + an isolated localStorage.
+    await page.goto("/");
+    await page.evaluate(() => {
+      try {
+        localStorage.clear();
+      } catch {}
+    });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByText("sunset", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("theme-toggle")).toHaveAttribute(
+      "title",
+      /light/i,
+    );
+  });
+});
+
 test("rooms rail collapse button changes the rail width", async ({ page }) => {
   const collapse = page.getByRole("button", { name: /Collapse rooms/i });
   const rail = page.getByTestId("rooms-rail");
