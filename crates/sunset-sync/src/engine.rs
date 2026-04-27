@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::message::{DigestRange, SyncMessage};
 use crate::peer::{InboundEvent, run_peer};
 use crate::reserved;
+use crate::signer::Signer;
 use crate::subscription_registry::{SubscriptionRegistry, parse_subscription_entry};
 use crate::transport::{Transport, TransportConnection};
 use crate::types::{PeerAddr, PeerId, SyncConfig, TrustSet};
@@ -51,6 +52,7 @@ pub struct SyncEngine<S: Store, T: Transport> {
     /// Local peer's identity. Required for signing `_sunset-sync/subscribe`
     /// entries.
     pub(crate) local_peer: PeerId,
+    pub(crate) signer: Arc<dyn Signer>,
     pub(crate) state: Arc<Mutex<EngineState>>,
     pub(crate) cmd_tx: mpsc::UnboundedSender<EngineCommand>,
     /// Held inside `run()`. `new()` creates the (tx, rx) pair; `run()`
@@ -62,13 +64,20 @@ impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T>
 where
     T::Connection: 'static,
 {
-    pub fn new(store: Arc<S>, transport: T, config: SyncConfig, local_peer: PeerId) -> Self {
+    pub fn new(
+        store: Arc<S>,
+        transport: T,
+        config: SyncConfig,
+        local_peer: PeerId,
+        signer: Arc<dyn Signer>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         Self {
             store,
             transport: Arc::new(transport),
             config,
             local_peer,
+            signer,
             state: Arc::new(Mutex::new(EngineState {
                 trust: TrustSet::default(),
                 registry: SubscriptionRegistry::new(),
@@ -93,11 +102,6 @@ where
     /// under `(local_peer, "_sunset-sync/subscribe")` with `value_hash =
     /// blake3(postcard(filter))` and priority = unix-timestamp-now,
     /// expires_at = priority + ttl.
-    ///
-    /// **Note:** v1 uses a stub signature (empty bytes) — the
-    /// `sunset_store::AcceptAllVerifier` accepts everything. When a real
-    /// signing scheme lands (sunset-core / identity subsystem), this
-    /// function will sign the entry with the local key.
     pub async fn publish_subscription(
         &self,
         filter: Filter,
@@ -514,6 +518,7 @@ where
         filter: Filter,
         ttl: std::time::Duration,
     ) -> Result<()> {
+        use sunset_store::canonical::signing_payload;
         use sunset_store::{ContentBlock, SignedKvEntry};
 
         let value = postcard::to_stdvec(&filter)
@@ -526,15 +531,16 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let entry = SignedKvEntry {
+        let mut entry = SignedKvEntry {
             verifying_key: self.local_peer.0.clone(),
             name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
             value_hash: block.hash(),
             priority: now_secs,
             expires_at: Some(now_secs.saturating_add(ttl.as_secs())),
-            // v1 stub signature; real signing lands in identity subsystem.
             signature: Bytes::new(),
         };
+        let payload = signing_payload(&entry);
+        entry.signature = self.signer.sign(&payload);
         self.store.insert(entry, Some(block)).await?;
         Ok(())
     }
@@ -547,10 +553,27 @@ mod tests {
     use sunset_store::VerifyingKey;
     use sunset_store_memory::MemoryStore;
 
+    use crate::Signer;
     use crate::test_transport::{TestNetwork, TestTransport};
 
     fn vk(b: &[u8]) -> VerifyingKey {
         VerifyingKey::new(Bytes::copy_from_slice(b))
+    }
+
+    /// Test-only signer that returns a non-empty stub signature. Adequate when
+    /// the receiving store uses `AcceptAllVerifier`.
+    struct StubSigner {
+        vk: VerifyingKey,
+    }
+
+    impl Signer for StubSigner {
+        fn verifying_key(&self) -> VerifyingKey {
+            self.vk.clone()
+        }
+
+        fn sign(&self, _payload: &[u8]) -> Bytes {
+            Bytes::from_static(&[0u8; 64])
+        }
     }
 
     fn make_engine(addr: &str, peer_label: &[u8]) -> SyncEngine<MemoryStore, TestTransport> {
@@ -561,7 +584,10 @@ mod tests {
             PeerAddr::new(Bytes::copy_from_slice(addr.as_bytes())),
         );
         let store = Arc::new(MemoryStore::with_accept_all());
-        SyncEngine::new(store, transport, SyncConfig::default(), local_peer)
+        let signer = Arc::new(StubSigner {
+            vk: local_peer.0.clone(),
+        });
+        SyncEngine::new(store, transport, SyncConfig::default(), local_peer, signer)
     }
 
     #[tokio::test(flavor = "current_thread")]

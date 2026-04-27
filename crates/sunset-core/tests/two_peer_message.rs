@@ -19,16 +19,33 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use rand_core::OsRng;
 
 use sunset_core::crypto::constants::test_fast_params;
 use sunset_core::{
     ComposedMessage, Identity, Room, compose_message, decode_message, room_messages_filter,
 };
-use sunset_store::{ContentBlock, Hash, Store as _};
+use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::test_transport::TestNetwork;
-use sunset_sync::{PeerAddr, PeerId, SyncConfig, SyncEngine};
+use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
+
+/// Test-only signer that returns a non-empty stub signature. Adequate when
+/// the receiving store uses `AcceptAllVerifier`.
+struct StubSigner {
+    vk: VerifyingKey,
+}
+
+impl Signer for StubSigner {
+    fn verifying_key(&self) -> VerifyingKey {
+        self.vk.clone()
+    }
+
+    fn sign(&self, _payload: &[u8]) -> Bytes {
+        Bytes::from_static(&[0u8; 64])
+    }
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn alice_encrypts_bob_decrypts() {
@@ -56,17 +73,26 @@ async fn alice_encrypts_bob_decrypts() {
             let alice_transport = net.transport(alice_peer.clone(), alice_addr.clone());
             let bob_transport = net.transport(bob_peer.clone(), bob_addr.clone());
 
+            let alice_signer = Arc::new(StubSigner {
+                vk: alice_peer.0.clone(),
+            });
+            let bob_signer = Arc::new(StubSigner {
+                vk: bob_peer.0.clone(),
+            });
+
             let alice_engine = Rc::new(SyncEngine::new(
                 alice_store.clone(),
                 alice_transport,
                 SyncConfig::default(),
                 alice_peer.clone(),
+                alice_signer,
             ));
             let bob_engine = Rc::new(SyncEngine::new(
                 bob_store.clone(),
                 bob_transport,
                 SyncConfig::default(),
                 bob_peer.clone(),
+                bob_signer,
             ));
 
             let alice_run = tokio::task::spawn_local({
