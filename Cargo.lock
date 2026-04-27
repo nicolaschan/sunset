@@ -1088,6 +1088,7 @@ dependencies = [
 name = "sunset-core-wasm"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "postcard",
  "rand_chacha",
  "rand_core",
