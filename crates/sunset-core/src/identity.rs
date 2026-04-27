@@ -30,12 +30,16 @@ impl std::fmt::Debug for Identity {
 impl Identity {
     /// Generate a fresh identity from the supplied RNG.
     pub fn generate<R: CryptoRngCore + ?Sized>(rng: &mut R) -> Self {
-        Self { signing: SigningKey::generate(rng) }
+        Self {
+            signing: SigningKey::generate(rng),
+        }
     }
 
     /// Reconstruct an identity from its 32-byte secret seed.
     pub fn from_secret_bytes(bytes: &[u8; 32]) -> Self {
-        Self { signing: SigningKey::from_bytes(bytes) }
+        Self {
+            signing: SigningKey::from_bytes(bytes),
+        }
     }
 
     /// Export the 32-byte secret seed.
@@ -45,7 +49,9 @@ impl Identity {
 
     /// Public half of this identity.
     pub fn public(&self) -> IdentityKey {
-        IdentityKey { verifying: self.signing.verifying_key() }
+        IdentityKey {
+            verifying: self.signing.verifying_key(),
+        }
     }
 
     /// Convenience: the public half encoded as a `sunset_store::VerifyingKey`.
@@ -68,7 +74,9 @@ pub struct IdentityKey {
 impl IdentityKey {
     /// Parse a 32-byte Ed25519 verifying key.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self> {
-        Ok(Self { verifying: DalekVerifyingKey::from_bytes(bytes)? })
+        Ok(Self {
+            verifying: DalekVerifyingKey::from_bytes(bytes)?,
+        })
     }
 
     /// Raw 32-byte encoding.
@@ -84,12 +92,12 @@ impl IdentityKey {
     /// Inverse of `store_verifying_key`.
     pub fn from_store_verifying_key(vk: &StoreVerifyingKey) -> Result<Self> {
         let bytes: &[u8] = vk.as_bytes();
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| Error::BadName(format!(
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            Error::BadName(format!(
                 "verifying key must be 32 bytes, got {}",
                 bytes.len(),
-            )))?;
+            ))
+        })?;
         Self::from_bytes(&arr)
     }
 
