@@ -67,7 +67,7 @@ impl Room {
 
         // 2. room_fingerprint = blake3.keyed_hash(K_room, FINGERPRINT_DOMAIN).
         let fingerprint =
-            RoomFingerprint(*blake3::keyed_hash(&*k_room, FINGERPRINT_DOMAIN).as_bytes());
+            RoomFingerprint(*blake3::keyed_hash(&k_room, FINGERPRINT_DOMAIN).as_bytes());
 
         // 3. K_epoch_0 = HKDF-SHA256(K_room, info = EPOCH_0_DOMAIN, 32 bytes).
         let mut epoch_0_root = Zeroizing::new([0u8; 32]);
