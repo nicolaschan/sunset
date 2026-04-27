@@ -3,11 +3,9 @@
 //! Wrap with `sunset_noise::NoiseTransport` to get authenticated
 //! encrypted connections suitable for `SyncEngine`.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
@@ -16,35 +14,45 @@ use sunset_sync::{
     Error as SyncError, PeerAddr, RawConnection, RawTransport, Result as SyncResult,
 };
 
-// Unified stream type covering both dial (MaybeTlsStream) and accept (plain TcpStream).
-enum WsStream {
-    Client(WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>),
-    Server(WebSocketStream<tokio::net::TcpStream>),
+// ---- split sink type ----
+
+enum WsSink {
+    Client(SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>),
+    Server(SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>),
 }
 
-impl WsStream {
+impl WsSink {
     async fn send(&mut self, msg: Message) -> Result<(), tokio_tungstenite::tungstenite::Error> {
         match self {
-            WsStream::Client(s) => s.send(msg).await,
-            WsStream::Server(s) => s.send(msg).await,
-        }
-    }
-
-    async fn next(&mut self) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
-        match self {
-            WsStream::Client(s) => s.next().await,
-            WsStream::Server(s) => s.next().await,
+            WsSink::Client(s) => s.send(msg).await,
+            WsSink::Server(s) => s.send(msg).await,
         }
     }
 
     async fn close(&mut self) {
         match self {
-            WsStream::Client(s) => {
-                s.close(None).await.ok();
+            WsSink::Client(s) => {
+                s.close().await.ok();
             }
-            WsStream::Server(s) => {
-                s.close(None).await.ok();
+            WsSink::Server(s) => {
+                s.close().await.ok();
             }
+        }
+    }
+}
+
+// ---- split stream type ----
+
+enum WsStream {
+    Client(SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
+    Server(SplitStream<WebSocketStream<tokio::net::TcpStream>>),
+}
+
+impl WsStream {
+    async fn next(&mut self) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
+        match self {
+            WsStream::Client(s) => s.next().await,
+            WsStream::Server(s) => s.next().await,
         }
     }
 }
@@ -101,7 +109,11 @@ impl RawTransport for WebSocketRawTransport {
         let (ws, _resp) = tokio_tungstenite::connect_async(url.as_str())
             .await
             .map_err(|e| SyncError::Transport(format!("ws connect: {e}")))?;
-        Ok(WebSocketRawConnection::new(WsStream::Client(ws)))
+        let (sink, stream) = ws.split();
+        Ok(WebSocketRawConnection::new(
+            WsSink::Client(sink),
+            WsStream::Client(stream),
+        ))
     }
 
     async fn accept(&self) -> SyncResult<Self::Connection> {
@@ -120,18 +132,27 @@ impl RawTransport for WebSocketRawTransport {
         let ws = tokio_tungstenite::accept_async(tcp)
             .await
             .map_err(|e| SyncError::Transport(format!("ws upgrade: {e}")))?;
-        Ok(WebSocketRawConnection::new(WsStream::Server(ws)))
+        let (sink, stream) = ws.split();
+        Ok(WebSocketRawConnection::new(
+            WsSink::Server(sink),
+            WsStream::Server(stream),
+        ))
     }
 }
 
 pub struct WebSocketRawConnection {
-    stream: Arc<Mutex<WsStream>>,
+    /// Write side — protected by its own mutex so send and recv can run
+    /// concurrently without blocking each other.
+    sink: Mutex<WsSink>,
+    /// Read side — protected by its own mutex.
+    stream: Mutex<WsStream>,
 }
 
 impl WebSocketRawConnection {
-    fn new(ws: WsStream) -> Self {
+    fn new(sink: WsSink, stream: WsStream) -> Self {
         Self {
-            stream: Arc::new(Mutex::new(ws)),
+            sink: Mutex::new(sink),
+            stream: Mutex::new(stream),
         }
     }
 }
@@ -139,7 +160,7 @@ impl WebSocketRawConnection {
 #[async_trait(?Send)]
 impl RawConnection for WebSocketRawConnection {
     async fn send_reliable(&self, bytes: Bytes) -> SyncResult<()> {
-        let mut s = self.stream.lock().await;
+        let mut s = self.sink.lock().await;
         s.send(Message::Binary(bytes.to_vec()))
             .await
             .map_err(|e| SyncError::Transport(format!("ws send: {e}")))
@@ -147,16 +168,19 @@ impl RawConnection for WebSocketRawConnection {
 
     async fn recv_reliable(&self) -> SyncResult<Bytes> {
         loop {
-            let mut s = self.stream.lock().await;
-            let msg = s
-                .next()
-                .await
-                .ok_or_else(|| SyncError::Transport("ws closed".into()))?
-                .map_err(|e| SyncError::Transport(format!("ws recv: {e}")))?;
+            let msg = {
+                let mut s = self.stream.lock().await;
+                s.next()
+                    .await
+                    .ok_or_else(|| SyncError::Transport("ws closed".into()))?
+                    .map_err(|e| SyncError::Transport(format!("ws recv: {e}")))?
+            };
             match msg {
                 Message::Binary(b) => return Ok(Bytes::from(b)),
-                Message::Ping(p) => {
-                    s.send(Message::Pong(p)).await.ok();
+                Message::Ping(_) => {
+                    // WebSocket ping: the tungstenite library auto-responds with
+                    // Pong in most configurations; we just skip and keep reading.
+                    continue;
                 }
                 Message::Pong(_) => continue,
                 Message::Close(_) => {
@@ -182,7 +206,7 @@ impl RawConnection for WebSocketRawConnection {
     }
 
     async fn close(&self) -> SyncResult<()> {
-        let mut s = self.stream.lock().await;
+        let mut s = self.sink.lock().await;
         s.close().await;
         Ok(())
     }

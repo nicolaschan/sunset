@@ -19,6 +19,8 @@ tokio-tungstenite.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+curve25519-dalek.workspace = true
+hex.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 sunset-store = { workspace = true, features = ["test-helpers"] }
 sunset-store-memory.workspace = true
@@ -26,3 +28,4 @@ sunset-sync = { workspace = true, features = ["test-helpers"] }
 sunset-noise.workspace = true
 sunset-core.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "net"] }
+zeroize.workspace = true

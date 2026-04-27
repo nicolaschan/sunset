@@ -16,7 +16,7 @@ use crate::peer::{InboundEvent, run_peer};
 use crate::reserved;
 use crate::signer::Signer;
 use crate::subscription_registry::{SubscriptionRegistry, parse_subscription_entry};
-use crate::transport::{Transport, TransportConnection};
+use crate::transport::Transport;
 use crate::types::{PeerAddr, PeerId, SyncConfig, TrustSet};
 
 /// A command sent from the public API into the running engine.
@@ -245,26 +245,28 @@ where
         let local_peer = self.local_peer.clone();
         let proto = self.config.protocol_version;
 
-        // Register the outbound sender under the connection's peer_id. For
-        // the TestTransport this is the peer's actual identity (the network
-        // tracks addr -> peer_id). For production transports that don't
-        // surface peer_id until after a handshake, the connection should
-        // either delay TransportConnection::peer_id() until it's authoritative
-        // or accept a re-key on PeerHello — handle that when those transports
-        // are added.
-        let peer_id = conn.peer_id();
-        self.state
-            .lock()
-            .await
-            .peer_outbound
-            .insert(peer_id, out_tx);
-
-        tokio::task::spawn_local(run_peer(conn, local_peer, proto, out_rx, inbound_tx));
+        // `peer_outbound` is registered when the remote's Hello arrives (in
+        // `handle_inbound_event`), keyed by the Hello-declared peer_id. This
+        // ensures the outbound key matches what the subscription registry uses
+        // (both are keyed by the application-layer identity the remote
+        // declared in its Hello, which may differ from the transport-layer
+        // routing identity returned by `conn.peer_id()`).
+        tokio::task::spawn_local(run_peer(
+            conn, local_peer, proto, out_tx, out_rx, inbound_tx,
+        ));
     }
 
     async fn handle_inbound_event(&self, event: InboundEvent) {
         match event {
-            InboundEvent::PeerHello { peer_id } => {
+            InboundEvent::PeerHello { peer_id, out_tx } => {
+                // Register the outbound sender under the Hello-declared peer_id.
+                // This key matches what the subscription registry uses, so push
+                // routing can find the sender correctly.
+                self.state
+                    .lock()
+                    .await
+                    .peer_outbound
+                    .insert(peer_id.clone(), out_tx);
                 // Fire bootstrap digest exchange on the subscribe namespace.
                 self.send_bootstrap_digest(&peer_id).await;
             }
@@ -532,7 +534,7 @@ where
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut entry = SignedKvEntry {
-            verifying_key: self.local_peer.0.clone(),
+            verifying_key: self.signer.verifying_key(),
             name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
             value_hash: block.hash(),
             priority: now_secs,
