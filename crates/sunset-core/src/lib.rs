@@ -14,4 +14,5 @@ pub mod identity;
 pub mod message;
 pub mod verifier;
 
+pub use crypto::room::{Room, RoomFingerprint};
 pub use error::{Error, Result};
