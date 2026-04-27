@@ -33,6 +33,7 @@ import sunset_web/views/main_panel
 import sunset_web/views/members
 import sunset_web/views/rooms
 import sunset_web/views/shell
+import sunset_web/views/voice_popover
 
 pub type View {
   LandingView
@@ -58,6 +59,12 @@ pub type Model {
     /// Name of the room currently hovered over while dragging — used
     /// for the visible drop-target indicator.
     drag_over_room: Option(String),
+    /// Member name whose voice popover is currently open. None when
+    /// no popover is showing.
+    voice_popover: Option(String),
+    /// Per-member voice tweaks (volume / denoise / deafened),
+    /// keyed by member name. Seeded from the fixture once.
+    voice_settings: Dict(String, domain.VoiceSettings),
   )
 }
 
@@ -82,6 +89,12 @@ pub type Msg {
   AddReaction(String, String)
   OpenDetail(String)
   CloseDetail
+  OpenVoicePopover(String)
+  CloseVoicePopover
+  SetMemberVolume(String, Int)
+  ToggleMemberDenoise(String)
+  ToggleMemberDeafen(String)
+  ResetMemberVoice(String)
 }
 
 pub fn main() {
@@ -138,6 +151,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       reactions: seed_reactions(),
       dragging_room: None,
       drag_over_room: None,
+      voice_popover: None,
+      voice_settings: seed_voice_settings(),
     )
 
   let subscribe_hash =
@@ -164,6 +179,34 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   }
 
   #(model, effect.batch([subscribe_hash, initial_persist, initial_hash_sync]))
+}
+
+/// Seed per-member voice tweaks for every in-call member: full
+/// volume, denoise on, not locally muted. Keyed by member name so
+/// callers don't need to thread MemberId through the popover wiring.
+fn seed_voice_settings() -> Dict(String, domain.VoiceSettings) {
+  fixture.members()
+  |> list.fold(dict.new(), fn(d, m) {
+    case m.in_call {
+      True ->
+        dict.insert(
+          d,
+          m.name,
+          domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
+        )
+      False -> d
+    }
+  })
+}
+
+fn member_voice_settings(
+  settings: Dict(String, domain.VoiceSettings),
+  name: String,
+) -> domain.VoiceSettings {
+  case dict.get(settings, name) {
+    Ok(s) -> s
+    Error(_) -> domain.VoiceSettings(volume: 100, denoise: True, deafened: False)
+  }
 }
 
 fn seed_reactions() -> Dict(String, List(Reaction)) {
@@ -404,6 +447,58 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
     CloseDetail -> #(Model(..model, detail_msg_id: None), effect.none())
+    OpenVoicePopover(name) -> #(
+      Model(..model, voice_popover: Some(name)),
+      effect.none(),
+    )
+    CloseVoicePopover -> #(
+      Model(..model, voice_popover: None),
+      effect.none(),
+    )
+    SetMemberVolume(name, value) -> {
+      let settings = member_voice_settings(model.voice_settings, name)
+      let next = domain.VoiceSettings(..settings, volume: value)
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(model.voice_settings, name, next),
+        ),
+        effect.none(),
+      )
+    }
+    ToggleMemberDenoise(name) -> {
+      let settings = member_voice_settings(model.voice_settings, name)
+      let next = domain.VoiceSettings(..settings, denoise: !settings.denoise)
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(model.voice_settings, name, next),
+        ),
+        effect.none(),
+      )
+    }
+    ToggleMemberDeafen(name) -> {
+      let settings = member_voice_settings(model.voice_settings, name)
+      let next = domain.VoiceSettings(..settings, deafened: !settings.deafened)
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(model.voice_settings, name, next),
+        ),
+        effect.none(),
+      )
+    }
+    ResetMemberVoice(name) -> #(
+      Model(
+        ..model,
+        voice_settings: dict.insert(
+          model.voice_settings,
+          name,
+          domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
+        ),
+      ),
+      effect.none(),
+    )
   }
 }
 
@@ -516,7 +611,9 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       channels: fixture.channels(),
       members: fixture.members(),
       current_channel: model.current_channel,
+      voice_popover_open: model.voice_popover,
       on_select_channel: SelectChannel,
+      on_open_voice_popover: OpenVoicePopover,
     ),
     main_panel.view(
       palette: palette,
@@ -535,7 +632,29 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
         details_panel.view(palette: palette, message: m, on_close: CloseDetail)
       None -> members.view(palette: palette, members: fixture.members())
     },
+    voice_popover_overlay(palette, model),
   )
+}
+
+fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
+  case model.voice_popover {
+    None -> element.fragment([])
+    Some(name) ->
+      case list.find(fixture.members(), fn(m) { m.name == name }) {
+        Error(_) -> element.fragment([])
+        Ok(m) ->
+          voice_popover.view(
+            palette: palette,
+            member: m,
+            settings: member_voice_settings(model.voice_settings, name),
+            on_close: CloseVoicePopover,
+            on_set_volume: fn(v) { SetMemberVolume(name, v) },
+            on_toggle_denoise: ToggleMemberDenoise(name),
+            on_toggle_deafen: ToggleMemberDeafen(name),
+            on_reset: ResetMemberVoice(name),
+          )
+      }
+  }
 }
 
 fn filter_rooms(rs: List(Room), search: String) -> List(Room) {

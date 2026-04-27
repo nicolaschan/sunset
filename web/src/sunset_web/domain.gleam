@@ -125,6 +125,22 @@ pub type DetailsOpt {
   NoDetails
 }
 
+/// Per-recipient voice tweaks the local user has applied to a peer
+/// in an active call. Mutated via the voice-member popover.
+pub type VoiceSettings {
+  VoiceSettings(
+    /// Playback volume for this peer's incoming stream as a percent.
+    /// 100 = unity. For other peers we allow 0-200%; for the user's
+    /// own outgoing channel the popover narrows the slider to 0-100%.
+    volume: Int,
+    /// Whether incoming-stream denoising is enabled for this peer.
+    denoise: Bool,
+    /// Whether this peer is muted locally ("mute for me"). Doesn't
+    /// affect anyone else.
+    deafened: Bool,
+  )
+}
+
 pub type Message {
   Message(
     id: String,

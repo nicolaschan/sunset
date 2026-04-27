@@ -20,6 +20,7 @@ pub fn view(
   channels: Element(msg),
   main: Element(msg),
   right_rail: Element(msg),
+  overlay: Element(msg),
 ) -> Element(msg) {
   let rooms_col = case rooms_collapsed {
     True -> "54px"
@@ -65,6 +66,7 @@ pub fn view(
         ],
       ),
       theme_toggle(mode, palette, toggle_mode),
+      overlay,
     ],
   )
 }

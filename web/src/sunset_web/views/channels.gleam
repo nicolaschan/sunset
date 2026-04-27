@@ -23,7 +23,9 @@ pub fn view(
   channels cs: List(Channel),
   members ms: List(Member),
   current_channel cur: ChannelId,
+  voice_popover_open voice_popover_open: Option(String),
   on_select_channel sel: fn(ChannelId) -> msg,
+  on_open_voice_popover on_open_voice_popover: fn(String) -> msg,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
@@ -75,7 +77,9 @@ pub fn view(
             p,
             "Voice",
             list.flatten([
-              list.map(voice_channels, fn(c) { voice_block(p, c, in_call) }),
+              list.map(voice_channels, fn(c) {
+                voice_block(p, c, in_call, voice_popover_open, on_open_voice_popover)
+              }),
             ]),
           ),
           case bridge_channels {
@@ -220,11 +224,20 @@ fn voice_block(
   p: Palette,
   c: Channel,
   in_call_members: List(Member),
+  popover_open: Option(String),
+  on_open_voice_popover: fn(String) -> msg,
 ) -> Element(msg) {
   let is_live = c.in_call > 0
   case is_live {
     False -> idle_voice_row(p, c)
-    True -> live_voice_block(p, c, in_call_members)
+    True ->
+      live_voice_block(
+        p,
+        c,
+        in_call_members,
+        popover_open,
+        on_open_voice_popover,
+      )
   }
 }
 
@@ -262,7 +275,13 @@ fn idle_voice_row(p: Palette, c: Channel) -> Element(msg) {
   )
 }
 
-fn live_voice_block(p: Palette, c: Channel, ms: List(Member)) -> Element(msg) {
+fn live_voice_block(
+  p: Palette,
+  c: Channel,
+  ms: List(Member),
+  popover_open: Option(String),
+  on_open_voice_popover: fn(String) -> msg,
+) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -313,7 +332,9 @@ fn live_voice_block(p: Palette, c: Channel, ms: List(Member)) -> Element(msg) {
         ],
         list.flatten([
           [connector_line(p)],
-          list.map(ms, fn(m) { voice_member_row(p, m) }),
+          list.map(ms, fn(m) {
+            voice_member_row(p, m, popover_open, on_open_voice_popover)
+          }),
         ]),
       ),
     ],
@@ -341,7 +362,12 @@ fn connector_line(p: Palette) -> Element(msg) {
   )
 }
 
-fn voice_member_row(p: Palette, m: Member) -> Element(msg) {
+fn voice_member_row(
+  p: Palette,
+  m: Member,
+  popover_open: Option(String),
+  on_open_voice_popover: fn(String) -> msg,
+) -> Element(msg) {
   let dot_color = case m.status {
     MutedP -> p.text_faint
     Speaking -> p.live
@@ -349,15 +375,32 @@ fn voice_member_row(p: Palette, m: Member) -> Element(msg) {
   }
   let speaking = m.status == Speaking
   let muted = m.status == MutedP
-  html.div(
+  let active = case popover_open {
+    Some(name) -> name == m.name
+    None -> False
+  }
+  let bg = case active {
+    True -> p.surface
+    False -> "transparent"
+  }
+  html.button(
     [
+      attribute.attribute("data-testid", "voice-member"),
+      attribute.attribute("data-voice-name", m.name),
+      event.on_click(on_open_voice_popover(m.name)),
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),
         #("gap", "8px"),
         #("padding", "4px 6px"),
         #("border-radius", "4px"),
+        #("border", "none"),
+        #("background", bg),
+        #("color", p.text),
+        #("text-align", "left"),
+        #("font-family", "inherit"),
         #("font-size", "15.625px"),
+        #("cursor", "pointer"),
       ]),
     ],
     [
