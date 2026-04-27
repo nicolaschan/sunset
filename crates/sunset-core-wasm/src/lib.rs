@@ -38,6 +38,7 @@ fn require_32(label: &str, slice: &[u8]) -> Result<[u8; 32], JsError> {
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen]
+#[derive(Debug)]
 pub struct GeneratedIdentity {
     #[wasm_bindgen(getter_with_clone)]
     pub secret: Vec<u8>,
@@ -153,6 +154,7 @@ pub fn compose_message(
 }
 
 #[wasm_bindgen]
+#[derive(Debug)]
 pub struct DecodedMessage {
     #[wasm_bindgen(getter_with_clone)]
     pub author_pubkey: Vec<u8>,
