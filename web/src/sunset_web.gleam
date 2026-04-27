@@ -52,6 +52,12 @@ pub type Model {
     reacting_to: Option(String),
     detail_msg_id: Option(String),
     reactions: Dict(String, List(Reaction)),
+    /// Name of the room currently being dragged in the rooms rail.
+    /// `None` between drag operations.
+    dragging_room: Option(String),
+    /// Name of the room currently hovered over while dragging — used
+    /// for the visible drop-target indicator.
+    drag_over_room: Option(String),
   )
 }
 
@@ -64,6 +70,11 @@ pub type Msg {
   JoinRoom(String)
   DeleteRoom(String)
   GoToLanding
+  DragRoomStart(String)
+  DragRoomOver(String)
+  DragRoomLeave(String)
+  DropRoomOn(String)
+  DragRoomEnd
   SelectChannel(ChannelId)
   ToggleRoomsRail
   UpdateDraft(String)
@@ -81,7 +92,6 @@ pub fn main() {
 
 fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   let stored_rooms = storage.read_joined_rooms()
-  let last_used = storage.read_last_used()
   let initial_hash = storage.read_hash()
   let initial_mode = case storage.read_saved_theme() {
     "dark" -> Dark
@@ -96,16 +106,16 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
 
   // Resolve the initial view + rooms list:
   //   * URL fragment wins if present.
-  //   * Otherwise fall back to the persisted last-used room.
+  //   * Otherwise fall back to the first joined room (the user's
+  //     stored ordering — head is the default).
   //   * Otherwise show the landing page.
-  // Direct-navigation to a room not yet in the joined list auto-joins
-  // it (so a shared link adds the room rather than dropping the user
-  // back to landing).
-  let initial_view = case initial_hash, last_used, stored_rooms {
-    "", "", _ -> LandingView
-    "", _, [] if last_used == "" -> LandingView
-    "", remembered, _ if remembered != "" -> RoomView(remembered)
-    name, _, _ -> RoomView(name)
+  // Direct-navigation to a room not yet in the joined list auto-adds
+  // it at the top, so a shared link behaves like a fresh "join new
+  // room" rather than dropping the user back to landing.
+  let initial_view = case initial_hash, stored_rooms {
+    "", [] -> LandingView
+    "", [first, ..] -> RoomView(first)
+    name, _ -> RoomView(name)
   }
 
   let joined = case initial_view {
@@ -126,6 +136,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       reacting_to: None,
       detail_msg_id: None,
       reactions: seed_reactions(),
+      dragging_room: None,
+      drag_over_room: None,
     )
 
   let subscribe_hash =
@@ -146,15 +158,9 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
     RoomView(name), "" ->
       effect.from(fn(_) {
         storage.set_hash(name)
-        storage.write_last_used(name)
         Nil
       })
-    RoomView(name), _ ->
-      effect.from(fn(_) {
-        storage.write_last_used(name)
-        Nil
-      })
-    LandingView, _ -> effect.none()
+    _, _ -> effect.none()
   }
 
   #(model, effect.batch([subscribe_hash, initial_persist, initial_hash_sync]))
@@ -165,12 +171,40 @@ fn seed_reactions() -> Dict(String, List(Reaction)) {
   |> list.fold(dict.new(), fn(d, m) { dict.insert(d, m.id, m.reactions) })
 }
 
-/// If joining a new room, add it to the head of the list.
-/// Otherwise, return the existing list preserving order.
+/// Add `name` to `existing` if it isn't already present (prepending
+/// at the head, which is where new rooms appear). If `name` is
+/// already in the list it is returned unchanged — selecting an
+/// existing room must NOT reorder the rail; only an explicit
+/// drag-drop reorders the user-managed list.
 fn ensure_joined(existing: List(String), name: String) -> List(String) {
   case list.contains(existing, name) {
     True -> existing
     False -> [name, ..existing]
+  }
+}
+
+/// Move `name` so it lands immediately before `target`. If `target`
+/// is the same as `name` (drop on self) the list is returned
+/// unchanged. If `name` is already adjacent above `target` the move
+/// is also a no-op.
+fn reorder_before(
+  rooms: List(String),
+  name: String,
+  target: String,
+) -> List(String) {
+  case name == target {
+    True -> rooms
+    False -> {
+      let without = list.filter(rooms, fn(r) { r != name })
+      list.flatten(
+        list.map(without, fn(r) {
+          case r == target {
+            True -> [name, r]
+            False -> [r]
+          }
+        }),
+      )
+    }
   }
 }
 
@@ -215,18 +249,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             Nil
           })
       }
-      let last_used_eff = case new_view {
-        RoomView(name) ->
-          effect.from(fn(_) {
-            storage.write_last_used(name)
-            Nil
-          })
-        LandingView -> effect.none()
-      }
-      #(
-        Model(..model, view: new_view, joined_rooms: new_rooms),
-        effect.batch([persisted, last_used_eff]),
-      )
+      #(Model(..model, view: new_view, joined_rooms: new_rooms), persisted)
     }
     UpdateLandingInput(s) -> #(Model(..model, landing_input: s), effect.none())
     UpdateSidebarSearch(s) -> #(
@@ -238,6 +261,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case name {
         "" -> #(model, effect.none())
         _ -> {
+          let was_new = !list.contains(model.joined_rooms, name)
           let new_rooms = ensure_joined(model.joined_rooms, name)
           let new_model =
             Model(
@@ -247,14 +271,23 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               landing_input: "",
               sidebar_search: "",
             )
+          let persist_eff = case was_new {
+            True ->
+              effect.from(fn(_) {
+                storage.write_joined_rooms(new_rooms)
+                Nil
+              })
+            False -> effect.none()
+          }
           #(
             new_model,
-            effect.from(fn(_) {
-              storage.write_joined_rooms(new_rooms)
-              storage.write_last_used(name)
-              storage.set_hash(name)
-              Nil
-            }),
+            effect.batch([
+              persist_eff,
+              effect.from(fn(_) {
+                storage.set_hash(name)
+                Nil
+              }),
+            ]),
           )
         }
       }
@@ -270,14 +303,9 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         True, [] -> LandingView
         False, _ -> model.view
       }
-      let new_last_used = case new_view {
-        RoomView(n) -> n
-        LandingView -> ""
-      }
       let persist =
         effect.from(fn(_) {
           storage.write_joined_rooms(new_rooms)
-          storage.write_last_used(new_last_used)
           case new_view {
             RoomView(n) -> storage.set_hash(n)
             LandingView -> storage.set_hash("")
@@ -294,6 +322,56 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         })
       #(Model(..model, view: LandingView), persist)
     }
+    DragRoomStart(name) -> #(
+      Model(..model, dragging_room: Some(name)),
+      effect.none(),
+    )
+    DragRoomOver(name) -> {
+      let next = case model.drag_over_room {
+        Some(current) if current == name -> model.drag_over_room
+        _ -> Some(name)
+      }
+      #(Model(..model, drag_over_room: next), effect.none())
+    }
+    DragRoomLeave(name) -> {
+      let next = case model.drag_over_room {
+        Some(current) if current == name -> None
+        _ -> model.drag_over_room
+      }
+      #(Model(..model, drag_over_room: next), effect.none())
+    }
+    DropRoomOn(target) -> {
+      case model.dragging_room {
+        None -> #(
+          Model(..model, drag_over_room: None),
+          effect.none(),
+        )
+        Some(src) -> {
+          let new_rooms = reorder_before(model.joined_rooms, src, target)
+          let persist = case new_rooms == model.joined_rooms {
+            True -> effect.none()
+            False ->
+              effect.from(fn(_) {
+                storage.write_joined_rooms(new_rooms)
+                Nil
+              })
+          }
+          #(
+            Model(
+              ..model,
+              joined_rooms: new_rooms,
+              dragging_room: None,
+              drag_over_room: None,
+            ),
+            persist,
+          )
+        }
+      }
+    }
+    DragRoomEnd -> #(
+      Model(..model, dragging_room: None, drag_over_room: None),
+      effect.none(),
+    )
     SelectChannel(id) -> #(Model(..model, current_channel: id), effect.none())
     ToggleRoomsRail -> #(
       Model(..model, rooms_collapsed: !model.rooms_collapsed),
@@ -416,6 +494,8 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       collapsed: model.rooms_collapsed,
       search: model.sidebar_search,
       noop: NoOp,
+      dragging: model.dragging_room,
+      drag_over: model.drag_over_room,
       on_select_room: fn(id) {
         let RoomId(name) = id
         JoinRoom(name)
@@ -423,6 +503,11 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_search_change: UpdateSidebarSearch,
       on_join: JoinRoom,
       on_delete: DeleteRoom,
+      on_drag_start: DragRoomStart,
+      on_drag_over: DragRoomOver,
+      on_drag_leave: DragRoomLeave,
+      on_drop: DropRoomOn,
+      on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
     ),
     channels.view(

@@ -6,12 +6,6 @@ pub fn read_joined_rooms() -> List(String)
 @external(javascript, "./storage.ffi.mjs", "writeJoinedRooms")
 pub fn write_joined_rooms(rooms: List(String)) -> Nil
 
-@external(javascript, "./storage.ffi.mjs", "readLastUsed")
-pub fn read_last_used() -> String
-
-@external(javascript, "./storage.ffi.mjs", "writeLastUsed")
-pub fn write_last_used(name: String) -> Nil
-
 @external(javascript, "./storage.ffi.mjs", "readHash")
 pub fn read_hash() -> String
 
