@@ -1,5 +1,6 @@
 //// Rooms rail (left column) — full and collapsed variants.
 
+import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/string
@@ -18,7 +19,12 @@ pub fn view(
   rooms rs: List(Room),
   current_room cur: RoomId,
   collapsed col: Bool,
+  search search_value: String,
+  noop noop: msg,
   on_select_room sel: fn(RoomId) -> msg,
+  on_search_change on_search_change: fn(String) -> msg,
+  on_join on_join: fn(String) -> msg,
+  on_delete on_delete: fn(String) -> msg,
   toggle toggle: msg,
 ) -> Element(msg) {
   let width = case col {
@@ -49,9 +55,9 @@ pub fn view(
       brand_row(p, col, toggle),
       case col {
         True -> element.fragment([])
-        False -> search(p)
+        False -> search_bar(p, search_value, noop, on_search_change, on_join)
       },
-      rooms_list(p, rs, cur, col, sel),
+      rooms_list(p, rs, cur, col, sel, on_delete),
       you_row(p, col),
     ],
   )
@@ -179,24 +185,94 @@ fn collapse_button(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
   )
 }
 
-fn search(p: Palette) -> Element(msg) {
-  html.div([ui.css([#("padding", "0 12px 8px 12px")])], [
-    html.input([
-      attribute.placeholder("Search rooms…"),
+fn search_bar(
+  p: Palette,
+  value: String,
+  noop: msg,
+  on_change: fn(String) -> msg,
+  on_join: fn(String) -> msg,
+) -> Element(msg) {
+  html.div(
+    [
       ui.css([
-        #("width", "100%"),
-        #("box-sizing", "border-box"),
-        #("background", p.surface_alt),
-        #("border", "1px solid " <> p.border_soft),
-        #("border-radius", "6px"),
-        #("padding", "6px 10px"),
-        #("font-family", "inherit"),
-        #("font-size", "15.625px"),
-        #("color", p.text),
-        #("outline", "none"),
+        #("padding", "0 12px 8px 12px"),
+        #("display", "flex"),
+        #("gap", "6px"),
+        #("align-items", "center"),
       ]),
-    ]),
-  ])
+    ],
+    [
+      html.input([
+        attribute.attribute("data-testid", "rooms-search"),
+        attribute.value(value),
+        attribute.placeholder("Search or join…"),
+        event.on_input(on_change),
+        on_enter_with_value(noop, on_join),
+        ui.css([
+          #("flex", "1"),
+          #("min-width", "0"),
+          #("box-sizing", "border-box"),
+          #("background", p.surface_alt),
+          #("border", "1px solid " <> p.border_soft),
+          #("border-radius", "6px"),
+          #("padding", "6px 10px"),
+          #("font-family", "inherit"),
+          #("font-size", "15.625px"),
+          #("color", p.text),
+          #("outline", "none"),
+        ]),
+      ]),
+      case value {
+        "" -> element.fragment([])
+        _ -> join_button(p, value, on_join)
+      },
+    ],
+  )
+}
+
+fn join_button(
+  p: Palette,
+  value: String,
+  on_join: fn(String) -> msg,
+) -> Element(msg) {
+  html.button(
+    [
+      attribute.title("Join " <> value),
+      attribute.attribute("data-testid", "rooms-search-join"),
+      event.on_click(on_join(value)),
+      ui.css([
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+        #("width", "28px"),
+        #("height", "28px"),
+        #("padding", "0"),
+        #("border", "1px solid " <> p.accent_deep),
+        #("background", p.accent),
+        #("color", p.accent_ink),
+        #("border-radius", "6px"),
+        #("cursor", "pointer"),
+        #("font-family", "inherit"),
+        #("font-size", "14px"),
+        #("font-weight", "600"),
+      ]),
+    ],
+    [html.text("↵")],
+  )
+}
+
+fn on_enter_with_value(
+  noop: msg,
+  on_join: fn(String) -> msg,
+) -> attribute.Attribute(msg) {
+  event.on("keydown", {
+    use key <- decode.subfield(["key"], decode.string)
+    use value <- decode.subfield(["target", "value"], decode.string)
+    decode.success(case key {
+      "Enter" -> on_join(value)
+      _ -> noop
+    })
+  })
 }
 
 fn rooms_list(
@@ -205,6 +281,7 @@ fn rooms_list(
   cur: RoomId,
   collapsed: Bool,
   sel: fn(RoomId) -> msg,
+  on_delete: fn(String) -> msg,
 ) -> Element(msg) {
   let padding = case collapsed {
     True -> "0 0 12px 0"
@@ -233,7 +310,7 @@ fn rooms_list(
     list.map(rs, fn(r) {
       case collapsed {
         True -> room_mini(p, r, cur, sel)
-        False -> room_full(p, r, cur, sel)
+        False -> room_full(p, r, cur, sel, on_delete)
       }
     }),
   )
@@ -244,78 +321,133 @@ fn room_full(
   r: Room,
   cur: RoomId,
   sel: fn(RoomId) -> msg,
+  on_delete: fn(String) -> msg,
 ) -> Element(msg) {
   let active = r.id == cur
   let bg = case active {
     True -> p.accent_soft
     False -> "transparent"
   }
-  html.button(
+  html.div(
     [
-      event.on_click(sel(r.id)),
+      attribute.class("room-row"),
       ui.css([
+        #("position", "relative"),
         #("display", "flex"),
         #("align-items", "center"),
-        #("gap", "10px"),
-        #("padding", "8px 10px"),
-        #("border", "none"),
-        #("background", bg),
-        #("border-radius", "6px"),
-        #("cursor", "pointer"),
-        #("text-align", "left"),
-        #("font-family", "inherit"),
-        #("color", p.text),
-        #("min-width", "0"),
       ]),
     ],
     [
-      conn_dot(p, r.status),
-      html.div(
+      html.button(
         [
+          event.on_click(sel(r.id)),
           ui.css([
             #("flex", "1"),
             #("min-width", "0"),
             #("display", "flex"),
-            #("flex-direction", "column"),
-            #("gap", "2px"),
+            #("align-items", "center"),
+            #("gap", "10px"),
+            #("padding", "8px 30px 8px 10px"),
+            #("border", "none"),
+            #("background", bg),
+            #("border-radius", "6px"),
+            #("cursor", "pointer"),
+            #("text-align", "left"),
+            #("font-family", "inherit"),
+            #("color", p.text),
           ]),
         ],
         [
-          html.span(
-            [
-              ui.css([
-                #("font-weight", case active {
-                  True -> "600"
-                  False -> "500"
-                }),
-                #("font-size", "16.25px"),
-                #("white-space", "nowrap"),
-                #("overflow", "hidden"),
-                #("text-overflow", "ellipsis"),
-              ]),
-            ],
-            [html.text(r.name)],
-          ),
+          conn_dot(p, r.status),
           html.div(
             [
               ui.css([
-                #("font-size", "14.375px"),
-                #("color", p.text_muted),
-                #("font-weight", "400"),
+                #("flex", "1"),
+                #("min-width", "0"),
                 #("display", "flex"),
-                #("gap", "6px"),
-                #("flex-wrap", "wrap"),
+                #("flex-direction", "column"),
+                #("gap", "2px"),
               ]),
             ],
-            meta_line(p, r),
+            [
+              html.span(
+                [
+                  ui.css([
+                    #("font-weight", case active {
+                      True -> "600"
+                      False -> "500"
+                    }),
+                    #("font-size", "16.25px"),
+                    #("white-space", "nowrap"),
+                    #("overflow", "hidden"),
+                    #("text-overflow", "ellipsis"),
+                  ]),
+                ],
+                [html.text(r.name)],
+              ),
+              html.div(
+                [
+                  ui.css([
+                    #("font-size", "14.375px"),
+                    #("color", p.text_muted),
+                    #("font-weight", "400"),
+                    #("display", "flex"),
+                    #("gap", "6px"),
+                    #("flex-wrap", "wrap"),
+                  ]),
+                ],
+                meta_line(p, r),
+              ),
+            ],
           ),
+          case r.unread {
+            0 -> element.fragment([])
+            n -> unread_pill(p, n)
+          },
         ],
       ),
-      case r.unread {
-        0 -> element.fragment([])
-        n -> unread_pill(p, n)
-      },
+      delete_button(p, r.name, on_delete),
     ],
+  )
+}
+
+/// Small × button anchored to the right edge of each room row. The
+/// button is hidden by default and revealed when the row is hovered
+/// (CSS rule lives in shell.gleam's global_reset).
+fn delete_button(
+  p: Palette,
+  name: String,
+  on_delete: fn(String) -> msg,
+) -> Element(msg) {
+  html.button(
+    [
+      attribute.title("Remove " <> name),
+      attribute.class("room-delete"),
+      attribute.attribute("data-testid", "room-delete"),
+      attribute.attribute("aria-label", "Remove " <> name),
+      event.on_click(on_delete(name)),
+      ui.css([
+        #("position", "absolute"),
+        #("top", "50%"),
+        #("right", "8px"),
+        #("transform", "translateY(-50%)"),
+        #("width", "20px"),
+        #("height", "20px"),
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+        #("padding", "0"),
+        #("border", "1px solid " <> p.border_soft),
+        #("background", p.surface),
+        #("color", p.text_muted),
+        #("border-radius", "4px"),
+        #("cursor", "pointer"),
+        #("font-family", "inherit"),
+        #("font-size", "13px"),
+        #("line-height", "1"),
+      ]),
+    ],
+    [html.text("×")],
   )
 }
 

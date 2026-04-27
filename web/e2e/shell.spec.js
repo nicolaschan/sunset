@@ -16,7 +16,17 @@
 import { expect, test } from "@playwright/test";
 
 test.beforeEach(async ({ page }) => {
+  // The chat shell now lives behind a hash-based route. Clear any
+  // persisted joined-rooms state ONCE, then navigate directly to a
+  // known fixture room so the existing layout tests render the chat
+  // shell and not the landing page.
   await page.goto("/");
+  await page.evaluate(() => {
+    try {
+      localStorage.clear();
+    } catch {}
+  });
+  await page.goto("/#dusk-collective");
   // Lustre mounts asynchronously; wait until the brand text appears.
   await expect(page.getByText("sunset", { exact: true })).toBeVisible();
 });
