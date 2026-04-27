@@ -242,7 +242,23 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [Reaction(emoji: "👍", count: 3, by_you: True)],
       bridge: NoBridge,
-      details: NoDetails,
+      details: HasDetails(
+        MessageDetails(
+          sender: "9b1d…74",
+          message_id: "f04a31bc88d2110e",
+          prev_id: "c1f02ee44a912b30",
+          signature: "ed25519:7d2…b48",
+          verified: True,
+          hops: ["noor", "you"],
+          sent_at: "5:47:18 pm",
+          delivered_at: "5:47:18 pm",
+          receipts: [
+            Receipt(name: "ravi", time: "5:47:19 pm", relay: Direct),
+            Receipt(name: "elena", time: "5:47:24 pm", relay: ViaPeer("noor")),
+            Receipt(name: "tomo", time: "5:47:31 pm", relay: TwoHop),
+          ],
+        ),
+      ),
     ),
     Message(
       id: "m2",
@@ -255,7 +271,22 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [],
       bridge: NoBridge,
-      details: NoDetails,
+      details: HasDetails(
+        MessageDetails(
+          sender: "3ea4…1c",
+          message_id: "5b21de70449cab02",
+          prev_id: "f04a31bc88d2110e",
+          signature: "ed25519:42c…9e1",
+          verified: True,
+          hops: ["ravi", "you"],
+          sent_at: "5:48:02 pm",
+          delivered_at: "5:48:02 pm",
+          receipts: [
+            Receipt(name: "elena", time: "5:48:06 pm", relay: ViaPeer("noor")),
+            Receipt(name: "tomo", time: "5:48:11 pm", relay: TwoHop),
+          ],
+        ),
+      ),
     ),
     Message(
       id: "m3",
@@ -268,7 +299,21 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [],
       bridge: HasBridge(Minecraft),
-      details: NoDetails,
+      details: HasDetails(
+        MessageDetails(
+          sender: "kc:7d…0b",
+          message_id: "a8f1ec3320459d72",
+          prev_id: "5b21de70449cab02",
+          signature: "minecraft-bridge",
+          verified: False,
+          hops: ["kasper", "minecraft-bridge", "you"],
+          sent_at: "5:49:11 pm",
+          delivered_at: "5:49:13 pm",
+          receipts: [
+            Receipt(name: "elena", time: "5:49:18 pm", relay: BridgeRelay),
+          ],
+        ),
+      ),
     ),
     Message(
       id: "m4",
@@ -288,7 +333,7 @@ pub fn messages() -> List(Message) {
         MessageDetails(
           sender: "8f3c…a2",
           message_id: "8f3c4a91b2d7ee08",
-          prev_id: "1c5fa23bc944d18e",
+          prev_id: "a8f1ec3320459d72",
           signature: "ed25519:a91…7e3",
           verified: True,
           hops: ["you", "ravi", "elena"],
@@ -314,7 +359,19 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [],
       bridge: NoBridge,
-      details: NoDetails,
+      details: HasDetails(
+        MessageDetails(
+          sender: "c084…fc",
+          message_id: "60bb4a0f719c2dee",
+          prev_id: "8f3c4a91b2d7ee08",
+          signature: "ed25519:5fa…d0c",
+          verified: True,
+          hops: ["elena", "noor", "you"],
+          sent_at: "5:51:09 pm",
+          delivered_at: "5:51:11 pm",
+          receipts: [Receipt(name: "tomo", time: "5:51:18 pm", relay: TwoHop)],
+        ),
+      ),
     ),
     Message(
       id: "m6",
@@ -327,7 +384,19 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [],
       bridge: NoBridge,
-      details: NoDetails,
+      details: HasDetails(
+        MessageDetails(
+          sender: "f59e…9e",
+          message_id: "b22a8e1cd0594481",
+          prev_id: "60bb4a0f719c2dee",
+          signature: "ed25519:1ac…3f7",
+          verified: True,
+          hops: ["tomo", "ravi", "you"],
+          sent_at: "5:52:23 pm",
+          delivered_at: "5:52:25 pm",
+          receipts: [],
+        ),
+      ),
     ),
     Message(
       id: "m7",
