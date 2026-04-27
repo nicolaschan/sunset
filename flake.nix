@@ -126,6 +126,8 @@
             pkgs.nodejs
             pkgs.bun
             pkgs.static-web-server
+            pkgs.wasm-bindgen-cli
+            pkgs.wasm-pack
           ];
           shellHook = ''
             ${if webHexDeps != null
@@ -137,7 +139,42 @@
           '';
         };
 
-        packages = pkgs.lib.optionalAttrs (webHexDeps != null) {
+        packages = {
+          sunset-core-wasm = pkgs.rustPlatform.buildRustPackage {
+            pname = "sunset-core-wasm";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            doCheck = false;
+            nativeBuildInputs = [ pkgs.wasm-bindgen-cli pkgs.lld ];
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+            # rustPlatform's cargoBuildHook hard-codes `--target <host-triple>`
+            # so we sidestep it and run our own build / wasm-bindgen / install.
+            buildPhase = ''
+              runHook preBuild
+              cargo build \
+                -j $NIX_BUILD_CORES \
+                --offline \
+                --release \
+                --target wasm32-unknown-unknown \
+                -p sunset-core-wasm \
+                --lib
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              wasm-bindgen \
+                --target web \
+                --out-dir wasm-out \
+                target/wasm32-unknown-unknown/release/sunset_core_wasm.wasm
+              mkdir -p $out
+              cp wasm-out/sunset_core_wasm.js $out/
+              cp wasm-out/sunset_core_wasm_bg.wasm $out/
+              runHook postInstall
+            '';
+          };
+        } // pkgs.lib.optionalAttrs (webHexDeps != null) {
           web = webDist;
         } // pkgs.lib.optionalAttrs (webNpmDeps != null) {
           web-node-modules = webNodeModules;

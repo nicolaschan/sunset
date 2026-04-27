@@ -1,0 +1,24 @@
+[package]
+name = "sunset-core-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+hex.workspace = true
+postcard.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+sunset-core.workspace = true
+sunset-store.workspace = true
+wasm-bindgen.workspace = true
+
+[dev-dependencies]
+wasm-bindgen-test.workspace = true
