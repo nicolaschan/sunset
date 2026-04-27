@@ -30,9 +30,7 @@ impl std::fmt::Debug for Identity {
 impl Identity {
     /// Generate a fresh identity from the supplied RNG.
     pub fn generate<R: CryptoRngCore + ?Sized>(rng: &mut R) -> Self {
-        let mut seed = [0u8; 32];
-        rng.fill_bytes(&mut seed);
-        Self { signing: SigningKey::from_bytes(&seed) }
+        Self { signing: SigningKey::generate(rng) }
     }
 
     /// Reconstruct an identity from its 32-byte secret seed.
