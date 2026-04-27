@@ -5,7 +5,7 @@
 //! used by `sunset_store::VerifyingKey`.
 
 use bytes::Bytes;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey as DalekVerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey as DalekVerifyingKey};
 use rand_core::CryptoRngCore;
 
 use sunset_store::VerifyingKey as StoreVerifyingKey;
@@ -107,6 +107,19 @@ impl IdentityKey {
     }
 }
 
+use ed25519_dalek::Signer as DalekSigner;
+
+impl sunset_sync::Signer for Identity {
+    fn verifying_key(&self) -> sunset_store::VerifyingKey {
+        self.store_verifying_key()
+    }
+
+    fn sign(&self, payload: &[u8]) -> bytes::Bytes {
+        let sig = DalekSigner::sign(&self.signing, payload);
+        bytes::Bytes::copy_from_slice(&sig.to_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +175,14 @@ mod tests {
         let svk = StoreVerifyingKey::new(Bytes::from_static(b"not 32 bytes"));
         let err = IdentityKey::from_store_verifying_key(&svk).unwrap_err();
         assert!(matches!(err, Error::BadName(_)));
+    }
+
+    #[test]
+    fn identity_implements_sync_signer() {
+        use sunset_sync::Signer as _;
+        let id = Identity::generate(&mut OsRng);
+        let sig: bytes::Bytes = sunset_sync::Signer::sign(&id, b"payload");
+        assert_eq!(sig.len(), 64);
+        assert_eq!(id.verifying_key(), id.store_verifying_key());
     }
 }
