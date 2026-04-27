@@ -2,9 +2,10 @@
 
 use ed25519_dalek::{Signature, VerifyingKey as DalekVerifyingKey};
 
-use sunset_store::{Error as StoreError, Result as StoreResult, SignatureVerifier, SignedKvEntry};
-
-use crate::canonical::signing_payload;
+use sunset_store::{
+    Error as StoreError, Result as StoreResult, SignatureVerifier, SignedKvEntry,
+    canonical::signing_payload,
+};
 
 /// Stateless verifier for entries signed by Ed25519 keys.
 #[derive(Debug, Default, Clone, Copy)]
@@ -38,8 +39,8 @@ mod tests {
     use rand_core::OsRng;
     use sunset_store::{Hash, SignedKvEntry, VerifyingKey};
 
-    use crate::canonical::signing_payload;
     use crate::identity::Identity;
+    use sunset_store::canonical::signing_payload;
 
     use super::*;
 

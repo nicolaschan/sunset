@@ -2,6 +2,7 @@
 //!
 //! See `docs/superpowers/specs/2026-04-25-sunset-store-and-sync-design.md` for design.
 
+pub mod canonical;
 pub mod error;
 pub mod filter;
 pub mod store;
@@ -11,6 +12,7 @@ pub mod verifier;
 #[cfg(feature = "test-helpers")]
 pub mod test_helpers;
 
+pub use canonical::signing_payload;
 pub use error::{Error, Result};
 pub use filter::{Event, Filter, Replay};
 pub use store::{EntryStream, EventStream, Store};
