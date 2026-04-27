@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-core", "crates/sunset-core-wasm"]
+members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm"]
 resolver = "2"
 
 [workspace.package]
@@ -15,6 +15,7 @@ blake3 = { version = "1", features = ["serde"] }
 bytes = { version = "1", features = ["serde"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "rand_core"] }
 hkdf = "0.12"
 rand_chacha = { version = "0.3", default-features = false }
@@ -27,14 +28,16 @@ futures = "0.3"
 hex = "0.4"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-curve25519", "use-blake2", "use-chacha20poly1305"] }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "rt", "macros", "time", "fs"] }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tokio-rusqlite = { version = "0.6", features = ["bundled"] }
 sunset-store = { path = "crates/sunset-store" }
 sunset-store-fs = { path = "crates/sunset-store-fs" }
 sunset-store-memory = { path = "crates/sunset-store-memory" }
 sunset-sync = { path = "crates/sunset-sync" }
+sunset-noise = { path = "crates/sunset-noise" }
 sunset-core = { path = "crates/sunset-core" }
 
 [workspace.lints.rust]

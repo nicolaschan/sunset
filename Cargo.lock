@@ -1031,6 +1031,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "snow"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82"
+dependencies = [
+ "blake2",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "rustc_version",
+ "subtle",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1096,6 +1109,25 @@ dependencies = [
  "sunset-store",
  "wasm-bindgen",
  "wasm-bindgen-test",
+]
+
+[[package]]
+name = "sunset-noise"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hex",
+ "rand_core",
+ "sha2",
+ "snow",
+ "sunset-store",
+ "sunset-sync",
+ "thiserror",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
