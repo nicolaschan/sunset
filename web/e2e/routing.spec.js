@@ -135,4 +135,90 @@ test.describe("landing + routing", () => {
 
     await expect(page.getByTestId("landing-view")).toBeVisible();
   });
+
+  test("selecting a room does not reorder the list", async ({ page }) => {
+    // Join three rooms in a known order. Joins prepend so the
+    // resulting top-to-bottom order is gamma → beta → alpha.
+    await page.goto("/");
+    await page.getByTestId("landing-input").fill("alpha");
+    await page.getByTestId("landing-input").press("Enter");
+    await page.getByTestId("rooms-search").fill("beta");
+    await page.getByTestId("rooms-search").press("Enter");
+    await page.getByTestId("rooms-search").fill("gamma");
+    await page.getByTestId("rooms-search").press("Enter");
+
+    const railOrder = async () =>
+      page
+        .getByTestId("rooms-rail")
+        .locator(".room-row")
+        .evaluateAll((rows) =>
+          rows.map((r) => r.getAttribute("data-room-name") || ""),
+        );
+
+    expect((await railOrder()).slice(0, 3)).toEqual([
+      "gamma",
+      "beta",
+      "alpha",
+    ]);
+
+    // Click the alpha row at the bottom — it should NOT bubble up.
+    await page
+      .getByTestId("rooms-rail")
+      .locator(".room-row", { hasText: "alpha" })
+      .click();
+    await expect(page).toHaveURL(/#alpha$/);
+
+    expect((await railOrder()).slice(0, 3)).toEqual([
+      "gamma",
+      "beta",
+      "alpha",
+    ]);
+  });
+
+  test("drag-drop reorders rooms and persists across reloads", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("landing-input").fill("alpha");
+    await page.getByTestId("landing-input").press("Enter");
+    await page.getByTestId("rooms-search").fill("beta");
+    await page.getByTestId("rooms-search").press("Enter");
+    await page.getByTestId("rooms-search").fill("gamma");
+    await page.getByTestId("rooms-search").press("Enter");
+
+    // HTML5 drag events aren't reliably synthesised by the WebDriver
+    // protocol; dispatch them manually so the test exercises the
+    // app's own dragstart / dragover / drop handlers.
+    await page.evaluate(() => {
+      const rows = document.querySelectorAll(
+        '[data-testid="rooms-rail"] .room-row',
+      );
+      const map = {};
+      rows.forEach((row) => {
+        const name = row.getAttribute("data-room-name");
+        if (name) map[name] = row;
+      });
+      const fire = (el, type) =>
+        el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+      // Drag alpha (bottom) onto gamma (top) → alpha lands above gamma.
+      fire(map.alpha, "dragstart");
+      fire(map.gamma, "dragover");
+      fire(map.gamma, "drop");
+      fire(map.alpha, "dragend");
+    });
+
+    const railOrder = async () =>
+      page
+        .getByTestId("rooms-rail")
+        .locator(".room-row")
+        .evaluateAll((rows) =>
+          rows.map((r) => r.getAttribute("data-room-name") || ""),
+        );
+
+    await expect.poll(railOrder).toEqual(["alpha", "gamma", "beta"]);
+
+    // Reload — the order should survive.
+    await page.reload();
+    await expect.poll(railOrder).toEqual(["alpha", "gamma", "beta"]);
+  });
 });

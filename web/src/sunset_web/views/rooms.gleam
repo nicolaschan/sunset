@@ -3,6 +3,7 @@
 import gleam/dynamic/decode
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, Some}
 import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
@@ -21,10 +22,17 @@ pub fn view(
   collapsed col: Bool,
   search search_value: String,
   noop noop: msg,
+  dragging dragging: Option(String),
+  drag_over drag_over: Option(String),
   on_select_room sel: fn(RoomId) -> msg,
   on_search_change on_search_change: fn(String) -> msg,
   on_join on_join: fn(String) -> msg,
   on_delete on_delete: fn(String) -> msg,
+  on_drag_start on_drag_start: fn(String) -> msg,
+  on_drag_over on_drag_over: fn(String) -> msg,
+  on_drag_leave on_drag_leave: fn(String) -> msg,
+  on_drop on_drop: fn(String) -> msg,
+  on_drag_end on_drag_end: msg,
   toggle toggle: msg,
 ) -> Element(msg) {
   let width = case col {
@@ -57,7 +65,21 @@ pub fn view(
         True -> element.fragment([])
         False -> search_bar(p, search_value, noop, on_search_change, on_join)
       },
-      rooms_list(p, rs, cur, col, sel, on_delete),
+      rooms_list(
+        p,
+        rs,
+        cur,
+        col,
+        dragging,
+        drag_over,
+        sel,
+        on_delete,
+        on_drag_start,
+        on_drag_over,
+        on_drag_leave,
+        on_drop,
+        on_drag_end,
+      ),
       you_row(p, col),
     ],
   )
@@ -280,8 +302,15 @@ fn rooms_list(
   rs: List(Room),
   cur: RoomId,
   collapsed: Bool,
+  dragging: Option(String),
+  drag_over: Option(String),
   sel: fn(RoomId) -> msg,
   on_delete: fn(String) -> msg,
+  on_drag_start: fn(String) -> msg,
+  on_drag_over: fn(String) -> msg,
+  on_drag_leave: fn(String) -> msg,
+  on_drop: fn(String) -> msg,
+  on_drag_end: msg,
 ) -> Element(msg) {
   let padding = case collapsed {
     True -> "0 0 12px 0"
@@ -310,7 +339,21 @@ fn rooms_list(
     list.map(rs, fn(r) {
       case collapsed {
         True -> room_mini(p, r, cur, sel)
-        False -> room_full(p, r, cur, sel, on_delete)
+        False ->
+          room_full(
+            p,
+            r,
+            cur,
+            dragging,
+            drag_over,
+            sel,
+            on_delete,
+            on_drag_start,
+            on_drag_over,
+            on_drag_leave,
+            on_drop,
+            on_drag_end,
+          )
       }
     }),
   )
@@ -320,21 +363,66 @@ fn room_full(
   p: Palette,
   r: Room,
   cur: RoomId,
+  dragging: Option(String),
+  drag_over: Option(String),
   sel: fn(RoomId) -> msg,
   on_delete: fn(String) -> msg,
+  on_drag_start: fn(String) -> msg,
+  on_drag_over: fn(String) -> msg,
+  on_drag_leave: fn(String) -> msg,
+  on_drop: fn(String) -> msg,
+  on_drag_end: msg,
 ) -> Element(msg) {
   let active = r.id == cur
   let bg = case active {
     True -> p.accent_soft
     False -> "transparent"
   }
+  let is_dragging_self = case dragging {
+    Some(name) -> name == r.name
+    _ -> False
+  }
+  let is_drop_target = case dragging, drag_over {
+    Some(src), Some(over) -> over == r.name && src != r.name
+    _, _ -> False
+  }
+  let drop_indicator_color = case is_drop_target {
+    True -> p.accent
+    False -> "transparent"
+  }
+  let row_opacity = case is_dragging_self {
+    True -> "0.4"
+    False -> "1"
+  }
   html.div(
     [
       attribute.class("room-row"),
+      attribute.attribute("data-room-name", r.name),
+      attribute.attribute("draggable", "true"),
+      event.on("dragstart", decode.success(on_drag_start(r.name))),
+      event.on("dragend", decode.success(on_drag_end)),
+      event.prevent_default(event.on(
+        "dragover",
+        decode.success(on_drag_over(r.name)),
+      )),
+      event.on("dragleave", decode.success(on_drag_leave(r.name))),
+      event.prevent_default(event.on(
+        "drop",
+        decode.success(on_drop(r.name)),
+      )),
       ui.css([
         #("position", "relative"),
         #("display", "flex"),
         #("align-items", "center"),
+        #("opacity", row_opacity),
+        #("cursor", "grab"),
+        // Top-edge drop indicator: highlights the row that the
+        // dragged item will be inserted *above*.
+        #("border-top", "2px solid " <> drop_indicator_color),
+        #("margin-top", case is_drop_target {
+          True -> "0"
+          False -> "2px"
+        }),
       ]),
     ],
     [
