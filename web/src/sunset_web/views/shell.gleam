@@ -14,17 +14,22 @@ pub fn view(
   mode: Mode,
   palette: Palette,
   rooms_collapsed: Bool,
+  detail_open: Bool,
   toggle_mode: msg,
   rooms: Element(msg),
   channels: Element(msg),
   main: Element(msg),
-  members: Element(msg),
+  right_rail: Element(msg),
 ) -> Element(msg) {
   let rooms_col = case rooms_collapsed {
     True -> "54px"
     False -> "260px"
   }
-  let grid_template = rooms_col <> " 230px 1fr 220px"
+  let right_col = case detail_open {
+    True -> "320px"
+    False -> "220px"
+  }
+  let grid_template = rooms_col <> " 230px 1fr " <> right_col
 
   html.div(
     [
@@ -56,7 +61,7 @@ pub fn view(
           rooms,
           channels,
           main,
-          members,
+          right_rail,
         ],
       ),
       theme_toggle(mode, palette, toggle_mode),
@@ -69,50 +74,68 @@ pub fn view(
 /// 0` to claim the full viewport, so the default 8px body margin would
 /// otherwise show up as a window-wide gap (and a vertical scrollbar where
 /// the viewport overflows).
+///
+/// Also defines a couple of hover-state rules — Lustre's inline `style`
+/// attributes can't express :hover, so the rules live here and views
+/// opt in via `attribute.class("...")`.
 fn global_reset() -> Element(msg) {
   html.style(
     [],
     "html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
      #app { height: 100%; }
-     *, *::before, *::after { box-sizing: border-box; }",
+     *, *::before, *::after { box-sizing: border-box; }
+     .msg-row .msg-actions {
+       opacity: 0;
+       pointer-events: none;
+       transition: opacity 120ms ease;
+     }
+     .msg-row:hover .msg-actions,
+     .msg-row.is-active .msg-actions {
+       opacity: 1;
+       pointer-events: auto;
+     }",
   )
 }
 
 fn theme_toggle(mode: Mode, palette: Palette, toggle_mode: msg) -> Element(msg) {
   html.button(
     [
+      // Pinned to the bottom-right of the viewport so it never collides
+      // with the message-details panel header (which lives at the top of
+      // the right column). Icon-only — the label was both redundant with
+      // the icon and a horizontal-overflow risk in the corner.
       ui.css([
         #("position", "fixed"),
-        #("top", "12px"),
-        #("right", "16px"),
+        #("bottom", "14px"),
+        #("right", "14px"),
         #("display", "inline-flex"),
         #("align-items", "center"),
-        #("gap", "6px"),
+        #("justify-content", "center"),
+        #("width", "32px"),
+        #("height", "32px"),
+        #("padding", "0"),
         #("background", palette.surface),
         #("color", palette.text_muted),
         #("border", "1px solid " <> palette.border),
         #("border-radius", "999px"),
-        #("padding", "6px 10px"),
         #("font-family", "inherit"),
-        #("font-size", "14.375px"),
         #("line-height", "1"),
         #("cursor", "pointer"),
         #("box-shadow", palette.shadow),
         #("z-index", "10"),
       ]),
       event.on_click(toggle_mode),
-      attribute.title("Toggle light/dark"),
+      attribute.title(case mode {
+        Light -> "Switch to dark mode"
+        Dark -> "Switch to light mode"
+      }),
+      attribute.attribute("aria-label", case mode {
+        Light -> "Switch to dark mode"
+        Dark -> "Switch to light mode"
+      }),
       attribute.attribute("data-testid", "theme-toggle"),
     ],
-    [
-      icon_for_mode(mode),
-      html.span([], [
-        html.text(case mode {
-          Light -> "Light"
-          Dark -> "Dark"
-        }),
-      ]),
-    ],
+    [icon_for_mode(mode)],
   )
 }
 

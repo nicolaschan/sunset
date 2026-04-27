@@ -5,10 +5,10 @@
 
 import sunset_web/domain.{
   type Channel, type Member, type Message, type Room, Away, Bridge, BridgeRelay,
-  Channel, ChannelId, Connected, Direct, HasBridge, HasRole, Member, MemberId,
-  Message, Minecraft, MutedP, NoBridge, NoRelay, NoRole, Offline, OneHop, Online,
-  Reaction, Reconnecting, Room, RoomId, SelfRelay, Speaking, TextChannel, TwoHop,
-  Voice,
+  Channel, ChannelId, Connected, Direct, HasBridge, HasDetails, HasRole, Member,
+  MemberId, Message, MessageDetails, Minecraft, MutedP, NoBridge, NoDetails,
+  NoRelay, NoRole, Offline, OneHop, Online, Reaction, Receipt, Reconnecting,
+  Room, RoomId, SelfRelay, Speaking, TextChannel, TwoHop, ViaPeer, Voice,
 }
 
 pub fn rooms() -> List(Room) {
@@ -242,6 +242,7 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [Reaction(emoji: "👍", count: 3, by_you: True)],
       bridge: NoBridge,
+      details: NoDetails,
     ),
     Message(
       id: "m2",
@@ -254,6 +255,7 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [],
       bridge: NoBridge,
+      details: NoDetails,
     ),
     Message(
       id: "m3",
@@ -266,6 +268,7 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [],
       bridge: HasBridge(Minecraft),
+      details: NoDetails,
     ),
     Message(
       id: "m4",
@@ -281,6 +284,24 @@ pub fn messages() -> List(Message) {
         Reaction(emoji: "👀", count: 2, by_you: True),
       ],
       bridge: NoBridge,
+      details: HasDetails(
+        MessageDetails(
+          sender: "8f3c…a2",
+          message_id: "8f3c4a91b2d7ee08",
+          prev_id: "1c5fa23bc944d18e",
+          signature: "ed25519:a91…7e3",
+          verified: True,
+          hops: ["you", "ravi", "elena"],
+          sent_at: "5:50:02 pm",
+          delivered_at: "5:50:03 pm",
+          receipts: [
+            Receipt(name: "ravi", time: "5:50:04 pm", relay: Direct),
+            Receipt(name: "elena", time: "5:50:08 pm", relay: ViaPeer("ravi")),
+            Receipt(name: "tomo", time: "5:50:14 pm", relay: TwoHop),
+            Receipt(name: "june", time: "5:50:22 pm", relay: Direct),
+          ],
+        ),
+      ),
     ),
     Message(
       id: "m5",
@@ -293,6 +314,7 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [],
       bridge: NoBridge,
+      details: NoDetails,
     ),
     Message(
       id: "m6",
@@ -305,6 +327,7 @@ pub fn messages() -> List(Message) {
       pending: False,
       reactions: [],
       bridge: NoBridge,
+      details: NoDetails,
     ),
     Message(
       id: "m7",
@@ -317,6 +340,7 @@ pub fn messages() -> List(Message) {
       pending: True,
       reactions: [],
       bridge: NoBridge,
+      details: NoDetails,
     ),
   ]
 }

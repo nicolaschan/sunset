@@ -48,8 +48,8 @@ test("all four columns render in light mode", async ({ page }) => {
 test("theme toggle flips light to dark", async ({ page }) => {
   const toggle = page.getByTestId("theme-toggle");
 
-  // Default label
-  await expect(toggle).toContainText("Light");
+  // The icon-only button advertises its target mode via title.
+  await expect(toggle).toHaveAttribute("title", /dark/i);
 
   // Capture the body bg before — light palette has #f7f5f1 (cream)
   const bgLight = await page.evaluate(
@@ -60,7 +60,7 @@ test("theme toggle flips light to dark", async ({ page }) => {
   );
 
   await toggle.click();
-  await expect(toggle).toContainText("Dark");
+  await expect(toggle).toHaveAttribute("title", /light/i);
 
   const bgDark = await page.evaluate(
     () =>
@@ -229,4 +229,83 @@ test("rooms list does not render timestamps", async ({ page }) => {
   expect(railText).not.toMatch(/\b\d+\s*(?:m|h|d)\b/);
   expect(railText).not.toMatch(/\bjust now\b/i);
   expect(railText).not.toMatch(/(?<!\w)now(?!\w)/);
+});
+
+test("hover on a message reveals the action toolbar", async ({ page }) => {
+  // The actions toolbar exists in the DOM but is invisible (opacity: 0)
+  // until the parent .msg-row is hovered.
+  const row = page.locator(".msg-row", { hasText: "routing thru ravi" });
+  await expect(row).toBeVisible();
+
+  const actions = row.locator(".msg-actions");
+
+  const initial = await actions.evaluate((el) => getComputedStyle(el).opacity);
+  expect(parseFloat(initial)).toBeLessThan(0.5);
+
+  // Hover the row itself — hovering the inner body text isn't a reliable
+  // way to activate :hover on the parent across all engines.
+  await row.hover();
+  // Opacity transitions over 120ms; poll until the hover-state CSS kicks in.
+  await expect
+    .poll(async () =>
+      parseFloat(await actions.evaluate((el) => getComputedStyle(el).opacity)),
+    )
+    .toBeGreaterThan(0.5);
+});
+
+test("react button opens the emoji picker; clicking an emoji reacts", async ({
+  page,
+}) => {
+  const row = page.locator(".msg-row", { hasText: "routing thru ravi" });
+  await row.hover();
+  await row.getByRole("button", { name: /^React$/ }).click();
+
+  const picker = page.getByTestId("reaction-picker");
+  await expect(picker).toBeVisible();
+
+  // Click a fresh emoji that the message doesn't already have.
+  await picker.getByRole("button", { name: /🔥/ }).click();
+  await expect(picker).not.toBeVisible();
+
+  // The new reaction pill should now appear under the message body.
+  await expect(row.getByText("🔥")).toBeVisible();
+});
+
+test("info button opens the details side panel with sender + receipts", async ({
+  page,
+}) => {
+  const row = page.locator(".msg-row", { hasText: "routing thru ravi" });
+  await row.hover();
+  await row.getByRole("button", { name: /Message details/i }).click();
+
+  const panel = page.getByTestId("details-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText("Message details")).toBeVisible();
+  await expect(panel.getByText(/8f3c…a2/)).toBeVisible();
+
+  // Receipts include the four people from the fixture.
+  for (const name of ["ravi", "elena", "tomo", "june"]) {
+    await expect(panel.getByText(name, { exact: false }).first()).toBeVisible();
+  }
+
+  await page.screenshot({
+    path: "test-results/shell-details-open.png",
+    fullPage: true,
+  });
+
+  // Closing the panel returns the right column to the members rail.
+  await page.getByTestId("details-close").click();
+  await expect(panel).not.toBeVisible();
+  await expect(page.getByText(/^Online — /)).toBeVisible();
+});
+
+test("info button is disabled when no crypto details are available", async ({
+  page,
+}) => {
+  // m1 (noor) is a fixture row without MessageDetails; its info button
+  // should be present but disabled.
+  const row = page.locator(".msg-row", { hasText: "shipping the relay path" });
+  await row.hover();
+  const info = row.getByRole("button", { name: /Message details/i });
+  await expect(info).toBeDisabled();
 });

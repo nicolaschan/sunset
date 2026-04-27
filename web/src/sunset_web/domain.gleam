@@ -97,6 +97,34 @@ pub type Reaction {
   Reaction(emoji: String, count: Int, by_you: Bool)
 }
 
+/// Per-recipient delivery confirmation, surfaced in the message-details
+/// side panel.
+pub type Receipt {
+  Receipt(name: String, time: String, relay: RelayStatus)
+}
+
+/// Cryptographic + delivery metadata available for messages we have
+/// full provenance on. In v1 only own outgoing messages have this; the
+/// chat-domain plan will populate it from real signed entries later.
+pub type MessageDetails {
+  MessageDetails(
+    sender: String,
+    message_id: String,
+    prev_id: String,
+    signature: String,
+    verified: Bool,
+    hops: List(String),
+    sent_at: String,
+    delivered_at: String,
+    receipts: List(Receipt),
+  )
+}
+
+pub type DetailsOpt {
+  HasDetails(MessageDetails)
+  NoDetails
+}
+
 pub type Message {
   Message(
     id: String,
@@ -109,6 +137,7 @@ pub type Message {
     pending: Bool,
     reactions: List(Reaction),
     bridge: BridgeOpt,
+    details: DetailsOpt,
   )
 }
 
