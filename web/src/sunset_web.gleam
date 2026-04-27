@@ -165,12 +165,13 @@ fn seed_reactions() -> Dict(String, List(Reaction)) {
   |> list.fold(dict.new(), fn(d, m) { dict.insert(d, m.id, m.reactions) })
 }
 
-/// Move `name` to the head of `existing`, prepending if it isn't there
-/// yet. Used to keep "most-recently-active" semantics on an explicit
-/// join while preserving the rest of the order.
+/// If joining a new room, add it to the head of the list.
+/// Otherwise, return the existing list preserving order.
 fn ensure_joined(existing: List(String), name: String) -> List(String) {
-  let rest = list.filter(existing, fn(r) { r != name })
-  [name, ..rest]
+  case list.contains(existing, name) {
+    True -> existing
+    False -> [name, ..existing]
+  }
 }
 
 fn sanitize(raw: String) -> String {
