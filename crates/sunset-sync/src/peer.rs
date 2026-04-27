@@ -15,7 +15,11 @@ use crate::types::PeerId;
 pub(crate) enum InboundEvent {
     /// Hello received; the peer's identity is now known.
     /// Protocol-version validation has already happened in the per-peer task.
-    PeerHello { peer_id: PeerId },
+    /// `out_tx` is the outbound sender to register under `peer_id`.
+    PeerHello {
+        peer_id: PeerId,
+        out_tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>,
+    },
     /// A SyncMessage arrived (other than Hello).
     Message { from: PeerId, message: SyncMessage },
     /// The peer's connection closed (graceful or error).
@@ -35,10 +39,15 @@ pub(crate) enum InboundEvent {
 ///
 /// `local_protocol_version` is `SyncConfig::protocol_version`.
 /// `local_peer` is the engine's local PeerId.
+/// `out_tx` is the outbound sender — passed through `PeerHello` so the engine
+/// can register it under the Hello-declared peer_id (not the transport-level
+/// peer_id, which may differ in schemes that separate routing identity from
+/// application identity, e.g. X25519 routing + Ed25519 application keys).
 pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     conn: Rc<C>,
     local_peer: PeerId,
     local_protocol_version: u32,
+    out_tx: mpsc::UnboundedSender<SyncMessage>,
     mut outbound_rx: mpsc::UnboundedReceiver<SyncMessage>,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
 ) {
@@ -73,6 +82,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             }
             let _ = inbound_tx.send(InboundEvent::PeerHello {
                 peer_id: peer_id.clone(),
+                out_tx,
             });
             peer_id
         }
@@ -192,10 +202,13 @@ mod tests {
                 let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
                 let (b_in_tx, mut b_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
 
+                // Pass clones into run_peer (it takes ownership); keep originals
+                // so we can drop them to trigger Goodbye.
                 tokio::task::spawn_local(run_peer(
                     Rc::new(alice_conn),
                     PeerId(vk(b"alice")),
                     1,
+                    a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
                 ));
@@ -203,25 +216,30 @@ mod tests {
                     Rc::new(bob_conn),
                     PeerId(vk(b"bob")),
                     1,
+                    b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
                 ));
 
                 // Each side observes the other's Hello.
                 match a_in_rx.recv().await.unwrap() {
-                    InboundEvent::PeerHello { peer_id } => {
+                    InboundEvent::PeerHello { peer_id, .. } => {
                         assert_eq!(peer_id, PeerId(vk(b"bob")));
                     }
                     other => panic!("expected Hello, got {other:?}"),
                 }
                 match b_in_rx.recv().await.unwrap() {
-                    InboundEvent::PeerHello { peer_id } => {
+                    InboundEvent::PeerHello { peer_id, .. } => {
                         assert_eq!(peer_id, PeerId(vk(b"alice")));
                     }
                     other => panic!("expected Hello, got {other:?}"),
                 }
 
-                // Drop outbound senders → both peers send Goodbye and exit.
+                // Drop outbound senders → channels close → send_tasks exit →
+                // both peers send Goodbye and the connections shut down.
+                // (run_peer passes the clone via PeerHello; the test's
+                // pattern-match above dropped it implicitly, so only the
+                // originals below keep the channels open.)
                 drop(a_out_tx);
                 drop(b_out_tx);
             })

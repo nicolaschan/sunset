@@ -53,3 +53,26 @@ pub trait TransportConnection {
     /// `Error::Transport("closed")` or similar.
     async fn close(&self) -> Result<()>;
 }
+
+/// Plain bytes pipe — no authentication, no `peer_id`. Implementations are
+/// unaware of any cryptography; a `NoiseTransport<R: RawTransport>` decorator
+/// (in the `sunset-noise` crate) wraps any RawTransport into an
+/// authenticated `Transport`.
+///
+/// New transport crates (browser WebSocket, WebRTC, WebTransport, …)
+/// implement only this trait — they need no crypto deps.
+#[async_trait(?Send)]
+pub trait RawTransport {
+    type Connection: RawConnection;
+    async fn connect(&self, addr: PeerAddr) -> Result<Self::Connection>;
+    async fn accept(&self) -> Result<Self::Connection>;
+}
+
+#[async_trait(?Send)]
+pub trait RawConnection {
+    async fn send_reliable(&self, bytes: Bytes) -> Result<()>;
+    async fn recv_reliable(&self) -> Result<Bytes>;
+    async fn send_unreliable(&self, bytes: Bytes) -> Result<()>;
+    async fn recv_unreliable(&self) -> Result<Bytes>;
+    async fn close(&self) -> Result<()>;
+}

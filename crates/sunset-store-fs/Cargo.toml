@@ -17,7 +17,7 @@ hex.workspace = true
 postcard.workspace = true
 sunset-store.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tokio-rusqlite.workspace = true
 
 [dev-dependencies]

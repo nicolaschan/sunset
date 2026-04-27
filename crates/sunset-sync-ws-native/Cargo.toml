@@ -1,5 +1,5 @@
 [package]
-name = "sunset-core"
+name = "sunset-sync-ws-native"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,25 +9,23 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-argon2.workspace = true
-blake3.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
-chacha20poly1305.workspace = true
-ed25519-dalek.workspace = true
-hex.workspace = true
-hkdf.workspace = true
-postcard.workspace = true
-rand_core.workspace = true
-serde.workspace = true
-sha2.workspace = true
-sunset-store.workspace = true
+futures-util.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
-zeroize.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros", "net"] }
+tokio-tungstenite.workspace = true
+url.workspace = true
 
 [dev-dependencies]
+curve25519-dalek.workspace = true
+hex.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 sunset-store = { workspace = true, features = ["test-helpers"] }
 sunset-store-memory.workspace = true
 sunset-sync = { workspace = true, features = ["test-helpers"] }
-tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
+sunset-noise.workspace = true
+sunset-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "net"] }
+zeroize.workspace = true

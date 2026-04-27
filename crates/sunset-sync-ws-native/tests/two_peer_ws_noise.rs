@@ -1,19 +1,7 @@
-//! End-to-end: alice composes an encrypted+signed chat message in an open
-//! room; bob (who opened the same room name) receives the entry and the
-//! content block via sunset-sync, then `decode_message` reconstructs the
-//! exact author key + body on the receiving peer.
-//!
-//! Demonstrates the full crypto spec authentication invariant traversed in
-//! anger: outer signature on insert (Ed25519Verifier), block-hash check,
-//! AEAD decryption with the shared K_epoch_0, and inner-signature verify.
-//!
-//! Note on verifier: this test uses `MemoryStore::with_accept_all()` rather
-//! than `Ed25519Verifier` because `sunset-sync` v1 writes its own internal
-//! subscription/presence entries with stub (empty) signatures that
-//! `Ed25519Verifier` would reject. The Ed25519Verifier integration is
-//! independently covered by `crates/sunset-core/src/message.rs`'s
-//! `composed_entry_passes_ed25519_verifier` unit test. Real sync-internal
-//! signing belongs to a follow-up plan.
+//! End-to-end: alice (dialer) and bob (listener) exchange a real
+//! sunset-core encrypted+signed message over a real localhost WebSocket
+//! wrapped in Noise. Both stores use Ed25519Verifier — proves the
+//! sync-internal signing path is real.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,75 +9,97 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rand_core::OsRng;
+use zeroize::Zeroizing;
 
 use sunset_core::crypto::constants::test_fast_params;
 use sunset_core::{
-    ComposedMessage, Identity, Room, compose_message, decode_message, room_messages_filter,
+    ComposedMessage, Ed25519Verifier, Identity, Room, compose_message, decode_message,
+    room_messages_filter,
 };
-use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
+use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret};
+use sunset_store::{ContentBlock, Hash, Store as _};
 use sunset_store_memory::MemoryStore;
-use sunset_sync::test_transport::TestNetwork;
-use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
+use sunset_sync::{PeerAddr, PeerId, SyncConfig, SyncEngine};
+use sunset_sync_ws_native::WebSocketRawTransport;
 
-/// Test-only signer that returns a non-empty stub signature. Adequate when
-/// the receiving store uses `AcceptAllVerifier`.
-struct StubSigner {
-    vk: VerifyingKey,
-}
+/// Adapter so sunset-core's `Identity` can be used as a NoiseIdentity
+/// without sunset-core itself depending on sunset-noise.
+struct IdentityNoiseAdapter(Identity);
 
-impl Signer for StubSigner {
-    fn verifying_key(&self) -> VerifyingKey {
-        self.vk.clone()
+impl NoiseIdentity for IdentityNoiseAdapter {
+    fn ed25519_public(&self) -> [u8; 32] {
+        self.0.public().as_bytes()
     }
-
-    fn sign(&self, _payload: &[u8]) -> Bytes {
-        Bytes::from_static(&[0u8; 64])
+    fn ed25519_secret_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.0.secret_bytes())
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn alice_encrypts_bob_decrypts() {
+async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             // ---- identities + rooms ----
             let alice = Identity::generate(&mut OsRng);
             let bob = Identity::generate(&mut OsRng);
-            let alice_room = Room::open_with_params("general", &test_fast_params()).unwrap();
-            let bob_room = Room::open_with_params("general", &test_fast_params()).unwrap();
+            let alice_room = Room::open_with_params("plan-c-test", &test_fast_params()).unwrap();
+            let bob_room = Room::open_with_params("plan-c-test", &test_fast_params()).unwrap();
             assert_eq!(alice_room.fingerprint(), bob_room.fingerprint());
 
-            // ---- per-peer stores with accept-all verifier (see module docs) ----
-            let alice_store = Arc::new(MemoryStore::with_accept_all());
-            let bob_store = Arc::new(MemoryStore::with_accept_all());
+            // ---- both stores use Ed25519Verifier ----
+            let alice_store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
+            let bob_store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
 
-            // ---- transport + engines ----
-            let net = TestNetwork::new();
-            let alice_addr = PeerAddr::new("alice");
-            let bob_addr = PeerAddr::new("bob");
+            // ---- bob listens on a random port ----
+            let bob_raw = WebSocketRawTransport::listening_on("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let bob_bound = bob_raw.local_addr().unwrap();
+            let bob_noise =
+                NoiseTransport::new(bob_raw, Arc::new(IdentityNoiseAdapter(bob.clone())));
+
+            // ---- alice dials ----
+            let alice_raw = WebSocketRawTransport::dial_only();
+            let alice_noise =
+                NoiseTransport::new(alice_raw, Arc::new(IdentityNoiseAdapter(alice.clone())));
+
+            // PeerAddr for alice to dial bob: ws://<bob_bound>#x25519=<bob_x25519_pub_hex>
+            let bob_seed = bob.secret_bytes();
+            let bob_x25519_secret = ed25519_seed_to_x25519_secret(&bob_seed);
+            let bob_x25519_pub = {
+                use curve25519_dalek::{MontgomeryPoint, scalar::Scalar};
+                let scalar = Scalar::from_bytes_mod_order(*bob_x25519_secret);
+                MontgomeryPoint::mul_base(&scalar).to_bytes()
+            };
+            let bob_addr = PeerAddr::new(Bytes::from(format!(
+                "ws://{}#x25519={}",
+                bob_bound,
+                hex::encode(bob_x25519_pub),
+            )));
+
+            // ---- engines (with real signers) ----
+            let alice_signer: Arc<dyn sunset_sync::Signer> = Arc::new(alice.clone());
+            let bob_signer: Arc<dyn sunset_sync::Signer> = Arc::new(bob.clone());
+
+            // PeerId uses the Ed25519 verifying key — the application-layer
+            // identity declared in Hello. This matches what the subscription
+            // registry keys on, so push routing from alice to bob works end-to-end.
+            // The Noise X25519 key is used only for the handshake (derived
+            // internally by NoiseTransport from the Ed25519 seed via SHA-512 clamp).
             let alice_peer = PeerId(alice.store_verifying_key());
             let bob_peer = PeerId(bob.store_verifying_key());
 
-            let alice_transport = net.transport(alice_peer.clone(), alice_addr.clone());
-            let bob_transport = net.transport(bob_peer.clone(), bob_addr.clone());
-
-            let alice_signer = Arc::new(StubSigner {
-                vk: alice_peer.0.clone(),
-            });
-            let bob_signer = Arc::new(StubSigner {
-                vk: bob_peer.0.clone(),
-            });
-
             let alice_engine = Rc::new(SyncEngine::new(
                 alice_store.clone(),
-                alice_transport,
+                alice_noise,
                 SyncConfig::default(),
                 alice_peer.clone(),
                 alice_signer,
             ));
             let bob_engine = Rc::new(SyncEngine::new(
                 bob_store.clone(),
-                bob_transport,
+                bob_noise,
                 SyncConfig::default(),
                 bob_peer.clone(),
                 bob_signer,
@@ -104,7 +114,7 @@ async fn alice_encrypts_bob_decrypts() {
                 async move { e.run().await }
             });
 
-            // ---- bob declares interest in #general ----
+            // ---- bob declares interest ----
             bob_engine
                 .publish_subscription(room_messages_filter(&bob_room), Duration::from_secs(60))
                 .await
@@ -113,9 +123,10 @@ async fn alice_encrypts_bob_decrypts() {
             // ---- alice connects to bob ----
             alice_engine.add_peer(bob_addr).await.unwrap();
 
+            // ---- wait for subscription propagation ----
             let registered = wait_for(
-                Duration::from_secs(2),
-                Duration::from_millis(20),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
                 || async {
                     alice_engine
                         .knows_peer_subscription(&bob.store_verifying_key())
@@ -125,22 +136,21 @@ async fn alice_encrypts_bob_decrypts() {
             .await;
             assert!(registered, "alice did not learn bob's subscription");
 
-            // ---- alice composes + inserts a real encrypted+signed message ----
-            let body = "hello bob, this is encrypted";
+            // ---- alice composes + inserts ----
+            let body = "hello bob via real ws + noise";
             let sent_at = 1_700_000_000_000u64;
             let ComposedMessage { entry, block } =
                 compose_message(&alice, &alice_room, 0, sent_at, body, &mut OsRng).unwrap();
             let expected_hash: Hash = block.hash();
-
             alice_store
                 .insert(entry.clone(), Some(block.clone()))
                 .await
-                .expect("alice's own store accepts her signed entry");
+                .expect("alice's own store accepts her real-signed entry");
 
-            // ---- wait for bob's store to have both the entry and the block ----
+            // ---- bob receives entry + block ----
             let bob_has_entry = wait_for(
-                Duration::from_secs(2),
-                Duration::from_millis(20),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
                 || async {
                     bob_store
                         .get_entry(&alice.store_verifying_key(), &entry.name)
@@ -153,8 +163,8 @@ async fn alice_encrypts_bob_decrypts() {
             assert!(bob_has_entry, "bob did not receive alice's entry");
 
             let bob_has_block = wait_for(
-                Duration::from_secs(2),
-                Duration::from_millis(20),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
                 || async {
                     bob_store
                         .get_content(&expected_hash)
@@ -177,22 +187,9 @@ async fn alice_encrypts_bob_decrypts() {
                 .await
                 .unwrap()
                 .unwrap();
-
             let decoded = decode_message(&bob_room, &bob_entry, &bob_block).unwrap();
             assert_eq!(decoded.author_key, alice.public());
-            assert_eq!(decoded.room_fingerprint, bob_room.fingerprint());
-            assert_eq!(decoded.epoch_id, 0);
             assert_eq!(decoded.body, body);
-            assert_eq!(decoded.sent_at_ms, sent_at);
-
-            // ---- a third party who never joined cannot decrypt ----
-            let charlie_room =
-                Room::open_with_params("not-the-right-name", &test_fast_params()).unwrap();
-            let err = decode_message(&charlie_room, &bob_entry, &bob_block).unwrap_err();
-            assert!(matches!(
-                err,
-                sunset_core::Error::BadName(_) | sunset_core::Error::AeadAuthFailed,
-            ));
 
             alice_run.abort();
             bob_run.abort();
@@ -200,7 +197,6 @@ async fn alice_encrypts_bob_decrypts() {
         .await;
 }
 
-/// Poll `condition` until it returns `true` or the deadline elapses.
 async fn wait_for<F, Fut>(deadline: Duration, interval: Duration, mut condition: F) -> bool
 where
     F: FnMut() -> Fut,

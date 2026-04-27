@@ -8,10 +8,26 @@ use bytes::Bytes;
 use sunset_store::{ContentBlock, Filter, SignedKvEntry, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::test_transport::TestNetwork;
-use sunset_sync::{PeerAddr, PeerId, SyncConfig, SyncEngine};
+use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
 
 fn vk(b: &[u8]) -> VerifyingKey {
     VerifyingKey::new(Bytes::copy_from_slice(b))
+}
+
+/// Test-only signer that returns a non-empty stub signature. Adequate when
+/// the receiving store uses `AcceptAllVerifier`.
+struct StubSigner {
+    vk: VerifyingKey,
+}
+
+impl Signer for StubSigner {
+    fn verifying_key(&self) -> VerifyingKey {
+        self.vk.clone()
+    }
+
+    fn sign(&self, _payload: &[u8]) -> Bytes {
+        Bytes::from_static(&[0u8; 64])
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -31,17 +47,26 @@ async fn alice_writes_bob_receives() {
             let alice_store = Arc::new(MemoryStore::with_accept_all());
             let bob_store = Arc::new(MemoryStore::with_accept_all());
 
+            let alice_signer = Arc::new(StubSigner {
+                vk: alice_id.0.clone(),
+            });
+            let bob_signer = Arc::new(StubSigner {
+                vk: bob_id.0.clone(),
+            });
+
             let alice_engine = Rc::new(SyncEngine::new(
                 alice_store.clone(),
                 alice_transport,
                 SyncConfig::default(),
                 alice_id.clone(),
+                alice_signer,
             ));
             let bob_engine = Rc::new(SyncEngine::new(
                 bob_store.clone(),
                 bob_transport,
                 SyncConfig::default(),
                 bob_id.clone(),
+                bob_signer,
             ));
 
             let alice_run = tokio::task::spawn_local({
