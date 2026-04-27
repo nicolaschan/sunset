@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
+hex.workspace = true
 postcard.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
