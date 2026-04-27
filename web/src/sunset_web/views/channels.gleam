@@ -268,7 +268,7 @@ fn live_voice_block(p: Palette, c: Channel, ms: List(Member)) -> Element(msg) {
       ui.css([
         #("background", p.accent_soft),
         #("border-radius", "6px"),
-        #("padding-bottom", "4px"),
+        #("padding-bottom", "10px"),
       ]),
     ],
     [
@@ -321,13 +321,16 @@ fn live_voice_block(p: Palette, c: Channel, ms: List(Member)) -> Element(msg) {
 }
 
 fn connector_line(p: Palette) -> Element(msg) {
+  // Bound to the inset of the members container's padding so the line
+  // only spans the rows themselves, not the surrounding whitespace at
+  // the top and bottom of the light-blue block.
   html.span(
     [
       ui.css([
         #("position", "absolute"),
         #("left", "16px"),
-        #("top", "0"),
-        #("bottom", "0"),
+        #("top", "4px"),
+        #("bottom", "10px"),
         #("width", "2px"),
         #("background", p.accent),
         #("opacity", "0.35"),

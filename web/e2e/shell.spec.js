@@ -299,13 +299,32 @@ test("info button opens the details side panel with sender + receipts", async ({
   await expect(page.getByText(/^Online — /)).toBeVisible();
 });
 
-test("info button is disabled when no crypto details are available", async ({
+test("info button is disabled while a message is still sending", async ({
   page,
 }) => {
-  // m1 (noor) is a fixture row without MessageDetails; its info button
-  // should be present but disabled.
-  const row = page.locator(".msg-row", { hasText: "shipping the relay path" });
+  // The pending message (m7) hasn't been delivered yet, so its
+  // crypto chain + receipts aren't populated. The info button should
+  // render but be disabled until the send completes.
+  const row = page.locator(".msg-row", { hasText: "noted. pushing a fix" });
   await row.hover();
   const info = row.getByRole("button", { name: /Message details/i });
   await expect(info).toBeDisabled();
+});
+
+test("info button on a delivered incoming message also opens details", async ({
+  page,
+}) => {
+  // Round-3: every fixture row except the pending one carries mocked
+  // crypto + receipts. Sanity-check that an incoming message (m1, sent
+  // by noor) opens a populated panel with the sender hash and at
+  // least one receipt row.
+  const row = page.locator(".msg-row", { hasText: "shipping the relay path" });
+  await row.hover();
+  await row.getByRole("button", { name: /Message details/i }).click();
+
+  const panel = page.getByTestId("details-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText(/9b1d…74/)).toBeVisible();
+  await expect(panel.getByTestId("receipt-row").first()).toBeVisible();
+  await page.getByTestId("details-close").click();
 });
