@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm"]
+members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native"]
 resolver = "2"
 
 [workspace.package]
@@ -34,12 +34,16 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tokio-rusqlite = { version = "0.6", features = ["bundled"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+url = "2"
 sunset-store = { path = "crates/sunset-store" }
 sunset-store-fs = { path = "crates/sunset-store-fs" }
 sunset-store-memory = { path = "crates/sunset-store-memory" }
 sunset-sync = { path = "crates/sunset-sync" }
 sunset-noise = { path = "crates/sunset-noise" }
 sunset-core = { path = "crates/sunset-core" }
+sunset-sync-ws-native = { path = "crates/sunset-sync-ws-native" }
 
 [workspace.lints.rust]
 unused_must_use = "deny"

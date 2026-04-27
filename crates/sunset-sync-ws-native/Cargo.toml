@@ -1,0 +1,28 @@
+[package]
+name = "sunset-sync-ws-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+sunset-sync.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros", "net"] }
+tokio-tungstenite.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+rand_core = { workspace = true, features = ["getrandom"] }
+sunset-store = { workspace = true, features = ["test-helpers"] }
+sunset-store-memory.workspace = true
+sunset-sync = { workspace = true, features = ["test-helpers"] }
+sunset-noise.workspace = true
+sunset-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "net"] }
