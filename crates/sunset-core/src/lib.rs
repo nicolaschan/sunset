@@ -17,6 +17,7 @@ pub mod verifier;
 pub use crypto::envelope::{EncryptedMessage, SignedMessage};
 pub use crypto::room::{Room, RoomFingerprint};
 pub use error::{Error, Result};
+pub use filters::room_messages_filter;
 pub use identity::{Identity, IdentityKey};
 pub use message::{ComposedMessage, DecodedMessage, compose_message, decode_message};
 pub use verifier::Ed25519Verifier;
