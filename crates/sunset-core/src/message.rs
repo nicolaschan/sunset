@@ -60,7 +60,7 @@ pub fn compose_message<R: CryptoRngCore + ?Sized>(
     let pt_hash: Hash = blake3::hash(&pt).into();
     let k_msg = derive_msg_key(epoch_root, epoch_id, &pt_hash);
     let aad = build_msg_aad(room_fp.as_bytes(), epoch_id, &identity.public(), sent_at_ms);
-    let ciphertext = aead_encrypt(&*k_msg, &nonce, &aad, &pt);
+    let ciphertext = aead_encrypt(&k_msg, &nonce, &aad, &pt);
 
     let envelope = EncryptedMessage {
         epoch_id,
@@ -112,7 +112,7 @@ pub fn decode_message(
         &author_key,
         entry.priority,
     );
-    let pt = aead_decrypt(&*k_msg, &envelope.nonce, &aad, &envelope.ciphertext)?;
+    let pt = aead_decrypt(&k_msg, &envelope.nonce, &aad, &envelope.ciphertext)?;
 
     let recomputed: Hash = blake3::hash(&pt).into();
     if recomputed != pt_hash {
@@ -127,9 +127,9 @@ pub fn decode_message(
 
     let expected_name = message_name(&room.fingerprint(), &entry.value_hash);
     if entry.name != expected_name {
-        return Err(Error::BadName(format!(
-            "name does not match `<hex_fp>/msg/<hex_value_hash>` for this room",
-        )));
+        return Err(Error::BadName(
+            "name does not match `<hex_fp>/msg/<hex_value_hash>` for this room".to_string(),
+        ));
     }
 
     let inner_payload = inner_sig_payload_bytes(
@@ -241,7 +241,7 @@ mod tests {
             let pt_hash = *forged.block.references.first().unwrap();
             let k_msg = derive_msg_key(room.epoch_root(0).unwrap(), 0, &pt_hash);
             let aad = build_msg_aad(room.fingerprint().as_bytes(), 0, &alice.public(), 1);
-            let pt = aead_decrypt(&*k_msg, &env.nonce, &aad, &env.ciphertext).unwrap();
+            let pt = aead_decrypt(&k_msg, &env.nonce, &aad, &env.ciphertext).unwrap();
             postcard::from_bytes(&pt).unwrap()
         };
         let mallory_sig = mallory.sign(&inner_sig_payload_bytes(
@@ -257,7 +257,7 @@ mod tests {
         let k_msg_new = derive_msg_key(room.epoch_root(0).unwrap(), 0, &pt_hash_new);
         let aad = build_msg_aad(room.fingerprint().as_bytes(), 0, &alice.public(), 1);
         let nonce = env.nonce;
-        let ct_new = aead_encrypt(&*k_msg_new, &nonce, &aad, &pt_new);
+        let ct_new = aead_encrypt(&k_msg_new, &nonce, &aad, &pt_new);
         let env_new = EncryptedMessage {
             epoch_id: 0,
             nonce,
