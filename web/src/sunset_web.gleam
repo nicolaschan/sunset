@@ -836,6 +836,8 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       },
       on_select_channel: SelectChannel,
       on_open_voice_popover: OpenVoicePopover,
+      viewport: model.viewport,
+      on_open_rooms: OpenDrawer(domain.RoomsDrawer),
     ),
     main_panel.view(
       palette: palette,

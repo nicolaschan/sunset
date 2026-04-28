@@ -10,9 +10,9 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Channel, type ChannelId, type ConnStatus, type Member, type Room, Bridge,
-  Connected, Minecraft, MutedP, Offline, Reconnecting, Speaking, TextChannel,
-  Voice,
+  type Channel, type ChannelId, type ConnStatus, type Member, type Room,
+  type Viewport, Bridge, Connected, Desktop, Minecraft, MutedP, Offline, Phone,
+  Reconnecting, Speaking, TextChannel, Voice,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -26,6 +26,8 @@ pub fn view(
   voice_popover_open voice_popover_open: Option(String),
   on_select_channel sel: fn(ChannelId) -> msg,
   on_open_voice_popover on_open_voice_popover: fn(String) -> msg,
+  viewport viewport: Viewport,
+  on_open_rooms on_open_rooms: msg,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
@@ -54,7 +56,7 @@ pub fn view(
       ]),
     ],
     [
-      room_header(p, r),
+      room_header(p, r, viewport, on_open_rooms),
       html.div(
         [
           ui.css([
@@ -99,9 +101,9 @@ pub fn view(
           },
         ],
       ),
-      case active_voice {
-        Some(c) -> self_control_bar(p, c.name)
-        None -> element.fragment([])
+      case viewport, active_voice {
+        Desktop, Some(c) -> self_control_bar(p, c.name)
+        _, _ -> element.fragment([])
       },
     ],
   )
@@ -114,25 +116,44 @@ fn result_to_option(r: Result(a, b)) -> Option(a) {
   }
 }
 
-fn room_header(p: Palette, r: Room) -> Element(msg) {
+fn room_header(
+  p: Palette,
+  r: Room,
+  viewport: Viewport,
+  on_open_rooms: msg,
+) -> Element(msg) {
   // Single-line title row, vertically centred in the 60px header. The
   // "X online" subtitle was dropped — the same count is already visible
   // in the members rail, and removing it gives the title room to breathe.
-  html.div(
-    [
-      ui.css([
-        #("box-sizing", "border-box"),
-        #("height", "60px"),
-        #("flex-shrink", "0"),
-        #("padding", "0 16px"),
-        #("border-bottom", "1px solid " <> p.border_soft),
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("gap", "8px"),
-        #("min-width", "0"),
-      ]),
-    ],
-    [
+  // On phone the title becomes a tappable button that opens the rooms drawer.
+  let title_el = case viewport {
+    Phone ->
+      html.button(
+        [
+          attribute.attribute("data-testid", "channels-room-title"),
+          attribute.title("Switch room"),
+          attribute.attribute("aria-label", "Switch room"),
+          event.on_click(on_open_rooms),
+          ui.css([
+            #("flex", "1"),
+            #("min-width", "0"),
+            #("display", "flex"),
+            #("align-items", "center"),
+            #("gap", "6px"),
+            #("padding", "0"),
+            #("border", "none"),
+            #("background", "transparent"),
+            #("color", p.text),
+            #("font-family", "inherit"),
+            #("font-weight", "600"),
+            #("font-size", "18.75px"),
+            #("text-align", "left"),
+            #("cursor", "pointer"),
+          ]),
+        ],
+        [title_text(r), conn_icon(p, r.status), chevron_right(p)],
+      )
+    Desktop ->
       html.span(
         [
           ui.css([
@@ -147,8 +168,66 @@ fn room_header(p: Palette, r: Room) -> Element(msg) {
           ]),
         ],
         [html.text(r.name)],
+      )
+  }
+  html.div(
+    [
+      ui.css([
+        #("box-sizing", "border-box"),
+        #("height", "60px"),
+        #("flex-shrink", "0"),
+        #("padding", "0 16px"),
+        #("border-bottom", "1px solid " <> p.border_soft),
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("gap", "8px"),
+        #("min-width", "0"),
+      ]),
+    ],
+    case viewport {
+      Phone -> [title_el]
+      Desktop -> [title_el, conn_icon(p, r.status)]
+    },
+  )
+}
+
+fn title_text(r: Room) -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("white-space", "nowrap"),
+        #("overflow", "hidden"),
+        #("text-overflow", "ellipsis"),
+        #("min-width", "0"),
+      ]),
+    ],
+    [html.text(r.name)],
+  )
+}
+
+fn chevron_right(p: Palette) -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "16"),
+      attribute.attribute("height", "16"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute("d", "M6 4l4 4-4 4"),
+          attribute.attribute("stroke", p.text_faint),
+          attribute.attribute("stroke-width", "1.5"),
+          attribute.attribute("stroke-linecap", "round"),
+          attribute.attribute("stroke-linejoin", "round"),
+        ],
+        [],
       ),
-      conn_icon(p, r.status),
     ],
   )
 }

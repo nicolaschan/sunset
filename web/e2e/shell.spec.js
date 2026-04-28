@@ -408,4 +408,15 @@ test.describe("phone shell smoke", () => {
     await expect(page.getByTestId("phone-members-toggle")).toBeVisible();
     await expect(page.getByTestId("phone-header").getByText("dusk-collective")).toBeVisible();
   });
+
+  test("tapping room title in channels drawer opens rooms drawer", async ({
+    page,
+  }) => {
+    await page.getByTestId("phone-rooms-toggle").click();
+    await expect(page.getByTestId("channels-drawer")).toBeVisible();
+    await expect(page.getByTestId("channels-room-title")).toBeVisible();
+
+    await page.getByTestId("channels-room-title").click();
+    await expect(page.getByTestId("rooms-drawer")).toBeVisible();
+  });
 });
