@@ -21,6 +21,7 @@ pub fn view(
   side side: Side,
   on_close on_close: msg,
   test_id test_id: String,
+  label label: String,
   content content: Element(msg),
 ) -> Element(msg) {
   let translate_closed = case side {
@@ -41,6 +42,7 @@ pub fn view(
     html.aside(
       [
         attribute.attribute("data-testid", test_id),
+        attribute.attribute("aria-label", label),
         attribute.attribute("aria-hidden", case open {
           True -> "false"
           False -> "true"

@@ -124,6 +124,7 @@ fn phone_view(
         side: drawer_module.Left,
         on_close: on_close_drawer,
         test_id: "channels-drawer",
+        label: "Channels",
         content: channels,
       ),
       drawer_module.view(
@@ -132,6 +133,7 @@ fn phone_view(
         side: drawer_module.Left,
         on_close: on_close_drawer,
         test_id: "rooms-drawer",
+        label: "Rooms",
         content: rooms,
       ),
       drawer_module.view(
@@ -140,6 +142,7 @@ fn phone_view(
         side: drawer_module.Right,
         on_close: on_close_drawer,
         test_id: "members-drawer",
+        label: "Members",
         content: right_rail,
       ),
       details_sheet,

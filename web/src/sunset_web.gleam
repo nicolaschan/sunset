@@ -670,7 +670,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
     OpenVoicePopover(name) -> #(
-      Model(..model, sheet: Some(domain.VoiceSheet(member_name: name))),
+      Model(
+        ..model,
+        sheet: Some(domain.VoiceSheet(member_name: name)),
+        reacting_to: None,
+      ),
       effect.none(),
     )
     CloseVoicePopover -> #(
