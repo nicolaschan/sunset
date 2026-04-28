@@ -480,9 +480,13 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         effect.from(fn(dispatch) {
           sunset.on_message(client, fn(im) { dispatch(IncomingMsg(im)) })
         })
-      // Presence wiring runs BEFORE add_relay so the membership tracker
-      // is subscribed to engine events before any PeerAdded events fire
-      // (engine.subscribe_engine_events does not replay history).
+      // Presence wiring is in ClientReady (not RelayConnectResult) so
+      // it kicks off even when there's no `?relay=` URL — the user
+      // still sees themselves in the member list. Effect order within a
+      // batch is unspecified by Lustre, but that's fine: Client::start_presence
+      // snapshots the engine's current peer set after subscribing, so
+      // already-connected peers are picked up regardless of when
+      // start_presence runs relative to add_relay.
       let presence_eff =
         effect.from(fn(dispatch) {
           let #(interval, ttl, refresh) = sunset.presence_params_from_url()
