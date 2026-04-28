@@ -2,7 +2,7 @@
 // call, caches the module exports, and exposes typed JS functions that
 // Gleam externals call.
 
-import { BitArray, Ok, Error as GError } from "../../prelude.mjs";
+import { BitArray, Ok, Error as GError, toList } from "../../prelude.mjs";
 import init, { Client } from "../../sunset_web_wasm.js";
 
 let initPromise = null;
@@ -149,3 +149,61 @@ export function incSentAtMs(msg) { return msg.sent_at_ms; }
 export function incBody(msg) { return msg.body; }
 export function incValueHashHex(msg) { return msg.value_hash_hex; }
 export function incIsSelf(msg) { return msg.is_self; }
+
+// Presence + membership FFI shims.
+
+export async function startPresence(client, intervalMs, ttlMs, refreshMs) {
+  try {
+    await client.start_presence(intervalMs, ttlMs, refreshMs);
+  } catch (e) {
+    console.warn("startPresence failed", e);
+  }
+}
+
+export function onMembersChanged(client, callback) {
+  client.on_members_changed((members) => {
+    try {
+      callback(toList(Array.from(members)));
+    } catch (e) {
+      console.warn("onMembersChanged callback threw", e);
+    }
+  });
+}
+
+export function onRelayStatusChanged(client, callback) {
+  client.on_relay_status_changed((s) => {
+    try {
+      callback(String(s));
+    } catch (e) {
+      console.warn("onRelayStatusChanged callback threw", e);
+    }
+  });
+}
+
+export function memPubkey(m) {
+  return new BitArray(m.pubkey);
+}
+export function memPresence(m) {
+  return m.presence;
+}
+export function memConnectionMode(m) {
+  return m.connection_mode;
+}
+export function memIsSelf(m) {
+  return m.is_self;
+}
+
+export function presenceParamsFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const parseOr = (key, dflt) => {
+    const raw = params.get(key);
+    if (raw === null) return dflt;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : dflt;
+  };
+  const interval = parseOr("presence_interval", 30000);
+  const ttl = parseOr("presence_ttl", 60000);
+  const refresh = parseOr("presence_refresh", 5000);
+  // Gleam tuple #(Int, Int, Int) is a 3-element JS array.
+  return [interval, ttl, refresh];
+}
