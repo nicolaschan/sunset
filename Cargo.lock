@@ -1685,6 +1685,7 @@ dependencies = [
  "sunset-store",
  "sunset-sync",
  "thiserror 2.0.18",
+ "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

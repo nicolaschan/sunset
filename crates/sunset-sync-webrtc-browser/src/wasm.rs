@@ -23,6 +23,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::poll_fn;
 use futures::stream::{Stream, StreamExt};
 use futures::task::Poll;
+use tokio::sync::Mutex;
 use js_sys::{ArrayBuffer, Reflect, Uint8Array};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
@@ -55,17 +56,24 @@ pub struct WebRtcRawTransport {
     local_peer: PeerId,
     ice_urls: Vec<String>,
     inner: Rc<RefCell<Inner>>,
+    /// Holds completed inbound connections produced by the background
+    /// accept worker. The worker drains `offers_rx` and runs the full
+    /// WebRTC handshake outside the engine's `select!` loop so it
+    /// survives the loop dropping its `accept()` future on every tick.
+    completed_rx: Rc<Mutex<mpsc::UnboundedReceiver<Result<WebRtcRawConnection>>>>,
 }
 
 struct Inner {
     dispatcher_started: bool,
+    accept_worker_started: bool,
     /// In-progress handshakes' inbound queues, keyed by remote peer.
     /// Connect-side registers before sending Offer; accept-side registers
     /// after receiving Offer.
     per_peer: HashMap<PeerId, mpsc::UnboundedSender<WebRtcSignalKind>>,
-    /// Drained by `accept()`. Each entry is (from_peer, offer_sdp).
+    /// Drained by the accept worker. Each entry is (from_peer, offer_sdp).
     offers_tx: mpsc::UnboundedSender<(PeerId, String)>,
     offers_rx: Option<mpsc::UnboundedReceiver<(PeerId, String)>>,
+    completed_tx: Option<mpsc::UnboundedSender<Result<WebRtcRawConnection>>>,
 }
 
 impl WebRtcRawTransport {
@@ -73,16 +81,20 @@ impl WebRtcRawTransport {
     /// e.g. `["stun:stun.l.google.com:19302".into()]`.
     pub fn new(signaler: Rc<dyn Signaler>, local_peer: PeerId, ice_urls: Vec<String>) -> Self {
         let (offers_tx, offers_rx) = mpsc::unbounded::<(PeerId, String)>();
+        let (completed_tx, completed_rx) = mpsc::unbounded::<Result<WebRtcRawConnection>>();
         Self {
             signaler,
             local_peer,
             ice_urls,
             inner: Rc::new(RefCell::new(Inner {
                 dispatcher_started: false,
+                accept_worker_started: false,
                 per_peer: HashMap::new(),
                 offers_tx,
                 offers_rx: Some(offers_rx),
+                completed_tx: Some(completed_tx),
             })),
+            completed_rx: Rc::new(Mutex::new(completed_rx)),
         }
     }
 
@@ -189,7 +201,12 @@ impl RawTransport for WebRtcRawTransport {
         );
 
         // Drive inbound (Answer + ICE) until the datachannel opens.
+        // ICE candidates that arrive before the Answer must be buffered:
+        // `addIceCandidate` errors with "remote description was null" if
+        // called before `setRemoteDescription`. We drain the buffer once
+        // the Answer is processed.
         let mut got_answer = false;
+        let mut pending_ice: Vec<String> = Vec::new();
         let open_fut = open_rx.fuse();
         futures::pin_mut!(open_fut);
         loop {
@@ -207,9 +224,16 @@ impl RawTransport for WebRtcRawTransport {
                                 Error::Transport(format!("setRemoteDescription: {e:?}"))
                             })?;
                             got_answer = true;
+                            for json in pending_ice.drain(..) {
+                                add_remote_ice(&pc, &json).await?;
+                            }
                         }
                         WebRtcSignalKind::IceCandidate(json) => {
-                            add_remote_ice(&pc, &json).await?;
+                            if got_answer {
+                                add_remote_ice(&pc, &json).await?;
+                            } else {
+                                pending_ice.push(json);
+                            }
                         }
                         WebRtcSignalKind::Offer(_) | WebRtcSignalKind::Answer(_) => {
                             // Glare or duplicate — ignore.
@@ -234,147 +258,181 @@ impl RawTransport for WebRtcRawTransport {
 
     async fn accept(&self) -> Result<Self::Connection> {
         self.ensure_dispatcher();
-
-        // Take the offers_rx the first time accept() is called; the
-        // engine calls accept() in a loop, so put it back when done.
-        let mut offers_rx = self
-            .inner
-            .borrow_mut()
-            .offers_rx
-            .take()
-            .ok_or_else(|| Error::Transport("accept already in progress".into()))?;
-        let result = self.accept_one(&mut offers_rx).await;
-        self.inner.borrow_mut().offers_rx = Some(offers_rx);
-        result
+        self.ensure_accept_worker();
+        // The background accept worker runs the full WebRTC handshake
+        // independently of the engine's `select!` loop (which would
+        // otherwise drop our future on every tick, restarting the
+        // handshake from scratch). Here we just await the next
+        // completed connection.
+        let mut completed_rx = self.completed_rx.lock().await;
+        completed_rx
+            .next()
+            .await
+            .ok_or_else(|| Error::Transport("accept worker terminated".into()))?
     }
 }
 
 impl WebRtcRawTransport {
-    async fn accept_one(
-        &self,
-        offers_rx: &mut mpsc::UnboundedReceiver<(PeerId, String)>,
-    ) -> Result<WebRtcRawConnection> {
-        let (from_peer, offer_sdp) = offers_rx
-            .next()
-            .await
-            .ok_or_else(|| Error::Transport("offers channel closed".into()))?;
-
-        let mut peer_in_rx = self.register_peer(from_peer.clone());
-
-        let pc = build_peer_connection(&self.ice_urls)?;
-        let (ice_tx, ice_rx) = mpsc::unbounded::<String>();
-        let (open_tx, open_rx) = oneshot::channel::<()>();
-        let (msg_tx, msg_rx) = mpsc::unbounded::<Bytes>();
-        let (dc_tx, dc_rx) = oneshot::channel::<RtcDataChannel>();
-
-        let on_ice = make_ice_closure(ice_tx);
-        pc.set_onicecandidate(Some(on_ice.as_ref().unchecked_ref()));
-
-        // When the inbound datachannel arrives, attach onmessage + onopen
-        // and forward the channel to dc_rx.
-        let dc_tx_cell = Rc::new(RefCell::new(Some(dc_tx)));
-        let open_tx_cell = Rc::new(RefCell::new(Some(open_tx)));
-        let msg_tx_for_dc = msg_tx;
-        let on_dc =
-            Closure::<dyn FnMut(RtcDataChannelEvent)>::new(move |ev: RtcDataChannelEvent| {
-                let dc = ev.channel();
-                dc.set_binary_type(RtcDataChannelType::Arraybuffer);
-
-                let on_open = make_open_closure_from_cell(open_tx_cell.clone());
-                dc.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-                // The closure is only ever fired once; once it has fired and
-                // signaled `open_tx`, dropping it is safe. To keep it alive
-                // until then, we leak it. Acceptable for v1 (page lifetime).
-                on_open.forget();
-
-                let on_msg = make_msg_closure(msg_tx_for_dc.clone());
-                dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-                // The msg closure must outlive the datachannel itself, which
-                // outlives the connection it's stored on. Page-lifetime leak
-                // is acceptable here for v1; revisit if cleanup becomes
-                // important.
-                on_msg.forget();
-
-                if let Some(tx) = dc_tx_cell.borrow_mut().take() {
-                    let _ = tx.send(dc);
+    /// Spawn the background accept worker on first use. The worker
+    /// drains `offers_rx` and runs the full WebRTC handshake for each
+    /// inbound offer, decoupled from the engine's `select!` loop.
+    fn ensure_accept_worker(&self) {
+        let (offers_rx_opt, completed_tx_opt) = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.accept_worker_started {
+                return;
+            }
+            inner.accept_worker_started = true;
+            (inner.offers_rx.take(), inner.completed_tx.take())
+        };
+        let mut offers_rx = match offers_rx_opt {
+            Some(r) => r,
+            None => return,
+        };
+        let completed_tx = match completed_tx_opt {
+            Some(t) => t,
+            None => return,
+        };
+        let signaler = self.signaler.clone();
+        let local_peer = self.local_peer.clone();
+        let ice_urls = self.ice_urls.clone();
+        let inner_ref = self.inner.clone();
+        spawn_local(async move {
+            while let Some((from_peer, offer_sdp)) = offers_rx.next().await {
+                let result = run_accept_one(
+                    signaler.clone(),
+                    local_peer.clone(),
+                    ice_urls.clone(),
+                    inner_ref.clone(),
+                    from_peer,
+                    offer_sdp,
+                )
+                .await;
+                if completed_tx.unbounded_send(result).is_err() {
+                    break;
                 }
-            });
-        pc.set_ondatachannel(Some(on_dc.as_ref().unchecked_ref()));
+            }
+        });
+    }
+}
 
-        let sd = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-        sd.set_sdp(&offer_sdp);
-        JsFuture::from(pc.set_remote_description(&sd))
-            .await
-            .map_err(|e| Error::Transport(format!("setRemoteDescription offer: {e:?}")))?;
+/// Run one inbound WebRTC handshake to completion. Free function so
+/// the background accept worker (spawned with no `&self`) can call it.
+async fn run_accept_one(
+    signaler: Rc<dyn Signaler>,
+    local_peer: PeerId,
+    ice_urls: Vec<String>,
+    inner: Rc<RefCell<Inner>>,
+    from_peer: PeerId,
+    offer_sdp: String,
+) -> Result<WebRtcRawConnection> {
+    let (peer_in_tx, mut peer_in_rx) = mpsc::unbounded::<WebRtcSignalKind>();
+    inner
+        .borrow_mut()
+        .per_peer
+        .insert(from_peer.clone(), peer_in_tx);
 
-        let answer = JsFuture::from(pc.create_answer())
-            .await
-            .map_err(|e| Error::Transport(format!("createAnswer: {e:?}")))?;
-        let sdp = sdp_from_session_description(&answer, "answer")?;
-        let sd = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
-        sd.set_sdp(&sdp);
-        JsFuture::from(pc.set_local_description(&sd))
-            .await
-            .map_err(|e| Error::Transport(format!("setLocalDescription answer: {e:?}")))?;
+    let pc = build_peer_connection(&ice_urls)?;
+    let (ice_tx, ice_rx) = mpsc::unbounded::<String>();
+    let (open_tx, open_rx) = oneshot::channel::<()>();
+    let (msg_tx, msg_rx) = mpsc::unbounded::<Bytes>();
+    let (dc_tx, dc_rx) = oneshot::channel::<RtcDataChannel>();
 
-        send_signal(
-            &*self.signaler,
-            self.local_peer.clone(),
-            from_peer.clone(),
-            0,
-            &WebRtcSignalKind::Answer(sdp),
-        )
-        .await?;
+    let on_ice = make_ice_closure(ice_tx);
+    pc.set_onicecandidate(Some(on_ice.as_ref().unchecked_ref()));
 
-        spawn_ice_forwarder(
-            self.signaler.clone(),
-            self.local_peer.clone(),
-            from_peer.clone(),
-            ice_rx,
-        );
+    let dc_tx_cell = Rc::new(RefCell::new(Some(dc_tx)));
+    let open_tx_cell = Rc::new(RefCell::new(Some(open_tx)));
+    let msg_tx_for_dc = msg_tx;
+    let on_dc = Closure::<dyn FnMut(RtcDataChannelEvent)>::new(move |ev: RtcDataChannelEvent| {
+        let dc = ev.channel();
+        dc.set_binary_type(RtcDataChannelType::Arraybuffer);
 
-        // Drain inbound ICE candidates while waiting for ondatachannel,
-        // then for dc.open. The dispatcher routes any remote ICE here.
-        let dc_fut = dc_rx.fuse();
-        let open_fut = open_rx.fuse();
-        futures::pin_mut!(dc_fut, open_fut);
-        let mut dc_opt: Option<RtcDataChannel> = None;
-        loop {
-            futures::select! {
-                got = dc_fut.as_mut() => {
-                    dc_opt = Some(got.map_err(|_| {
-                        Error::Transport("peer connection dropped before ondatachannel".into())
-                    })?);
+        let on_open = make_open_closure_from_cell(open_tx_cell.clone());
+        dc.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+        on_open.forget();
+
+        let on_msg = make_msg_closure(msg_tx_for_dc.clone());
+        dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+        on_msg.forget();
+
+        if let Some(tx) = dc_tx_cell.borrow_mut().take() {
+            let _ = tx.send(dc);
+        }
+    });
+    pc.set_ondatachannel(Some(on_dc.as_ref().unchecked_ref()));
+
+    let sd = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+    sd.set_sdp(&offer_sdp);
+    JsFuture::from(pc.set_remote_description(&sd))
+        .await
+        .map_err(|e| Error::Transport(format!("setRemoteDescription offer: {e:?}")))?;
+
+    let answer = JsFuture::from(pc.create_answer())
+        .await
+        .map_err(|e| Error::Transport(format!("createAnswer: {e:?}")))?;
+    let sdp = sdp_from_session_description(&answer, "answer")?;
+    let sd = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+    sd.set_sdp(&sdp);
+    JsFuture::from(pc.set_local_description(&sd))
+        .await
+        .map_err(|e| Error::Transport(format!("setLocalDescription answer: {e:?}")))?;
+
+    send_signal(
+        &*signaler,
+        local_peer.clone(),
+        from_peer.clone(),
+        0,
+        &WebRtcSignalKind::Answer(sdp),
+    )
+    .await?;
+
+    spawn_ice_forwarder(
+        signaler.clone(),
+        local_peer.clone(),
+        from_peer.clone(),
+        ice_rx,
+    );
+
+    let dc_fut = dc_rx.fuse();
+    let open_fut = open_rx.fuse();
+    futures::pin_mut!(dc_fut, open_fut);
+    let mut dc_opt: Option<RtcDataChannel> = None;
+    loop {
+        futures::select! {
+            got = dc_fut.as_mut() => {
+                dc_opt = Some(got.map_err(|_| {
+                    Error::Transport("peer connection dropped before ondatachannel".into())
+                })?);
+            }
+            _ = open_fut.as_mut() => {
+                if dc_opt.is_some() {
+                    break;
                 }
-                _ = open_fut.as_mut() => {
-                    if dc_opt.is_some() {
-                        break;
-                    }
-                }
-                opt = peer_in_rx.next().fuse() => {
-                    let kind = opt.ok_or_else(|| {
-                        Error::Transport("signaling closed mid-handshake".into())
-                    })?;
-                    if let WebRtcSignalKind::IceCandidate(json) = kind {
-                        add_remote_ice(&pc, &json).await?;
-                    }
+            }
+            opt = peer_in_rx.next().fuse() => {
+                let kind = opt.ok_or_else(|| {
+                    Error::Transport("signaling closed mid-handshake".into())
+                })?;
+                if let WebRtcSignalKind::IceCandidate(json) = kind {
+                    add_remote_ice(&pc, &json).await?;
                 }
             }
         }
-
-        self.unregister_peer(&from_peer);
-
-        let dc = dc_opt.ok_or_else(|| Error::Transport("no inbound datachannel".into()))?;
-        Ok(WebRtcRawConnection {
-            _pc: pc,
-            dc,
-            rx: RefCell::new(msg_rx),
-            _on_ice: on_ice,
-            _on_open: None,
-            _on_msg: None,
-            _on_dc: Some(on_dc),
-        })
     }
+
+    inner.borrow_mut().per_peer.remove(&from_peer);
+
+    let dc = dc_opt.ok_or_else(|| Error::Transport("no inbound datachannel".into()))?;
+    Ok(WebRtcRawConnection {
+        _pc: pc,
+        dc,
+        rx: RefCell::new(msg_rx),
+        _on_ice: on_ice,
+        _on_open: None,
+        _on_msg: None,
+        _on_dc: Some(on_dc),
+    })
 }
 
 pub struct WebRtcRawConnection {
@@ -433,11 +491,13 @@ impl RawConnection for WebRtcRawConnection {
 // Helpers
 // -----------------------------------------------------------------------
 
-/// Parse `webrtc://<hex-pubkey>`.
+/// Parse `webrtc://<hex-pubkey>` (optionally followed by a `#…` fragment
+/// consumed by upstream decorators like NoiseTransport).
 fn parse_addr_peer_id(addr: &PeerAddr) -> Result<PeerId> {
     let s = std::str::from_utf8(addr.as_bytes())
         .map_err(|e| Error::Transport(format!("addr not utf-8: {e}")))?;
-    let suffix = s
+    let no_frag = s.split('#').next().unwrap_or(s);
+    let suffix = no_frag
         .strip_prefix("webrtc://")
         .ok_or_else(|| Error::Transport(format!("addr not webrtc://: {s}")))?;
     let bytes =

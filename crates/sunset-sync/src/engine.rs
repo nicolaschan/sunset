@@ -19,6 +19,23 @@ use crate::subscription_registry::{SubscriptionRegistry, parse_subscription_entr
 use crate::transport::Transport;
 use crate::types::{PeerAddr, PeerId, SyncConfig, TrustSet};
 
+/// Free helper that spins up the outbound channel + spawns the per-peer
+/// task. Extracted from `SyncEngine::spawn_peer` so the AddPeer command
+/// handler can call it from a `'static` spawned task without holding
+/// `&self`.
+fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
+    conn: C,
+    local_peer: PeerId,
+    proto: u32,
+    inbound_tx: mpsc::UnboundedSender<InboundEvent>,
+) {
+    let conn = Rc::new(conn);
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+    crate::spawn::spawn_local(run_peer(
+        conn, local_peer, proto, out_tx, out_rx, inbound_tx,
+    ));
+}
+
 /// A command sent from the public API into the running engine.
 pub(crate) enum EngineCommand {
     AddPeer {
@@ -216,8 +233,26 @@ where
     ) {
         match cmd {
             EngineCommand::AddPeer { addr, ack } => {
-                let r = self.do_add_peer(addr, inbound_tx.clone()).await;
-                let _ = ack.send(r);
+                // Spawn the connect+spawn_peer chain as a background task
+                // so the engine's `select!` loop stays responsive during
+                // the handshake. This is load-bearing for transports
+                // whose `connect()` depends on the engine making forward
+                // progress (e.g. WebRTC, where SDP/ICE flows over the
+                // existing CRDT replication).
+                let transport = self.transport.clone();
+                let local_peer = self.local_peer.clone();
+                let proto = self.config.protocol_version;
+                let inbound_tx = inbound_tx.clone();
+                crate::spawn::spawn_local(async move {
+                    let r = match transport.connect(addr).await {
+                        Ok(conn) => {
+                            spawn_run_peer(conn, local_peer, proto, inbound_tx);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    };
+                    let _ = ack.send(r);
+                });
             }
             EngineCommand::PublishSubscription { filter, ttl, ack } => {
                 let r = self.do_publish_subscription(filter, ttl).await;
@@ -230,35 +265,17 @@ where
         }
     }
 
-    async fn do_add_peer(
-        &self,
-        addr: PeerAddr,
-        inbound_tx: mpsc::UnboundedSender<InboundEvent>,
-    ) -> Result<()> {
-        let conn = self.transport.connect(addr).await?;
-        self.spawn_peer(conn, inbound_tx).await;
-        Ok(())
-    }
-
     async fn spawn_peer(
         &self,
         conn: T::Connection,
         inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     ) {
-        let conn = Rc::new(conn);
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
-        let local_peer = self.local_peer.clone();
-        let proto = self.config.protocol_version;
-
-        // `peer_outbound` is registered when the remote's Hello arrives (in
-        // `handle_inbound_event`), keyed by the Hello-declared peer_id. This
-        // ensures the outbound key matches what the subscription registry uses
-        // (both are keyed by the application-layer identity the remote
-        // declared in its Hello, which may differ from the transport-layer
-        // routing identity returned by `conn.peer_id()`).
-        crate::spawn::spawn_local(run_peer(
-            conn, local_peer, proto, out_tx, out_rx, inbound_tx,
-        ));
+        spawn_run_peer(
+            conn,
+            self.local_peer.clone(),
+            self.config.protocol_version,
+            inbound_tx,
+        );
     }
 
     async fn handle_inbound_event(&self, event: InboundEvent) {

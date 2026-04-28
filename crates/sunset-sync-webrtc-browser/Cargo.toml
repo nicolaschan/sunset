@@ -21,6 +21,7 @@ serde.workspace = true
 sunset-store.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys.workspace = true
