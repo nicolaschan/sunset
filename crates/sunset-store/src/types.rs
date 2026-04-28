@@ -76,10 +76,11 @@ pub struct SignedKvEntry {
 }
 
 /// A signed, fire-and-forget datagram. Same trust model as
-/// `SignedKvEntry` (sender-attributable via Ed25519 signature) but
-/// with no LWW, no priority, no expiry, and no content-addressed
-/// indirection. Used by the Bus's ephemeral delivery path; carried
-/// over an unreliable transport channel and never persisted.
+/// `SignedKvEntry` (sender-attributable via the host-supplied
+/// signature scheme) but with no LWW, no priority, no expiry, and
+/// no content-addressed indirection. Used by the Bus's ephemeral
+/// delivery path; carried over an unreliable transport channel and
+/// never persisted.
 ///
 /// `signature` covers the canonical postcard encoding of
 /// `(verifying_key, name, payload)` — see
