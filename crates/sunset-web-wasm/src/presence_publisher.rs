@@ -28,9 +28,7 @@ pub fn spawn_publisher(
         let name_str = format!("{room_fp_hex}/presence/{my_hex}");
         loop {
             if let Err(e) = publish_once(&identity, &name_str, &store, ttl_ms).await {
-                web_sys::console::warn_1(&JsValue::from_str(&format!(
-                    "presence publisher: {e}"
-                )));
+                web_sys::console::warn_1(&JsValue::from_str(&format!("presence publisher: {e}")));
             }
             sleep(Duration::from_millis(interval_ms)).await;
         }
