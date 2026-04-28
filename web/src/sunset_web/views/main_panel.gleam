@@ -9,6 +9,7 @@
 ////
 //// Image attachments are still deferred to a later plan.
 
+import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
@@ -32,6 +33,8 @@ pub fn view(
   messages ms: List(Message),
   draft draft: String,
   on_draft on_draft: fn(String) -> msg,
+  on_submit on_submit: msg,
+  noop noop: msg,
   reacting_to reacting_to: Option(String),
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
@@ -60,7 +63,7 @@ pub fn view(
         on_add_reaction,
         on_open_detail,
       ),
-      composer(p, channel_name, draft, on_draft),
+      composer(p, channel_name, draft, on_draft, on_submit, noop),
     ],
   )
 }
@@ -666,6 +669,8 @@ fn composer(
   channel_name: String,
   draft: String,
   on_draft: fn(String) -> msg,
+  on_submit: msg,
+  noop: msg,
 ) -> Element(msg) {
   // Fixed 64px height with a 1px border-top — the rooms-rail you_row
   // and channels-rail self-bar share the same shape so the three
@@ -702,6 +707,13 @@ fn composer(
             attribute.value(draft),
             attribute.placeholder("Message #" <> channel_name),
             event.on_input(on_draft),
+            event.on("keydown", {
+              use key <- decode.subfield(["key"], decode.string)
+              decode.success(case key {
+                "Enter" -> on_submit
+                _ -> noop
+              })
+            }),
             ui.css([
               #("flex", "1"),
               #("border", "none"),
