@@ -15,6 +15,7 @@
 import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import lustre
 import lustre/effect.{type Effect}
@@ -36,6 +37,7 @@ import sunset_web/views/members
 import sunset_web/views/phone_header
 import sunset_web/views/rooms
 import sunset_web/views/shell
+import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
 
 pub type View {
@@ -839,6 +841,27 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _, _ -> element.fragment([])
   }
 
+  let user_in_call =
+    list.any(fixture.members(), fn(m) { m.you && m.in_call })
+
+  let active_voice_channel_name =
+    list.find(
+      fixture.channels(),
+      fn(c) { c.kind == domain.Voice && c.in_call > 0 },
+    )
+    |> result.map(fn(c) { c.name })
+    |> result.unwrap("")
+
+  let voice_minibar_el = case model.viewport, user_in_call {
+    domain.Phone, True ->
+      voice_minibar.view(
+        palette: palette,
+        channel_name: active_voice_channel_name,
+        on_open: OpenVoicePopover("you"),
+      )
+    _, _ -> element.fragment([])
+  }
+
   shell.view(
     model.mode,
     palette,
@@ -919,7 +942,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_open_channels: OpenDrawer(domain.ChannelsDrawer),
       on_open_members: OpenDrawer(domain.MembersDrawer),
     ),
-    element.fragment([]),
+    voice_minibar_el,
     details_sheet_el,
     voice_sheet_el,
     element.fragment([]),

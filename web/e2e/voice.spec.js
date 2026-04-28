@@ -126,6 +126,31 @@ test("reset restores defaults after edits", async ({ page }) => {
   await expect(denoise).toHaveAttribute("aria-pressed", "true");
 });
 
+test.describe("phone — voice mini-bar", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  test("mini-bar visible in chat view while in call", async ({ page }) => {
+    await expect(page.getByTestId("voice-minibar")).toBeVisible();
+    await expect(page.getByTestId("voice-minibar")).toContainText("Lounge");
+  });
+
+  test("tapping mini-bar opens self voice sheet", async ({ page }) => {
+    await page.getByTestId("voice-minibar").click();
+    const sheet = page.getByTestId("voice-sheet");
+    await expect(sheet).toBeVisible();
+    // "you" appears in both the member name and the initials; use first() to avoid strict-mode error.
+    await expect(sheet.getByText("you", { exact: true }).first()).toBeVisible();
+    // Self row hides mute-for-me + reset.
+    await expect(sheet.getByTestId("voice-popover-deafen")).toHaveCount(0);
+  });
+});
+
 test.describe("phone — voice sheet", () => {
   test.beforeEach(async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
