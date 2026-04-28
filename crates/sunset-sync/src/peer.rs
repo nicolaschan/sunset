@@ -221,16 +221,12 @@ async fn send_unreliable_message<C: TransportConnection + ?Sized>(
     conn.send_unreliable(bytes).await
 }
 
-async fn recv_reliable_message<C: TransportConnection + ?Sized>(
-    conn: &C,
-) -> Result<SyncMessage> {
+async fn recv_reliable_message<C: TransportConnection + ?Sized>(conn: &C) -> Result<SyncMessage> {
     let bytes: Bytes = conn.recv_reliable().await?;
     SyncMessage::decode(&bytes)
 }
 
-async fn recv_unreliable_message<C: TransportConnection + ?Sized>(
-    conn: &C,
-) -> Result<SyncMessage> {
+async fn recv_unreliable_message<C: TransportConnection + ?Sized>(conn: &C) -> Result<SyncMessage> {
     let bytes: Bytes = conn.recv_unreliable().await?;
     SyncMessage::decode(&bytes)
 }
