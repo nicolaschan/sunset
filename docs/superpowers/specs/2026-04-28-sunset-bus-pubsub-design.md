@@ -264,6 +264,7 @@ Both must round-trip across browsers/native; both gate on test vectors that fail
 | Failure | Behavior |
 |---|---|
 | `publish_ephemeral` with no matching peers | Returns `Ok(())`. Datagram dropped silently — same as no listener. Loopback to local subscribers still happens. |
+| Subscribe-late race: peer publishes ephemeral before our subscription has propagated through the registry | Some initial datagrams missed silently. **Inherent to pub/sub; no mitigation in this layer.** Applications that need "I'm ready to receive" guarantees should layer a reliable handshake on top of the bus (e.g., the voice plan sends a small durable "subscribed" marker before the publisher starts streaming). The bus does NOT block subscribe on registry propagation, because (a) the registry is broadcast to N peers and acks from any subset prove nothing about the others, (b) the receiver-side window between registry-arrival and routing-table-update is still there even after an ack, and (c) standard pub/sub semantics don't promise instantaneous join — replay or handshake is the consumer's choice. |
 | Matching peer has no unreliable channel (relay-only WS connection) | Skipped silently in v1; logged at debug. **V_forwarding addresses this.** |
 | Signature verification fails on receive | Drop datagram; log at warn. |
 | Unreliable send fails (queue full, channel closed) | Drop; log at debug. Per-peer task continues. |
@@ -300,6 +301,22 @@ Both must round-trip across browsers/native; both gate on test vectors that fail
 Voice plan (Plan C) covers the browser e2e of ephemeral over real WebRTC. This spec doesn't add Playwright tests directly; the bus is exercised via Rust tests + the future voice plan.
 
 ---
+
+## Layer boundary — JS / Gleam surface
+
+**This plan adds zero JS / Gleam surface.** The Bus is a Rust-internal API consumed only by Rust callers (`sunset-core`'s chat code today; the future voice plan tomorrow; eventually `sunset-tui`, `sunset-relay`, `sunset-mod`).
+
+This plan also pins a load-bearing invariant for downstream plans: **all business logic — routing, signing, framing, codec, packet sequencing, AEAD, jitter handling — lives in Rust crates**. The Gleam UI and JS FFI shim should be purely plumbing:
+
+| Layer | Owns | Surfaces to JS/Gleam |
+|---|---|---|
+| sunset-store | CRDT, content-addressed blobs, signing canonical encoding | none |
+| sunset-sync | transports, replication, subscription registry, ephemeral routing | none |
+| sunset-core | Identity, Room, message composition, **Bus**, future voice session lifecycle, Opus, framing, AEAD | none |
+| sunset-web-wasm | thin wasm-bindgen wrappers; `Client` class with one method per high-level user action | only what's listed here |
+| Gleam UI / sunset.ffi.mjs | render state; dispatch user events; wire MediaStream → wasm pipe; wire decoded samples → AudioContext; URL params; localStorage | UI state, DOM, MediaStream/AudioContext glue |
+
+When the future voice plan lands, the rule it must obey: the Gleam/JS code paths are limited to (a) MediaStream/AudioContext I/O glue, (b) one-line method calls into the Rust Client per user action, (c) callback registration for state and decoded audio. Encoding, sequencing, peer selection, retry, etc., never leak above the wasm boundary.
 
 ## Out of scope
 
