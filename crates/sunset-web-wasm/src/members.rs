@@ -37,7 +37,6 @@ impl Presence {
 /// - `age_ms < interval_ms`         → Online
 /// - `interval_ms ≤ age_ms < ttl_ms` → Away
 /// - `age_ms ≥ ttl_ms`              → Offline (caller drops member from list)
-#[allow(dead_code)]
 pub fn presence_bucket(age_ms: u64, interval_ms: u64, ttl_ms: u64) -> Presence {
     if age_ms < interval_ms {
         Presence::Online
@@ -79,7 +78,6 @@ impl MemberJs {
 
 /// Pure derivation: given the current state, return the rendered
 /// member list. Self is always present and always Online.
-#[allow(dead_code)]
 pub fn derive_members(
     now_ms: u64,
     interval_ms: u64,
@@ -101,7 +99,11 @@ pub fn derive_members(
         .iter()
         .filter(|(pk, _)| *pk != self_peer)
         .collect();
-    others.sort_by(|(a, _), (b, _)| a.verifying_key().as_bytes().cmp(b.verifying_key().as_bytes()));
+    others.sort_by(|(a, _), (b, _)| {
+        a.verifying_key()
+            .as_bytes()
+            .cmp(b.verifying_key().as_bytes())
+    });
     for (pk, last_ms) in others {
         let age = now_ms.saturating_sub(*last_ms);
         let presence = presence_bucket(age, interval_ms, ttl_ms);
@@ -127,11 +129,16 @@ pub fn derive_members(
 /// Stable shape signature used to debounce callbacks. The tracker
 /// compares the current signature with the previously-emitted one
 /// and only fires the callback if it changed.
-#[allow(dead_code)]
 pub fn members_signature(members: &[MemberJs]) -> Vec<(Vec<u8>, String, String)> {
     members
         .iter()
-        .map(|m| (m.pubkey.clone(), m.presence.clone(), m.connection_mode.clone()))
+        .map(|m| {
+            (
+                m.pubkey.clone(),
+                m.presence.clone(),
+                m.connection_mode.clone(),
+            )
+        })
         .collect()
 }
 
@@ -196,10 +203,7 @@ mod tests {
         // dave: no kind → "unknown"
         let out = derive_members(200, 1000, 3000, &me, &presence, &kinds);
         assert_eq!(out.len(), 4);
-        let modes: Vec<&str> = out
-            .iter()
-            .map(|m| m.connection_mode.as_str())
-            .collect();
+        let modes: Vec<&str> = out.iter().map(|m| m.connection_mode.as_str()).collect();
         assert_eq!(modes, vec!["self", "via_relay", "direct", "unknown"]);
     }
 
