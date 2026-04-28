@@ -1733,10 +1733,12 @@ dependencies = [
 name = "sunset-web-wasm"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "hex",
  "js-sys",
+ "postcard",
  "rand_chacha",
  "rand_core",
  "sunset-core",
@@ -1744,12 +1746,15 @@ dependencies = [
  "sunset-store",
  "sunset-store-memory",
  "sunset-sync",
+ "sunset-sync-webrtc-browser",
  "sunset-sync-ws-browser",
  "thiserror 2.0.18",
+ "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "web-time",
  "zeroize",
 ]
 

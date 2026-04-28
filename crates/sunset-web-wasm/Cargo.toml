@@ -12,9 +12,11 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
+postcard.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
 sunset-core.workspace = true
@@ -22,8 +24,11 @@ sunset-noise.workspace = true
 sunset-store.workspace = true
 sunset-store-memory.workspace = true
 sunset-sync.workspace = true
+sunset-sync-webrtc-browser.workspace = true
 sunset-sync-ws-browser.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+web-time.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
