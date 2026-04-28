@@ -12,9 +12,9 @@ pub mod verifier;
 #[cfg(feature = "test-helpers")]
 pub mod test_helpers;
 
-pub use canonical::signing_payload;
+pub use canonical::{datagram_signing_payload, signing_payload};
 pub use error::{Error, Result};
 pub use filter::{Event, Filter, Replay};
 pub use store::{EntryStream, EventStream, Store};
-pub use types::{ContentBlock, Cursor, Hash, SignedKvEntry, VerifyingKey};
+pub use types::{ContentBlock, Cursor, Hash, SignedDatagram, SignedKvEntry, VerifyingKey};
 pub use verifier::{AcceptAllVerifier, SignatureVerifier};

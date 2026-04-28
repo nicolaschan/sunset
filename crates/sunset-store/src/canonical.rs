@@ -14,7 +14,7 @@
 use bytes::Bytes;
 use serde::Serialize;
 
-use crate::{Hash, SignedKvEntry, VerifyingKey};
+use crate::{Hash, SignedDatagram, SignedKvEntry, VerifyingKey};
 
 /// The fields of `SignedKvEntry` that are covered by the signature, in the
 /// frozen canonical order.
@@ -38,6 +38,24 @@ pub fn signing_payload(entry: &SignedKvEntry) -> Vec<u8> {
         expires_at: entry.expires_at,
     };
     postcard::to_stdvec(&unsigned).expect("postcard encoding of UnsignedEntryRef is infallible")
+}
+
+/// Canonical bytes covered by `SignedDatagram::signature`. Postcard
+/// encoding of `(verifying_key, name, payload)`. Frozen by the
+/// `datagram_payload_frozen_vector` test below.
+pub fn datagram_signing_payload(d: &SignedDatagram) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct UnsignedDatagramRef<'a> {
+        verifying_key: &'a VerifyingKey,
+        name: &'a Bytes,
+        payload: &'a Bytes,
+    }
+    let unsigned = UnsignedDatagramRef {
+        verifying_key: &d.verifying_key,
+        name: &d.name,
+        payload: &d.payload,
+    };
+    postcard::to_stdvec(&unsigned).expect("postcard encoding of UnsignedDatagramRef is infallible")
 }
 
 #[cfg(test)]
@@ -80,6 +98,42 @@ mod tests {
         assert_eq!(
             digest.to_hex().as_str(),
             "d15d46aa02779b076df6f8223577aead0385307e3817112c65297661af2b3094",
+            "If this fails the canonical signing encoding has drifted — DO NOT update this hex without bumping the wire-format version.",
+        );
+    }
+
+    fn sample_datagram() -> SignedDatagram {
+        SignedDatagram {
+            verifying_key: VerifyingKey::new(Bytes::from_static(
+                b"sample-vk-32-bytes-aaaaaaaaaaaaa",
+            )),
+            name: Bytes::from_static(b"room/general/voice/alice/0042"),
+            payload: Bytes::from_static(b"opaque-payload-bytes"),
+            signature: Bytes::from_static(b"ignored"),
+        }
+    }
+
+    #[test]
+    fn datagram_payload_excludes_signature_field() {
+        let mut a = sample_datagram();
+        let mut b = sample_datagram();
+        b.signature = Bytes::from_static(b"completely different");
+        assert_eq!(datagram_signing_payload(&a), datagram_signing_payload(&b));
+        a.payload = Bytes::from_static(b"different payload");
+        assert_ne!(datagram_signing_payload(&a), datagram_signing_payload(&b));
+    }
+
+    /// Frozen wire-format vector. If this hex changes, every existing
+    /// SignedDatagram signature in the wild becomes invalid — bump the
+    /// wire-format version before updating the constant.
+    #[test]
+    fn datagram_payload_frozen_vector() {
+        let d = sample_datagram();
+        let payload = datagram_signing_payload(&d);
+        let digest = blake3::hash(&payload);
+        assert_eq!(
+            digest.to_hex().as_str(),
+            "6a41b250cbcdac14e6b6dba7bcd691a81e161f5b4ec7721e8fa2eb83422682b6",
             "If this fails the canonical signing encoding has drifted — DO NOT update this hex without bumping the wire-format version.",
         );
     }

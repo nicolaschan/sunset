@@ -75,6 +75,23 @@ pub struct SignedKvEntry {
     pub signature: bytes::Bytes,
 }
 
+/// A signed, fire-and-forget datagram. Same trust model as
+/// `SignedKvEntry` (sender-attributable via Ed25519 signature) but
+/// with no LWW, no priority, no expiry, and no content-addressed
+/// indirection. Used by the Bus's ephemeral delivery path; carried
+/// over an unreliable transport channel and never persisted.
+///
+/// `signature` covers the canonical postcard encoding of
+/// `(verifying_key, name, payload)` — see
+/// `canonical::datagram_signing_payload`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedDatagram {
+    pub verifying_key: VerifyingKey,
+    pub name: bytes::Bytes,
+    pub payload: bytes::Bytes,
+    pub signature: bytes::Bytes,
+}
+
 /// Content-addressed blob. `references` form a DAG over content blocks;
 /// `hash(self) = blake3(postcard::to_stdvec(self))`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
