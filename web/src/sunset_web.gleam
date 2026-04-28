@@ -868,6 +868,7 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
         Ok(m) ->
           voice_popover.view(
             palette: palette,
+            placement: voice_popover.Floating,
             member: m,
             settings: member_voice_settings(model.voice_settings, name),
             on_close: CloseVoicePopover,
