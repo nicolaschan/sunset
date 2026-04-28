@@ -192,7 +192,9 @@ fn desktop_view(
             #("display", "grid"),
             #("grid-template-columns", grid_template),
             #("grid-template-rows", "100vh"),
+            #("grid-template-rows", "100dvh"),
             #("height", "100vh"),
+            #("height", "100dvh"),
             #("overflow", "hidden"),
             #("transition", "grid-template-columns 220ms ease"),
           ]),
@@ -244,7 +246,21 @@ fn global_reset() -> Element(msg) {
      .room-row:focus-within .room-delete {
        opacity: 1;
        pointer-events: auto;
-     }",
+     }
+     /* iOS no-zoom: input fonts must be >= 16px on phone. */
+     @media (max-width: 767px) {
+       input, textarea, select { font-size: 16px; }
+     }
+     /* Touch devices: hover-only affordances are always visible. */
+     @media (hover: none) {
+       .msg-row .msg-actions,
+       .room-row .room-delete {
+         opacity: 1;
+         pointer-events: auto;
+       }
+     }
+     /* Stop page-bounce from rubber-banding the address bar. */
+     .scroll-area { overscroll-behavior: contain; }",
   )
 }
 

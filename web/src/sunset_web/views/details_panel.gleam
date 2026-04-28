@@ -44,6 +44,7 @@ fn rendered(
       attribute.attribute("data-testid", "details-panel"),
       ui.css([
         #("height", "100vh"),
+        #("height", "100dvh"),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("background", p.surface),
@@ -83,6 +84,7 @@ fn empty(p: Palette, on_close: msg) -> Element(msg) {
       attribute.attribute("data-testid", "details-panel"),
       ui.css([
         #("height", "100vh"),
+        #("height", "100dvh"),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("background", p.surface),

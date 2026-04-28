@@ -39,6 +39,7 @@ pub fn view(palette p: Palette, members ms: List(Member)) -> Element(msg) {
     [
       ui.css([
         #("height", "100vh"),
+        #("height", "100dvh"),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("background", p.surface),

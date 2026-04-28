@@ -46,6 +46,7 @@ pub fn view(
     [
       ui.css([
         #("height", "100vh"),
+        #("height", "100dvh"),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("background", p.surface),
@@ -144,6 +145,7 @@ fn messages_list(
 
   html.div(
     [
+      attribute.class("scroll-area"),
       ui.css([
         #("flex", "1 1 auto"),
         #("overflow-y", "auto"),
@@ -679,11 +681,12 @@ fn composer(
     [
       ui.css([
         #("box-sizing", "border-box"),
-        #("height", "64px"),
+        #("min-height", "64px"),
         #("flex-shrink", "0"),
         #("display", "flex"),
         #("align-items", "center"),
         #("padding", "0 20px"),
+        #("padding-bottom", "env(safe-area-inset-bottom)"),
         #("border-top", "1px solid " <> p.border_soft),
       ]),
     ],

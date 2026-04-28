@@ -235,6 +235,19 @@ test("viewport meta is mobile-friendly (safe-area + keyboard resize)", async ({
   expect(content).toContain("interactive-widget=resizes-content");
 });
 
+test("composer input font-size is at least 16px (iOS no-zoom)", async ({
+  page,
+}) => {
+  // The composer input or textarea must render at >= 16px on phone so iOS
+  // doesn't auto-zoom on focus. We assert via computed style; this passes
+  // on desktop too since the inherited size is already >= 16px.
+  const fontSize = await page.evaluate(() => {
+    const el = document.querySelector("main input, main textarea");
+    return el ? parseFloat(getComputedStyle(el).fontSize) : 0;
+  });
+  expect(fontSize).toBeGreaterThanOrEqual(16);
+});
+
 test("channels and main column bottom borders line up", async ({ page }) => {
   // Channels rail is the second <aside>; main column is <main>.
   const offsets = await page.evaluate(() => {
