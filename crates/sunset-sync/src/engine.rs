@@ -575,9 +575,7 @@ where
     #[allow(dead_code)]
     async fn emit_engine_event(&self, ev: EngineEvent) {
         let mut state = self.state.lock().await;
-        state
-            .event_subs
-            .retain(|tx| tx.send(ev.clone()).is_ok());
+        state.event_subs.retain(|tx| tx.send(ev.clone()).is_ok());
     }
 
     /// Real implementation of `publish_subscription`'s server side.
