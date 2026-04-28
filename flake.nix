@@ -114,6 +114,18 @@
 
           exec node_modules/.bin/playwright test "$@"
         '';
+        sunsetRelayPkg = pkgs.rustPlatform.buildRustPackage {
+          pname = "sunset-relay";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [ "-p" "sunset-relay" "--bin" "sunset-relay" ];
+          doCheck = false;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ];
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = [
@@ -140,6 +152,21 @@
         };
 
         packages = {
+          sunset-relay = sunsetRelayPkg;
+
+          sunset-relay-docker = pkgs.dockerTools.buildLayeredImage {
+            name = "sunset-relay";
+            tag = "latest";
+            contents = [ sunsetRelayPkg pkgs.cacert ];
+            config = {
+              Entrypoint = [ "/bin/sunset-relay" ];
+              Cmd = [ "--config" "/etc/sunset-relay.toml" ];
+              ExposedPorts."8443/tcp" = {};
+              Env = [ "RUST_LOG=sunset_relay=info" ];
+              Volumes."/var/lib/sunset-relay" = {};
+            };
+          };
+
           sunset-core-wasm = pkgs.rustPlatform.buildRustPackage {
             pname = "sunset-core-wasm";
             version = "0.1.0";
