@@ -25,6 +25,7 @@ import sunset_web/domain.{
 }
 import sunset_web/fixture
 import sunset_web/storage
+import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
 import sunset_web/theme.{type Mode, Dark, Light}
 import sunset_web/views/channels
 import sunset_web/views/details_panel
@@ -65,6 +66,12 @@ pub type Model {
     /// Per-member voice tweaks (volume / denoise / deafened),
     /// keyed by member name. Seeded from the fixture once.
     voice_settings: Dict(String, domain.VoiceSettings),
+    /// Engine handle. None until the wasm bundle finishes initialising.
+    client: Option(ClientHandle),
+    /// Real chat messages received from the engine. Empty on first load.
+    messages: List(domain.Message),
+    /// Relay connection status: "disconnected", "connecting", "connected", "error".
+    relay_status: String,
   )
 }
 
@@ -95,6 +102,14 @@ pub type Msg {
   ToggleMemberDenoise(String)
   ToggleMemberDeafen(String)
   ResetMemberVoice(String)
+  // sunset-web-wasm bridge wiring:
+  IdentityReady(BitArray)
+  ClientReady(ClientHandle)
+  RelayConnectResult(Result(Nil, String))
+  SubscribePublishResult(Result(Nil, String))
+  IncomingMsg(IncomingMessage)
+  SubmitDraft
+  MessageSent(Result(String, String))
 }
 
 pub fn main() {
@@ -153,6 +168,9 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       drag_over_room: None,
       voice_popover: None,
       voice_settings: seed_voice_settings(),
+      client: None,
+      messages: [],
+      relay_status: "disconnected",
     )
 
   let subscribe_hash =
@@ -178,7 +196,17 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
     _, _ -> effect.none()
   }
 
-  #(model, effect.batch([subscribe_hash, initial_persist, initial_hash_sync]))
+  // Bootstrap the sunset-web-wasm bridge: load identity → create client →
+  // (optionally) connect to relay from ?relay=… query param.
+  let bootstrap =
+    effect.from(fn(dispatch) {
+      sunset.load_or_create_identity(fn(seed) { dispatch(IdentityReady(seed)) })
+    })
+
+  #(
+    model,
+    effect.batch([subscribe_hash, initial_persist, initial_hash_sync, bootstrap]),
+  )
 }
 
 /// Seed per-member voice tweaks for every in-call member: full
@@ -254,6 +282,18 @@ fn reorder_before(
 fn sanitize(raw: String) -> String {
   string.trim(raw)
 }
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "currentTimeMs")
+fn current_time_ms() -> Int
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "shortPubkey")
+fn short_pubkey(bits: BitArray) -> String
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "shortInitials")
+fn short_initials(bits: BitArray) -> String
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "formatTimeMs")
+fn format_time_ms(ms: Int) -> String
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
@@ -421,6 +461,96 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
     UpdateDraft(s) -> #(Model(..model, draft: s), effect.none())
+    IdentityReady(seed) -> {
+      let create_client_eff =
+        effect.from(fn(dispatch) {
+          sunset.create_client(seed, "sunset-demo", fn(client) {
+            dispatch(ClientReady(client))
+          })
+        })
+      #(model, create_client_eff)
+    }
+    ClientReady(client) -> {
+      let on_msg_eff =
+        effect.from(fn(dispatch) {
+          sunset.on_message(client, fn(im) { dispatch(IncomingMsg(im)) })
+        })
+      let connect_eff = case sunset.relay_url_param() {
+        Ok(url) ->
+          effect.from(fn(dispatch) {
+            sunset.add_relay(client, url, fn(r) {
+              dispatch(RelayConnectResult(r))
+            })
+          })
+        Error(_) -> effect.none()
+      }
+      let new_status = case sunset.relay_url_param() {
+        Ok(_) -> "connecting"
+        Error(_) -> "disconnected"
+      }
+      #(
+        Model(..model, client: Some(client), relay_status: new_status),
+        effect.batch([on_msg_eff, connect_eff]),
+      )
+    }
+    RelayConnectResult(Ok(_)) ->
+      case model.client {
+        Some(client) -> {
+          let pub_eff =
+            effect.from(fn(dispatch) {
+              sunset.publish_room_subscription(client, fn(r) {
+                dispatch(SubscribePublishResult(r))
+              })
+            })
+          #(Model(..model, relay_status: "connected"), pub_eff)
+        }
+        None -> #(model, effect.none())
+      }
+    RelayConnectResult(Error(_)) -> #(
+      Model(..model, relay_status: "error"),
+      effect.none(),
+    )
+    SubscribePublishResult(_) -> #(model, effect.none())
+    IncomingMsg(im) -> {
+      let new_msg =
+        domain.Message(
+          id: sunset.inc_value_hash_hex(im),
+          author: short_pubkey(sunset.inc_author_pubkey(im)),
+          initials: short_initials(sunset.inc_author_pubkey(im)),
+          time: format_time_ms(sunset.inc_sent_at_ms(im)),
+          body: sunset.inc_body(im),
+          seen_by: 0,
+          you: sunset.inc_is_self(im),
+          pending: False,
+          reactions: [],
+          bridge: NoBridge,
+          details: domain.NoDetails,
+        )
+      // Append; dedupe by id to handle Replay::All re-emits.
+      let updated =
+        case list.any(model.messages, fn(m) { m.id == new_msg.id }) {
+          True -> model.messages
+          False -> list.append(model.messages, [new_msg])
+        }
+      #(Model(..model, messages: updated), effect.none())
+    }
+    SubmitDraft -> {
+      let body = sanitize(model.draft)
+      case body, model.client {
+        "", _ -> #(model, effect.none())
+        _, None -> #(model, effect.none())
+        body, Some(client) -> {
+          let send_eff =
+            effect.from(fn(dispatch) {
+              sunset.send_message(client, body, current_time_ms(), fn(r) {
+                dispatch(MessageSent(r))
+              })
+            })
+          #(Model(..model, draft: ""), send_eff)
+        }
+      }
+    }
+    MessageSent(_) -> #(model, effect.none())
     ToggleReactionPicker(id) -> {
       let next = case model.reacting_to {
         Some(open) if open == id -> None
@@ -562,7 +692,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
   let active_room = lookup_room(displayed_rooms, current_name)
 
-  let raw_messages = fixture.messages()
+  let raw_messages = model.messages
   let messages_with_live_reactions =
     list.map(raw_messages, fn(m) {
       case dict.get(model.reactions, m.id) {
@@ -621,6 +751,8 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       messages: messages_with_live_reactions,
       draft: model.draft,
       on_draft: UpdateDraft,
+      on_submit: SubmitDraft,
+      noop: NoOp,
       reacting_to: model.reacting_to,
       detail_msg_id: model.detail_msg_id,
       on_toggle_reaction_picker: ToggleReactionPicker,

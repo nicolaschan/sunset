@@ -10,6 +10,7 @@ pub mod message;
 pub mod peer;
 pub mod reserved;
 pub mod signer;
+pub mod spawn;
 pub mod subscription_registry;
 pub mod transport;
 pub mod types;

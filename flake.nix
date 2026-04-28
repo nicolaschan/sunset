@@ -100,6 +100,15 @@
           lustre = true;
           buildPhase = ''
             runHook preBuild
+            # Trigger Gleam compile to create build/dev/javascript/, then
+            # stage the sunset-web-wasm bundle there so Lustre's esbuild can
+            # resolve the `import init from "../../sunset_web_wasm.js"` line
+            # in sunset.ffi.mjs at bundle time. (sunset.ffi.mjs gets copied
+            # to build/dev/javascript/sunset_web/sunset_web/sunset.ffi.mjs;
+            # the relative path resolves back up to build/dev/javascript/.)
+            gleam build
+            cp ${sunsetWebWasmPkg}/sunset_web_wasm.js build/dev/javascript/
+            cp ${sunsetWebWasmPkg}/sunset_web_wasm_bg.wasm build/dev/javascript/
             gleam run -m lustre/dev build sunset_web --minify
             runHook postBuild
           '';
@@ -137,6 +146,7 @@
           export PATH="${pkgs.lib.makeBinPath [
             pkgs.nodejs
             pkgs.static-web-server
+            sunsetRelayPkg
           ]}:$PATH"
           export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
           export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1

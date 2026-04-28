@@ -2,17 +2,30 @@
 // call, caches the module exports, and exposes typed JS functions that
 // Gleam externals call.
 
+import { BitArray, Ok, Error as GError } from "../../prelude.mjs";
 import init, { Client } from "../../sunset_web_wasm.js";
 
 let initPromise = null;
 function ensureLoaded() {
   if (!initPromise) {
-    initPromise = init();
+    // Explicitly pass the .wasm URL relative to the HTML page; the
+    // default import.meta.url-based lookup breaks once the
+    // wasm-bindgen JS gets bundled into sunset_web.js.
+    initPromise = init("./sunset_web_wasm_bg.wasm");
   }
   return initPromise;
 }
 
 const IDENTITY_KEY = "sunset/identity-seed";
+
+function bitsToBytes(bits) {
+  // Gleam BitArray exposes its raw buffer in different ways depending on the
+  // runtime version; try each in order.
+  if (bits.rawBuffer) return bits.rawBuffer;
+  if (bits.buffer) return bits.buffer;
+  if (bits instanceof Uint8Array) return bits;
+  return new Uint8Array(bits);
+}
 
 export function loadOrCreateIdentity(callback) {
   let bytes;
@@ -27,17 +40,12 @@ export function loadOrCreateIdentity(callback) {
     const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
     window.localStorage.setItem(IDENTITY_KEY, hex);
   }
-  // Convert Uint8Array to a Gleam BitArray. Gleam's BitArray on JS is the
-  // {@link BitArray} class from the Gleam runtime; constructing it from a
-  // Uint8Array works directly (the runtime accepts a buffer).
-  callback(bytes);
+  callback(new BitArray(bytes));
 }
 
 export async function createClient(seed, roomName, callback) {
   await ensureLoaded();
-  // `seed` arrives from Gleam as a BitArray. Its `.buffer` (or `.rawBuffer`)
-  // is the underlying Uint8Array. Try both depending on the runtime version.
-  const seedBytes = seed.buffer || seed.rawBuffer || seed;
+  const seedBytes = bitsToBytes(seed);
   const client = new Client(seedBytes, roomName);
   callback(client);
 }
@@ -45,18 +53,18 @@ export async function createClient(seed, roomName, callback) {
 export async function addRelay(client, url, callback) {
   try {
     await client.add_relay(url);
-    callback({ Ok: undefined });
+    callback(new Ok(undefined));
   } catch (e) {
-    callback({ Error: String(e) });
+    callback(new GError(String(e)));
   }
 }
 
 export async function publishRoomSubscription(client, callback) {
   try {
     await client.publish_room_subscription();
-    callback({ Ok: undefined });
+    callback(new Ok(undefined));
   } catch (e) {
-    callback({ Error: String(e) });
+    callback(new GError(String(e)));
   }
 }
 
@@ -64,9 +72,9 @@ export async function sendMessage(client, body, sentAtMs, callback) {
   try {
     const nonce = window.crypto.getRandomValues(new Uint8Array(32));
     const valueHashHex = await client.send_message(body, sentAtMs, nonce);
-    callback({ Ok: valueHashHex });
+    callback(new Ok(valueHashHex));
   } catch (e) {
-    callback({ Error: String(e) });
+    callback(new GError(String(e)));
   }
 }
 
@@ -83,13 +91,39 @@ export function relayStatus(client) {
 export function relayUrlParam() {
   const params = new URLSearchParams(window.location.search);
   const v = params.get("relay");
-  if (v === null) return { 0: undefined };  // Gleam Error(Nil)
-  return { 0: v };                            // Gleam Ok(string)
+  if (v === null) return new GError(undefined);
+  return new Ok(v);
+}
+
+// Helpers used by sunset_web.gleam for rendering IncomingMessage fields.
+
+export function currentTimeMs() {
+  return Date.now();
+}
+
+export function shortPubkey(bits) {
+  const bytes = bitsToBytes(bits);
+  return Array.from(bytes.slice(0, 4), (b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export function shortInitials(bits) {
+  const bytes = bitsToBytes(bits);
+  return Array.from(bytes.slice(0, 1), (b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase();
+}
+
+export function formatTimeMs(ms) {
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
 }
 
 // IncomingMessage accessors. The wasm-bindgen-generated class exposes
 // fields directly via getters.
-export function incAuthorPubkey(msg) { return msg.author_pubkey; }
+export function incAuthorPubkey(msg) { return new BitArray(msg.author_pubkey); }
 export function incEpochId(msg) { return msg.epoch_id; }
 export function incSentAtMs(msg) { return msg.sent_at_ms; }
 export function incBody(msg) { return msg.body; }

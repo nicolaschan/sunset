@@ -56,9 +56,6 @@ impl Relay {
         // 1. Identity (load-or-generate; persists to disk on first start).
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let identity = identity::load_or_generate(&config.identity_secret_path).await?;
-        let banner = identity::format_address(&config.listen_addr, &identity);
-        tracing::info!("\n{}", banner);
-        println!("{}", banner);
 
         let ed25519_public = identity.public().as_bytes();
         let x25519_public = {
@@ -77,7 +74,13 @@ impl Relay {
 
         // 3. Listener + Noise wrapper.
         let raw = WebSocketRawTransport::listening_on(config.listen_addr).await?;
+        // Resolve the actual bound address (matters when config requested
+        // port 0 for an OS-assigned random port — the banner must reflect
+        // what clients should connect to, not the unbound config value).
         let bound = raw.local_addr().unwrap_or(config.listen_addr);
+        let banner = identity::format_address(&bound, &identity);
+        tracing::info!("\n{}", banner);
+        println!("{}", banner);
         let local_address = format!("ws://{}#x25519={}", bound, hex::encode(x25519_public));
         let noise = NoiseTransport::new(raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
 
