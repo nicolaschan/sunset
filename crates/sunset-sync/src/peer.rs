@@ -199,9 +199,18 @@ enum ChannelKind {
 }
 
 fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
+    // Exhaustive on purpose: when a new SyncMessage variant lands,
+    // the compiler MUST force a routing decision here. Don't add a
+    // wildcard arm — the silent default is the wrong way to fail.
     match msg {
         SyncMessage::EphemeralDelivery { .. } => ChannelKind::Unreliable,
-        _ => ChannelKind::Reliable,
+        SyncMessage::Hello { .. }
+        | SyncMessage::EventDelivery { .. }
+        | SyncMessage::BlobRequest { .. }
+        | SyncMessage::BlobResponse { .. }
+        | SyncMessage::DigestExchange { .. }
+        | SyncMessage::Fetch { .. }
+        | SyncMessage::Goodbye {} => ChannelKind::Reliable,
     }
 }
 
