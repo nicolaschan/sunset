@@ -172,6 +172,33 @@ where
         rx
     }
 
+    /// Publish a signed ephemeral datagram. Routes via the subscription
+    /// registry: every peer whose filter matches receives the datagram
+    /// over the unreliable channel. Locally, in-process subscribers
+    /// whose filter matches also receive a copy. Fire-and-forget — does
+    /// NOT verify the signature on send (the caller is the signer); does
+    /// NOT persist; does NOT retry. Returns `Ok(())` even if no peers
+    /// match.
+    pub async fn publish_ephemeral(&self, datagram: sunset_store::SignedDatagram) -> Result<()> {
+        // Loopback: deliver to local subscribers first.
+        self.dispatch_ephemeral_local(&datagram).await;
+
+        // Fan-out to remote peers whose subscription filter matches.
+        let msg = SyncMessage::EphemeralDelivery {
+            datagram: datagram.clone(),
+        };
+        let state = self.state.lock().await;
+        for peer in state
+            .registry
+            .peers_matching(&datagram.verifying_key, &datagram.name)
+        {
+            if let Some(tx) = state.peer_outbound.get(&peer) {
+                let _ = tx.send(msg.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Snapshot the engine's currently-connected peer set with each
     /// peer's transport kind. Pairs with `subscribe_engine_events()`
     /// to seed initial state for a subscriber that joins after some
@@ -1106,6 +1133,62 @@ mod tests {
         ) -> std::result::Result<(), sunset_store::Error> {
             Err(sunset_store::Error::SignatureInvalid)
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_ephemeral_loopback_delivers_to_local_subscriber() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                let mut sub = engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+
+                let datagram = sunset_store::SignedDatagram {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(b"voice/alice/0001"),
+                    payload: Bytes::from_static(b"frame"),
+                    signature: Bytes::from_static(&[0u8; 64]),
+                };
+
+                engine.publish_ephemeral(datagram.clone()).await.unwrap();
+
+                let got = sub.recv().await.expect("loopback delivery");
+                assert_eq!(got, datagram);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_ephemeral_skips_subscriber_whose_filter_does_not_match() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                let mut sub = engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+
+                let datagram = sunset_store::SignedDatagram {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(b"chat/alice/0001"),
+                    payload: Bytes::from_static(b"frame"),
+                    signature: Bytes::from_static(&[0u8; 64]),
+                };
+
+                engine.publish_ephemeral(datagram).await.unwrap();
+
+                let got =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await;
+                assert!(
+                    got.is_err(),
+                    "subscriber must NOT receive a non-matching datagram"
+                );
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
