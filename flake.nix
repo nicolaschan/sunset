@@ -208,7 +208,6 @@
             contents = [ sunsetRelayPkg pkgs.cacert ];
             config = {
               Entrypoint = [ "/bin/sunset-relay" ];
-              Cmd = [ "--config" "/etc/sunset-relay.toml" ];
               ExposedPorts."8443/tcp" = {};
               Env = [ "RUST_LOG=sunset_relay=info" ];
               Volumes."/var/lib/sunset-relay" = {};
