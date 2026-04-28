@@ -103,3 +103,43 @@ pub fn inc_value_hash_hex(msg: IncomingMessage) -> String
 
 @external(javascript, "./sunset.ffi.mjs", "incIsSelf")
 pub fn inc_is_self(msg: IncomingMessage) -> Bool
+
+pub type MemberJs
+
+/// Start the heartbeat publisher + membership tracker. Idempotent.
+@external(javascript, "./sunset.ffi.mjs", "startPresence")
+pub fn start_presence(
+  client: ClientHandle,
+  interval_ms: Int,
+  ttl_ms: Int,
+  refresh_ms: Int,
+) -> Nil
+
+@external(javascript, "./sunset.ffi.mjs", "onMembersChanged")
+pub fn on_members_changed(
+  client: ClientHandle,
+  callback: fn(List(MemberJs)) -> Nil,
+) -> Nil
+
+@external(javascript, "./sunset.ffi.mjs", "onRelayStatusChanged")
+pub fn on_relay_status_changed(
+  client: ClientHandle,
+  callback: fn(String) -> Nil,
+) -> Nil
+
+@external(javascript, "./sunset.ffi.mjs", "memPubkey")
+pub fn mem_pubkey(m: MemberJs) -> BitArray
+
+@external(javascript, "./sunset.ffi.mjs", "memPresence")
+pub fn mem_presence(m: MemberJs) -> String
+
+@external(javascript, "./sunset.ffi.mjs", "memConnectionMode")
+pub fn mem_connection_mode(m: MemberJs) -> String
+
+@external(javascript, "./sunset.ffi.mjs", "memIsSelf")
+pub fn mem_is_self(m: MemberJs) -> Bool
+
+/// Read presence-cadence params from `?presence_interval=&presence_ttl=&presence_refresh=`.
+/// Returns `#(interval_ms, ttl_ms, refresh_ms)`. Defaults: 30000/60000/5000.
+@external(javascript, "./sunset.ffi.mjs", "presenceParamsFromUrl")
+pub fn presence_params_from_url() -> #(Int, Int, Int)

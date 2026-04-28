@@ -53,6 +53,20 @@ pub(crate) enum EngineCommand {
     },
 }
 
+/// Lifecycle events emitted by the engine. Subscribers receive
+/// every event from the moment they subscribe; events emitted
+/// before subscription are NOT replayed.
+#[derive(Clone, Debug)]
+pub enum EngineEvent {
+    PeerAdded {
+        peer_id: PeerId,
+        kind: crate::transport::TransportKind,
+    },
+    PeerRemoved {
+        peer_id: PeerId,
+    },
+}
+
 /// Mutable state inside the engine. Held under a `tokio::sync::Mutex` so
 /// command processing and per-peer task callbacks can both update it.
 pub(crate) struct EngineState {
@@ -60,6 +74,14 @@ pub(crate) struct EngineState {
     pub registry: SubscriptionRegistry,
     /// Per-peer outbound message senders.
     pub peer_outbound: HashMap<PeerId, mpsc::UnboundedSender<SyncMessage>>,
+    /// Per-peer transport kind (Primary vs Secondary). Updated in
+    /// lockstep with `peer_outbound` so callers can snapshot
+    /// `(peer, kind)` after subscribing late and missing the
+    /// corresponding `PeerAdded` event.
+    pub peer_kinds: HashMap<PeerId, crate::transport::TransportKind>,
+    /// Live `EngineEvent` subscribers. Dead senders (closed by the
+    /// receiver being dropped) are evicted lazily on the next emit.
+    pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
 }
 
 pub struct SyncEngine<S: Store, T: Transport> {
@@ -99,6 +121,8 @@ where
                 trust: TrustSet::default(),
                 registry: SubscriptionRegistry::new(),
                 peer_outbound: HashMap::new(),
+                peer_kinds: HashMap::new(),
+                event_subs: Vec::new(),
             })),
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
@@ -113,6 +137,29 @@ where
             .send(EngineCommand::AddPeer { addr, ack })
             .map_err(|_| Error::Closed)?;
         rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Subscribe to lifecycle events emitted by the engine. Each call
+    /// returns a fresh receiver. Events are delivered to every live
+    /// subscriber; subscribers receive only events that happen after
+    /// they subscribe (no replay).
+    pub async fn subscribe_engine_events(&self) -> mpsc::UnboundedReceiver<EngineEvent> {
+        let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+        self.state.lock().await.event_subs.push(tx);
+        rx
+    }
+
+    /// Snapshot the engine's currently-connected peer set with each
+    /// peer's transport kind. Pairs with `subscribe_engine_events()`
+    /// to seed initial state for a subscriber that joins after some
+    /// peers are already connected (no-replay race).
+    pub async fn current_peers(&self) -> Vec<(PeerId, crate::transport::TransportKind)> {
+        let state = self.state.lock().await;
+        state
+            .peer_kinds
+            .iter()
+            .map(|(pk, k)| (pk.clone(), *k))
+            .collect()
     }
 
     /// Publish this peer's subscription filter. Writes a signed KV entry
@@ -280,15 +327,25 @@ where
 
     async fn handle_inbound_event(&self, event: InboundEvent) {
         match event {
-            InboundEvent::PeerHello { peer_id, out_tx } => {
-                // Register the outbound sender under the Hello-declared peer_id.
-                // This key matches what the subscription registry uses, so push
-                // routing can find the sender correctly.
-                self.state
-                    .lock()
-                    .await
-                    .peer_outbound
-                    .insert(peer_id.clone(), out_tx);
+            InboundEvent::PeerHello {
+                peer_id,
+                kind,
+                out_tx,
+            } => {
+                // Register the outbound sender + transport kind under the
+                // Hello-declared peer_id. peer_outbound + peer_kinds move
+                // together so a late `current_peers()` snapshot reflects
+                // the same set as the live subscription stream.
+                {
+                    let mut state = self.state.lock().await;
+                    state.peer_outbound.insert(peer_id.clone(), out_tx);
+                    state.peer_kinds.insert(peer_id.clone(), kind);
+                }
+                self.emit_engine_event(EngineEvent::PeerAdded {
+                    peer_id: peer_id.clone(),
+                    kind,
+                })
+                .await;
                 // Fire bootstrap digest exchange on the subscribe namespace.
                 self.send_bootstrap_digest(&peer_id).await;
             }
@@ -297,7 +354,13 @@ where
             }
             InboundEvent::Disconnected { peer_id, reason } => {
                 eprintln!("sunset-sync: peer {peer_id:?} disconnected: {reason}");
-                self.state.lock().await.peer_outbound.remove(&peer_id);
+                {
+                    let mut state = self.state.lock().await;
+                    state.peer_outbound.remove(&peer_id);
+                    state.peer_kinds.remove(&peer_id);
+                }
+                self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
+                    .await;
             }
         }
     }
@@ -559,6 +622,13 @@ where
             .registry
             .iter()
             .any(|(k, _)| k == vk)
+    }
+
+    /// Fan-out an event to every live subscriber. Drops senders whose
+    /// receivers have been dropped (lazy GC).
+    async fn emit_engine_event(&self, ev: EngineEvent) {
+        let mut state = self.state.lock().await;
+        state.event_subs.retain(|tx| tx.send(ev.clone()).is_ok());
     }
 
     /// Real implementation of `publish_subscription`'s server side.
@@ -845,6 +915,71 @@ mod tests {
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
                 engine.tick_anti_entropy().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn engine_event_fan_out_to_multiple_subscribers() {
+        use crate::engine::EngineEvent;
+        use crate::transport::TransportKind;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let mut sub_a = engine.subscribe_engine_events().await;
+                let mut sub_b = engine.subscribe_engine_events().await;
+
+                engine
+                    .emit_engine_event(EngineEvent::PeerAdded {
+                        peer_id: PeerId(vk(b"bob")),
+                        kind: TransportKind::Primary,
+                    })
+                    .await;
+
+                let a = sub_a.recv().await.expect("sub_a got event");
+                let b = sub_b.recv().await.expect("sub_b got event");
+                match (a, b) {
+                    (
+                        EngineEvent::PeerAdded {
+                            peer_id: pa,
+                            kind: ka,
+                        },
+                        EngineEvent::PeerAdded {
+                            peer_id: pb,
+                            kind: kb,
+                        },
+                    ) => {
+                        assert_eq!(pa, PeerId(vk(b"bob")));
+                        assert_eq!(pb, PeerId(vk(b"bob")));
+                        assert_eq!(ka, TransportKind::Primary);
+                        assert_eq!(kb, TransportKind::Primary);
+                    }
+                    _ => panic!("expected PeerAdded events"),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn engine_event_drops_dead_subscriber() {
+        use crate::engine::EngineEvent;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let sub_a = engine.subscribe_engine_events().await;
+                drop(sub_a);
+
+                engine
+                    .emit_engine_event(EngineEvent::PeerRemoved {
+                        peer_id: PeerId(vk(b"bob")),
+                    })
+                    .await;
+
+                assert!(engine.state.lock().await.event_subs.is_empty());
             })
             .await;
     }

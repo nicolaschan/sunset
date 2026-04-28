@@ -122,6 +122,18 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   await pageA.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
   await pageB.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
 
+  // peer_connection_mode reads from the membership tracker's peer_kinds
+  // map, which is only populated once start_presence is called (the
+  // tracker subscribes to engine events + seeds from a snapshot). The
+  // production Gleam UI calls start_presence on bootstrap; we mirror
+  // that here so peer_connection_mode returns real values. Use fast
+  // params (compressed cadence is harmless for this test).
+  for (const p of [pageA, pageB]) {
+    await p.evaluate(async () => {
+      await window.sunsetClient.start_presence(300, 900, 100);
+    });
+  }
+
   // Grab each peer's pubkey.
   const aPub = await pageA.evaluate(() =>
     Array.from(window.sunsetClient.public_key),

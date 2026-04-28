@@ -8,12 +8,20 @@ mod client;
 #[cfg(target_arch = "wasm32")]
 mod identity;
 #[cfg(target_arch = "wasm32")]
+mod members;
+#[cfg(target_arch = "wasm32")]
+mod membership_tracker;
+#[cfg(target_arch = "wasm32")]
 mod messages;
+#[cfg(target_arch = "wasm32")]
+mod presence_publisher;
 #[cfg(target_arch = "wasm32")]
 mod relay_signaler;
 
 #[cfg(target_arch = "wasm32")]
 pub use client::Client;
+#[cfg(target_arch = "wasm32")]
+pub use members::MemberJs;
 #[cfg(target_arch = "wasm32")]
 pub use messages::IncomingMessage;
 #[cfg(target_arch = "wasm32")]

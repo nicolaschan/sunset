@@ -72,6 +72,8 @@ pub type Model {
     messages: List(domain.Message),
     /// Relay connection status: "disconnected", "connecting", "connected", "error".
     relay_status: String,
+    /// Live members list from the presence tracker. Empty on first load.
+    members: List(domain.Member),
   )
 }
 
@@ -110,6 +112,8 @@ pub type Msg {
   IncomingMsg(IncomingMessage)
   SubmitDraft
   MessageSent(Result(String, String))
+  MembersUpdated(List(domain.Member))
+  RelayStatusUpdated(String)
 }
 
 pub fn main() {
@@ -171,6 +175,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       client: None,
       messages: [],
       relay_status: "disconnected",
+      members: [],
     )
 
   let subscribe_hash =
@@ -473,6 +478,24 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         effect.from(fn(dispatch) {
           sunset.on_message(client, fn(im) { dispatch(IncomingMsg(im)) })
         })
+      // Presence wiring is in ClientReady (not RelayConnectResult) so
+      // it kicks off even when there's no `?relay=` URL — the user
+      // still sees themselves in the member list. Effect order within a
+      // batch is unspecified by Lustre, but that's fine: Client::start_presence
+      // snapshots the engine's current peer set after subscribing, so
+      // already-connected peers are picked up regardless of when
+      // start_presence runs relative to add_relay.
+      let presence_eff =
+        effect.from(fn(dispatch) {
+          let #(interval, ttl, refresh) = sunset.presence_params_from_url()
+          sunset.start_presence(client, interval, ttl, refresh)
+          sunset.on_members_changed(client, fn(ms) {
+            dispatch(MembersUpdated(map_members(ms)))
+          })
+          sunset.on_relay_status_changed(client, fn(s) {
+            dispatch(RelayStatusUpdated(s))
+          })
+        })
       let connect_eff = case sunset.relay_url_param() {
         Ok(url) ->
           effect.from(fn(dispatch) {
@@ -488,7 +511,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(
         Model(..model, client: Some(client), relay_status: new_status),
-        effect.batch([on_msg_eff, connect_eff]),
+        effect.batch([on_msg_eff, presence_eff, connect_eff]),
       )
     }
     RelayConnectResult(Ok(_)) ->
@@ -550,6 +573,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     }
     MessageSent(_) -> #(model, effect.none())
+    MembersUpdated(ms) -> #(Model(..model, members: ms), effect.none())
+    RelayStatusUpdated(s) -> #(Model(..model, relay_status: s), effect.none())
     ToggleReactionPicker(id) -> {
       let next = case model.reacting_to {
         Some(open) if open == id -> None
@@ -731,6 +756,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
     ),
+    // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
     channels.view(
       palette: palette,
       room: active_room,
@@ -758,7 +784,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     case detail_msg {
       Some(m) ->
         details_panel.view(palette: palette, message: m, on_close: CloseDetail)
-      None -> members.view(palette: palette, members: fixture.members())
+      None -> members.view(palette: palette, members: model.members)
     },
     voice_popover_overlay(palette, model),
   )
@@ -768,6 +794,7 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
   case model.voice_popover {
     None -> element.fragment([])
     Some(name) ->
+      // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
       case list.find(fixture.members(), fn(m) { m.name == name }) {
         Error(_) -> element.fragment([])
         Ok(m) ->
@@ -837,4 +864,38 @@ fn synthetic_room(name: String) -> Room {
 fn find_message(ms: List(Message), id: String) -> Option(Message) {
   list.find(ms, fn(m) { m.id == id })
   |> option.from_result
+}
+
+fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
+  list.map(ms, fn(m) {
+    let pk = sunset.mem_pubkey(m)
+    domain.Member(
+      id: domain.MemberId(short_pubkey(pk)),
+      name: short_pubkey(pk),
+      initials: short_initials(pk),
+      status: presence_to_status(sunset.mem_presence(m)),
+      relay: connection_mode_to_relay(sunset.mem_connection_mode(m)),
+      you: sunset.mem_is_self(m),
+      in_call: False,
+      bridge: domain.NoBridge,
+      role: domain.NoRole,
+    )
+  })
+}
+
+fn presence_to_status(s: String) -> domain.Presence {
+  case s {
+    "online" -> domain.Online
+    "away" -> domain.Away
+    _ -> domain.OfflineP
+  }
+}
+
+fn connection_mode_to_relay(s: String) -> domain.RelayStatus {
+  case s {
+    "direct" -> domain.Direct
+    "via_relay" -> domain.OneHop
+    "self" -> domain.SelfRelay
+    _ -> domain.NoRelay
+  }
 }
