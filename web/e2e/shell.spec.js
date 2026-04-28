@@ -485,3 +485,28 @@ test.describe("phone — details sheet", () => {
     await expect(sheet.getByText(/8f3c…a2/)).toBeVisible();
   });
 });
+
+test.describe("phone — reaction picker", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  // Skipped: depends on msg-row elements being present in the chat column.
+  // Since Plan E, messages come from the live engine only, so no .msg-row
+  // exists on a fresh page load (the engine isn't connected in tests).
+  // Unblock once fixtures are merged back or the test seeds a message first.
+  test.skip("react button opens the picker as a bottom sheet", async ({ page }) => {
+    const row = page.locator(".msg-row").first();
+    // Tap the React action — actions are always-visible on touch (Task 18).
+    await row.getByRole("button", { name: /^React$/ }).click();
+    const sheet = page.getByTestId("reaction-sheet");
+    await expect(sheet).toBeVisible();
+    // Click an emoji and confirm sheet closes.
+    await sheet.getByRole("button", { name: /🔥/ }).click();
+    await expect(sheet).not.toBeVisible();
+  });
+});

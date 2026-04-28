@@ -18,8 +18,12 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import lustre
+import lustre/attribute
 import lustre/effect.{type Effect}
 import lustre/element.{type Element}
+import lustre/element/html
+import lustre/event
+import sunset_web/ui
 import sunset_web/domain.{
   type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
   NoRelay, Reaction, Reconnecting, Room, RoomId,
@@ -796,6 +800,18 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _ -> None
   }
 
+  let reaction_sheet_el = case model.viewport, model.reacting_to {
+    domain.Phone, Some(id) ->
+      bottom_sheet.view(
+        palette: palette,
+        open: True,
+        on_close: ToggleReactionPicker(id),
+        test_id: "reaction-sheet",
+        content: phone_reaction_grid(palette, id),
+      )
+    _, _ -> element.fragment([])
+  }
+
   let details_sheet_el = case model.viewport, model.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
       case find_message(messages_with_live_reactions, id) {
@@ -947,7 +963,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     voice_minibar_el,
     details_sheet_el,
     voice_sheet_el,
-    element.fragment([]),
+    reaction_sheet_el,
   )
 }
 
@@ -1060,4 +1076,38 @@ fn connection_mode_to_relay(s: String) -> domain.RelayStatus {
     "self" -> domain.SelfRelay
     _ -> domain.NoRelay
   }
+}
+
+fn phone_reaction_grid(palette: theme.Palette, message_id: String) -> Element(Msg) {
+  let emojis = ["🌅", "👍", "👀", "🔥", "🌙"]
+  html.div(
+    [
+      attribute.attribute("data-testid", "reaction-picker"),
+      ui.css([
+        #("display", "grid"),
+        #("grid-template-columns", "repeat(5, 1fr)"),
+        #("gap", "8px"),
+        #("padding", "16px 16px 24px 16px"),
+      ]),
+    ],
+    list.map(emojis, fn(e) {
+      html.button(
+        [
+          attribute.attribute("aria-label", e),
+          event.on_click(AddReaction(message_id, e)),
+          ui.css([
+            #("padding", "12px"),
+            #("font-size", "26px"),
+            #("border", "1px solid " <> palette.border_soft),
+            #("background", palette.surface),
+            #("color", palette.text),
+            #("border-radius", "10px"),
+            #("font-family", "inherit"),
+            #("cursor", "pointer"),
+          ]),
+        ],
+        [html.text(e)],
+      )
+    }),
+  )
 }

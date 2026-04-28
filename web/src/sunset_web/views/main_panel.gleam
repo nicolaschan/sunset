@@ -135,6 +135,7 @@ fn messages_list(
       }
       message_view(
         p,
+        viewport,
         m,
         grouped,
         i == last_seen_index,
@@ -167,6 +168,7 @@ fn messages_list(
 
 fn message_view(
   p: Palette,
+  viewport: domain.Viewport,
   m: Message,
   grouped: Bool,
   show_read_marker: Bool,
@@ -237,9 +239,9 @@ fn message_view(
           on_add_reaction,
           on_open_detail,
         ),
-        case picker_open {
-          True -> reaction_picker(p, m.id, on_add_reaction)
-          False -> element.fragment([])
+        case viewport, picker_open {
+          domain.Desktop, True -> reaction_picker(p, m.id, on_add_reaction)
+          _, _ -> element.fragment([])
         },
       ],
     ),
