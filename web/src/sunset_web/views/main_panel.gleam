@@ -29,6 +29,7 @@ const quick_reactions = ["🌅", "👍", "👀", "🔥", "🌙"]
 
 pub fn view(
   palette p: Palette,
+  viewport viewport: domain.Viewport,
   current_channel cur: ChannelId,
   messages ms: List(Message),
   draft draft: String,
@@ -57,6 +58,7 @@ pub fn view(
       channel_header(p, channel_name),
       messages_list(
         p,
+        viewport,
         ms,
         reacting_to,
         detail_msg_id,
@@ -64,7 +66,7 @@ pub fn view(
         on_add_reaction,
         on_open_detail,
       ),
-      composer(p, channel_name, draft, on_draft, on_submit, noop),
+      composer(p, viewport, channel_name, draft, on_draft, on_submit, noop),
     ],
   )
 }
@@ -101,6 +103,7 @@ fn channel_header(p: Palette, name: String) -> Element(msg) {
 
 fn messages_list(
   p: Palette,
+  viewport: domain.Viewport,
   ms: List(Message),
   reacting_to: Option(String),
   detail_msg_id: Option(String),
@@ -149,7 +152,10 @@ fn messages_list(
       ui.css([
         #("flex", "1 1 auto"),
         #("overflow-y", "auto"),
-        #("padding", "16px 20px"),
+        #("padding", case viewport {
+          domain.Phone -> "12px 12px"
+          domain.Desktop -> "16px 20px"
+        }),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("gap", "0"),
@@ -668,6 +674,7 @@ fn typing_indicator(p: Palette) -> Element(msg) {
 
 fn composer(
   p: Palette,
+  viewport: domain.Viewport,
   channel_name: String,
   draft: String,
   on_draft: fn(String) -> msg,
@@ -685,7 +692,10 @@ fn composer(
         #("flex-shrink", "0"),
         #("display", "flex"),
         #("align-items", "center"),
-        #("padding", "0 20px"),
+        #("padding", case viewport {
+          domain.Phone -> "0 12px"
+          domain.Desktop -> "0 20px"
+        }),
         #("padding-bottom", "env(safe-area-inset-bottom)"),
         #("border-top", "1px solid " <> p.border_soft),
       ]),

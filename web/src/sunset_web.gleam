@@ -916,6 +916,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     ),
     main_panel.view(
       palette: palette,
+      viewport: model.viewport,
       current_channel: model.current_channel,
       messages: messages_with_live_reactions,
       draft: model.draft,
