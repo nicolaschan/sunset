@@ -393,6 +393,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               view: RoomView(name),
               landing_input: "",
               sidebar_search: "",
+              drawer: None,
             )
           let persist_eff = case was_new {
             True ->
@@ -822,6 +823,9 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_drop: DropRoomOn,
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
+      viewport: model.viewport,
+      mode: model.mode,
+      on_toggle_mode: ToggleMode,
     ),
     // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
     channels.view(

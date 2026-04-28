@@ -419,4 +419,32 @@ test.describe("phone shell smoke", () => {
     await page.getByTestId("channels-room-title").click();
     await expect(page.getByTestId("rooms-drawer")).toBeVisible();
   });
+
+  test("rooms drawer closes after selecting a room", async ({ page }) => {
+    await page.getByTestId("phone-rooms-toggle").click();
+    await page.getByTestId("channels-room-title").click();
+    // Sidebar search lives inside the rooms drawer.
+    const drawer = page.getByTestId("rooms-drawer");
+    await drawer.getByTestId("rooms-search").fill("design-crit");
+    await drawer.getByTestId("rooms-search").press("Enter");
+
+    // Either the drawer is closed (translateX(-100%)) or no longer visible.
+    // Simplest assertion: backdrop opacity is 0 (drawer closed).
+    // Three drawer-backdrop elements exist (channels/rooms/members); all should
+    // be at opacity 0 when no drawer is open. Check them individually.
+    for (const backdrop of await page.getByTestId("drawer-backdrop").all()) {
+      await expect(backdrop).toHaveCSS("opacity", "0");
+    }
+    await expect(page).toHaveURL(/#design-crit$/);
+  });
+
+  test("phone has theme toggle in rooms drawer footer (and not as a fixed pill)", async ({
+    page,
+  }) => {
+    await page.getByTestId("phone-rooms-toggle").click();
+    await page.getByTestId("channels-room-title").click();
+    await expect(page.getByTestId("phone-theme-toggle")).toBeVisible();
+    // Desktop fixed toggle isn't rendered on phone.
+    expect(await page.getByTestId("theme-toggle").count()).toBe(0);
+  });
 });
