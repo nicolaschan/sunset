@@ -14,6 +14,15 @@ pub fn room_messages_filter(room: &Room) -> Filter {
     Filter::NamePrefix(Bytes::from(format!("{}/msg/", room.fingerprint().to_hex())))
 }
 
+/// All entries under the given room — broader than `room_messages_filter`,
+/// covers `<room_fp>/msg/`, `<room_fp>/webrtc/`, and any future per-room
+/// namespace. Use this for the engine subscription so peers send us
+/// everything in the room (signaling included), and let local consumers
+/// sub-filter via `room_messages_filter` etc.
+pub fn room_filter(room: &Room) -> Filter {
+    Filter::NamePrefix(Bytes::from(format!("{}/", room.fingerprint().to_hex())))
+}
+
 #[cfg(test)]
 mod tests {
     use rand_core::OsRng;

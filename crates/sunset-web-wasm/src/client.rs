@@ -1,6 +1,7 @@
 //! JS-exported Client: identity + room + sync engine wired together.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,12 +13,16 @@ use zeroize::Zeroizing;
 use sunset_core::{Ed25519Verifier, Identity, Room};
 use sunset_noise::{NoiseIdentity, NoiseTransport};
 use sunset_store_memory::MemoryStore;
-use sunset_sync::{PeerId, Signer, SyncConfig, SyncEngine};
+use sunset_sync::{MultiTransport, PeerId, Signer, SyncConfig, SyncEngine};
+use sunset_sync_webrtc_browser::WebRtcRawTransport;
 use sunset_sync_ws_browser::WebSocketRawTransport;
 
 use crate::identity::identity_from_seed;
+use crate::relay_signaler::RelaySignaler;
 
-type Engine = SyncEngine<MemoryStore, NoiseTransport<WebSocketRawTransport>>;
+type WsT = NoiseTransport<WebSocketRawTransport>;
+type RtcT = NoiseTransport<WebRtcRawTransport>;
+type Engine = SyncEngine<MemoryStore, MultiTransport<WsT, RtcT>>;
 
 /// Adapter so sunset-core's `Identity` works as a NoiseIdentity.
 struct IdentityNoiseAdapter(Identity);
@@ -39,6 +44,8 @@ pub struct Client {
     engine: Rc<Engine>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     relay_status: Rc<RefCell<&'static str>>,
+    /// Peers we've successfully attached a direct WebRTC transport to.
+    direct_peers: Rc<RefCell<HashSet<PeerId>>>,
 }
 
 #[wasm_bindgen]
@@ -51,14 +58,31 @@ impl Client {
 
         let store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
 
-        let raw = WebSocketRawTransport::dial_only();
-        let noise = NoiseTransport::new(raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
+        // Build the WebSocket transport (relay path).
+        let ws_raw = WebSocketRawTransport::dial_only();
+        let ws_noise =
+            NoiseTransport::new(ws_raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
 
+        // Build the WebRTC transport (direct path), backed by the
+        // RelaySignaler that drives Noise_KK over CRDT entries.
+        let room_fp_hex = room.fingerprint().to_hex();
+        let signaler = RelaySignaler::new(identity.clone(), room_fp_hex.clone(), &store);
         let local_peer = PeerId(identity.store_verifying_key());
+        let signaler_dyn: Rc<dyn sunset_sync::Signaler> = signaler;
+        let rtc_raw = WebRtcRawTransport::new(
+            signaler_dyn,
+            local_peer.clone(),
+            vec!["stun:stun.l.google.com:19302".into()],
+        );
+        let rtc_noise =
+            NoiseTransport::new(rtc_raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
+
+        let multi = MultiTransport::new(ws_noise, rtc_noise);
+
         let signer: Arc<dyn Signer> = Arc::new(identity.clone());
         let engine = Rc::new(SyncEngine::new(
             store.clone(),
-            noise,
+            multi,
             SyncConfig::default(),
             local_peer,
             signer,
@@ -79,6 +103,7 @@ impl Client {
             engine,
             on_message: Rc::new(RefCell::new(None)),
             relay_status: Rc::new(RefCell::new("disconnected")),
+            direct_peers: Rc::new(RefCell::new(HashSet::new())),
         })
     }
 
@@ -107,9 +132,49 @@ impl Client {
         }
     }
 
+    /// Establish a direct WebRTC peer connection. Signaling rides on the
+    /// existing relay-mediated CRDT replication, encrypted under Noise_KK.
+    /// After this returns, `peer_connection_mode(peer_pubkey)` reads
+    /// `"direct"`.
+    pub async fn connect_direct(&self, peer_pubkey: &[u8]) -> Result<(), JsError> {
+        let pk: [u8; 32] = peer_pubkey
+            .try_into()
+            .map_err(|_| JsError::new("peer_pubkey must be 32 bytes"))?;
+        let x_pub = sunset_noise::ed25519_public_to_x25519(&pk)
+            .map_err(|e| JsError::new(&format!("x25519 derive: {e}")))?;
+        let addr_str = format!("webrtc://{}#x25519={}", hex::encode(pk), hex::encode(x_pub));
+        let addr = sunset_sync::PeerAddr::new(Bytes::from(addr_str));
+        self.engine
+            .add_peer(addr)
+            .await
+            .map_err(|e| JsError::new(&format!("connect_direct: {e}")))?;
+        let peer_id = PeerId(sunset_store::VerifyingKey::new(Bytes::copy_from_slice(&pk)));
+        self.direct_peers.borrow_mut().insert(peer_id);
+        Ok(())
+    }
+
+    /// Returns one of `"direct"`, `"via_relay"`, or `"unknown"`.
+    pub fn peer_connection_mode(&self, peer_pubkey: &[u8]) -> String {
+        let pk: [u8; 32] = match peer_pubkey.try_into() {
+            Ok(p) => p,
+            Err(_) => return "unknown".to_owned(),
+        };
+        let peer_id = PeerId(sunset_store::VerifyingKey::new(Bytes::copy_from_slice(&pk)));
+        if self.direct_peers.borrow().contains(&peer_id) {
+            "direct".to_owned()
+        } else if *self.relay_status.borrow() == "connected" {
+            "via_relay".to_owned()
+        } else {
+            "unknown".to_owned()
+        }
+    }
+
     pub async fn publish_room_subscription(&self) -> Result<(), JsError> {
         use std::time::Duration;
-        let filter = sunset_core::room_messages_filter(&self.room);
+        // Broader filter: covers <fp>/msg/ + <fp>/webrtc/ + future
+        // per-room namespaces. The relay sends us everything in the room;
+        // local consumers (chat UI, RelaySignaler) sub-filter as they go.
+        let filter = sunset_core::room_filter(&self.room);
         self.engine
             .publish_subscription(filter, Duration::from_secs(3600))
             .await

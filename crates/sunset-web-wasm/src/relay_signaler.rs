@@ -24,6 +24,7 @@
 //!   - Subsequent send/recv → `KkSession::encrypt`/`decrypt`.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -115,10 +116,10 @@ impl RelaySignaler {
         local_identity: Identity,
         room_fp_hex: String,
         store: &Arc<MemoryStore>,
-    ) -> Arc<Self> {
+    ) -> Rc<Self> {
         let local_x25519_secret = ed25519_seed_to_x25519_secret(&local_identity.secret_bytes());
         let (inbound_tx, inbound_rx) = mpsc::unbounded::<SignalMessage>();
-        let signaler = Arc::new(Self {
+        let signaler = Rc::new(Self {
             local_identity,
             local_x25519_secret,
             x25519_pub_cache: Mutex::new(HashMap::new()),
