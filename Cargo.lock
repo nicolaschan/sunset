@@ -1666,6 +1666,7 @@ dependencies = [
  "sunset-store-memory",
  "thiserror 2.0.18",
  "tokio",
+ "wasm-bindgen-futures",
  "wasmtimer",
  "web-time",
 ]
