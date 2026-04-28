@@ -115,10 +115,62 @@ where
         }
     }
 
+    fn kind(&self) -> crate::transport::TransportKind {
+        use crate::transport::TransportKind;
+        match self {
+            MultiConnection::Primary(_) => TransportKind::Primary,
+            MultiConnection::Secondary(_) => TransportKind::Secondary,
+        }
+    }
+
     async fn close(&self) -> Result<()> {
         match self {
             MultiConnection::Primary(c) => c.close().await,
             MultiConnection::Secondary(c) => c.close().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::TransportKind;
+    use crate::types::PeerId;
+    use async_trait::async_trait;
+    use sunset_store::VerifyingKey;
+
+    struct StubConn;
+    #[async_trait(?Send)]
+    impl TransportConnection for StubConn {
+        async fn send_reliable(&self, _: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn recv_reliable(&self) -> Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        async fn send_unreliable(&self, _: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn recv_unreliable(&self) -> Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        fn peer_id(&self) -> PeerId {
+            PeerId(VerifyingKey::new(Bytes::from_static(&[0u8; 32])))
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn primary_variant_reports_primary() {
+        let c: MultiConnection<StubConn, StubConn> = MultiConnection::Primary(StubConn);
+        assert_eq!(c.kind(), TransportKind::Primary);
+    }
+
+    #[test]
+    fn secondary_variant_reports_secondary() {
+        let c: MultiConnection<StubConn, StubConn> = MultiConnection::Secondary(StubConn);
+        assert_eq!(c.kind(), TransportKind::Secondary);
     }
 }
