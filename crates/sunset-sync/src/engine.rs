@@ -256,7 +256,7 @@ where
         // (both are keyed by the application-layer identity the remote
         // declared in its Hello, which may differ from the transport-layer
         // routing identity returned by `conn.peer_id()`).
-        tokio::task::spawn_local(run_peer(
+        crate::spawn::spawn_local(run_peer(
             conn, local_peer, proto, out_tx, out_rx, inbound_tx,
         ));
     }
@@ -813,7 +813,7 @@ mod tests {
         local
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
-                let h = tokio::task::spawn_local({
+                let h = crate::spawn::spawn_local({
                     let engine = engine.clone();
                     async move { engine.run().await }
                 });

@@ -193,7 +193,7 @@ mod tests {
                 let alice = net.transport(PeerId(vk(b"alice")), peer_addr("alice"));
                 let bob = net.transport(PeerId(vk(b"bob")), peer_addr("bob"));
                 let bob_accept =
-                    tokio::task::spawn_local(async move { bob.accept().await.unwrap() });
+                    crate::spawn::spawn_local(async move { bob.accept().await.unwrap() });
                 let alice_conn = alice.connect(peer_addr("bob")).await.unwrap();
                 let bob_conn = bob_accept.await.unwrap();
 
@@ -204,7 +204,7 @@ mod tests {
 
                 // Pass clones into run_peer (it takes ownership); keep originals
                 // so we can drop them to trigger Goodbye.
-                tokio::task::spawn_local(run_peer(
+                crate::spawn::spawn_local(run_peer(
                     Rc::new(alice_conn),
                     PeerId(vk(b"alice")),
                     1,
@@ -212,7 +212,7 @@ mod tests {
                     a_out_rx,
                     a_in_tx,
                 ));
-                tokio::task::spawn_local(run_peer(
+                crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
                     PeerId(vk(b"bob")),
                     1,
