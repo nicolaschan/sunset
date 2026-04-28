@@ -104,10 +104,15 @@ pub fn derive_members(
             .as_bytes()
             .cmp(b.verifying_key().as_bytes())
     });
-    // Whether the engine is currently connected to any relay (Primary
-    // transport). If so, a peer known only via heartbeat (i.e. NOT in
-    // peer_kinds — the relay forwarded its presence entry) is reachable
-    // "via_relay". Without a relay we have no idea — fall back to "unknown".
+    // V1 single-relay topology assumption: if we hold any Primary
+    // transport (i.e. an open relay connection), then a peer for whom
+    // we have no direct/relay transport entry yet — most commonly
+    // because the relay forwarded their presence entry without us
+    // building a transport to them — is reachable "via_relay".
+    // Revisit when multi-relay/federated routing lands: the right
+    // model then is to track which specific relay forwarded each
+    // heartbeat and key the via_relay decision on whether that relay
+    // is currently in peer_kinds.
     let any_relay = peer_kinds
         .values()
         .any(|k| *k == TransportKind::Primary);

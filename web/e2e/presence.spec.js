@@ -101,9 +101,13 @@ test("two browsers see each other in the member rail", async ({ browser }) => {
   await a.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
   await b.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
 
-  // Page exposes received members on window.__sunsetLastMembers via the
-  // FFI shim — confirm via a small init script that captures the array
-  // on every callback fire.
+  // We register an `on_members_changed` callback that stashes plain-JS
+  // copies on `window.__sunsetLastMembers` so subsequent
+  // `waitForFunction` calls can poll without a fresh RPC. NOTE: this
+  // overwrites whatever callback the Gleam UI bootstrap registered, so
+  // the Lustre member rail stops getting updates for the rest of this
+  // test — fine here because we only assert the underlying data, not
+  // the UI render.
   for (const p of [a, b]) {
     await p.evaluate(() => {
       // Stash members as plain JS objects (wasm-bindgen objects can
