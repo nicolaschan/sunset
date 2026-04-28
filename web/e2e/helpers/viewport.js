@@ -29,6 +29,8 @@ export async function openMembersDrawer(page, testInfo) {
 
 export async function closeDrawer(page, testInfo) {
   if (!isMobile(testInfo)) return;
-  await page.getByTestId("drawer-backdrop").click();
+  // Multiple drawer-backdrop elements exist (one per drawer); click the first
+  // with force:true because the drawer content can intercept pointer events.
+  await page.getByTestId("drawer-backdrop").first().click({ force: true });
   await page.waitForTimeout(260);
 }

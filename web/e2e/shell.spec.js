@@ -62,7 +62,8 @@ test("all four columns render in light mode", async ({ page }) => {
   });
 });
 
-test("theme toggle flips light to dark", async ({ page }) => {
+test("theme toggle flips light to dark", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   const toggle = page.getByTestId("theme-toggle");
 
   // The icon-only button advertises its target mode via title.
@@ -94,7 +95,8 @@ test("theme toggle flips light to dark", async ({ page }) => {
   });
 });
 
-test("theme choice persists across reloads", async ({ page }) => {
+test("theme choice persists across reloads", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   const toggle = page.getByTestId("theme-toggle");
   // Start in light mode (the default for this beforeEach setup).
   await expect(toggle).toHaveAttribute("title", /dark/i);
@@ -115,7 +117,8 @@ test.describe("system theme default", () => {
 
   test("with no saved choice, the OS dark preference wins", async ({
     page,
-  }) => {
+  }, testInfo) => {
+    test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
     // Use a dedicated emulated colorScheme + an isolated localStorage.
     await page.goto("/");
     await page.evaluate(() => {
@@ -132,7 +135,8 @@ test.describe("system theme default", () => {
   });
 });
 
-test("rooms rail collapse button changes the rail width", async ({ page }) => {
+test("rooms rail collapse button changes the rail width", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   const collapse = page.getByRole("button", { name: /Collapse rooms/i });
   const rail = page.getByTestId("rooms-rail");
 
@@ -168,7 +172,8 @@ test("no body-level scrollbar appears", async ({ page }) => {
 
 test("collapsed rail hides the logo and never overflows horizontally", async ({
   page,
-}) => {
+}, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   const rail = page.getByTestId("rooms-rail");
 
   await page.getByRole("button", { name: /Collapse rooms/i }).click();
@@ -248,7 +253,8 @@ test("composer input font-size is at least 16px (iOS no-zoom)", async ({
   expect(fontSize).toBeGreaterThanOrEqual(16);
 });
 
-test("channels and main column bottom borders line up", async ({ page }) => {
+test("channels and main column bottom borders line up", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   // Channels rail is the second <aside>; main column is <main>.
   const offsets = await page.evaluate(() => {
     const channelsHeader = document.querySelectorAll("aside")[1].firstElementChild;
@@ -266,7 +272,8 @@ test("channels and main column bottom borders line up", async ({ page }) => {
   expect(Math.abs(offsets.channels - offsets.main)).toBeLessThanOrEqual(1);
 });
 
-test("column-bottom rows share a top y-coordinate", async ({ page }) => {
+test("column-bottom rows share a top y-coordinate", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   // Rooms rail's pinned 'you' row, channels rail's self-control bar, and
   // main panel's composer all sit at the bottom of their column. Their
   // top borders must align horizontally so the layout reads as a single

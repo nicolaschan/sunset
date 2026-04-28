@@ -4,6 +4,7 @@
 // clears it before each navigation.
 
 import { expect, test } from "@playwright/test";
+import { openRoomsDrawer } from "./helpers/viewport.js";
 
 test.describe("landing + routing", () => {
   test.beforeEach(async ({ page }) => {
@@ -64,14 +65,16 @@ test.describe("landing + routing", () => {
     await expect(page.getByTestId("rooms-rail")).toBeVisible();
   });
 
-  test("rooms-rail search filters the visible rooms", async ({ page }) => {
+  test("rooms-rail search filters the visible rooms", async ({ page }, testInfo) => {
     await page.goto("/#dusk-collective");
     // Add a second room from the sidebar so we have two to filter.
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("design-crit");
     await page.getByTestId("rooms-search-join").click();
     await expect(page).toHaveURL(/#design-crit$/);
 
     // Filter by "dusk" — only dusk-collective should remain visible.
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("dusk");
     await expect(
       page.getByTestId("rooms-rail").getByText("dusk-collective"),
@@ -102,11 +105,12 @@ test.describe("landing + routing", () => {
 
   test("delete button removes a room; deleting all returns to landing", async ({
     page,
-  }) => {
+  }, testInfo) => {
     await page.goto("/");
     // Join two rooms.
     await page.getByTestId("landing-input").fill("dusk-collective");
     await page.getByTestId("landing-input").press("Enter");
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("design-crit");
     await page.getByTestId("rooms-search").press("Enter");
     await expect(page).toHaveURL(/#design-crit$/);
@@ -114,6 +118,7 @@ test.describe("landing + routing", () => {
     // Delete the active room (design-crit). The rail's per-row delete
     // button is hidden until hover; force the click since the room-row
     // wrappers carry the hover-only styling.
+    await openRoomsDrawer(page, testInfo);
     await page
       .getByTestId("rooms-rail")
       .locator('.room-row', { hasText: "design-crit" })
@@ -126,6 +131,16 @@ test.describe("landing + routing", () => {
       page.getByTestId("rooms-rail").getByText("design-crit"),
     ).not.toBeVisible();
 
+    // On mobile the rooms drawer stays open after deletion. Reload the page to
+    // reset all in-memory state (drawer open/closed), then re-open the drawer.
+    await page.reload();
+    if (testInfo.project.name === "mobile-chrome") {
+      await expect(page.getByTestId("phone-header")).toBeVisible();
+    } else {
+      await expect(page.getByText("sunset", { exact: true })).toBeVisible();
+    }
+    await openRoomsDrawer(page, testInfo);
+
     // Delete the last remaining room → back to landing.
     await page
       .getByTestId("rooms-rail")
@@ -136,14 +151,16 @@ test.describe("landing + routing", () => {
     await expect(page.getByTestId("landing-view")).toBeVisible();
   });
 
-  test("selecting a room does not reorder the list", async ({ page }) => {
+  test("selecting a room does not reorder the list", async ({ page }, testInfo) => {
     // Join three rooms in a known order. Joins prepend so the
     // resulting top-to-bottom order is gamma → beta → alpha.
     await page.goto("/");
     await page.getByTestId("landing-input").fill("alpha");
     await page.getByTestId("landing-input").press("Enter");
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("beta");
     await page.getByTestId("rooms-search").press("Enter");
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("gamma");
     await page.getByTestId("rooms-search").press("Enter");
 
@@ -155,6 +172,7 @@ test.describe("landing + routing", () => {
           rows.map((r) => r.getAttribute("data-room-name") || ""),
         );
 
+    await openRoomsDrawer(page, testInfo);
     expect((await railOrder()).slice(0, 3)).toEqual([
       "gamma",
       "beta",
@@ -168,6 +186,7 @@ test.describe("landing + routing", () => {
       .click();
     await expect(page).toHaveURL(/#alpha$/);
 
+    await openRoomsDrawer(page, testInfo);
     expect((await railOrder()).slice(0, 3)).toEqual([
       "gamma",
       "beta",
