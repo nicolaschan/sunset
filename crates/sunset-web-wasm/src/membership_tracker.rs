@@ -203,6 +203,13 @@ fn derive_relay_status(peer_kinds: &HashMap<PeerId, TransportKind>, prior: &str)
     }
 }
 
+/// Public re-evaluation entry point used by `Client::start_presence`
+/// after seeding `peer_kinds` from the engine snapshot. Mirrors
+/// `maybe_fire_relay_status` but exposed for one-shot kicks.
+pub fn fire_relay_status_now(handles: &TrackerHandles) {
+    maybe_fire_relay_status(handles);
+}
+
 fn maybe_fire_relay_status(handles: &TrackerHandles) {
     let prior = handles.last_relay_status.borrow().clone();
     let next = derive_relay_status(&handles.peer_kinds.borrow(), &prior);

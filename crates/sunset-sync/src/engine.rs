@@ -74,6 +74,11 @@ pub(crate) struct EngineState {
     pub registry: SubscriptionRegistry,
     /// Per-peer outbound message senders.
     pub peer_outbound: HashMap<PeerId, mpsc::UnboundedSender<SyncMessage>>,
+    /// Per-peer transport kind (Primary vs Secondary). Updated in
+    /// lockstep with `peer_outbound` so callers can snapshot
+    /// `(peer, kind)` after subscribing late and missing the
+    /// corresponding `PeerAdded` event.
+    pub peer_kinds: HashMap<PeerId, crate::transport::TransportKind>,
     /// Live `EngineEvent` subscribers. Dead senders (closed by the
     /// receiver being dropped) are evicted lazily on the next emit.
     pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
@@ -116,6 +121,7 @@ where
                 trust: TrustSet::default(),
                 registry: SubscriptionRegistry::new(),
                 peer_outbound: HashMap::new(),
+                peer_kinds: HashMap::new(),
                 event_subs: Vec::new(),
             })),
             cmd_tx,
@@ -141,6 +147,19 @@ where
         let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
         self.state.lock().await.event_subs.push(tx);
         rx
+    }
+
+    /// Snapshot the engine's currently-connected peer set with each
+    /// peer's transport kind. Pairs with `subscribe_engine_events()`
+    /// to seed initial state for a subscriber that joins after some
+    /// peers are already connected (no-replay race).
+    pub async fn current_peers(&self) -> Vec<(PeerId, crate::transport::TransportKind)> {
+        let state = self.state.lock().await;
+        state
+            .peer_kinds
+            .iter()
+            .map(|(pk, k)| (pk.clone(), *k))
+            .collect()
     }
 
     /// Publish this peer's subscription filter. Writes a signed KV entry
@@ -313,14 +332,15 @@ where
                 kind,
                 out_tx,
             } => {
-                // Register the outbound sender under the Hello-declared peer_id.
-                // This key matches what the subscription registry uses, so push
-                // routing can find the sender correctly.
-                self.state
-                    .lock()
-                    .await
-                    .peer_outbound
-                    .insert(peer_id.clone(), out_tx);
+                // Register the outbound sender + transport kind under the
+                // Hello-declared peer_id. peer_outbound + peer_kinds move
+                // together so a late `current_peers()` snapshot reflects
+                // the same set as the live subscription stream.
+                {
+                    let mut state = self.state.lock().await;
+                    state.peer_outbound.insert(peer_id.clone(), out_tx);
+                    state.peer_kinds.insert(peer_id.clone(), kind);
+                }
                 self.emit_engine_event(EngineEvent::PeerAdded {
                     peer_id: peer_id.clone(),
                     kind,
@@ -334,7 +354,11 @@ where
             }
             InboundEvent::Disconnected { peer_id, reason } => {
                 eprintln!("sunset-sync: peer {peer_id:?} disconnected: {reason}");
-                self.state.lock().await.peer_outbound.remove(&peer_id);
+                {
+                    let mut state = self.state.lock().await;
+                    state.peer_outbound.remove(&peer_id);
+                    state.peer_kinds.remove(&peer_id);
+                }
                 self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
                     .await;
             }

@@ -136,8 +136,10 @@ impl Client {
 
     /// Establish a direct WebRTC peer connection. Signaling rides on the
     /// existing relay-mediated CRDT replication, encrypted under Noise_KK.
-    /// After this returns, `peer_connection_mode(peer_pubkey)` reads
-    /// `"direct"`.
+    /// After this returns, `peer_connection_mode(peer_pubkey)` will
+    /// eventually read `"direct"` once the remote's Hello arrives and the
+    /// engine emits `PeerAdded { kind: Secondary }`. The on_members_changed
+    /// callback (if registered) will fire when the transition lands.
     pub async fn connect_direct(&self, peer_pubkey: &[u8]) -> Result<(), JsError> {
         let pk: [u8; 32] = peer_pubkey
             .try_into()
@@ -169,9 +171,12 @@ impl Client {
         .to_owned()
     }
 
-    /// Start the heartbeat publisher + the membership tracker.
-    /// Idempotent: a second call is a no-op. The Gleam UI calls this
-    /// once after the Client is constructed.
+    /// Start the heartbeat publisher + the membership tracker. Idempotent.
+    ///
+    /// May be called either before or after `add_relay` / `connect_direct`:
+    /// the tracker subscribes to the engine's no-replay event stream AND
+    /// snapshots the engine's current peer set, so already-connected peers
+    /// are picked up regardless of call order.
     pub async fn start_presence(&self, interval_ms: u32, ttl_ms: u32, refresh_ms: u32) {
         if *self.presence_started.borrow() {
             return;
@@ -190,6 +195,18 @@ impl Client {
         );
 
         let engine_events = self.engine.subscribe_engine_events().await;
+
+        // Seed peer_kinds from the engine's snapshot. Order matters:
+        // subscribe FIRST, then snapshot — so events fired between the
+        // two land in the receiver and just produce idempotent re-inserts.
+        let snapshot = self.engine.current_peers().await;
+        {
+            let mut peer_kinds = self.tracker_handles.peer_kinds.borrow_mut();
+            for (pk, kind) in snapshot {
+                peer_kinds.insert(pk, kind);
+            }
+        }
+
         crate::membership_tracker::spawn_tracker(
             self.store.clone(),
             engine_events,
@@ -200,6 +217,10 @@ impl Client {
             refresh_ms as u64,
             (*self.tracker_handles).clone(),
         );
+
+        // Fire an initial relay_status callback in case the seed
+        // pushed us into "connected" / "disconnected".
+        crate::membership_tracker::fire_relay_status_now(&self.tracker_handles);
     }
 
     pub fn on_members_changed(&self, callback: js_sys::Function) {
