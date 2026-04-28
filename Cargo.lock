@@ -1672,6 +1672,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunset-sync-webrtc-browser"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "hex",
+ "js-sys",
+ "postcard",
+ "serde",
+ "sunset-store",
+ "sunset-sync",
+ "thiserror 2.0.18",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+]
+
+[[package]]
 name = "sunset-sync-ws-browser"
 version = "0.1.0"
 dependencies = [
@@ -1713,10 +1734,12 @@ dependencies = [
 name = "sunset-web-wasm"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "hex",
  "js-sys",
+ "postcard",
  "rand_chacha",
  "rand_core",
  "sunset-core",
@@ -1724,12 +1747,15 @@ dependencies = [
  "sunset-store",
  "sunset-store-memory",
  "sunset-sync",
+ "sunset-sync-webrtc-browser",
  "sunset-sync-ws-browser",
  "thiserror 2.0.18",
+ "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "web-time",
  "zeroize",
 ]
 

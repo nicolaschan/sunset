@@ -9,11 +9,15 @@ mod client;
 mod identity;
 #[cfg(target_arch = "wasm32")]
 mod messages;
+#[cfg(target_arch = "wasm32")]
+mod relay_signaler;
 
 #[cfg(target_arch = "wasm32")]
 pub use client::Client;
 #[cfg(target_arch = "wasm32")]
 pub use messages::IncomingMessage;
+#[cfg(target_arch = "wasm32")]
+pub use relay_signaler::{RelaySignaler, signaling_filter};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Client;

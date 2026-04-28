@@ -47,7 +47,27 @@ export async function createClient(seed, roomName, callback) {
   await ensureLoaded();
   const seedBytes = bitsToBytes(seed);
   const client = new Client(seedBytes, roomName);
+  // Test-only hook: expose the client to Playwright when SUNSET_TEST is
+  // set on `window` before the bundle loads. No-op in production.
+  if (typeof window !== "undefined" && window.SUNSET_TEST) {
+    window.sunsetClient = client;
+  }
   callback(client);
+}
+
+export async function clientConnectDirect(client, peerPubkey, callback) {
+  try {
+    const bytes = bitsToBytes(peerPubkey);
+    await client.connect_direct(bytes);
+    callback(new Ok(undefined));
+  } catch (e) {
+    callback(new GError(String(e)));
+  }
+}
+
+export function clientPeerConnectionMode(client, peerPubkey) {
+  const bytes = bitsToBytes(peerPubkey);
+  return client.peer_connection_mode(bytes);
 }
 
 export async function addRelay(client, url, callback) {
