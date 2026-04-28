@@ -18,8 +18,6 @@ pub(crate) enum InboundEvent {
     /// `out_tx` is the outbound sender to register under `peer_id`.
     PeerHello {
         peer_id: PeerId,
-        // Read in Task 5 (engine fan-out of PeerAdded events).
-        #[allow(dead_code)]
         kind: crate::transport::TransportKind,
         out_tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>,
     },

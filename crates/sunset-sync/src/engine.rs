@@ -310,7 +310,7 @@ where
         match event {
             InboundEvent::PeerHello {
                 peer_id,
-                kind: _,
+                kind,
                 out_tx,
             } => {
                 // Register the outbound sender under the Hello-declared peer_id.
@@ -321,6 +321,11 @@ where
                     .await
                     .peer_outbound
                     .insert(peer_id.clone(), out_tx);
+                self.emit_engine_event(EngineEvent::PeerAdded {
+                    peer_id: peer_id.clone(),
+                    kind,
+                })
+                .await;
                 // Fire bootstrap digest exchange on the subscribe namespace.
                 self.send_bootstrap_digest(&peer_id).await;
             }
@@ -330,6 +335,8 @@ where
             InboundEvent::Disconnected { peer_id, reason } => {
                 eprintln!("sunset-sync: peer {peer_id:?} disconnected: {reason}");
                 self.state.lock().await.peer_outbound.remove(&peer_id);
+                self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
+                    .await;
             }
         }
     }
@@ -570,9 +577,6 @@ where
 
     /// Fan-out an event to every live subscriber. Drops senders whose
     /// receivers have been dropped (lazy GC).
-    // Used by Task 5 (handle_inbound_event will call this to emit
-    // PeerAdded/PeerRemoved). Tagged dead_code until that wiring lands.
-    #[allow(dead_code)]
     async fn emit_engine_event(&self, ev: EngineEvent) {
         let mut state = self.state.lock().await;
         state.event_subs.retain(|tx| tx.send(ev.clone()).is_ok());
@@ -862,6 +866,71 @@ mod tests {
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
                 engine.tick_anti_entropy().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn engine_event_fan_out_to_multiple_subscribers() {
+        use crate::engine::EngineEvent;
+        use crate::transport::TransportKind;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let mut sub_a = engine.subscribe_engine_events().await;
+                let mut sub_b = engine.subscribe_engine_events().await;
+
+                engine
+                    .emit_engine_event(EngineEvent::PeerAdded {
+                        peer_id: PeerId(vk(b"bob")),
+                        kind: TransportKind::Primary,
+                    })
+                    .await;
+
+                let a = sub_a.recv().await.expect("sub_a got event");
+                let b = sub_b.recv().await.expect("sub_b got event");
+                match (a, b) {
+                    (
+                        EngineEvent::PeerAdded {
+                            peer_id: pa,
+                            kind: ka,
+                        },
+                        EngineEvent::PeerAdded {
+                            peer_id: pb,
+                            kind: kb,
+                        },
+                    ) => {
+                        assert_eq!(pa, PeerId(vk(b"bob")));
+                        assert_eq!(pb, PeerId(vk(b"bob")));
+                        assert_eq!(ka, TransportKind::Primary);
+                        assert_eq!(kb, TransportKind::Primary);
+                    }
+                    _ => panic!("expected PeerAdded events"),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn engine_event_drops_dead_subscriber() {
+        use crate::engine::EngineEvent;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let sub_a = engine.subscribe_engine_events().await;
+                drop(sub_a);
+
+                engine
+                    .emit_engine_event(EngineEvent::PeerRemoved {
+                        peer_id: PeerId(vk(b"bob")),
+                    })
+                    .await;
+
+                assert!(engine.state.lock().await.event_subs.is_empty());
             })
             .await;
     }
