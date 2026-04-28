@@ -113,9 +113,7 @@ pub fn derive_members(
     // model then is to track which specific relay forwarded each
     // heartbeat and key the via_relay decision on whether that relay
     // is currently in peer_kinds.
-    let any_relay = peer_kinds
-        .values()
-        .any(|k| *k == TransportKind::Primary);
+    let any_relay = peer_kinds.values().any(|k| *k == TransportKind::Primary);
     for (pk, last_ms) in others {
         let age = now_ms.saturating_sub(*last_ms);
         let presence = presence_bucket(age, interval_ms, ttl_ms);
