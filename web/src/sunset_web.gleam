@@ -32,6 +32,7 @@ import sunset_web/views/details_panel
 import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
+import sunset_web/views/phone_header
 import sunset_web/views/rooms
 import sunset_web/views/shell
 import sunset_web/views/voice_popover
@@ -793,9 +794,12 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
   shell.view(
     model.mode,
     palette,
+    model.viewport,
     model.rooms_collapsed,
     detail_msg != None,
+    model.drawer,
     ToggleMode,
+    CloseDrawer,
     rooms.view(
       palette: palette,
       rooms: filtered,
@@ -856,6 +860,16 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       None -> members.view(palette: palette, members: model.members)
     },
     voice_popover_overlay(palette, model),
+    phone_header.view(
+      palette: palette,
+      room: active_room,
+      on_open_channels: OpenDrawer(domain.ChannelsDrawer),
+      on_open_members: OpenDrawer(domain.MembersDrawer),
+    ),
+    element.fragment([]),
+    element.fragment([]),
+    element.fragment([]),
+    element.fragment([]),
   )
 }
 

@@ -1,16 +1,155 @@
-//// 4-column app shell (rooms · channels · main · members).
-////
-//// Children come in as four already-rendered Lustre elements; this module
-//// only owns the outer grid + body chrome + theme-toggle button.
+//// 4-column app shell (rooms · channels · main · members) on desktop;
+//// header + chat + drawers + sheets on phone. The viewport branch is
+//// handed in by the caller.
 
+import gleam/option
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
+import sunset_web/domain.{
+  type Drawer, type Viewport, ChannelsDrawer, Desktop, MembersDrawer, Phone,
+  RoomsDrawer,
+}
 import sunset_web/theme.{type Mode, type Palette, Dark, Light}
 import sunset_web/ui
+import sunset_web/views/drawer as drawer_module
 
 pub fn view(
+  mode: Mode,
+  palette: Palette,
+  viewport: Viewport,
+  rooms_collapsed: Bool,
+  detail_open: Bool,
+  drawer: option.Option(Drawer),
+  toggle_mode: msg,
+  on_close_drawer: msg,
+  rooms: Element(msg),
+  channels: Element(msg),
+  main: Element(msg),
+  right_rail: Element(msg),
+  overlay: Element(msg),
+  phone_header_el: Element(msg),
+  voice_minibar: Element(msg),
+  details_sheet: Element(msg),
+  voice_sheet: Element(msg),
+  reaction_sheet: Element(msg),
+) -> Element(msg) {
+  case viewport {
+    Desktop ->
+      desktop_view(
+        mode,
+        palette,
+        rooms_collapsed,
+        detail_open,
+        toggle_mode,
+        rooms,
+        channels,
+        main,
+        right_rail,
+        overlay,
+      )
+    Phone ->
+      phone_view(
+        palette,
+        drawer,
+        on_close_drawer,
+        rooms,
+        channels,
+        main,
+        right_rail,
+        phone_header_el,
+        voice_minibar,
+        details_sheet,
+        voice_sheet,
+        reaction_sheet,
+      )
+  }
+}
+
+fn phone_view(
+  palette: Palette,
+  drawer: option.Option(Drawer),
+  on_close_drawer: msg,
+  rooms: Element(msg),
+  channels: Element(msg),
+  main: Element(msg),
+  right_rail: Element(msg),
+  phone_header_el: Element(msg),
+  voice_minibar: Element(msg),
+  details_sheet: Element(msg),
+  voice_sheet: Element(msg),
+  reaction_sheet: Element(msg),
+) -> Element(msg) {
+  let rooms_open = drawer == option.Some(RoomsDrawer)
+  let channels_open = drawer == option.Some(ChannelsDrawer)
+  let members_open = drawer == option.Some(MembersDrawer)
+
+  html.div(
+    [
+      ui.css([
+        #("position", "fixed"),
+        #("inset", "0"),
+        #("background", palette.bg),
+        #("color", palette.text),
+        #("font-family", theme.font_sans),
+        #("font-size", "16.875px"),
+        #("line-height", "1.45"),
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("height", "100vh"),
+        #("height", "100dvh"),
+        #("overflow", "hidden"),
+      ]),
+    ],
+    [
+      global_reset(),
+      phone_header_el,
+      html.main(
+        [
+          ui.css([
+            #("flex", "1"),
+            #("min-height", "0"),
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("overflow", "hidden"),
+          ]),
+        ],
+        [main],
+      ),
+      voice_minibar,
+      drawer_module.view(
+        palette: palette,
+        open: channels_open,
+        side: drawer_module.Left,
+        on_close: on_close_drawer,
+        test_id: "channels-drawer",
+        content: channels,
+      ),
+      drawer_module.view(
+        palette: palette,
+        open: rooms_open,
+        side: drawer_module.Left,
+        on_close: on_close_drawer,
+        test_id: "rooms-drawer",
+        content: rooms,
+      ),
+      drawer_module.view(
+        palette: palette,
+        open: members_open,
+        side: drawer_module.Right,
+        on_close: on_close_drawer,
+        test_id: "members-drawer",
+        content: right_rail,
+      ),
+      details_sheet,
+      voice_sheet,
+      reaction_sheet,
+    ],
+  )
+}
+
+fn desktop_view(
   mode: Mode,
   palette: Palette,
   rooms_collapsed: Bool,

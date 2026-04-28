@@ -393,3 +393,19 @@ test.skip("info button on a delivered incoming message also opens details", asyn
   await expect(panel.getByTestId("receipt-row").first()).toBeVisible();
   await page.getByTestId("details-close").click();
 });
+
+test.describe("phone shell smoke", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  test("phone header is visible on phone viewport", async ({ page }) => {
+    await expect(page.getByTestId("phone-rooms-toggle")).toBeVisible();
+    await expect(page.getByTestId("phone-members-toggle")).toBeVisible();
+    await expect(page.getByTestId("phone-header").getByText("dusk-collective")).toBeVisible();
+  });
+});
