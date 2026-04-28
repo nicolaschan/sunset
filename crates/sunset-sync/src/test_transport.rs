@@ -3,8 +3,8 @@
 //! `TestNetwork` is a registry that mediates between `TestTransport`s.
 //! Each transport has a `PeerAddr`; calling `connect(addr)` looks up the
 //! matching transport in the network and creates a paired `TestConnection`
-//! on both sides. Unreliable channels are no-ops (return pending) since
-//! sunset-sync v1 only uses reliable.
+//! on both sides. Both reliable and unreliable channels are real in-memory
+//! pipes (separate `mpsc::unbounded_channel` pairs).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -60,6 +60,9 @@ struct ConnectRequest {
     /// (acceptor will send via `tx_to_initiator`; receive via `rx_from_initiator`.)
     tx_to_initiator: mpsc::UnboundedSender<Bytes>,
     rx_from_initiator: mpsc::UnboundedReceiver<Bytes>,
+    /// Parallel unreliable channel pair installed on the acceptor's side.
+    tx_to_initiator_unrel: mpsc::UnboundedSender<Bytes>,
+    rx_from_initiator_unrel: mpsc::UnboundedReceiver<Bytes>,
     /// Reply channel: acceptor signals "connection installed" so the
     /// initiator can complete `connect()`.
     ready: oneshot::Sender<()>,
@@ -97,10 +100,15 @@ impl Transport for TestTransport {
             .cloned()
             .ok_or_else(|| Error::Transport(format!("no peer at {:?}", addr)))?;
 
-        // Build the channel pair.
+        // Build the channel pair (reliable).
         let (tx_initiator_to_acceptor, rx_initiator_to_acceptor) =
             mpsc::unbounded_channel::<Bytes>();
         let (tx_acceptor_to_initiator, rx_acceptor_to_initiator) =
+            mpsc::unbounded_channel::<Bytes>();
+        // Build the channel pair (unreliable).
+        let (tx_initiator_to_acceptor_unrel, rx_initiator_to_acceptor_unrel) =
+            mpsc::unbounded_channel::<Bytes>();
+        let (tx_acceptor_to_initiator_unrel, rx_acceptor_to_initiator_unrel) =
             mpsc::unbounded_channel::<Bytes>();
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
 
@@ -112,6 +120,8 @@ impl Transport for TestTransport {
                 // rx_initiator_to_acceptor for its recv.
                 tx_to_initiator: tx_acceptor_to_initiator,
                 rx_from_initiator: rx_initiator_to_acceptor,
+                tx_to_initiator_unrel: tx_acceptor_to_initiator_unrel,
+                rx_from_initiator_unrel: rx_initiator_to_acceptor_unrel,
                 ready: ready_tx,
             })
             .map_err(|_| Error::Transport("acceptor inbox closed".into()))?;
@@ -127,6 +137,8 @@ impl Transport for TestTransport {
             target_peer_id,
             tx_initiator_to_acceptor,
             rx_acceptor_to_initiator,
+            tx_initiator_to_acceptor_unrel,
+            rx_acceptor_to_initiator_unrel,
         ))
     }
 
@@ -147,6 +159,8 @@ impl Transport for TestTransport {
             req.from_peer,
             req.tx_to_initiator,
             req.rx_from_initiator,
+            req.tx_to_initiator_unrel,
+            req.rx_from_initiator_unrel,
         ))
     }
 }
@@ -156,6 +170,8 @@ pub struct TestConnection {
     peer_id: PeerId,
     tx: mpsc::UnboundedSender<Bytes>,
     rx: RefCell<mpsc::UnboundedReceiver<Bytes>>,
+    tx_unrel: mpsc::UnboundedSender<Bytes>,
+    rx_unrel: RefCell<mpsc::UnboundedReceiver<Bytes>>,
 }
 
 impl TestConnection {
@@ -163,11 +179,15 @@ impl TestConnection {
         peer_id: PeerId,
         tx: mpsc::UnboundedSender<Bytes>,
         rx: mpsc::UnboundedReceiver<Bytes>,
+        tx_unrel: mpsc::UnboundedSender<Bytes>,
+        rx_unrel: mpsc::UnboundedReceiver<Bytes>,
     ) -> Self {
         Self {
             peer_id,
             tx,
             rx: RefCell::new(rx),
+            tx_unrel,
+            rx_unrel: RefCell::new(rx_unrel),
         }
     }
 }
@@ -191,14 +211,21 @@ impl TransportConnection for TestConnection {
             .ok_or_else(|| Error::Transport("connection closed".into()))
     }
 
-    async fn send_unreliable(&self, _bytes: Bytes) -> Result<()> {
-        // No-op for v1; sunset-sync doesn't use the unreliable channel.
-        Ok(())
+    async fn send_unreliable(&self, bytes: Bytes) -> Result<()> {
+        self.tx_unrel
+            .send(bytes)
+            .map_err(|_| Error::Transport("connection closed".into()))
     }
 
+    // `borrow_mut()` is held across `.await` intentionally: single-threaded
+    // (?Send) executor means no concurrent borrow can occur while suspended.
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn recv_unreliable(&self) -> Result<Bytes> {
-        // Never resolves in v1 — sunset-sync doesn't read this.
-        std::future::pending().await
+        self.rx_unrel
+            .borrow_mut()
+            .recv()
+            .await
+            .ok_or_else(|| Error::Transport("connection closed".into()))
     }
 
     fn peer_id(&self) -> PeerId {
@@ -252,6 +279,40 @@ mod tests {
                     .unwrap();
                 let got = alice_conn.recv_reliable().await.unwrap();
                 assert_eq!(got, Bytes::from_static(b"world"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pair_can_send_and_recv_unreliable() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice_addr = PeerAddr::new("alice");
+                let bob_addr = PeerAddr::new("bob");
+                let alice = net.transport(PeerId(vk(b"alice")), alice_addr.clone());
+                let bob = net.transport(PeerId(vk(b"bob")), bob_addr.clone());
+
+                let bob_accept =
+                    tokio::task::spawn_local(async move { bob.accept().await.unwrap() });
+
+                let alice_conn = alice.connect(bob_addr).await.unwrap();
+                let bob_conn = bob_accept.await.unwrap();
+
+                alice_conn
+                    .send_unreliable(Bytes::from_static(b"datagram"))
+                    .await
+                    .unwrap();
+                let got = bob_conn.recv_unreliable().await.unwrap();
+                assert_eq!(got, Bytes::from_static(b"datagram"));
+
+                bob_conn
+                    .send_unreliable(Bytes::from_static(b"reply"))
+                    .await
+                    .unwrap();
+                let got = alice_conn.recv_unreliable().await.unwrap();
+                assert_eq!(got, Bytes::from_static(b"reply"));
             })
             .await;
     }
