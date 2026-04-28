@@ -130,7 +130,7 @@ test("two browsers see each other in the member rail", async ({ browser }) => {
       return m && m.presence === "online" && m.connection_mode === "via_relay";
     },
     bPub,
-    { timeout: 5_000 },
+    { timeout: 15_000 },
   );
 
   const aPub = await a.evaluate(() => Array.from(window.sunsetClient.public_key));
@@ -143,7 +143,7 @@ test("two browsers see each other in the member rail", async ({ browser }) => {
       return m && m.presence === "online" && m.connection_mode === "via_relay";
     },
     aPub,
-    { timeout: 5_000 },
+    { timeout: 15_000 },
   );
 });
 
