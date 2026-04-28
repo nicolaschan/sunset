@@ -24,10 +24,11 @@
 
 The Plan C threat model already covered Noise-over-Bytes-channel guarantees. WebRTC adds:
 
-- **Datachannel uses DTLS-SRTP** at the WebRTC layer (browser-mandated). The Noise tunnel still wraps the bytes inside, so even if DTLS were compromised, payloads remain Noise-protected.
+- **DTLS-SRTP at the WebRTC layer is not trusted for confidentiality.** We wrap the WebRTC datachannel with `NoiseTransport<R>` (the same decorator as for WebSocket from Plan C), so payloads have the same Noise IK protection regardless of underlying transport. DTLS being broken or MITM'd by a hostile browser/proxy/extension still leaves the Noise tunnel intact.
 - **STUN/TURN servers see connection metadata** (peer IPs, timing). This is the standard WebRTC tradeoff. Operators concerned about IP exposure can run their own STUN/TURN.
-- **Browser's WebRTC implementation is large attack surface.** We defer to the browser's hardening; sunset.chat doesn't try to harden WebRTC further.
-- **The ICE candidate exchange leaks peer IPs to room members** (via the encrypted signaling entries — only room members can decrypt). This is acceptable for the chat threat model: room members already know each other's pubkeys and can correlate.
+- **Browser's WebRTC implementation is large attack surface.** We defer to the browser's hardening for the connection mechanics; the Noise layer above it is what we trust for application data confidentiality.
+- **Signaling content (SDP/ICE) is encrypted under pairwise Noise_KK with PFS.** Other room members CANNOT decrypt signaling exchanges between Alice and Bob — protects IP addresses, codec preferences, and (when voice ships) call participation metadata.
+- **Signaling existence is metadata-visible.** The fact that Alice posted a signaling entry addressed to Bob is observable to anyone watching the entry stream (entry's `verifying_key` and `name` are plaintext per Plan 6). Hiding this would require the sender-identity-hiding work deferred in the crypto spec.
 
 ## Architecture
 
@@ -104,9 +105,41 @@ pub enum WebRtcSignalPayload {
 }
 ```
 
-**Encryption layer:** SDP/ICE payloads contain peer IP addresses (sensitive metadata). They should be AEAD-encrypted under K_room so eavesdroppers without the room name can't see them. v1: encrypt with the same per-message AEAD scheme from sunset-core (HKDF from K_room → message key, XChaCha20-Poly1305). The signaling content block uses the same `EncryptedMessage` shape as chat messages, just with a different inner enum.
+**Encryption layer: pairwise Noise_KK with full PFS, per signaling exchange.**
 
-Actually — to keep v1 small, **defer the AEAD encryption to V1.5**. v1 ships SDP/ICE as plaintext inside the ContentBlock. The outer signature still authenticates; only confidentiality of SDP is missing. Document the gap and close it before voice ships (because voice signaling will absolutely need encrypted SDP).
+Rationale:
+
+- SDP/ICE content is pairwise (Alice→Bob, Bob→Alice) — other room members don't need to read it. Room-key encryption would expose call participation patterns to non-participants.
+- WebRTC's DTLS-SRTP is *not* trusted as the encryption layer for the resulting datachannel. Just as we wrap WebSocket in Noise (Plan C) without relying on TLS, we wrap the WebRTC datachannel in Noise too. So the datachannel layer is already protected — but the *signaling* still needs its own protection because it travels through the relay-mediated store, visible to everyone.
+- Both peers have static X25519 keys (derived from their Ed25519 identities per Plan C's `ed25519_seed_to_x25519_secret`). Both peers know each other's pubkeys (from chat-message exchange). So **Noise_KK** ("both statics known a priori") fits perfectly.
+
+Pattern: **`Noise_KK_25519_XChaChaPoly_BLAKE2b`** — same primitives as the connection-level Noise from Plan C; only the pattern letter differs (KK vs IK). Reuses the existing `snow` dependency in `sunset-noise`.
+
+Sequence:
+
+```text
+Alice → Bob (msg 1, Noise_KK message 1):
+   - Alice generates ephemeral e_A
+   - Computes shared secrets: ee chain via DH(e_A, bob_static), DH(alice_static, bob_static)
+   - Payload: postcard(WebRtcSignalPayload::Offer(sdp))
+   - Encrypts payload under derived handshake key
+   - Wraps in EncryptedSignalEnvelope, posts as CRDT entry <room_fp>/webrtc/<A>/<B>/0
+
+Bob → Alice (msg 2, Noise_KK message 2):
+   - Bob generates ephemeral e_B
+   - Completes DH chain: DH(e_B, e_A), DH(e_B, alice_static)
+   - Payload: postcard(WebRtcSignalPayload::Answer(sdp))
+   - Both sides now have a Noise transport state with full PFS
+   - Posts as <room_fp>/webrtc/<B>/<A>/0
+
+ICE candidates (msg 3..N, Noise transport mode):
+   - Each side encrypts using ratcheting transport keys
+   - Posted as <room_fp>/webrtc/<sender>/<receiver>/<seq>
+```
+
+**PFS at the signaling layer is real** — both sides contribute ephemerals, so future static-key compromise can't retroactively decrypt past handshakes.
+
+**Implementation:** new module `crates/sunset-noise/src/kk.rs` exposing `KkInitiator` / `KkResponder` / `KkSession` types that wrap `snow::HandshakeState` for the KK pattern. ~80% code reuse from the existing IK helpers in `handshake.rs` — only the pattern string and the message-message-message flow differs.
 
 ### `WebRtcRawTransport` — over web-sys::RtcPeerConnection
 
@@ -295,7 +328,7 @@ For the kill-relay test specifically: once the WebRTC connection is up, the Sync
 - TURN servers / configurable ICE config.
 - Auto-upgrade to WebRTC when both peers learn each other's pubkeys.
 - Reconnection after WebRTC drops.
-- AEAD encryption of SDP/ICE signaling content (signed but plaintext in v1; encrypted in V1.5 before voice).
+- ~~AEAD encryption of SDP/ICE signaling content~~ — done in v1 via Noise_KK with PFS.
 - Renegotiation for adding/removing media tracks.
 - DataChannel-based reliable channel as the relay's main transport (would let relays use WebRTC for federation too — voice prereq).
 - Browser detection / fallback messaging for browsers without WebRTC support (every modern browser supports it; no real-world concern).
