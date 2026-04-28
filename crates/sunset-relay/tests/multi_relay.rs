@@ -117,7 +117,7 @@ async fn alice_to_bob_via_two_relays() {
 
             // Relay A: listen, no federated peers yet (we'll learn its address first).
             let config_a = relay_config(dir_a.path(), "127.0.0.1:0", &[]);
-            let relay_a = Relay::new(config_a).await.expect("relay A new");
+            let mut relay_a = Relay::new(config_a).await.expect("relay A new");
             let relay_a_addr = relay_a.dial_address();
             let _engine_a_task = relay_a.run_for_test().await.expect("relay A run");
 
@@ -127,7 +127,7 @@ async fn alice_to_bob_via_two_relays() {
                 "127.0.0.1:0",
                 std::slice::from_ref(&relay_a_addr),
             );
-            let relay_b = Relay::new(config_b).await.expect("relay B new");
+            let mut relay_b = Relay::new(config_b).await.expect("relay B new");
             let relay_b_addr = relay_b.dial_address();
             let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");
 
@@ -254,7 +254,7 @@ async fn failover_when_relay_a_dies() {
 
             // Relay A.
             let config_a = relay_config(dir_a.path(), "127.0.0.1:0", &[]);
-            let relay_a = Relay::new(config_a).await.expect("relay A new");
+            let mut relay_a = Relay::new(config_a).await.expect("relay A new");
             let relay_a_addr = relay_a.dial_address();
             let engine_a_task = relay_a.run_for_test().await.expect("relay A run");
 
@@ -264,7 +264,7 @@ async fn failover_when_relay_a_dies() {
                 "127.0.0.1:0",
                 std::slice::from_ref(&relay_a_addr),
             );
-            let relay_b = Relay::new(config_b).await.expect("relay B new");
+            let mut relay_b = Relay::new(config_b).await.expect("relay B new");
             let relay_b_addr = relay_b.dial_address();
             let relay_b_vk = VerifyingKey::new(Bytes::copy_from_slice(&relay_b.ed25519_public));
             let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");

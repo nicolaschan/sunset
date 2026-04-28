@@ -516,6 +516,31 @@ where
         }
     }
 
+    /// Snapshot of currently connected peers (peers for which the engine has
+    /// an outbound channel, i.e. that completed `PeerHello`). Order is
+    /// unspecified.
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
+        self.state
+            .lock()
+            .await
+            .peer_outbound
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot of `(PeerId, Filter)` for every peer whose
+    /// `_sunset-sync/subscribe` entry is currently in the registry.
+    pub async fn subscriptions_snapshot(&self) -> Vec<(PeerId, Filter)> {
+        self.state
+            .lock()
+            .await
+            .registry
+            .iter()
+            .map(|(vk, f)| (PeerId(vk.clone()), f.clone()))
+            .collect()
+    }
+
     /// Test-only helper: bypass the command channel and update trust
     /// directly. Used to set up state without spinning up `run()`.
     #[cfg(test)]

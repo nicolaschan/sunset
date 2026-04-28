@@ -18,6 +18,8 @@ pub struct Config {
     pub interest_filter: InterestFilter,
     pub identity_secret_path: PathBuf,
     pub peers: Vec<String>,
+    /// HTTP plaintext status page bind address. `None` disables the page.
+    pub http_listen_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +37,11 @@ struct RawConfig {
     identity_secret: Option<String>,
     #[serde(default)]
     peers: Vec<String>,
+    /// `"auto"` (default): bind status to `<listen_ip>:<listen_port + 1>`,
+    /// or `<listen_ip>:0` if `listen_addr` uses port 0.
+    /// `"off"`: don't serve the status page.
+    /// Otherwise: parsed as a `SocketAddr`.
+    http_listen_addr: Option<String>,
 }
 
 impl Config {
@@ -73,12 +80,27 @@ impl Config {
             Some(path) => PathBuf::from(path),
         };
 
+        let http_listen_addr = match raw.http_listen_addr.as_deref() {
+            None | Some("auto") => {
+                let next = listen_addr.port().checked_add(1).unwrap_or(0);
+                let port = if listen_addr.port() == 0 { 0 } else { next };
+                Some(SocketAddr::new(listen_addr.ip(), port))
+            }
+            Some("off") => None,
+            Some(other) => Some(
+                other
+                    .parse()
+                    .map_err(|e| Error::Config(format!("http_listen_addr parse: {e}")))?,
+            ),
+        };
+
         Ok(Config {
             listen_addr,
             data_dir,
             interest_filter,
             identity_secret_path,
             peers: raw.peers,
+            http_listen_addr,
         })
     }
 }
@@ -95,6 +117,36 @@ mod tests {
         assert_eq!(c.interest_filter, InterestFilter::All);
         assert_eq!(c.identity_secret_path, PathBuf::from("./data/identity.key"));
         assert!(c.peers.is_empty());
+        assert_eq!(c.http_listen_addr.unwrap().to_string(), "0.0.0.0:8444");
+    }
+
+    #[test]
+    fn http_listen_addr_off_disables_page() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:8443"
+            http_listen_addr = "off"
+        "#;
+        let c = Config::from_toml(toml).unwrap();
+        assert!(c.http_listen_addr.is_none());
+    }
+
+    #[test]
+    fn http_listen_addr_explicit_overrides_auto() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:8443"
+            http_listen_addr = "127.0.0.1:9090"
+        "#;
+        let c = Config::from_toml(toml).unwrap();
+        assert_eq!(c.http_listen_addr.unwrap().to_string(), "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn http_listen_addr_auto_with_port_zero_picks_random() {
+        let toml = r#"
+            listen_addr = "127.0.0.1:0"
+        "#;
+        let c = Config::from_toml(toml).unwrap();
+        assert_eq!(c.http_listen_addr.unwrap().port(), 0);
     }
 
     #[test]

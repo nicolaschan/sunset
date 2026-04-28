@@ -1589,6 +1589,7 @@ dependencies = [
  "bytes",
  "clap",
  "curve25519-dalek",
+ "futures",
  "hex",
  "rand_core",
  "serde",
@@ -1605,6 +1606,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "web-time",
  "zeroize",
 ]
 
