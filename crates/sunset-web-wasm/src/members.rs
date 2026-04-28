@@ -104,6 +104,13 @@ pub fn derive_members(
             .as_bytes()
             .cmp(b.verifying_key().as_bytes())
     });
+    // Whether the engine is currently connected to any relay (Primary
+    // transport). If so, a peer known only via heartbeat (i.e. NOT in
+    // peer_kinds — the relay forwarded its presence entry) is reachable
+    // "via_relay". Without a relay we have no idea — fall back to "unknown".
+    let any_relay = peer_kinds
+        .values()
+        .any(|k| *k == TransportKind::Primary);
     for (pk, last_ms) in others {
         let age = now_ms.saturating_sub(*last_ms);
         let presence = presence_bucket(age, interval_ms, ttl_ms);
@@ -113,6 +120,7 @@ pub fn derive_members(
         let connection_mode = match peer_kinds.get(pk) {
             Some(TransportKind::Secondary) => "direct",
             Some(TransportKind::Primary) => "via_relay",
+            _ if any_relay => "via_relay",
             _ => "unknown",
         }
         .to_owned();
@@ -200,11 +208,26 @@ mod tests {
         let mut kinds = HashMap::new();
         kinds.insert(bob.clone(), TransportKind::Primary);
         kinds.insert(carol.clone(), TransportKind::Secondary);
-        // dave: no kind → "unknown"
+        // dave: no kind, but a Primary (bob) exists → dave's presence was
+        // forwarded by the relay → "via_relay".
         let out = derive_members(200, 1000, 3000, &me, &presence, &kinds);
         assert_eq!(out.len(), 4);
         let modes: Vec<&str> = out.iter().map(|m| m.connection_mode.as_str()).collect();
-        assert_eq!(modes, vec!["self", "via_relay", "direct", "unknown"]);
+        assert_eq!(modes, vec!["self", "via_relay", "direct", "via_relay"]);
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn derive_members_unknown_when_no_relay_no_kind() {
+        let me = pk(1);
+        let dave = pk(4);
+        let mut presence = HashMap::new();
+        presence.insert(dave.clone(), 100);
+        // No Primary in peer_kinds → dave's presence has no traceable
+        // route → "unknown".
+        let kinds = HashMap::new();
+        let out = derive_members(200, 1000, 3000, &me, &presence, &kinds);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].connection_mode, "unknown");
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test]
