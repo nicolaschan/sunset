@@ -117,6 +117,7 @@ pub type Msg {
 }
 
 pub fn main() {
+  storage.install_mobile_viewport_meta()
   let app = lustre.application(init, update, view)
   let assert Ok(_) = lustre.start(app, "#app", Nil)
   Nil

@@ -225,6 +225,16 @@ test("favicon link points at favicon.svg", async ({ page }) => {
   expect(href).toMatch(/favicon\.svg$/);
 });
 
+test("viewport meta is mobile-friendly (safe-area + keyboard resize)", async ({
+  page,
+}) => {
+  const content = await page.evaluate(
+    () => document.querySelector('meta[name="viewport"]').getAttribute("content"),
+  );
+  expect(content).toContain("viewport-fit=cover");
+  expect(content).toContain("interactive-widget=resizes-content");
+});
+
 test("channels and main column bottom borders line up", async ({ page }) => {
   // Channels rail is the second <aside>; main column is <main>.
   const offsets = await page.evaluate(() => {

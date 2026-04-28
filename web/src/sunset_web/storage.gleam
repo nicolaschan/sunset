@@ -39,3 +39,8 @@ pub fn is_phone_viewport() -> Bool
 /// on every resize.
 @external(javascript, "./storage.ffi.mjs", "onViewportChange")
 pub fn on_viewport_change(callback: fn(Bool) -> Nil) -> Nil
+
+/// Replace the default `<meta name="viewport">` with a mobile-friendly
+/// one that enables safe-area insets and keyboard-aware resizing.
+@external(javascript, "./storage.ffi.mjs", "installMobileViewportMeta")
+pub fn install_mobile_viewport_meta() -> Nil

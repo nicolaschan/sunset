@@ -145,3 +145,24 @@ export function onViewportChange(callback) {
     // best-effort: viewport tracking is non-critical.
   }
 }
+
+// Override the default viewport meta tag with one that:
+//   * cover: enables env(safe-area-inset-*) under iOS notch / dynamic island.
+//   * interactive-widget=resizes-content: tells iOS/Android to resize the
+//     layout viewport (not just the visual viewport) when the keyboard
+//     opens, so position:fixed footers/composers don't get covered.
+export function installMobileViewportMeta() {
+  try {
+    const existing = document.querySelectorAll('meta[name="viewport"]');
+    existing.forEach((el) => el.remove());
+    const meta = document.createElement("meta");
+    meta.setAttribute("name", "viewport");
+    meta.setAttribute(
+      "content",
+      "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content",
+    );
+    document.head.appendChild(meta);
+  } catch {
+    // ignored: best-effort.
+  }
+}
