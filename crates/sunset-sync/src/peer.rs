@@ -58,7 +58,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         protocol_version: local_protocol_version,
         peer_id: local_peer.clone(),
     };
-    if let Err(e) = send_message(&*conn, &our_hello).await {
+    if let Err(e) = send_reliable_message(&*conn, &our_hello).await {
         let _ = inbound_tx.send(InboundEvent::Disconnected {
             peer_id: conn.peer_id(),
             reason: format!("send hello: {e}"),
@@ -67,7 +67,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     }
 
     // Receive the peer's Hello.
-    let peer_id = match recv_message(&*conn).await {
+    let peer_id = match recv_reliable_message(&*conn).await {
         Ok(SyncMessage::Hello {
             protocol_version,
             peer_id,
@@ -105,14 +105,18 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         }
     };
 
-    // Concurrent recv + send loops.
-    let recv_task = {
+    // Concurrent recv loops — reliable and unreliable channels are
+    // independent; each drains its own physical channel and routes the
+    // decoded SyncMessage into the same `inbound_tx`. The engine's
+    // dispatch is channel-agnostic; only the per-peer task knows which
+    // wire carried the message.
+    let recv_reliable_task = {
         let conn = conn.clone();
         let inbound_tx = inbound_tx.clone();
         let peer_id = peer_id.clone();
         async move {
             loop {
-                match recv_message(&*conn).await {
+                match recv_reliable_message(&*conn).await {
                     Ok(SyncMessage::Goodbye {}) => {
                         let _ = inbound_tx.send(InboundEvent::Disconnected {
                             peer_id: peer_id.clone(),
@@ -134,10 +138,35 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                     Err(e) => {
                         let _ = inbound_tx.send(InboundEvent::Disconnected {
                             peer_id: peer_id.clone(),
-                            reason: format!("recv: {e}"),
+                            reason: format!("recv reliable: {e}"),
                         });
                         break;
                     }
+                }
+            }
+        }
+    };
+
+    let recv_unreliable_task = {
+        let conn = conn.clone();
+        let inbound_tx = inbound_tx.clone();
+        let peer_id = peer_id.clone();
+        async move {
+            // Unreliable recv error: stop the unreliable loop only.
+            // Disconnection is reported by the reliable recv task —
+            // unreliable can fail independently without tearing down
+            // the peer. In practice the underlying channel is paired
+            // with reliable, so a real disconnect will surface there
+            // too.
+            while let Ok(message) = recv_unreliable_message(&*conn).await {
+                if inbound_tx
+                    .send(InboundEvent::Message {
+                        from: peer_id.clone(),
+                        message,
+                    })
+                    .is_err()
+                {
+                    break;
                 }
             }
         }
@@ -147,26 +176,62 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let conn = conn.clone();
         async move {
             while let Some(msg) = outbound_rx.recv().await {
-                if send_message(&*conn, &msg).await.is_err() {
+                let result = match outbound_kind(&msg) {
+                    ChannelKind::Reliable => send_reliable_message(&*conn, &msg).await,
+                    ChannelKind::Unreliable => send_unreliable_message(&*conn, &msg).await,
+                };
+                if result.is_err() {
                     break;
                 }
             }
-            // Channel closed — send Goodbye and close.
-            let _ = send_message(&*conn, &SyncMessage::Goodbye {}).await;
+            let _ = send_reliable_message(&*conn, &SyncMessage::Goodbye {}).await;
             let _ = conn.close().await;
         }
     };
 
-    tokio::join!(recv_task, send_task);
+    tokio::join!(recv_reliable_task, recv_unreliable_task, send_task);
 }
 
-async fn send_message<C: TransportConnection + ?Sized>(conn: &C, msg: &SyncMessage) -> Result<()> {
+/// Which physical channel a SyncMessage flows over.
+enum ChannelKind {
+    Reliable,
+    Unreliable,
+}
+
+fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
+    match msg {
+        SyncMessage::EphemeralDelivery { .. } => ChannelKind::Unreliable,
+        _ => ChannelKind::Reliable,
+    }
+}
+
+async fn send_reliable_message<C: TransportConnection + ?Sized>(
+    conn: &C,
+    msg: &SyncMessage,
+) -> Result<()> {
     let bytes = msg.encode()?;
     conn.send_reliable(bytes).await
 }
 
-async fn recv_message<C: TransportConnection + ?Sized>(conn: &C) -> Result<SyncMessage> {
+async fn send_unreliable_message<C: TransportConnection + ?Sized>(
+    conn: &C,
+    msg: &SyncMessage,
+) -> Result<()> {
+    let bytes = msg.encode()?;
+    conn.send_unreliable(bytes).await
+}
+
+async fn recv_reliable_message<C: TransportConnection + ?Sized>(
+    conn: &C,
+) -> Result<SyncMessage> {
     let bytes: Bytes = conn.recv_reliable().await?;
+    SyncMessage::decode(&bytes)
+}
+
+async fn recv_unreliable_message<C: TransportConnection + ?Sized>(
+    conn: &C,
+) -> Result<SyncMessage> {
+    let bytes: Bytes = conn.recv_unreliable().await?;
     SyncMessage::decode(&bytes)
 }
 
