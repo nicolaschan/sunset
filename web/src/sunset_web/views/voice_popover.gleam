@@ -100,7 +100,15 @@ fn header(
     [
       avatar(p, m),
       html.div(
-        [ui.css([#("flex", "1"), #("min-width", "0"), #("display", "flex"), #("flex-direction", "column"), #("gap", "2px")])],
+        [
+          ui.css([
+            #("flex", "1"),
+            #("min-width", "0"),
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "2px"),
+          ]),
+        ],
         [
           html.div(
             [
@@ -579,13 +587,10 @@ fn mute_for_me_button(
   html.button(
     [
       attribute.attribute("data-testid", "voice-popover-deafen"),
-      attribute.attribute(
-        "aria-pressed",
-        case deafened {
-          True -> "true"
-          False -> "false"
-        },
-      ),
+      attribute.attribute("aria-pressed", case deafened {
+        True -> "true"
+        False -> "false"
+      }),
       event.on_click(on_toggle),
       ui.css([
         #("flex", "1"),

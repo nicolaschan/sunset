@@ -406,10 +406,7 @@ fn room_full(
         decode.success(on_drag_over(r.name)),
       )),
       event.on("dragleave", decode.success(on_drag_leave(r.name))),
-      event.prevent_default(event.on(
-        "drop",
-        decode.success(on_drop(r.name)),
-      )),
+      event.prevent_default(event.on("drop", decode.success(on_drop(r.name)))),
       ui.css([
         #("position", "relative"),
         #("display", "flex"),

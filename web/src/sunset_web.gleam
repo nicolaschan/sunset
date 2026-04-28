@@ -233,7 +233,8 @@ fn member_voice_settings(
 ) -> domain.VoiceSettings {
   case dict.get(settings, name) {
     Ok(s) -> s
-    Error(_) -> domain.VoiceSettings(volume: 100, denoise: True, deafened: False)
+    Error(_) ->
+      domain.VoiceSettings(volume: 100, denoise: True, deafened: False)
   }
 }
 
@@ -425,10 +426,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     DropRoomOn(target) -> {
       case model.dragging_room {
-        None -> #(
-          Model(..model, drag_over_room: None),
-          effect.none(),
-        )
+        None -> #(Model(..model, drag_over_room: None), effect.none())
         Some(src) -> {
           let new_rooms = reorder_before(model.joined_rooms, src, target)
           let persist = case new_rooms == model.joined_rooms {
@@ -527,11 +525,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           details: domain.NoDetails,
         )
       // Append; dedupe by id to handle Replay::All re-emits.
-      let updated =
-        case list.any(model.messages, fn(m) { m.id == new_msg.id }) {
-          True -> model.messages
-          False -> list.append(model.messages, [new_msg])
-        }
+      let updated = case
+        list.any(model.messages, fn(m) { m.id == new_msg.id })
+      {
+        True -> model.messages
+        False -> list.append(model.messages, [new_msg])
+      }
       #(Model(..model, messages: updated), effect.none())
     }
     SubmitDraft -> {
@@ -581,10 +580,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, voice_popover: Some(name)),
       effect.none(),
     )
-    CloseVoicePopover -> #(
-      Model(..model, voice_popover: None),
-      effect.none(),
-    )
+    CloseVoicePopover -> #(Model(..model, voice_popover: None), effect.none())
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, volume: value)

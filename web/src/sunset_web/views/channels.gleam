@@ -78,7 +78,13 @@ pub fn view(
             "Voice",
             list.flatten([
               list.map(voice_channels, fn(c) {
-                voice_block(p, c, in_call, voice_popover_open, on_open_voice_popover)
+                voice_block(
+                  p,
+                  c,
+                  in_call,
+                  voice_popover_open,
+                  on_open_voice_popover,
+                )
               }),
             ]),
           ),
