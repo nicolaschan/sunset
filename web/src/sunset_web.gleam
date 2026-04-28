@@ -27,6 +27,7 @@ import sunset_web/fixture
 import sunset_web/storage
 import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
 import sunset_web/theme.{type Mode, Dark, Light}
+import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
 import sunset_web/views/details_panel
 import sunset_web/views/landing
@@ -792,6 +793,52 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _ -> None
   }
 
+  let details_sheet_el = case model.viewport, model.sheet {
+    domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
+      case find_message(messages_with_live_reactions, id) {
+        Some(m) ->
+          bottom_sheet.view(
+            palette: palette,
+            open: True,
+            on_close: CloseDetail,
+            test_id: "details-sheet",
+            content: details_panel.view(
+              palette: palette,
+              message: m,
+              on_close: CloseDetail,
+            ),
+          )
+        None -> element.fragment([])
+      }
+    _, _ -> element.fragment([])
+  }
+
+  let voice_sheet_el = case model.viewport, model.sheet {
+    domain.Phone, Some(domain.VoiceSheet(member_name: name)) ->
+      case list.find(fixture.members(), fn(m) { m.name == name }) {
+        Ok(m) ->
+          bottom_sheet.view(
+            palette: palette,
+            open: True,
+            on_close: CloseVoicePopover,
+            test_id: "voice-sheet",
+            content: voice_popover.view(
+              palette: palette,
+              placement: voice_popover.InSheet,
+              member: m,
+              settings: member_voice_settings(model.voice_settings, name),
+              on_close: CloseVoicePopover,
+              on_set_volume: fn(v) { SetMemberVolume(name, v) },
+              on_toggle_denoise: ToggleMemberDenoise(name),
+              on_toggle_deafen: ToggleMemberDeafen(name),
+              on_reset: ResetMemberVoice(name),
+            ),
+          )
+        Error(_) -> element.fragment([])
+      }
+    _, _ -> element.fragment([])
+  }
+
   shell.view(
     model.mode,
     palette,
@@ -860,10 +907,10 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_add_reaction: AddReaction,
       on_open_detail: OpenDetail,
     ),
-    case detail_msg {
-      Some(m) ->
+    case model.viewport, detail_msg {
+      domain.Desktop, Some(m) ->
         details_panel.view(palette: palette, message: m, on_close: CloseDetail)
-      None -> members.view(palette: palette, members: model.members)
+      _, _ -> members.view(palette: palette, members: model.members)
     },
     voice_popover_overlay(palette, model),
     phone_header.view(
@@ -873,15 +920,15 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_open_members: OpenDrawer(domain.MembersDrawer),
     ),
     element.fragment([]),
-    element.fragment([]),
-    element.fragment([]),
+    details_sheet_el,
+    voice_sheet_el,
     element.fragment([]),
   )
 }
 
 fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
-  case model.sheet {
-    Some(domain.VoiceSheet(member_name: name)) ->
+  case model.viewport, model.sheet {
+    domain.Desktop, Some(domain.VoiceSheet(member_name: name)) ->
       // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
       case list.find(fixture.members(), fn(m) { m.name == name }) {
         Error(_) -> element.fragment([])
@@ -898,7 +945,7 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
             on_reset: ResetMemberVoice(name),
           )
       }
-    _ -> element.fragment([])
+    _, _ -> element.fragment([])
   }
 }
 

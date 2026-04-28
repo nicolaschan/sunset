@@ -448,3 +448,27 @@ test.describe("phone shell smoke", () => {
     expect(await page.getByTestId("theme-toggle").count()).toBe(0);
   });
 });
+
+test.describe("phone — details sheet", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  // Skipped: depends on fixture messages being rendered into the chat column.
+  // Since Plan E, messages come from the live engine only, so the msg-row
+  // with "routing thru ravi" does not exist on a fresh page load. Unblock
+  // once fixtures are merged back or messages carry HasDetails from the engine.
+  test.skip("info button on a delivered message opens the details bottom sheet", async ({
+    page,
+  }) => {
+    const row = page.locator(".msg-row", { hasText: "routing thru ravi" });
+    await row.getByRole("button", { name: /Message details/i }).click();
+    const sheet = page.getByTestId("details-sheet");
+    await expect(sheet).toBeVisible();
+    await expect(sheet.getByText(/8f3c…a2/)).toBeVisible();
+  });
+});

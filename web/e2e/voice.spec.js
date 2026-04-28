@@ -125,3 +125,29 @@ test("reset restores defaults after edits", async ({ page }) => {
   await expect(popover.getByText("100%")).toBeVisible();
   await expect(denoise).toHaveAttribute("aria-pressed", "true");
 });
+
+test.describe("phone — voice sheet", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  test("tapping an in-call member opens the voice bottom sheet", async ({
+    page,
+  }) => {
+    await page.getByTestId("phone-rooms-toggle").click();
+    // The voice channel block lives in the channels drawer.
+    const channelsDrawer = page.getByTestId("channels-drawer");
+    await channelsDrawer
+      .locator('[data-testid="voice-member"][data-voice-name="ravi"]')
+      .click();
+
+    const sheet = page.getByTestId("voice-sheet");
+    await expect(sheet).toBeVisible();
+    await expect(sheet.getByText("ravi", { exact: true })).toBeVisible();
+    await expect(sheet.getByTestId("voice-popover-volume")).toBeVisible();
+  });
+});
