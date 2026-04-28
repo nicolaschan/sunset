@@ -282,6 +282,10 @@ impl Store for FsStore {
             .await
             .map_err(|e| Error::Backend(format!("current_cursor: {e}")))
     }
+
+    fn verifier(&self) -> Arc<dyn SignatureVerifier> {
+        self.verifier.clone()
+    }
 }
 
 #[cfg(test)]

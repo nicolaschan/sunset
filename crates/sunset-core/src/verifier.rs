@@ -3,7 +3,7 @@
 use ed25519_dalek::{Signature, VerifyingKey as DalekVerifyingKey};
 
 use sunset_store::{
-    Error as StoreError, Result as StoreResult, SignatureVerifier, SignedKvEntry,
+    Error as StoreError, Result as StoreResult, SignatureVerifier, SignedKvEntry, VerifyingKey,
     canonical::signing_payload,
 };
 
@@ -13,22 +13,29 @@ pub struct Ed25519Verifier;
 
 impl SignatureVerifier for Ed25519Verifier {
     fn verify(&self, entry: &SignedKvEntry) -> StoreResult<()> {
-        let vk_bytes: [u8; 32] = entry
-            .verifying_key
+        let payload = signing_payload(entry);
+        self.verify_raw(&entry.verifying_key, &payload, &entry.signature)
+    }
+
+    fn verify_raw(
+        &self,
+        verifying_key: &VerifyingKey,
+        payload: &[u8],
+        signature: &[u8],
+    ) -> StoreResult<()> {
+        let vk_bytes: [u8; 32] = verifying_key
             .as_bytes()
             .try_into()
             .map_err(|_| StoreError::SignatureInvalid)?;
         let vk =
             DalekVerifyingKey::from_bytes(&vk_bytes).map_err(|_| StoreError::SignatureInvalid)?;
 
-        let sig_bytes: &[u8] = &entry.signature;
-        let sig_arr: &[u8; 64] = sig_bytes
+        let sig_arr: &[u8; 64] = signature
             .try_into()
             .map_err(|_| StoreError::SignatureInvalid)?;
         let sig = Signature::from_bytes(sig_arr);
 
-        let payload = signing_payload(entry);
-        vk.verify_strict(&payload, &sig)
+        vk.verify_strict(payload, &sig)
             .map_err(|_| StoreError::SignatureInvalid)
     }
 }

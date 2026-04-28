@@ -82,6 +82,12 @@ pub(crate) struct EngineState {
     /// Live `EngineEvent` subscribers. Dead senders (closed by the
     /// receiver being dropped) are evicted lazily on the next emit.
     pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
+    /// Active in-process ephemeral subscribers. Each is a (filter,
+    /// sender) pair; the engine dispatches a `SignedDatagram` to
+    /// every subscriber whose filter matches the datagram's name.
+    /// Dead senders (closed receivers) are evicted lazily on the
+    /// next dispatch.
+    pub ephemeral_subs: Vec<(Filter, mpsc::UnboundedSender<sunset_store::SignedDatagram>)>,
 }
 
 pub struct SyncEngine<S: Store, T: Transport> {
@@ -123,6 +129,7 @@ where
                 peer_outbound: HashMap::new(),
                 peer_kinds: HashMap::new(),
                 event_subs: Vec::new(),
+                ephemeral_subs: Vec::new(),
             })),
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
@@ -146,6 +153,22 @@ where
     pub async fn subscribe_engine_events(&self) -> mpsc::UnboundedReceiver<EngineEvent> {
         let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
         self.state.lock().await.event_subs.push(tx);
+        rx
+    }
+
+    /// Subscribe to ephemeral datagrams matching `filter`. Returns a
+    /// fresh receiver. The engine dispatches a clone of every received
+    /// `SignedDatagram` whose `(verifying_key, name)` matches the
+    /// filter to this receiver. Subscription is in-process only; for
+    /// remote peers to route ephemeral traffic to us, the caller must
+    /// also publish the filter via `publish_subscription` (the Bus
+    /// layer does this transparently in `bus.subscribe`).
+    pub async fn subscribe_ephemeral(
+        &self,
+        filter: Filter,
+    ) -> mpsc::UnboundedReceiver<sunset_store::SignedDatagram> {
+        let (tx, rx) = mpsc::unbounded_channel::<sunset_store::SignedDatagram>();
+        self.state.lock().await.ephemeral_subs.push((filter, tx));
         rx
     }
 
@@ -412,9 +435,8 @@ where
                 // v1: Fetch is a future-extension when DigestRange grows
                 // beyond All; nothing to do today.
             }
-            SyncMessage::EphemeralDelivery { .. } => {
-                // Wired up in Bus-T5: verify + dispatch to ephemeral
-                // subscribers. For now the variant exists only on the wire.
+            SyncMessage::EphemeralDelivery { datagram } => {
+                self.handle_ephemeral_delivery(from, datagram).await;
             }
             SyncMessage::Hello { .. } | SyncMessage::Goodbye { .. } => {
                 // Handled by the per-peer task; engine ignores.
@@ -635,6 +657,41 @@ where
         state.event_subs.retain(|tx| tx.send(ev.clone()).is_ok());
     }
 
+    /// Fan-out a datagram to every in-process subscriber whose filter
+    /// matches `(datagram.verifying_key, datagram.name)`. Drops dead
+    /// senders (closed receivers) lazily.
+    async fn dispatch_ephemeral_local(&self, datagram: &sunset_store::SignedDatagram) {
+        let mut state = self.state.lock().await;
+        state.ephemeral_subs.retain(|(filter, tx)| {
+            if filter.matches(&datagram.verifying_key, &datagram.name) {
+                tx.send(datagram.clone()).is_ok()
+            } else {
+                !tx.is_closed()
+            }
+        });
+    }
+
+    /// Handle an inbound `EphemeralDelivery`: verify the datagram's
+    /// signature against the store's configured verifier and, on
+    /// success, fan it out to every in-process subscriber whose filter
+    /// matches.
+    async fn handle_ephemeral_delivery(
+        &self,
+        from: PeerId,
+        datagram: sunset_store::SignedDatagram,
+    ) {
+        let payload = sunset_store::canonical::datagram_signing_payload(&datagram);
+        let verifier = self.store.verifier();
+        if verifier
+            .verify_raw(&datagram.verifying_key, &payload, &datagram.signature)
+            .is_err()
+        {
+            eprintln!("sunset-sync: dropping ephemeral datagram from {from:?} — bad signature");
+            return;
+        }
+        self.dispatch_ephemeral_local(&datagram).await;
+    }
+
     /// Real implementation of `publish_subscription`'s server side.
     async fn do_publish_subscription(
         &self,
@@ -700,13 +757,20 @@ mod tests {
     }
 
     fn make_engine(addr: &str, peer_label: &[u8]) -> SyncEngine<MemoryStore, TestTransport> {
+        make_engine_with_store(addr, peer_label, Arc::new(MemoryStore::with_accept_all()))
+    }
+
+    fn make_engine_with_store(
+        addr: &str,
+        peer_label: &[u8],
+        store: Arc<MemoryStore>,
+    ) -> SyncEngine<MemoryStore, TestTransport> {
         let net = TestNetwork::new();
         let local_peer = PeerId(vk(peer_label));
         let transport = net.transport(
             local_peer.clone(),
             PeerAddr::new(Bytes::copy_from_slice(addr.as_bytes())),
         );
-        let store = Arc::new(MemoryStore::with_accept_all());
         let signer = Arc::new(StubSigner {
             vk: local_peer.0.clone(),
         });
@@ -986,6 +1050,62 @@ mod tests {
                 assert!(engine.state.lock().await.event_subs.is_empty());
             })
             .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_ephemeral_delivery_drops_bad_signature() {
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Use a verifier that rejects everything to simulate
+                // signature failure deterministically.
+                let store = Arc::new(MemoryStore::new(Arc::new(RejectAllVerifier)));
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store));
+
+                let mut sub = engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+
+                engine
+                    .handle_ephemeral_delivery(
+                        PeerId(vk(b"bob")),
+                        SignedDatagram {
+                            verifying_key: vk(b"bob"),
+                            name: Bytes::from_static(b"voice/bob/0001"),
+                            payload: Bytes::from_static(b"forged"),
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                let got =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await;
+                assert!(got.is_err(), "bad-signature datagram must be dropped");
+            })
+            .await;
+    }
+
+    /// Verifier that rejects every signature. Used to test the
+    /// "drop on bad signature" path deterministically.
+    struct RejectAllVerifier;
+
+    impl sunset_store::SignatureVerifier for RejectAllVerifier {
+        fn verify(
+            &self,
+            _entry: &sunset_store::SignedKvEntry,
+        ) -> std::result::Result<(), sunset_store::Error> {
+            Err(sunset_store::Error::SignatureInvalid)
+        }
+        fn verify_raw(
+            &self,
+            _vk: &VerifyingKey,
+            _payload: &[u8],
+            _sig: &[u8],
+        ) -> std::result::Result<(), sunset_store::Error> {
+            Err(sunset_store::Error::SignatureInvalid)
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

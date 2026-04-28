@@ -1,11 +1,14 @@
 //! The `Store` trait: the public surface every backend implements.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::LocalBoxStream;
 
 use crate::error::Result;
 use crate::filter::{Event, Filter, Replay};
 use crate::types::{ContentBlock, Cursor, Hash, SignedKvEntry, VerifyingKey};
+use crate::verifier::SignatureVerifier;
 
 /// Stream of `SignedKvEntry` values yielded by `Store::iter`.
 pub type EntryStream<'a> = LocalBoxStream<'a, Result<SignedKvEntry>>;
@@ -68,4 +71,9 @@ pub trait Store {
     /// ordering is guaranteed: a cursor captured later is strictly greater than
     /// one captured earlier (assuming intervening inserts).
     async fn current_cursor(&self) -> Result<Cursor>;
+
+    /// The signature verifier this store was constructed with.
+    /// Engines reuse this for verifying messages outside the store
+    /// itself (e.g. ephemeral datagrams in `sunset-sync`).
+    fn verifier(&self) -> Arc<dyn SignatureVerifier>;
 }

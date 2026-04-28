@@ -243,6 +243,10 @@ impl Store for MemoryStore {
     async fn current_cursor(&self) -> Result<Cursor> {
         Ok(self.current_cursor_now().await)
     }
+
+    fn verifier(&self) -> Arc<dyn SignatureVerifier> {
+        self.verifier.clone()
+    }
 }
 
 #[cfg(test)]
@@ -409,6 +413,14 @@ mod tests {
         struct RejectAll;
         impl SignatureVerifier for RejectAll {
             fn verify(&self, _e: &SignedKvEntry) -> sunset_store::Result<()> {
+                Err(sunset_store::Error::SignatureInvalid)
+            }
+            fn verify_raw(
+                &self,
+                _vk: &VerifyingKey,
+                _payload: &[u8],
+                _sig: &[u8],
+            ) -> sunset_store::Result<()> {
                 Err(sunset_store::Error::SignatureInvalid)
             }
         }
