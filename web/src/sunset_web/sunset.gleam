@@ -60,6 +60,25 @@ pub fn on_message(
 @external(javascript, "./sunset.ffi.mjs", "relayStatus")
 pub fn relay_status(client: ClientHandle) -> String
 
+/// Establish a direct WebRTC peer connection. Signaling rides over the
+/// existing relay-mediated CRDT replication (Noise_KK encrypted, full
+/// PFS). Calls `callback` with `Ok(Nil)` once the WebRTC datachannel +
+/// Noise_IK handshake complete or `Error(msg)` on failure.
+@external(javascript, "./sunset.ffi.mjs", "clientConnectDirect")
+pub fn client_connect_direct(
+  client: ClientHandle,
+  peer_pubkey: BitArray,
+  callback: fn(Result(Nil, String)) -> Nil,
+) -> Nil
+
+/// Synchronous accessor: returns "direct", "via_relay", or "unknown" for
+/// the given remote peer's pubkey.
+@external(javascript, "./sunset.ffi.mjs", "clientPeerConnectionMode")
+pub fn client_peer_connection_mode(
+  client: ClientHandle,
+  peer_pubkey: BitArray,
+) -> String
+
 /// Read the `?relay=<url-encoded>` query parameter from the current URL.
 /// Returns `Ok(url)` if present, `Error(Nil)` otherwise.
 @external(javascript, "./sunset.ffi.mjs", "relayUrlParam")
