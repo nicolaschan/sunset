@@ -26,5 +26,5 @@ pub use message::{DigestRange, SyncMessage};
 pub use multi_transport::{MultiConnection, MultiTransport};
 pub use signaler::{SignalMessage, Signaler};
 pub use signer::Signer;
-pub use transport::{RawConnection, RawTransport, Transport, TransportConnection};
+pub use transport::{RawConnection, RawTransport, Transport, TransportConnection, TransportKind};
 pub use types::{PeerAddr, PeerId, SyncConfig, TrustSet};

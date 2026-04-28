@@ -7,6 +7,24 @@ use bytes::Bytes;
 use crate::error::Result;
 use crate::types::{PeerAddr, PeerId};
 
+/// Which side of a `MultiTransport` (or which discriminator a
+/// future multi-fanout transport chooses) produced this connection.
+/// Used by callers (e.g. UI clients) to render per-peer routing
+/// state without having to know the concrete transport type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TransportKind {
+    /// Primary half of a `MultiTransport`. In v1 this is the
+    /// relay-mediated WebSocket path.
+    Primary,
+    /// Secondary half of a `MultiTransport`. In v1 this is the
+    /// direct WebRTC datachannel.
+    Secondary,
+    /// Used by transports that don't participate in a
+    /// `MultiTransport` (e.g. `TestTransport`, single-transport
+    /// setups).
+    Unknown,
+}
+
 /// A factory for inbound and outbound peer connections.
 ///
 /// Implementations are `?Send`-compatible so they work in single-threaded
@@ -49,6 +67,13 @@ pub trait TransportConnection {
     /// The peer's identity at the other end of this connection.
     fn peer_id(&self) -> PeerId;
 
+    /// Identifies which transport produced this connection. Default
+    /// is `TransportKind::Unknown`; `MultiConnection` overrides to
+    /// return `Primary` or `Secondary`.
+    fn kind(&self) -> TransportKind {
+        TransportKind::Unknown
+    }
+
     /// Close the connection. Subsequent send/recv calls return
     /// `Error::Transport("closed")` or similar.
     async fn close(&self) -> Result<()>;
@@ -75,4 +100,41 @@ pub trait RawConnection {
     async fn send_unreliable(&self, bytes: Bytes) -> Result<()>;
     async fn recv_unreliable(&self) -> Result<Bytes>;
     async fn close(&self) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::PeerId;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use sunset_store::VerifyingKey;
+
+    struct DummyConn;
+    #[async_trait(?Send)]
+    impl TransportConnection for DummyConn {
+        async fn send_reliable(&self, _: Bytes) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn recv_reliable(&self) -> crate::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        async fn send_unreliable(&self, _: Bytes) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn recv_unreliable(&self) -> crate::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        fn peer_id(&self) -> PeerId {
+            PeerId(VerifyingKey::new(Bytes::from_static(&[0u8; 32])))
+        }
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_kind_is_unknown() {
+        assert_eq!(DummyConn.kind(), TransportKind::Unknown);
+    }
 }
