@@ -150,13 +150,10 @@ fn phone_view(
             #("border-radius", "10px"),
             #("background", p.accent),
             #("color", p.accent_ink),
-            #(
-              "cursor",
-              case input {
-                "" -> "default"
-                _ -> "pointer"
-              },
-            ),
+            #("cursor", case input {
+              "" -> "default"
+              _ -> "pointer"
+            }),
           ]),
         ],
         [html.text("Join")],

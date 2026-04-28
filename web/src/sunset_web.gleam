@@ -23,7 +23,6 @@ import lustre/effect.{type Effect}
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
-import sunset_web/ui
 import sunset_web/domain.{
   type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
   NoRelay, Reaction, Reconnecting, Room, RoomId,
@@ -32,6 +31,7 @@ import sunset_web/fixture
 import sunset_web/storage
 import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
 import sunset_web/theme.{type Mode, Dark, Light}
+import sunset_web/ui
 import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
 import sunset_web/views/details_panel
@@ -728,10 +728,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // Crossing the boundary in either direction closes any open drawer.
       // Sheets intentionally survive: DetailsSheet and VoiceSheet render
       // on both viewports (right-rail / floating popover on desktop).
-      #(
-        Model(..model, viewport: v, drawer: None),
-        effect.none(),
-      )
+      #(Model(..model, viewport: v, drawer: None), effect.none())
     }
     OpenDrawer(d) -> #(Model(..model, drawer: Some(d)), effect.none())
     CloseDrawer -> #(Model(..model, drawer: None), effect.none())
@@ -872,14 +869,12 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _, _ -> element.fragment([])
   }
 
-  let user_in_call =
-    list.any(fixture.members(), fn(m) { m.you && m.in_call })
+  let user_in_call = list.any(fixture.members(), fn(m) { m.you && m.in_call })
 
   let active_voice_channel_name =
-    list.find(
-      fixture.channels(),
-      fn(c) { c.kind == domain.Voice && c.in_call > 0 },
-    )
+    list.find(fixture.channels(), fn(c) {
+      c.kind == domain.Voice && c.in_call > 0
+    })
     |> result.map(fn(c) { c.name })
     |> result.unwrap("")
 
@@ -1092,7 +1087,10 @@ fn connection_mode_to_relay(s: String) -> domain.RelayStatus {
   }
 }
 
-fn phone_reaction_grid(palette: theme.Palette, message_id: String) -> Element(Msg) {
+fn phone_reaction_grid(
+  palette: theme.Palette,
+  message_id: String,
+) -> Element(Msg) {
   let emojis = ["🌅", "👍", "👀", "🔥", "🌙"]
   html.div(
     [
