@@ -10,17 +10,36 @@ import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
+import sunset_web/domain
 import sunset_web/theme.{type Mode, type Palette, Dark, Light}
 import sunset_web/ui
 
 pub fn view(
   palette p: Palette,
   mode mode: Mode,
+  viewport viewport: domain.Viewport,
   input input: String,
   noop noop: msg,
   on_input on_input: fn(String) -> msg,
   on_join on_join: fn(String) -> msg,
   on_toggle_mode on_toggle_mode: msg,
+) -> Element(msg) {
+  case viewport {
+    domain.Phone ->
+      phone_view(p, mode, input, noop, on_input, on_join, on_toggle_mode)
+    domain.Desktop ->
+      desktop_view(p, mode, input, noop, on_input, on_join, on_toggle_mode)
+  }
+}
+
+fn desktop_view(
+  p: Palette,
+  mode: Mode,
+  input: String,
+  noop: msg,
+  on_input: fn(String) -> msg,
+  on_join: fn(String) -> msg,
+  on_toggle_mode: msg,
 ) -> Element(msg) {
   html.div(
     [
@@ -44,6 +63,129 @@ pub fn view(
       reset_style(),
       card(p, input, noop, on_input, on_join),
       mode_toggle_button(p, mode, on_toggle_mode),
+    ],
+  )
+}
+
+fn phone_view(
+  p: Palette,
+  mode: Mode,
+  input: String,
+  noop: msg,
+  on_input: fn(String) -> msg,
+  on_join: fn(String) -> msg,
+  on_toggle_mode: msg,
+) -> Element(msg) {
+  html.div(
+    [
+      attribute.attribute("data-testid", "landing-view"),
+      ui.css([
+        #("position", "fixed"),
+        #("inset", "0"),
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("justify-content", "center"),
+        #("padding", "24px"),
+        #("padding-top", "calc(env(safe-area-inset-top) + 24px)"),
+        #("padding-bottom", "calc(env(safe-area-inset-bottom) + 24px)"),
+        #("background", p.bg),
+        #("color", p.text),
+        #("font-family", theme.font_sans),
+      ]),
+    ],
+    [
+      html.h1(
+        [
+          ui.css([
+            #("font-size", "44px"),
+            #("font-weight", "700"),
+            #("margin", "0 0 12px 0"),
+            #("color", p.text),
+          ]),
+        ],
+        [html.text("sunset.chat")],
+      ),
+      html.p(
+        [
+          ui.css([
+            #("font-size", "18px"),
+            #("color", p.text_muted),
+            #("margin", "0 0 32px 0"),
+          ]),
+        ],
+        [html.text("Pick a room name to join.")],
+      ),
+      html.input([
+        attribute.attribute("data-testid", "landing-input"),
+        attribute.attribute("type", "text"),
+        attribute.value(input),
+        attribute.placeholder("room-name"),
+        event.on_input(on_input),
+        on_enter_with_value(noop, on_join),
+        ui.css([
+          #("width", "100%"),
+          #("box-sizing", "border-box"),
+          #("padding", "14px 16px"),
+          #("font-size", "18px"),
+          #("font-family", "inherit"),
+          #("border", "1px solid " <> p.border),
+          #("border-radius", "10px"),
+          #("background", p.surface),
+          #("color", p.text),
+          #("margin-bottom", "12px"),
+        ]),
+      ]),
+      html.button(
+        [
+          attribute.attribute("data-testid", "landing-join"),
+          attribute.disabled(input == ""),
+          event.on_click(on_join(input)),
+          ui.css([
+            #("width", "100%"),
+            #("padding", "14px"),
+            #("font-size", "18px"),
+            #("font-weight", "600"),
+            #("font-family", "inherit"),
+            #("border", "none"),
+            #("border-radius", "10px"),
+            #("background", p.accent),
+            #("color", p.accent_ink),
+            #(
+              "cursor",
+              case input {
+                "" -> "default"
+                _ -> "pointer"
+              },
+            ),
+          ]),
+        ],
+        [html.text("Join")],
+      ),
+      html.button(
+        [
+          attribute.attribute("data-testid", "theme-toggle"),
+          event.on_click(on_toggle_mode),
+          ui.css([
+            #("position", "fixed"),
+            #("top", "calc(env(safe-area-inset-top) + 12px)"),
+            #("right", "12px"),
+            #("padding", "8px 12px"),
+            #("border", "1px solid " <> p.border),
+            #("background", p.surface),
+            #("color", p.text_muted),
+            #("border-radius", "999px"),
+            #("font-family", "inherit"),
+            #("font-size", "13px"),
+            #("cursor", "pointer"),
+          ]),
+        ],
+        [
+          html.text(case mode {
+            Light -> "🌙"
+            Dark -> "☀"
+          }),
+        ],
+      ),
     ],
   )
 }

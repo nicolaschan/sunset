@@ -765,6 +765,7 @@ fn view(model: Model) -> Element(Msg) {
       landing.view(
         palette: palette,
         mode: model.mode,
+        viewport: model.viewport,
         input: model.landing_input,
         noop: NoOp,
         on_input: UpdateLandingInput,

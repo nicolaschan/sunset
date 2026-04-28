@@ -227,4 +227,21 @@ test.describe("landing + routing", () => {
     await page.reload();
     await expect.poll(railOrder).toEqual(["alpha", "gamma", "beta"]);
   });
+
+  test.describe("phone — landing", () => {
+    test.beforeEach(async ({ page }, testInfo) => {
+      test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    });
+
+    test("landing fills the viewport edge-to-edge", async ({ page }) => {
+      await page.goto("/");
+      await expect(page.getByTestId("landing-view")).toBeVisible();
+      const input = page.getByTestId("landing-input");
+      await expect(input).toBeVisible();
+      const inputBox = await input.boundingBox();
+      const viewport = page.viewportSize();
+      // Input should be near full-width minus our 24px gutters.
+      expect(inputBox.width).toBeGreaterThan(viewport.width - 60);
+    });
+  });
 });
