@@ -15,7 +15,6 @@ use sunset_store::{ContentBlock, SignedKvEntry, Store, canonical::signing_payloa
 use sunset_store_memory::MemoryStore;
 
 /// Spawn the heartbeat publisher. Runs forever (page lifetime).
-#[allow(dead_code)]
 pub fn spawn_publisher(
     identity: Identity,
     room_fp_hex: String,
@@ -35,7 +34,6 @@ pub fn spawn_publisher(
     });
 }
 
-#[allow(dead_code)]
 async fn publish_once(
     identity: &Identity,
     name_str: &str,

@@ -1,7 +1,6 @@
 //! JS-exported Client: identity + room + sync engine wired together.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -43,9 +42,9 @@ pub struct Client {
     store: Arc<MemoryStore>,
     engine: Rc<Engine>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
-    relay_status: Rc<RefCell<&'static str>>,
-    /// Peers we've successfully attached a direct WebRTC transport to.
-    direct_peers: Rc<RefCell<HashSet<PeerId>>>,
+    relay_status: Rc<RefCell<String>>,
+    presence_started: Rc<RefCell<bool>>,
+    tracker_handles: Rc<crate::membership_tracker::TrackerHandles>,
 }
 
 #[wasm_bindgen]
@@ -102,8 +101,11 @@ impl Client {
             store,
             engine,
             on_message: Rc::new(RefCell::new(None)),
-            relay_status: Rc::new(RefCell::new("disconnected")),
-            direct_peers: Rc::new(RefCell::new(HashSet::new())),
+            relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
+            presence_started: Rc::new(RefCell::new(false)),
+            tracker_handles: Rc::new(crate::membership_tracker::TrackerHandles::new(
+                "disconnected",
+            )),
         })
     }
 
@@ -114,19 +116,19 @@ impl Client {
 
     #[wasm_bindgen(getter)]
     pub fn relay_status(&self) -> String {
-        (*self.relay_status.borrow()).to_owned()
+        self.relay_status.borrow().clone()
     }
 
     pub async fn add_relay(&self, url_with_fragment: String) -> Result<(), JsError> {
-        *self.relay_status.borrow_mut() = "connecting";
+        *self.relay_status.borrow_mut() = "connecting".to_owned();
         let addr = sunset_sync::PeerAddr::new(Bytes::from(url_with_fragment));
         match self.engine.add_peer(addr).await {
             Ok(()) => {
-                *self.relay_status.borrow_mut() = "connected";
+                *self.relay_status.borrow_mut() = "connected".to_owned();
                 Ok(())
             }
             Err(e) => {
-                *self.relay_status.borrow_mut() = "error";
+                *self.relay_status.borrow_mut() = "error".to_owned();
                 Err(JsError::new(&format!("add_relay: {e}")))
             }
         }
@@ -148,25 +150,64 @@ impl Client {
             .add_peer(addr)
             .await
             .map_err(|e| JsError::new(&format!("connect_direct: {e}")))?;
-        let peer_id = PeerId(sunset_store::VerifyingKey::new(Bytes::copy_from_slice(&pk)));
-        self.direct_peers.borrow_mut().insert(peer_id);
         Ok(())
     }
 
     /// Returns one of `"direct"`, `"via_relay"`, or `"unknown"`.
     pub fn peer_connection_mode(&self, peer_pubkey: &[u8]) -> String {
+        use sunset_sync::TransportKind;
         let pk: [u8; 32] = match peer_pubkey.try_into() {
             Ok(p) => p,
             Err(_) => return "unknown".to_owned(),
         };
         let peer_id = PeerId(sunset_store::VerifyingKey::new(Bytes::copy_from_slice(&pk)));
-        if self.direct_peers.borrow().contains(&peer_id) {
-            "direct".to_owned()
-        } else if *self.relay_status.borrow() == "connected" {
-            "via_relay".to_owned()
-        } else {
-            "unknown".to_owned()
+        match self.tracker_handles.peer_kinds.borrow().get(&peer_id) {
+            Some(TransportKind::Secondary) => "direct",
+            Some(TransportKind::Primary) => "via_relay",
+            _ => "unknown",
         }
+        .to_owned()
+    }
+
+    /// Start the heartbeat publisher + the membership tracker.
+    /// Idempotent: a second call is a no-op. The Gleam UI calls this
+    /// once after the Client is constructed.
+    pub async fn start_presence(&self, interval_ms: u32, ttl_ms: u32, refresh_ms: u32) {
+        if *self.presence_started.borrow() {
+            return;
+        }
+        *self.presence_started.borrow_mut() = true;
+
+        let room_fp_hex = self.room.fingerprint().to_hex();
+        let local_peer = sunset_sync::PeerId(self.identity.store_verifying_key());
+
+        crate::presence_publisher::spawn_publisher(
+            self.identity.clone(),
+            room_fp_hex.clone(),
+            self.store.clone(),
+            interval_ms as u64,
+            ttl_ms as u64,
+        );
+
+        let engine_events = self.engine.subscribe_engine_events().await;
+        crate::membership_tracker::spawn_tracker(
+            self.store.clone(),
+            engine_events,
+            local_peer,
+            room_fp_hex,
+            interval_ms as u64,
+            ttl_ms as u64,
+            refresh_ms as u64,
+            (*self.tracker_handles).clone(),
+        );
+    }
+
+    pub fn on_members_changed(&self, callback: js_sys::Function) {
+        *self.tracker_handles.on_members.borrow_mut() = Some(callback);
+    }
+
+    pub fn on_relay_status_changed(&self, callback: js_sys::Function) {
+        *self.tracker_handles.on_relay_status.borrow_mut() = Some(callback);
     }
 
     pub async fn publish_room_subscription(&self) -> Result<(), JsError> {

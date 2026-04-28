@@ -31,7 +31,6 @@ use crate::members::{derive_members, members_signature};
 type MemberSig = Vec<(Vec<u8>, String, String)>;
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct TrackerHandles {
     pub on_members: Rc<RefCell<Option<js_sys::Function>>>,
     pub on_relay_status: Rc<RefCell<Option<js_sys::Function>>>,
@@ -40,7 +39,6 @@ pub struct TrackerHandles {
 }
 
 impl TrackerHandles {
-    #[allow(dead_code)]
     pub fn new(initial_relay_status: &str) -> Self {
         Self {
             on_members: Rc::new(RefCell::new(None)),
@@ -52,7 +50,6 @@ impl TrackerHandles {
 }
 
 /// Spawn the tracker. Runs forever (page lifetime).
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_tracker(
     store: std::sync::Arc<MemoryStore>,
