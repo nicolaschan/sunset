@@ -1,0 +1,37 @@
+[package]
+name = "sunset-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sunset-relay"
+path = "src/main.rs"
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
+serde = { workspace = true, features = ["derive"] }
+sunset-core.workspace = true
+sunset-noise.workspace = true
+sunset-store.workspace = true
+sunset-store-fs.workspace = true
+sunset-sync.workspace = true
+sunset-sync-ws-native.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "signal", "fs", "sync", "net"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+curve25519-dalek.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "signal", "fs", "sync", "net"] }
