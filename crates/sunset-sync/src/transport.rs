@@ -105,33 +105,7 @@ pub trait RawConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PeerId;
-    use async_trait::async_trait;
-    use bytes::Bytes;
-    use sunset_store::VerifyingKey;
-
-    struct DummyConn;
-    #[async_trait(?Send)]
-    impl TransportConnection for DummyConn {
-        async fn send_reliable(&self, _: Bytes) -> crate::Result<()> {
-            Ok(())
-        }
-        async fn recv_reliable(&self) -> crate::Result<Bytes> {
-            Ok(Bytes::new())
-        }
-        async fn send_unreliable(&self, _: Bytes) -> crate::Result<()> {
-            Ok(())
-        }
-        async fn recv_unreliable(&self) -> crate::Result<Bytes> {
-            Ok(Bytes::new())
-        }
-        fn peer_id(&self) -> PeerId {
-            PeerId(VerifyingKey::new(Bytes::from_static(&[0u8; 32])))
-        }
-        async fn close(&self) -> crate::Result<()> {
-            Ok(())
-        }
-    }
+    use crate::test_fixtures::DummyConn;
 
     #[test]
     fn default_kind_is_unknown() {

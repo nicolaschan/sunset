@@ -20,6 +20,9 @@ pub mod types;
 #[cfg(feature = "test-helpers")]
 pub mod test_transport;
 
+#[cfg(test)]
+mod test_fixtures;
+
 pub use engine::SyncEngine;
 pub use error::{Error, Result};
 pub use message::{DigestRange, SyncMessage};
