@@ -53,6 +53,20 @@ pub(crate) enum EngineCommand {
     },
 }
 
+/// Lifecycle events emitted by the engine. Subscribers receive
+/// every event from the moment they subscribe; events emitted
+/// before subscription are NOT replayed.
+#[derive(Clone, Debug)]
+pub enum EngineEvent {
+    PeerAdded {
+        peer_id: PeerId,
+        kind: crate::transport::TransportKind,
+    },
+    PeerRemoved {
+        peer_id: PeerId,
+    },
+}
+
 /// Mutable state inside the engine. Held under a `tokio::sync::Mutex` so
 /// command processing and per-peer task callbacks can both update it.
 pub(crate) struct EngineState {
@@ -60,6 +74,9 @@ pub(crate) struct EngineState {
     pub registry: SubscriptionRegistry,
     /// Per-peer outbound message senders.
     pub peer_outbound: HashMap<PeerId, mpsc::UnboundedSender<SyncMessage>>,
+    /// Live `EngineEvent` subscribers. Dead senders (closed by the
+    /// receiver being dropped) are evicted lazily on the next emit.
+    pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
 }
 
 pub struct SyncEngine<S: Store, T: Transport> {
@@ -99,6 +116,7 @@ where
                 trust: TrustSet::default(),
                 registry: SubscriptionRegistry::new(),
                 peer_outbound: HashMap::new(),
+                event_subs: Vec::new(),
             })),
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
@@ -113,6 +131,16 @@ where
             .send(EngineCommand::AddPeer { addr, ack })
             .map_err(|_| Error::Closed)?;
         rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Subscribe to lifecycle events emitted by the engine. Each call
+    /// returns a fresh receiver. Events are delivered to every live
+    /// subscriber; subscribers receive only events that happen after
+    /// they subscribe (no replay).
+    pub async fn subscribe_engine_events(&self) -> mpsc::UnboundedReceiver<EngineEvent> {
+        let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+        self.state.lock().await.event_subs.push(tx);
+        rx
     }
 
     /// Publish this peer's subscription filter. Writes a signed KV entry
@@ -538,6 +566,18 @@ where
             .registry
             .iter()
             .any(|(k, _)| k == vk)
+    }
+
+    /// Fan-out an event to every live subscriber. Drops senders whose
+    /// receivers have been dropped (lazy GC).
+    // Used by Task 5 (handle_inbound_event will call this to emit
+    // PeerAdded/PeerRemoved). Tagged dead_code until that wiring lands.
+    #[allow(dead_code)]
+    async fn emit_engine_event(&self, ev: EngineEvent) {
+        let mut state = self.state.lock().await;
+        state
+            .event_subs
+            .retain(|tx| tx.send(ev.clone()).is_ok());
     }
 
     /// Real implementation of `publish_subscription`'s server side.
