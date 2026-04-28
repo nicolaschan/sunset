@@ -52,7 +52,6 @@ pub type Model {
     current_channel: ChannelId,
     draft: String,
     reacting_to: Option(String),
-    detail_msg_id: Option(String),
     reactions: Dict(String, List(Reaction)),
     /// Name of the room currently being dragged in the rooms rail.
     /// `None` between drag operations.
@@ -60,9 +59,6 @@ pub type Model {
     /// Name of the room currently hovered over while dragging — used
     /// for the visible drop-target indicator.
     drag_over_room: Option(String),
-    /// Member name whose voice popover is currently open. None when
-    /// no popover is showing.
-    voice_popover: Option(String),
     /// Per-member voice tweaks (volume / denoise / deafened),
     /// keyed by member name. Seeded from the fixture once.
     voice_settings: Dict(String, domain.VoiceSettings),
@@ -185,11 +181,9 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       current_channel: ChannelId(fixture.initial_channel_id),
       draft: "",
       reacting_to: None,
-      detail_msg_id: None,
       reactions: seed_reactions(),
       dragging_room: None,
       drag_over_room: None,
-      voice_popover: None,
       voice_settings: seed_voice_settings(),
       client: None,
       messages: [],
@@ -636,15 +630,33 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(new_model, effect.none())
     }
     OpenDetail(id) -> #(
-      Model(..model, detail_msg_id: Some(id), reacting_to: None),
+      Model(
+        ..model,
+        sheet: Some(domain.DetailsSheet(message_id: id)),
+        reacting_to: None,
+      ),
       effect.none(),
     )
-    CloseDetail -> #(Model(..model, detail_msg_id: None), effect.none())
+    CloseDetail -> #(
+      // Only close if the active sheet is the details one — guards against
+      // a Voice sheet being opened concurrently and accidentally dismissed.
+      Model(..model, sheet: case model.sheet {
+        Some(domain.DetailsSheet(_)) -> None
+        other -> other
+      }),
+      effect.none(),
+    )
     OpenVoicePopover(name) -> #(
-      Model(..model, voice_popover: Some(name)),
+      Model(..model, sheet: Some(domain.VoiceSheet(member_name: name))),
       effect.none(),
     )
-    CloseVoicePopover -> #(Model(..model, voice_popover: None), effect.none())
+    CloseVoicePopover -> #(
+      Model(..model, sheet: case model.sheet {
+        Some(domain.VoiceSheet(_)) -> None
+        other -> other
+      }),
+      effect.none(),
+    )
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, volume: value)
@@ -772,9 +784,10 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       }
     })
 
-  let detail_msg = case model.detail_msg_id {
-    None -> None
-    Some(id) -> find_message(messages_with_live_reactions, id)
+  let detail_msg = case model.sheet {
+    Some(domain.DetailsSheet(message_id: id)) ->
+      find_message(messages_with_live_reactions, id)
+    _ -> None
   }
 
   shell.view(
@@ -813,7 +826,10 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       channels: fixture.channels(),
       members: fixture.members(),
       current_channel: model.current_channel,
-      voice_popover_open: model.voice_popover,
+      voice_popover_open: case model.sheet {
+        Some(domain.VoiceSheet(member_name: name)) -> Some(name)
+        _ -> None
+      },
       on_select_channel: SelectChannel,
       on_open_voice_popover: OpenVoicePopover,
     ),
@@ -826,7 +842,10 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_submit: SubmitDraft,
       noop: NoOp,
       reacting_to: model.reacting_to,
-      detail_msg_id: model.detail_msg_id,
+      detail_msg_id: case model.sheet {
+        Some(domain.DetailsSheet(message_id: id)) -> Some(id)
+        _ -> None
+      },
       on_toggle_reaction_picker: ToggleReactionPicker,
       on_add_reaction: AddReaction,
       on_open_detail: OpenDetail,
@@ -841,9 +860,8 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
 }
 
 fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
-  case model.voice_popover {
-    None -> element.fragment([])
-    Some(name) ->
+  case model.sheet {
+    Some(domain.VoiceSheet(member_name: name)) ->
       // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
       case list.find(fixture.members(), fn(m) { m.name == name }) {
         Error(_) -> element.fragment([])
@@ -859,6 +877,7 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
             on_reset: ResetMemberVoice(name),
           )
       }
+    _ -> element.fragment([])
   }
 }
 
