@@ -112,3 +112,36 @@ export function prefersDark() {
     return false;
   }
 }
+
+// Phone vs desktop is gated on a single CSS-media-query equivalent.
+// Returns a fresh boolean each call so the caller doesn't need to
+// hold a reference to the MediaQueryList.
+export function isPhoneViewport() {
+  try {
+    return (
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(max-width: 767px)").matches
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Subscribes `callback(isPhone: bool)` to viewport changes via
+// MediaQueryList.addEventListener. Fires once for each crossing of
+// the 768px boundary; not on every resize.
+export function onViewportChange(callback) {
+  try {
+    if (typeof window.matchMedia !== "function") return;
+    const mql = window.matchMedia("(max-width: 767px)");
+    const handler = (e) => callback(e.matches);
+    // addEventListener is the modern API; older Safari needs addListener.
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", handler);
+    } else if (typeof mql.addListener === "function") {
+      mql.addListener(handler);
+    }
+  } catch {
+    // best-effort: viewport tracking is non-critical.
+  }
+}

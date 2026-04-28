@@ -29,3 +29,13 @@ pub fn write_saved_theme(value: String) -> Nil
 /// user hasn't toggled the theme yet.
 @external(javascript, "./storage.ffi.mjs", "prefersDark")
 pub fn prefers_dark() -> Bool
+
+/// True when the current viewport width is <= 767px (phone tier).
+@external(javascript, "./storage.ffi.mjs", "isPhoneViewport")
+pub fn is_phone_viewport() -> Bool
+
+/// Register a callback that fires whenever the viewport crosses the
+/// 768px boundary (in either direction). Fires once per crossing, not
+/// on every resize.
+@external(javascript, "./storage.ffi.mjs", "onViewportChange")
+pub fn on_viewport_change(callback: fn(Bool) -> Nil) -> Nil
