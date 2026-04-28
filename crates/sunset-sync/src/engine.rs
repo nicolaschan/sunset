@@ -280,7 +280,11 @@ where
 
     async fn handle_inbound_event(&self, event: InboundEvent) {
         match event {
-            InboundEvent::PeerHello { peer_id, out_tx } => {
+            InboundEvent::PeerHello {
+                peer_id,
+                kind: _,
+                out_tx,
+            } => {
                 // Register the outbound sender under the Hello-declared peer_id.
                 // This key matches what the subscription registry uses, so push
                 // routing can find the sender correctly.

@@ -18,6 +18,9 @@ pub(crate) enum InboundEvent {
     /// `out_tx` is the outbound sender to register under `peer_id`.
     PeerHello {
         peer_id: PeerId,
+        // Read in Task 5 (engine fan-out of PeerAdded events).
+        #[allow(dead_code)]
+        kind: crate::transport::TransportKind,
         out_tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>,
     },
     /// A SyncMessage arrived (other than Hello).
@@ -51,6 +54,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     mut outbound_rx: mpsc::UnboundedReceiver<SyncMessage>,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
 ) {
+    let local_kind = conn.kind();
     // Send our Hello.
     let our_hello = SyncMessage::Hello {
         protocol_version: local_protocol_version,
@@ -82,6 +86,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             }
             let _ = inbound_tx.send(InboundEvent::PeerHello {
                 peer_id: peer_id.clone(),
+                kind: local_kind,
                 out_tx,
             });
             peer_id
