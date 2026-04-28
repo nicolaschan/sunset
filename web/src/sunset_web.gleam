@@ -41,6 +41,7 @@ import sunset_web/views/members
 import sunset_web/views/phone_header
 import sunset_web/views/rooms
 import sunset_web/views/shell
+import sunset_web/views/touch_drag
 import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
 
@@ -243,6 +244,18 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       })
     })
 
+  let subscribe_touch_drag =
+    effect.from(fn(dispatch) {
+      touch_drag.attach(
+        touch_drag.Callbacks(
+          on_start: fn(name) { dispatch(DragRoomStart(name)) },
+          on_over: fn(name) { dispatch(DragRoomOver(name)) },
+          on_drop: fn(name) { dispatch(DropRoomOn(name)) },
+          on_end: fn() { dispatch(DragRoomEnd) },
+        ),
+      )
+    })
+
   #(
     model,
     effect.batch([
@@ -251,6 +264,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       initial_hash_sync,
       bootstrap,
       subscribe_viewport,
+      subscribe_touch_drag,
     ]),
   )
 }

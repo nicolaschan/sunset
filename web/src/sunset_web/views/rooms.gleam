@@ -419,6 +419,7 @@ fn room_full(
     [
       attribute.class("room-row"),
       attribute.attribute("data-room-name", r.name),
+      attribute.attribute("data-room-row", r.name),
       attribute.attribute("draggable", "true"),
       event.on("dragstart", decode.success(on_drag_start(r.name))),
       event.on("dragend", decode.success(on_drag_end)),
