@@ -241,3 +241,140 @@ async fn alice_to_bob_via_two_relays() {
         })
         .await;
 }
+
+// -- Test 2: failover when one relay dies --
+
+#[tokio::test(flavor = "current_thread")]
+async fn failover_when_relay_a_dies() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir_a = tempfile::tempdir().unwrap();
+            let dir_b = tempfile::tempdir().unwrap();
+
+            // Relay A.
+            let config_a = relay_config(dir_a.path(), "127.0.0.1:0", &[]);
+            let relay_a = Relay::new(config_a).await.expect("relay A new");
+            let relay_a_addr = relay_a.dial_address();
+            let engine_a_task = relay_a.run_for_test().await.expect("relay A run");
+
+            // Relay B (federated to A).
+            let config_b = relay_config(
+                dir_b.path(),
+                "127.0.0.1:0",
+                std::slice::from_ref(&relay_a_addr),
+            );
+            let relay_b = Relay::new(config_b).await.expect("relay B new");
+            let relay_b_addr = relay_b.dial_address();
+            let relay_b_vk = VerifyingKey::new(Bytes::copy_from_slice(&relay_b.ed25519_public));
+            let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Alice connects to BOTH; bob connects to BOTH.
+            let alice = Identity::generate(&mut OsRng);
+            let bob = Identity::generate(&mut OsRng);
+            let alice_room =
+                Room::open_with_params("plan-d-failover", &test_fast_params()).unwrap();
+            let bob_room = Room::open_with_params("plan-d-failover", &test_fast_params()).unwrap();
+
+            let (alice_store, alice_engine) = make_client(alice.clone(), &relay_a_addr).await;
+            alice_engine
+                .add_peer(PeerAddr::new(Bytes::from(relay_b_addr.clone())))
+                .await
+                .expect("alice dial relay B");
+
+            let (bob_store, bob_engine) = make_client(bob.clone(), &relay_a_addr).await;
+            bob_engine
+                .add_peer(PeerAddr::new(Bytes::from(relay_b_addr.clone())))
+                .await
+                .expect("bob dial relay B");
+
+            bob_engine
+                .publish_subscription(room_messages_filter(&bob_room), Duration::from_secs(60))
+                .await
+                .unwrap();
+
+            // Wait for alice to learn relay B's subscription (confirms federation + alice→B path
+            // is established before we kill relay A).
+            let alice_knows_relay_b = wait_for(
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+                || async { alice_engine.knows_peer_subscription(&relay_b_vk).await },
+            )
+            .await;
+            assert!(
+                alice_knows_relay_b,
+                "alice did not learn relay B's subscription before starting"
+            );
+
+            // Compose msg-1; expect it to arrive normally (both relays alive).
+            let ComposedMessage {
+                entry: e1,
+                block: b1,
+            } = compose_message(
+                &alice,
+                &alice_room,
+                0,
+                1,
+                "msg-1 (both relays alive)",
+                &mut OsRng,
+            )
+            .unwrap();
+            alice_store
+                .insert(e1.clone(), Some(b1.clone()))
+                .await
+                .unwrap();
+
+            let bob_has_msg1 = wait_for(
+                Duration::from_secs(10),
+                Duration::from_millis(50),
+                || async {
+                    bob_store
+                        .get_entry(&alice.store_verifying_key(), &e1.name)
+                        .await
+                        .unwrap()
+                        .is_some()
+                },
+            )
+            .await;
+            assert!(bob_has_msg1, "bob did not receive msg-1");
+
+            // Kill relay A.
+            engine_a_task.abort();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Compose msg-2; expect it to still arrive via relay B.
+            let ComposedMessage {
+                entry: e2,
+                block: b2,
+            } = compose_message(
+                &alice,
+                &alice_room,
+                0,
+                2,
+                "msg-2 (after relay A killed)",
+                &mut OsRng,
+            )
+            .unwrap();
+            alice_store
+                .insert(e2.clone(), Some(b2.clone()))
+                .await
+                .unwrap();
+
+            let bob_has_msg2 = wait_for(
+                Duration::from_secs(15),
+                Duration::from_millis(50),
+                || async {
+                    bob_store
+                        .get_entry(&alice.store_verifying_key(), &e2.name)
+                        .await
+                        .unwrap()
+                        .is_some()
+                },
+            )
+            .await;
+            assert!(bob_has_msg2, "bob did not receive msg-2 after relay A died");
+        })
+        .await;
+}
