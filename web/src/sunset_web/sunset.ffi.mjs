@@ -163,7 +163,18 @@ export async function startPresence(client, intervalMs, ttlMs, refreshMs) {
 export function onMembersChanged(client, callback) {
   client.on_members_changed((members) => {
     try {
-      callback(toList(Array.from(members)));
+      // Copy fields into plain JS objects so we don't hold raw
+      // wasm-bindgen pointers across the JS/Gleam boundary —
+      // FinalizationRegistry would eventually GC the wrappers, but
+      // explicit copy + free is safer and more predictable.
+      const copied = Array.from(members, (m) => ({
+        pubkey: m.pubkey,                // Vec<u8> getter -> Uint8Array
+        presence: m.presence,            // String getter -> string
+        connection_mode: m.connection_mode,
+        is_self: m.is_self,
+      }));
+      Array.from(members).forEach((m) => m.free());
+      callback(toList(copied));
     } catch (e) {
       console.warn("onMembersChanged callback threw", e);
     }
@@ -198,7 +209,7 @@ export function presenceParamsFromUrl() {
   const parseOr = (key, dflt) => {
     const raw = params.get(key);
     if (raw === null) return dflt;
-    const n = parseInt(raw, 10);
+    const n = Number(raw);  // strict — "30000abc" -> NaN, unlike parseInt
     return Number.isFinite(n) && n > 0 ? n : dflt;
   };
   const interval = parseOr("presence_interval", 30000);
