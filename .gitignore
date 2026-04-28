@@ -2,5 +2,8 @@
 .worktrees/
 .direnv/
 
+# Nix build result
+result
+
 # Rust build artifacts
 target/
