@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-relay"]
+members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-web-wasm", "crates/sunset-relay"]
 resolver = "2"
 
 [workspace.package]
@@ -57,6 +57,7 @@ sunset-sync = { path = "crates/sunset-sync" }
 sunset-noise = { path = "crates/sunset-noise" }
 sunset-core = { path = "crates/sunset-core" }
 sunset-sync-ws-native = { path = "crates/sunset-sync-ws-native" }
+sunset-sync-ws-browser = { path = "crates/sunset-sync-ws-browser" }
 
 [workspace.lints.rust]
 unused_must_use = "deny"

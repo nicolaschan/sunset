@@ -1669,6 +1669,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunset-web-wasm"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "hex",
+ "js-sys",
+ "rand_chacha",
+ "rand_core",
+ "sunset-core",
+ "sunset-noise",
+ "sunset-store",
+ "sunset-store-memory",
+ "sunset-sync",
+ "sunset-sync-ws-browser",
+ "thiserror 2.0.18",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+ "zeroize",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
