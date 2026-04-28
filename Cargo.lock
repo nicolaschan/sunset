@@ -1661,6 +1661,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "ed25519-dalek",
  "futures",
  "postcard",
  "serde",
