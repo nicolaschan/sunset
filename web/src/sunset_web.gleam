@@ -74,6 +74,16 @@ pub type Model {
     relay_status: String,
     /// Live members list from the presence tracker. Empty on first load.
     members: List(domain.Member),
+    /// Viewport class — drives the desktop/phone branch in `shell.view`.
+    viewport: domain.Viewport,
+    /// Currently open drawer on phone. Ignored on desktop. Channels and
+    /// rooms drawers cross-transition (one swaps for the other) rather
+    /// than stack.
+    drawer: Option(domain.Drawer),
+    /// Currently open bottom sheet on phone. Also drives the desktop
+    /// right-rail (DetailsSheet → details_panel) and floating voice
+    /// popover (VoiceSheet → voice_popover.view).
+    sheet: Option(domain.Sheet),
   )
 }
 
@@ -114,6 +124,9 @@ pub type Msg {
   MessageSent(Result(String, String))
   MembersUpdated(List(domain.Member))
   RelayStatusUpdated(String)
+  ViewportChanged(domain.Viewport)
+  OpenDrawer(domain.Drawer)
+  CloseDrawer
 }
 
 pub fn main() {
@@ -156,6 +169,11 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
     RoomView(name) -> ensure_joined(stored_rooms, name)
   }
 
+  let initial_viewport = case storage.is_phone_viewport() {
+    True -> domain.Phone
+    False -> domain.Desktop
+  }
+
   let model =
     Model(
       mode: initial_mode,
@@ -177,6 +195,9 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       messages: [],
       relay_status: "disconnected",
       members: [],
+      viewport: initial_viewport,
+      drawer: None,
+      sheet: None,
     )
 
   let subscribe_hash =
@@ -209,9 +230,26 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       sunset.load_or_create_identity(fn(seed) { dispatch(IdentityReady(seed)) })
     })
 
+  let subscribe_viewport =
+    effect.from(fn(dispatch) {
+      storage.on_viewport_change(fn(is_phone) {
+        let v = case is_phone {
+          True -> domain.Phone
+          False -> domain.Desktop
+        }
+        dispatch(ViewportChanged(v))
+      })
+    })
+
   #(
     model,
-    effect.batch([subscribe_hash, initial_persist, initial_hash_sync, bootstrap]),
+    effect.batch([
+      subscribe_hash,
+      initial_persist,
+      initial_hash_sync,
+      bootstrap,
+      subscribe_viewport,
+    ]),
   )
 }
 
@@ -651,6 +689,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       ),
       effect.none(),
     )
+    ViewportChanged(v) -> {
+      // Crossing the boundary in either direction closes any open drawer.
+      // Sheets intentionally survive: DetailsSheet and VoiceSheet render
+      // on both viewports (right-rail / floating popover on desktop).
+      #(
+        Model(..model, viewport: v, drawer: None),
+        effect.none(),
+      )
+    }
+    OpenDrawer(d) -> #(Model(..model, drawer: Some(d)), effect.none())
+    CloseDrawer -> #(Model(..model, drawer: None), effect.none())
   }
 }
 
