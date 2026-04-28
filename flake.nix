@@ -59,6 +59,39 @@
           }
           else null;
 
+        sunsetWebWasmPkg = pkgs.rustPlatform.buildRustPackage {
+          pname = "sunset-web-wasm";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          doCheck = false;
+          nativeBuildInputs = [ pkgs.wasm-bindgen-cli pkgs.lld ];
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+          buildPhase = ''
+            runHook preBuild
+            cargo build \
+              -j $NIX_BUILD_CORES \
+              --offline \
+              --release \
+              --target wasm32-unknown-unknown \
+              -p sunset-web-wasm \
+              --lib
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            wasm-bindgen \
+              --target web \
+              --out-dir wasm-out \
+              target/wasm32-unknown-unknown/release/sunset_web_wasm.wasm
+            mkdir -p $out
+            cp wasm-out/sunset_web_wasm.js $out/
+            cp wasm-out/sunset_web_wasm_bg.wasm $out/
+            runHook postInstall
+          '';
+        };
+
         webDist = gleamLib.buildGleamPackage {
           name = "sunset-web";
           src = ./web;
@@ -79,6 +112,10 @@
             if [ -d priv ]; then
               cp -r priv/. $out/
             fi
+            # Copy the sunset-web-wasm bundle alongside the Gleam JS so
+            # sunset.ffi.mjs can `import` from a relative path.
+            cp ${sunsetWebWasmPkg}/sunset_web_wasm.js $out/
+            cp ${sunsetWebWasmPkg}/sunset_web_wasm_bg.wasm $out/
             # Lustre emits an absolute `/sunset_web.js` script src which only
             # works at site root. Rewrite to a relative path so the artefact
             # serves correctly under any GitHub Pages sub-path.
@@ -153,6 +190,7 @@
 
         packages = {
           sunset-relay = sunsetRelayPkg;
+          sunset-web-wasm = sunsetWebWasmPkg;
 
           sunset-relay-docker = pkgs.dockerTools.buildLayeredImage {
             name = "sunset-relay";

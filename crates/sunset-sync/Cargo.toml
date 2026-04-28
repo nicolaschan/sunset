@@ -19,6 +19,10 @@ serde.workspace = true
 sunset-store.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+web-time.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasmtimer.workspace = true
 
 [dev-dependencies]
 sunset-store = { workspace = true, features = ["test-helpers"] }

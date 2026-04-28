@@ -148,7 +148,12 @@ where
             .subscribe(Filter::NamePrefix(Bytes::new()), Replay::None)
             .await?;
 
+        // Anti-entropy timer. tokio::time::interval works on native; on
+        // wasm32 we use the wasmtimer drop-in (browser timers via setTimeout).
+        #[cfg(not(target_arch = "wasm32"))]
         let mut anti_entropy = tokio::time::interval(self.config.anti_entropy_interval);
+        #[cfg(target_arch = "wasm32")]
+        let mut anti_entropy = wasmtimer::tokio::interval(self.config.anti_entropy_interval);
         // First tick fires immediately; skip it so the bootstrap exchange
         // isn't duplicated immediately after PeerHello.
         anti_entropy.tick().await;
@@ -529,8 +534,8 @@ where
             data: Bytes::from(value),
             references: vec![],
         };
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now_secs = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut entry = SignedKvEntry {
