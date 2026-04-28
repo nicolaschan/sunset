@@ -155,7 +155,12 @@ impl Client {
         Ok(())
     }
 
-    /// Returns one of `"direct"`, `"via_relay"`, or `"unknown"`.
+    /// Returns one of `"direct"`, `"via_relay"`, `"unknown"`.
+    ///
+    /// Reads from the membership tracker's `peer_kinds`, which is only
+    /// populated after `start_presence` has been called. Callers that
+    /// invoke this before `start_presence` will get `"unknown"` even
+    /// when a real connection exists.
     pub fn peer_connection_mode(&self, peer_pubkey: &[u8]) -> String {
         use sunset_sync::TransportKind;
         let pk: [u8; 32] = match peer_pubkey.try_into() {

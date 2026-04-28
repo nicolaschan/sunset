@@ -1,10 +1,6 @@
 //! Per-room membership state derived from heartbeat presence entries
 //! and engine peer events. Pure data + reducer functions; the
 //! orchestrating task lives in `membership_tracker.rs`.
-//!
-//! Items in this module are consumed by `membership_tracker` (Task 7);
-//! `#[allow(dead_code)]` is applied to keep clippy clean while the
-//! consumer is being landed.
 
 use std::collections::HashMap;
 
@@ -14,7 +10,6 @@ use sunset_sync::{PeerId, TransportKind};
 
 /// Three-state presence bucket derived from heartbeat age.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Presence {
     Online,
     Away,
@@ -22,7 +17,6 @@ pub enum Presence {
 }
 
 impl Presence {
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Presence::Online => "online",

@@ -79,7 +79,7 @@ fn kind(&self) -> TransportKind {
 }
 ```
 
-`NoiseConnection<C>` delegates to its inner: `self.raw.kind()`. So a `NoiseConnection<MultiConnection<...>>` reports the right kind.
+*(REVISED 2026-04-28: not implemented. Actual layering is `MultiTransport<NoiseTransport<...>, NoiseTransport<...>>`, so `MultiConnection` is the OUTERMOST connection type and its own `kind()` override answers correctly. `NoiseConnection` keeps the default `Unknown`. If the wrapping order ever flips to put `NoiseConnection` outside `MultiConnection`, add the delegation then.)*
 
 **`EngineEvent` (new):**
 ```rust
@@ -137,6 +137,7 @@ Field accessors via `#[wasm_bindgen(getter)]` (mirrors `IncomingMessage`).
     - if `is_self` → `self`
     - else if `peer_kinds[pk] == Secondary` → `direct`
     - else if `peer_kinds[pk] == Primary` → `via_relay`
+    - else if any peer in `peer_kinds` is `Primary` → `via_relay`  *(REVISED 2026-04-28: covers peers reached transitively through the relay; V1 single-relay topology only — revisit on multi-relay)*
     - else → `unknown`
 - Self always present, always `online`, always `connection_mode = self`.
 
@@ -257,7 +258,7 @@ fn connection_mode_to_relay(s: String) -> domain.RelayStatus {
 }
 ```
 
-**View consumers:** Replace every `fixture.members()` call site (`view.members`, `voice_popover` lookups, `details_panel` mappings) with `model.members`. Where the resulting list is empty (e.g., before presence kicks in), fall through to `fixture.members()` as a placeholder OR show an "alone in the room" empty state. **Decision: show the real empty state** (just the self pill) — pure fixture rendering when real data exists is misleading.
+**View consumers:** Replace `fixture.members()` at the live-list render site (`view.members`) with `model.members`. Where the resulting list is empty (e.g., before presence kicks in), show the real empty state (just the self pill) — pure fixture rendering when real data exists is misleading. *(REVISED 2026-04-28: voice-related call sites stay fixture-backed for now: the `channels.view` rail still gets `fixture.members()` for in-call counts, and the voice popover lookup still keys on fixture member names. Both are out of scope until V3 voice presence.)*
 
 The `voice_popover` reads voice_settings keyed by member name. Member names are now `short_pubkey(pk)` strings. This works as long as `voice_settings` is empty (no voice in this scope).
 

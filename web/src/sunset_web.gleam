@@ -760,6 +760,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
     ),
+    // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
     channels.view(
       palette: palette,
       room: active_room,
@@ -797,6 +798,7 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
   case model.voice_popover {
     None -> element.fragment([])
     Some(name) ->
+      // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
       case list.find(fixture.members(), fn(m) { m.name == name }) {
         Error(_) -> element.fragment([])
         Ok(m) ->
