@@ -48,6 +48,9 @@ pub enum SyncMessage {
     Fetch {
         entries: Vec<(VerifyingKey, Bytes)>,
     },
+    EphemeralDelivery {
+        datagram: sunset_store::SignedDatagram,
+    },
     Goodbye {},
 }
 
@@ -107,5 +110,44 @@ mod tests {
     fn decode_garbage_returns_decode_error() {
         let err = SyncMessage::decode(&[0xff, 0xff, 0xff, 0xff]).unwrap_err();
         assert!(matches!(err, Error::Decode(_)));
+    }
+
+    #[test]
+    fn ephemeral_delivery_postcard_roundtrip() {
+        use sunset_store::SignedDatagram;
+        let m = SyncMessage::EphemeralDelivery {
+            datagram: SignedDatagram {
+                verifying_key: vk(b"alice"),
+                name: Bytes::from_static(b"room/voice/alice/0042"),
+                payload: Bytes::from_static(b"opus-frame-bytes"),
+                signature: Bytes::from_static(&[0xab; 64]),
+            },
+        };
+        let encoded = m.encode().unwrap();
+        let decoded = SyncMessage::decode(&encoded).unwrap();
+        assert_eq!(m, decoded);
+    }
+
+    /// Frozen wire-format vector for SyncMessage::EphemeralDelivery.
+    /// If this hex changes, every existing peer breaks — bump the wire
+    /// format version, don't fix the test.
+    #[test]
+    fn ephemeral_delivery_frozen_vector() {
+        use sunset_store::SignedDatagram;
+        let m = SyncMessage::EphemeralDelivery {
+            datagram: SignedDatagram {
+                verifying_key: vk(b"alice"),
+                name: Bytes::from_static(b"room/voice/alice/0042"),
+                payload: Bytes::from_static(b"opus-frame-bytes"),
+                signature: Bytes::from_static(&[0xab; 64]),
+            },
+        };
+        let encoded = m.encode().unwrap();
+        let digest = blake3::hash(&encoded);
+        assert_eq!(
+            digest.to_hex().as_str(),
+            "313e80dd346c26e06cc1cc6288a1446b87a162dce603061ae97194cc44bbe019",
+            "If this fails the EphemeralDelivery wire format has drifted — DO NOT update this hex without bumping the wire-format version.",
+        );
     }
 }

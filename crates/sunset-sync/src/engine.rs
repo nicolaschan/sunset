@@ -412,6 +412,10 @@ where
                 // v1: Fetch is a future-extension when DigestRange grows
                 // beyond All; nothing to do today.
             }
+            SyncMessage::EphemeralDelivery { .. } => {
+                // Wired up in Bus-T5: verify + dispatch to ephemeral
+                // subscribers. For now the variant exists only on the wire.
+            }
             SyncMessage::Hello { .. } | SyncMessage::Goodbye { .. } => {
                 // Handled by the per-peer task; engine ignores.
             }
