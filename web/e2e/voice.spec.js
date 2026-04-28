@@ -4,6 +4,7 @@
 // footer, since muting yourself locally doesn't make sense.
 
 import { expect, test } from "@playwright/test";
+import { openChannelsDrawer } from "./helpers/viewport.js";
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
@@ -16,9 +17,10 @@ test.beforeEach(async ({ page }) => {
   await expect(page.getByText("sunset", { exact: true })).toBeVisible();
 });
 
-test("clicking a voice member opens the popover", async ({ page }) => {
+test("clicking a voice member opens the popover", async ({ page }, testInfo) => {
   await expect(page.getByTestId("voice-popover")).toHaveCount(0);
 
+  await openChannelsDrawer(page, testInfo);
   await page
     .locator('[data-testid="voice-member"][data-voice-name="ravi"]')
     .click();
@@ -31,7 +33,8 @@ test("clicking a voice member opens the popover", async ({ page }) => {
   await expect(page.getByTestId("voice-popover-reset")).toBeVisible();
 });
 
-test("close button dismisses the popover", async ({ page }) => {
+test("close button dismisses the popover", async ({ page }, testInfo) => {
+  await openChannelsDrawer(page, testInfo);
   await page
     .locator('[data-testid="voice-member"][data-voice-name="ravi"]')
     .click();
@@ -41,7 +44,8 @@ test("close button dismisses the popover", async ({ page }) => {
   await expect(page.getByTestId("voice-popover")).toHaveCount(0);
 });
 
-test("volume slider updates the displayed percentage", async ({ page }) => {
+test("volume slider updates the displayed percentage", async ({ page }, testInfo) => {
+  await openChannelsDrawer(page, testInfo);
   await page
     .locator('[data-testid="voice-member"][data-voice-name="ravi"]')
     .click();
@@ -63,8 +67,9 @@ test("volume slider updates the displayed percentage", async ({ page }) => {
 
 test("non-self volume slider goes up to 200%, self caps at 100%", async ({
   page,
-}) => {
+}, testInfo) => {
   // Other peer: 0–200 range.
+  await openChannelsDrawer(page, testInfo);
   await page
     .locator('[data-testid="voice-member"][data-voice-name="ravi"]')
     .click();
@@ -80,7 +85,8 @@ test("non-self volume slider goes up to 200%, self caps at 100%", async ({
   await expect(selfSlider).toHaveAttribute("max", "100");
 });
 
-test("denoise toggle flips aria-pressed state", async ({ page }) => {
+test("denoise toggle flips aria-pressed state", async ({ page }, testInfo) => {
+  await openChannelsDrawer(page, testInfo);
   await page
     .locator('[data-testid="voice-member"][data-voice-name="ravi"]')
     .click();
@@ -94,7 +100,8 @@ test("denoise toggle flips aria-pressed state", async ({ page }) => {
   await expect(toggle).toHaveAttribute("aria-pressed", "true");
 });
 
-test("self row hides mute-for-me + reset footer", async ({ page }) => {
+test("self row hides mute-for-me + reset footer", async ({ page }, testInfo) => {
+  await openChannelsDrawer(page, testInfo);
   await page
     .locator('[data-testid="voice-member"][data-voice-name="you"]')
     .click();
@@ -104,7 +111,8 @@ test("self row hides mute-for-me + reset footer", async ({ page }) => {
   await expect(page.getByTestId("voice-popover-reset")).toHaveCount(0);
 });
 
-test("reset restores defaults after edits", async ({ page }) => {
+test("reset restores defaults after edits", async ({ page }, testInfo) => {
+  await openChannelsDrawer(page, testInfo);
   await page
     .locator('[data-testid="voice-member"][data-voice-name="ravi"]')
     .click();
@@ -124,4 +132,55 @@ test("reset restores defaults after edits", async ({ page }) => {
   await page.getByTestId("voice-popover-reset").click();
   await expect(popover.getByText("100%")).toBeVisible();
   await expect(denoise).toHaveAttribute("aria-pressed", "true");
+});
+
+test.describe("phone — voice mini-bar", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  test("mini-bar visible in chat view while in call", async ({ page }) => {
+    await expect(page.getByTestId("voice-minibar")).toBeVisible();
+    await expect(page.getByTestId("voice-minibar")).toContainText("Lounge");
+  });
+
+  test("tapping mini-bar opens self voice sheet", async ({ page }) => {
+    await page.getByTestId("voice-minibar").click();
+    const sheet = page.getByTestId("voice-sheet");
+    await expect(sheet).toBeVisible();
+    // "you" appears in both the member name and the initials; use first() to avoid strict-mode error.
+    await expect(sheet.getByText("you", { exact: true }).first()).toBeVisible();
+    // Self row hides mute-for-me + reset.
+    await expect(sheet.getByTestId("voice-popover-deafen")).toHaveCount(0);
+  });
+});
+
+test.describe("phone — voice sheet", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  test("tapping an in-call member opens the voice bottom sheet", async ({
+    page,
+  }) => {
+    await page.getByTestId("phone-rooms-toggle").click();
+    // The voice channel block lives in the channels drawer.
+    const channelsDrawer = page.getByTestId("channels-drawer");
+    await channelsDrawer
+      .locator('[data-testid="voice-member"][data-voice-name="ravi"]')
+      .click();
+
+    const sheet = page.getByTestId("voice-sheet");
+    await expect(sheet).toBeVisible();
+    await expect(sheet.getByText("ravi", { exact: true })).toBeVisible();
+    await expect(sheet.getByTestId("voice-popover-volume")).toBeVisible();
+  });
 });

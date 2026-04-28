@@ -12,7 +12,7 @@ import lustre/event
 import sunset_web/domain.{
   type ConnStatus, type Room, type RoomId, Connected, Offline, Reconnecting,
 }
-import sunset_web/theme.{type Palette}
+import sunset_web/theme.{type Mode, type Palette}
 import sunset_web/ui
 
 pub fn view(
@@ -34,6 +34,9 @@ pub fn view(
   on_drop on_drop: fn(String) -> msg,
   on_drag_end on_drag_end: msg,
   toggle toggle: msg,
+  viewport viewport: domain.Viewport,
+  mode mode: Mode,
+  on_toggle_mode on_toggle_mode: msg,
 ) -> Element(msg) {
   let width = case col {
     True -> "54px"
@@ -46,6 +49,7 @@ pub fn view(
         #("width", width),
         #("min-width", width),
         #("height", "100vh"),
+        #("height", "100dvh"),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("background", p.surface),
@@ -60,7 +64,7 @@ pub fn view(
       ]),
     ],
     [
-      brand_row(p, col, toggle),
+      brand_row(p, col, toggle, viewport),
       case col {
         True -> element.fragment([])
         False -> search_bar(p, search_value, noop, on_search_change, on_join)
@@ -81,11 +85,20 @@ pub fn view(
         on_drag_end,
       ),
       you_row(p, col),
+      case viewport {
+        domain.Phone -> phone_theme_toggle_row(p, mode, on_toggle_mode)
+        domain.Desktop -> element.fragment([])
+      },
     ],
   )
 }
 
-fn brand_row(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
+fn brand_row(
+  p: Palette,
+  collapsed: Bool,
+  toggle: msg,
+  viewport: domain.Viewport,
+) -> Element(msg) {
   case collapsed {
     True ->
       // Collapsed: just the chevron, centered in the 54px rail. No logo.
@@ -101,7 +114,12 @@ fn brand_row(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
             #("padding", "0"),
           ]),
         ],
-        [collapse_button(p, collapsed, toggle)],
+        [
+          case viewport {
+            domain.Phone -> element.fragment([])
+            domain.Desktop -> collapse_button(p, collapsed, toggle)
+          },
+        ],
       )
     False ->
       // Expanded: logo + brand text on the left, chevron on the right.
@@ -146,7 +164,10 @@ fn brand_row(p: Palette, collapsed: Bool, toggle: msg) -> Element(msg) {
               ),
             ],
           ),
-          collapse_button(p, collapsed, toggle),
+          case viewport {
+            domain.Phone -> element.fragment([])
+            domain.Desktop -> collapse_button(p, collapsed, toggle)
+          },
         ],
       )
   }
@@ -398,6 +419,7 @@ fn room_full(
     [
       attribute.class("room-row"),
       attribute.attribute("data-room-name", r.name),
+      attribute.attribute("data-room-row", r.name),
       attribute.attribute("draggable", "true"),
       event.on("dragstart", decode.success(on_drag_start(r.name))),
       event.on("dragend", decode.success(on_drag_end)),
@@ -831,6 +853,41 @@ fn logo(size: Int) -> Element(msg) {
         [],
       ),
     ],
+  )
+}
+
+fn phone_theme_toggle_row(
+  p: Palette,
+  mode: Mode,
+  on_toggle: msg,
+) -> Element(msg) {
+  let label = case mode {
+    theme.Light -> "Switch to dark mode"
+    theme.Dark -> "Switch to light mode"
+  }
+  html.button(
+    [
+      attribute.attribute("data-testid", "phone-theme-toggle"),
+      attribute.title(label),
+      attribute.attribute("aria-label", label),
+      event.on_click(on_toggle),
+      ui.css([
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("gap", "8px"),
+        #("padding", "12px 16px"),
+        #("border", "none"),
+        #("border-top", "1px solid " <> p.border_soft),
+        #("background", "transparent"),
+        #("color", p.text),
+        #("font-family", "inherit"),
+        #("font-size", "16.875px"),
+        #("cursor", "pointer"),
+        #("text-align", "left"),
+        #("width", "100%"),
+      ]),
+    ],
+    [html.text(label)],
   )
 }
 

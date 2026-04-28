@@ -112,3 +112,57 @@ export function prefersDark() {
     return false;
   }
 }
+
+// Phone vs desktop is gated on a single CSS-media-query equivalent.
+// Returns a fresh boolean each call so the caller doesn't need to
+// hold a reference to the MediaQueryList.
+export function isPhoneViewport() {
+  try {
+    return (
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(max-width: 767px)").matches
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Subscribes `callback(isPhone: bool)` to viewport changes via
+// MediaQueryList.addEventListener. Fires once for each crossing of
+// the 768px boundary; not on every resize.
+export function onViewportChange(callback) {
+  try {
+    if (typeof window.matchMedia !== "function") return;
+    const mql = window.matchMedia("(max-width: 767px)");
+    const handler = (e) => callback(e.matches);
+    // addEventListener is the modern API; older Safari needs addListener.
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", handler);
+    } else if (typeof mql.addListener === "function") {
+      mql.addListener(handler);
+    }
+  } catch {
+    // best-effort: viewport tracking is non-critical.
+  }
+}
+
+// Override the default viewport meta tag with one that:
+//   * cover: enables env(safe-area-inset-*) under iOS notch / dynamic island.
+//   * interactive-widget=resizes-content: tells iOS/Android to resize the
+//     layout viewport (not just the visual viewport) when the keyboard
+//     opens, so position:fixed footers/composers don't get covered.
+export function installMobileViewportMeta() {
+  try {
+    const existing = document.querySelectorAll('meta[name="viewport"]');
+    existing.forEach((el) => el.remove());
+    const meta = document.createElement("meta");
+    meta.setAttribute("name", "viewport");
+    meta.setAttribute(
+      "content",
+      "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content",
+    );
+    document.head.appendChild(meta);
+  } catch {
+    // ignored: best-effort.
+  }
+}

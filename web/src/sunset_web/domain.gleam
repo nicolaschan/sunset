@@ -168,3 +168,31 @@ pub type RoleOpt {
   HasRole(String)
   NoRole
 }
+
+/// Viewport class derived from `matchMedia("(max-width: 767px)")`.
+/// Updated on init and on resize. Phone gates the entire mobile
+/// layout branch in `shell.view`.
+pub type Viewport {
+  Phone
+  Desktop
+}
+
+/// Drawer that's currently open on phone. Carried as `Option(Drawer)`
+/// on the model; `None` means closed. Desktop ignores this field
+/// because drawers don't render on desktop. Channels↔rooms is modeled
+/// as a swap (replacing the field's value), not a stack.
+pub type Drawer {
+  RoomsDrawer
+  ChannelsDrawer
+  MembersDrawer
+}
+
+/// Bottom sheet currently open on phone. Carried as `Option(Sheet)` on
+/// the model; `None` means closed. Replaces two separate optional
+/// fields (detail message id, voice popover member name) so the model
+/// can't end up with both the details panel AND the voice popover up
+/// at the same time.
+pub type Sheet {
+  DetailsSheet(message_id: String)
+  VoiceSheet(member_name: String)
+}

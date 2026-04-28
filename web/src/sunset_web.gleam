@@ -15,10 +15,14 @@
 import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import lustre
+import lustre/attribute
 import lustre/effect.{type Effect}
 import lustre/element.{type Element}
+import lustre/element/html
+import lustre/event
 import sunset_web/domain.{
   type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
   NoRelay, Reaction, Reconnecting, Room, RoomId,
@@ -27,13 +31,18 @@ import sunset_web/fixture
 import sunset_web/storage
 import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
 import sunset_web/theme.{type Mode, Dark, Light}
+import sunset_web/ui
+import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
 import sunset_web/views/details_panel
 import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
+import sunset_web/views/phone_header
 import sunset_web/views/rooms
 import sunset_web/views/shell
+import sunset_web/views/touch_drag
+import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
 
 pub type View {
@@ -52,7 +61,6 @@ pub type Model {
     current_channel: ChannelId,
     draft: String,
     reacting_to: Option(String),
-    detail_msg_id: Option(String),
     reactions: Dict(String, List(Reaction)),
     /// Name of the room currently being dragged in the rooms rail.
     /// `None` between drag operations.
@@ -60,9 +68,6 @@ pub type Model {
     /// Name of the room currently hovered over while dragging — used
     /// for the visible drop-target indicator.
     drag_over_room: Option(String),
-    /// Member name whose voice popover is currently open. None when
-    /// no popover is showing.
-    voice_popover: Option(String),
     /// Per-member voice tweaks (volume / denoise / deafened),
     /// keyed by member name. Seeded from the fixture once.
     voice_settings: Dict(String, domain.VoiceSettings),
@@ -74,6 +79,16 @@ pub type Model {
     relay_status: String,
     /// Live members list from the presence tracker. Empty on first load.
     members: List(domain.Member),
+    /// Viewport class — drives the desktop/phone branch in `shell.view`.
+    viewport: domain.Viewport,
+    /// Currently open drawer on phone. Ignored on desktop. Channels and
+    /// rooms drawers cross-transition (one swaps for the other) rather
+    /// than stack.
+    drawer: Option(domain.Drawer),
+    /// Currently open bottom sheet on phone. Also drives the desktop
+    /// right-rail (DetailsSheet → details_panel) and floating voice
+    /// popover (VoiceSheet → voice_popover.view).
+    sheet: Option(domain.Sheet),
   )
 }
 
@@ -114,9 +129,13 @@ pub type Msg {
   MessageSent(Result(String, String))
   MembersUpdated(List(domain.Member))
   RelayStatusUpdated(String)
+  ViewportChanged(domain.Viewport)
+  OpenDrawer(domain.Drawer)
+  CloseDrawer
 }
 
 pub fn main() {
+  storage.install_mobile_viewport_meta()
   let app = lustre.application(init, update, view)
   let assert Ok(_) = lustre.start(app, "#app", Nil)
   Nil
@@ -155,6 +174,11 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
     RoomView(name) -> ensure_joined(stored_rooms, name)
   }
 
+  let initial_viewport = case storage.is_phone_viewport() {
+    True -> domain.Phone
+    False -> domain.Desktop
+  }
+
   let model =
     Model(
       mode: initial_mode,
@@ -166,16 +190,17 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       current_channel: ChannelId(fixture.initial_channel_id),
       draft: "",
       reacting_to: None,
-      detail_msg_id: None,
       reactions: seed_reactions(),
       dragging_room: None,
       drag_over_room: None,
-      voice_popover: None,
       voice_settings: seed_voice_settings(),
       client: None,
       messages: [],
       relay_status: "disconnected",
       members: [],
+      viewport: initial_viewport,
+      drawer: None,
+      sheet: None,
     )
 
   let subscribe_hash =
@@ -208,9 +233,39 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       sunset.load_or_create_identity(fn(seed) { dispatch(IdentityReady(seed)) })
     })
 
+  let subscribe_viewport =
+    effect.from(fn(dispatch) {
+      storage.on_viewport_change(fn(is_phone) {
+        let v = case is_phone {
+          True -> domain.Phone
+          False -> domain.Desktop
+        }
+        dispatch(ViewportChanged(v))
+      })
+    })
+
+  let subscribe_touch_drag =
+    effect.from(fn(dispatch) {
+      touch_drag.attach(
+        touch_drag.Callbacks(
+          on_start: fn(name) { dispatch(DragRoomStart(name)) },
+          on_over: fn(name) { dispatch(DragRoomOver(name)) },
+          on_drop: fn(name) { dispatch(DropRoomOn(name)) },
+          on_end: fn() { dispatch(DragRoomEnd) },
+        ),
+      )
+    })
+
   #(
     model,
-    effect.batch([subscribe_hash, initial_persist, initial_hash_sync, bootstrap]),
+    effect.batch([
+      subscribe_hash,
+      initial_persist,
+      initial_hash_sync,
+      bootstrap,
+      subscribe_viewport,
+      subscribe_touch_drag,
+    ]),
   )
 }
 
@@ -359,6 +414,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               view: RoomView(name),
               landing_input: "",
               sidebar_search: "",
+              drawer: None,
             )
           let persist_eff = case was_new {
             True ->
@@ -597,15 +653,37 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(new_model, effect.none())
     }
     OpenDetail(id) -> #(
-      Model(..model, detail_msg_id: Some(id), reacting_to: None),
+      Model(
+        ..model,
+        sheet: Some(domain.DetailsSheet(message_id: id)),
+        reacting_to: None,
+      ),
       effect.none(),
     )
-    CloseDetail -> #(Model(..model, detail_msg_id: None), effect.none())
+    CloseDetail -> #(
+      // Only close if the active sheet is the details one — guards against
+      // a Voice sheet being opened concurrently and accidentally dismissed.
+      Model(..model, sheet: case model.sheet {
+        Some(domain.DetailsSheet(_)) -> None
+        other -> other
+      }),
+      effect.none(),
+    )
     OpenVoicePopover(name) -> #(
-      Model(..model, voice_popover: Some(name)),
+      Model(
+        ..model,
+        sheet: Some(domain.VoiceSheet(member_name: name)),
+        reacting_to: None,
+      ),
       effect.none(),
     )
-    CloseVoicePopover -> #(Model(..model, voice_popover: None), effect.none())
+    CloseVoicePopover -> #(
+      Model(..model, sheet: case model.sheet {
+        Some(domain.VoiceSheet(_)) -> None
+        other -> other
+      }),
+      effect.none(),
+    )
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, volume: value)
@@ -650,6 +728,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       ),
       effect.none(),
     )
+    ViewportChanged(v) -> {
+      // Crossing the boundary in either direction closes any open drawer.
+      // Sheets intentionally survive: DetailsSheet and VoiceSheet render
+      // on both viewports (right-rail / floating popover on desktop).
+      #(Model(..model, viewport: v, drawer: None), effect.none())
+    }
+    OpenDrawer(d) -> #(Model(..model, drawer: Some(d)), effect.none())
+    CloseDrawer -> #(Model(..model, drawer: None), effect.none())
   }
 }
 
@@ -698,6 +784,7 @@ fn view(model: Model) -> Element(Msg) {
       landing.view(
         palette: palette,
         mode: model.mode,
+        viewport: model.viewport,
         input: model.landing_input,
         noop: NoOp,
         on_input: UpdateLandingInput,
@@ -722,17 +809,98 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       }
     })
 
-  let detail_msg = case model.detail_msg_id {
-    None -> None
-    Some(id) -> find_message(messages_with_live_reactions, id)
+  let detail_msg = case model.sheet {
+    Some(domain.DetailsSheet(message_id: id)) ->
+      find_message(messages_with_live_reactions, id)
+    _ -> None
+  }
+
+  let reaction_sheet_el = case model.viewport, model.reacting_to {
+    domain.Phone, Some(id) ->
+      bottom_sheet.view(
+        palette: palette,
+        open: True,
+        on_close: ToggleReactionPicker(id),
+        test_id: "reaction-sheet",
+        content: phone_reaction_grid(palette, id),
+      )
+    _, _ -> element.fragment([])
+  }
+
+  let details_sheet_el = case model.viewport, model.sheet {
+    domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
+      case find_message(messages_with_live_reactions, id) {
+        Some(m) ->
+          bottom_sheet.view(
+            palette: palette,
+            open: True,
+            on_close: CloseDetail,
+            test_id: "details-sheet",
+            content: details_panel.view(
+              palette: palette,
+              message: m,
+              on_close: CloseDetail,
+            ),
+          )
+        None -> element.fragment([])
+      }
+    _, _ -> element.fragment([])
+  }
+
+  let voice_sheet_el = case model.viewport, model.sheet {
+    domain.Phone, Some(domain.VoiceSheet(member_name: name)) ->
+      case list.find(fixture.members(), fn(m) { m.name == name }) {
+        Ok(m) ->
+          bottom_sheet.view(
+            palette: palette,
+            open: True,
+            on_close: CloseVoicePopover,
+            test_id: "voice-sheet",
+            content: voice_popover.view(
+              palette: palette,
+              placement: voice_popover.InSheet,
+              member: m,
+              settings: member_voice_settings(model.voice_settings, name),
+              on_close: CloseVoicePopover,
+              on_set_volume: fn(v) { SetMemberVolume(name, v) },
+              on_toggle_denoise: ToggleMemberDenoise(name),
+              on_toggle_deafen: ToggleMemberDeafen(name),
+              on_reset: ResetMemberVoice(name),
+            ),
+          )
+        Error(_) -> element.fragment([])
+      }
+    _, _ -> element.fragment([])
+  }
+
+  let user_in_call = list.any(fixture.members(), fn(m) { m.you && m.in_call })
+
+  let active_voice_channel_name =
+    list.find(fixture.channels(), fn(c) {
+      c.kind == domain.Voice && c.in_call > 0
+    })
+    |> result.map(fn(c) { c.name })
+    |> result.unwrap("")
+
+  let voice_minibar_el = case model.viewport, user_in_call {
+    domain.Phone, True ->
+      voice_minibar.view(
+        palette: palette,
+        channel_name: active_voice_channel_name,
+        on_open: OpenVoicePopover("you"),
+      )
+    _, _ -> element.fragment([])
   }
 
   shell.view(
     model.mode,
     palette,
+    model.viewport,
     model.rooms_collapsed,
     detail_msg != None,
+    model.drawer,
     ToggleMode,
+    CloseDrawer,
     rooms.view(
       palette: palette,
       rooms: filtered,
@@ -755,6 +923,9 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_drop: DropRoomOn,
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
+      viewport: model.viewport,
+      mode: model.mode,
+      on_toggle_mode: ToggleMode,
     ),
     // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
     channels.view(
@@ -763,12 +934,18 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       channels: fixture.channels(),
       members: fixture.members(),
       current_channel: model.current_channel,
-      voice_popover_open: model.voice_popover,
+      voice_popover_open: case model.sheet {
+        Some(domain.VoiceSheet(member_name: name)) -> Some(name)
+        _ -> None
+      },
       on_select_channel: SelectChannel,
       on_open_voice_popover: OpenVoicePopover,
+      viewport: model.viewport,
+      on_open_rooms: OpenDrawer(domain.RoomsDrawer),
     ),
     main_panel.view(
       palette: palette,
+      viewport: model.viewport,
       current_channel: model.current_channel,
       messages: messages_with_live_reactions,
       draft: model.draft,
@@ -776,30 +953,43 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_submit: SubmitDraft,
       noop: NoOp,
       reacting_to: model.reacting_to,
-      detail_msg_id: model.detail_msg_id,
+      detail_msg_id: case model.sheet {
+        Some(domain.DetailsSheet(message_id: id)) -> Some(id)
+        _ -> None
+      },
       on_toggle_reaction_picker: ToggleReactionPicker,
       on_add_reaction: AddReaction,
       on_open_detail: OpenDetail,
     ),
-    case detail_msg {
-      Some(m) ->
+    case model.viewport, detail_msg {
+      domain.Desktop, Some(m) ->
         details_panel.view(palette: palette, message: m, on_close: CloseDetail)
-      None -> members.view(palette: palette, members: model.members)
+      _, _ -> members.view(palette: palette, members: model.members)
     },
     voice_popover_overlay(palette, model),
+    phone_header.view(
+      palette: palette,
+      room: active_room,
+      on_open_channels: OpenDrawer(domain.ChannelsDrawer),
+      on_open_members: OpenDrawer(domain.MembersDrawer),
+    ),
+    voice_minibar_el,
+    details_sheet_el,
+    voice_sheet_el,
+    reaction_sheet_el,
   )
 }
 
 fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
-  case model.voice_popover {
-    None -> element.fragment([])
-    Some(name) ->
+  case model.viewport, model.sheet {
+    domain.Desktop, Some(domain.VoiceSheet(member_name: name)) ->
       // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
       case list.find(fixture.members(), fn(m) { m.name == name }) {
         Error(_) -> element.fragment([])
         Ok(m) ->
           voice_popover.view(
             palette: palette,
+            placement: voice_popover.Floating,
             member: m,
             settings: member_voice_settings(model.voice_settings, name),
             on_close: CloseVoicePopover,
@@ -809,6 +999,7 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
             on_reset: ResetMemberVoice(name),
           )
       }
+    _, _ -> element.fragment([])
   }
 }
 
@@ -898,4 +1089,41 @@ fn connection_mode_to_relay(s: String) -> domain.RelayStatus {
     "self" -> domain.SelfRelay
     _ -> domain.NoRelay
   }
+}
+
+fn phone_reaction_grid(
+  palette: theme.Palette,
+  message_id: String,
+) -> Element(Msg) {
+  let emojis = ["🌅", "👍", "👀", "🔥", "🌙"]
+  html.div(
+    [
+      attribute.attribute("data-testid", "reaction-picker"),
+      ui.css([
+        #("display", "grid"),
+        #("grid-template-columns", "repeat(5, 1fr)"),
+        #("gap", "8px"),
+        #("padding", "16px 16px 24px 16px"),
+      ]),
+    ],
+    list.map(emojis, fn(e) {
+      html.button(
+        [
+          attribute.attribute("aria-label", e),
+          event.on_click(AddReaction(message_id, e)),
+          ui.css([
+            #("padding", "12px"),
+            #("font-size", "26px"),
+            #("border", "1px solid " <> palette.border_soft),
+            #("background", palette.surface),
+            #("color", palette.text),
+            #("border-radius", "10px"),
+            #("font-family", "inherit"),
+            #("cursor", "pointer"),
+          ]),
+        ],
+        [html.text(e)],
+      )
+    }),
+  )
 }

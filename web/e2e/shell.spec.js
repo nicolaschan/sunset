@@ -62,7 +62,8 @@ test("all four columns render in light mode", async ({ page }) => {
   });
 });
 
-test("theme toggle flips light to dark", async ({ page }) => {
+test("theme toggle flips light to dark", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   const toggle = page.getByTestId("theme-toggle");
 
   // The icon-only button advertises its target mode via title.
@@ -94,7 +95,8 @@ test("theme toggle flips light to dark", async ({ page }) => {
   });
 });
 
-test("theme choice persists across reloads", async ({ page }) => {
+test("theme choice persists across reloads", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   const toggle = page.getByTestId("theme-toggle");
   // Start in light mode (the default for this beforeEach setup).
   await expect(toggle).toHaveAttribute("title", /dark/i);
@@ -115,7 +117,8 @@ test.describe("system theme default", () => {
 
   test("with no saved choice, the OS dark preference wins", async ({
     page,
-  }) => {
+  }, testInfo) => {
+    test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
     // Use a dedicated emulated colorScheme + an isolated localStorage.
     await page.goto("/");
     await page.evaluate(() => {
@@ -132,7 +135,8 @@ test.describe("system theme default", () => {
   });
 });
 
-test("rooms rail collapse button changes the rail width", async ({ page }) => {
+test("rooms rail collapse button changes the rail width", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   const collapse = page.getByRole("button", { name: /Collapse rooms/i });
   const rail = page.getByTestId("rooms-rail");
 
@@ -168,7 +172,8 @@ test("no body-level scrollbar appears", async ({ page }) => {
 
 test("collapsed rail hides the logo and never overflows horizontally", async ({
   page,
-}) => {
+}, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   const rail = page.getByTestId("rooms-rail");
 
   await page.getByRole("button", { name: /Collapse rooms/i }).click();
@@ -225,7 +230,31 @@ test("favicon link points at favicon.svg", async ({ page }) => {
   expect(href).toMatch(/favicon\.svg$/);
 });
 
-test("channels and main column bottom borders line up", async ({ page }) => {
+test("viewport meta is mobile-friendly (safe-area + keyboard resize)", async ({
+  page,
+}) => {
+  const content = await page.evaluate(
+    () => document.querySelector('meta[name="viewport"]').getAttribute("content"),
+  );
+  expect(content).toContain("viewport-fit=cover");
+  expect(content).toContain("interactive-widget=resizes-content");
+});
+
+test("composer input font-size is at least 16px (iOS no-zoom)", async ({
+  page,
+}) => {
+  // The composer input or textarea must render at >= 16px on phone so iOS
+  // doesn't auto-zoom on focus. We assert via computed style; this passes
+  // on desktop too since the inherited size is already >= 16px.
+  const fontSize = await page.evaluate(() => {
+    const el = document.querySelector("main input, main textarea");
+    return el ? parseFloat(getComputedStyle(el).fontSize) : 0;
+  });
+  expect(fontSize).toBeGreaterThanOrEqual(16);
+});
+
+test("channels and main column bottom borders line up", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   // Channels rail is the second <aside>; main column is <main>.
   const offsets = await page.evaluate(() => {
     const channelsHeader = document.querySelectorAll("aside")[1].firstElementChild;
@@ -243,7 +272,8 @@ test("channels and main column bottom borders line up", async ({ page }) => {
   expect(Math.abs(offsets.channels - offsets.main)).toBeLessThanOrEqual(1);
 });
 
-test("column-bottom rows share a top y-coordinate", async ({ page }) => {
+test("column-bottom rows share a top y-coordinate", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
   // Rooms rail's pinned 'you' row, channels rail's self-control bar, and
   // main panel's composer all sit at the bottom of their column. Their
   // top borders must align horizontally so the layout reads as a single
@@ -382,4 +412,108 @@ test.skip("info button on a delivered incoming message also opens details", asyn
   await expect(panel.getByText(/9b1d…74/)).toBeVisible();
   await expect(panel.getByTestId("receipt-row").first()).toBeVisible();
   await page.getByTestId("details-close").click();
+});
+
+test.describe("phone shell smoke", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  test("phone header is visible on phone viewport", async ({ page }) => {
+    await expect(page.getByTestId("phone-rooms-toggle")).toBeVisible();
+    await expect(page.getByTestId("phone-members-toggle")).toBeVisible();
+    await expect(page.getByTestId("phone-header").getByText("dusk-collective")).toBeVisible();
+  });
+
+  test("tapping room title in channels drawer opens rooms drawer", async ({
+    page,
+  }) => {
+    await page.getByTestId("phone-rooms-toggle").click();
+    await expect(page.getByTestId("channels-drawer")).toBeVisible();
+    await expect(page.getByTestId("channels-room-title")).toBeVisible();
+
+    await page.getByTestId("channels-room-title").click();
+    await expect(page.getByTestId("rooms-drawer")).toBeVisible();
+  });
+
+  test("rooms drawer closes after selecting a room", async ({ page }) => {
+    await page.getByTestId("phone-rooms-toggle").click();
+    await page.getByTestId("channels-room-title").click();
+    // Sidebar search lives inside the rooms drawer.
+    const drawer = page.getByTestId("rooms-drawer");
+    await drawer.getByTestId("rooms-search").fill("design-crit");
+    await drawer.getByTestId("rooms-search").press("Enter");
+
+    // Either the drawer is closed (translateX(-100%)) or no longer visible.
+    // Simplest assertion: backdrop opacity is 0 (drawer closed).
+    // Three drawer-backdrop elements exist (channels/rooms/members); all should
+    // be at opacity 0 when no drawer is open. Check them individually.
+    for (const backdrop of await page.getByTestId("drawer-backdrop").all()) {
+      await expect(backdrop).toHaveCSS("opacity", "0");
+    }
+    await expect(page).toHaveURL(/#design-crit$/);
+  });
+
+  test("phone has theme toggle in rooms drawer footer (and not as a fixed pill)", async ({
+    page,
+  }) => {
+    await page.getByTestId("phone-rooms-toggle").click();
+    await page.getByTestId("channels-room-title").click();
+    await expect(page.getByTestId("phone-theme-toggle")).toBeVisible();
+    // Desktop fixed toggle isn't rendered on phone.
+    expect(await page.getByTestId("theme-toggle").count()).toBe(0);
+  });
+});
+
+test.describe("phone — details sheet", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  // Skipped: depends on fixture messages being rendered into the chat column.
+  // Since Plan E, messages come from the live engine only, so the msg-row
+  // with "routing thru ravi" does not exist on a fresh page load. Unblock
+  // once fixtures are merged back or messages carry HasDetails from the engine.
+  test.skip("info button on a delivered message opens the details bottom sheet", async ({
+    page,
+  }) => {
+    const row = page.locator(".msg-row", { hasText: "routing thru ravi" });
+    await row.getByRole("button", { name: /Message details/i }).click();
+    const sheet = page.getByTestId("details-sheet");
+    await expect(sheet).toBeVisible();
+    await expect(sheet.getByText(/8f3c…a2/)).toBeVisible();
+  });
+});
+
+test.describe("phone — reaction picker", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    await page.goto("/");
+    await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+    await page.goto("/#dusk-collective");
+    await expect(page.getByTestId("phone-header")).toBeVisible();
+  });
+
+  // Skipped: depends on msg-row elements being present in the chat column.
+  // Since Plan E, messages come from the live engine only, so no .msg-row
+  // exists on a fresh page load (the engine isn't connected in tests).
+  // Unblock once fixtures are merged back or the test seeds a message first.
+  test.skip("react button opens the picker as a bottom sheet", async ({ page }) => {
+    const row = page.locator(".msg-row").first();
+    // Tap the React action — actions are always-visible on touch (Task 18).
+    await row.getByRole("button", { name: /^React$/ }).click();
+    const sheet = page.getByTestId("reaction-sheet");
+    await expect(sheet).toBeVisible();
+    // Click an emoji and confirm sheet closes.
+    await sheet.getByRole("button", { name: /🔥/ }).click();
+    await expect(sheet).not.toBeVisible();
+  });
 });

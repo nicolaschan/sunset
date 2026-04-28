@@ -25,8 +25,14 @@ import sunset_web/domain.{
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
+pub type Placement {
+  Floating
+  InSheet
+}
+
 pub fn view(
   palette p: Palette,
+  placement placement: Placement,
   member m: Member,
   settings settings: VoiceSettings,
   on_close on_close: msg,
@@ -41,38 +47,52 @@ pub fn view(
     False -> 200
   }
 
-  html.div(
-    [
-      attribute.attribute("data-testid", "voice-popover"),
-      ui.css([
-        // Float over the four-column grid. Anchored at top-left of the
-        // chat area so the popover stays a stable, easy target without
-        // needing live anchor positioning. The user can dismiss with
-        // the X or by clicking another voice row.
-        #("position", "fixed"),
-        #("top", "120px"),
-        #("left", "540px"),
-        #("width", "320px"),
-        #("background", p.surface),
-        #("color", p.text),
-        #("border", "1px solid " <> p.border),
-        #("border-radius", "10px"),
-        #("box-shadow", p.shadow_lg),
-        #("z-index", "20"),
-        #("display", "flex"),
-        #("flex-direction", "column"),
-      ]),
-    ],
-    [
-      header(p, m, settings, on_close),
-      waveform_strip(p, m, settings),
-      body(p, m, settings, max_volume, on_set_volume, on_toggle_denoise),
-      case is_self {
-        True -> element.fragment([])
-        False -> footer(p, settings, on_toggle_deafen, on_reset)
-      },
-    ],
-  )
+  let body_children = [
+    header(p, m, settings, on_close),
+    waveform_strip(p, m, settings),
+    body(p, m, settings, max_volume, on_set_volume, on_toggle_denoise),
+    case is_self {
+      True -> element.fragment([])
+      False -> footer(p, settings, on_toggle_deafen, on_reset)
+    },
+  ]
+
+  case placement {
+    Floating ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "voice-popover"),
+          ui.css([
+            #("position", "fixed"),
+            #("top", "120px"),
+            #("left", "540px"),
+            #("width", "320px"),
+            #("background", p.surface),
+            #("color", p.text),
+            #("border", "1px solid " <> p.border),
+            #("border-radius", "10px"),
+            #("box-shadow", p.shadow_lg),
+            #("z-index", "20"),
+            #("display", "flex"),
+            #("flex-direction", "column"),
+          ]),
+        ],
+        body_children,
+      )
+    InSheet ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "voice-popover"),
+          ui.css([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("width", "100%"),
+            #("color", p.text),
+          ]),
+        ],
+        body_children,
+      )
+  }
 }
 
 fn header(

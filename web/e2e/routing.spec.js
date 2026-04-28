@@ -4,6 +4,7 @@
 // clears it before each navigation.
 
 import { expect, test } from "@playwright/test";
+import { openRoomsDrawer } from "./helpers/viewport.js";
 
 test.describe("landing + routing", () => {
   test.beforeEach(async ({ page }) => {
@@ -64,14 +65,16 @@ test.describe("landing + routing", () => {
     await expect(page.getByTestId("rooms-rail")).toBeVisible();
   });
 
-  test("rooms-rail search filters the visible rooms", async ({ page }) => {
+  test("rooms-rail search filters the visible rooms", async ({ page }, testInfo) => {
     await page.goto("/#dusk-collective");
     // Add a second room from the sidebar so we have two to filter.
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("design-crit");
     await page.getByTestId("rooms-search-join").click();
     await expect(page).toHaveURL(/#design-crit$/);
 
     // Filter by "dusk" — only dusk-collective should remain visible.
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("dusk");
     await expect(
       page.getByTestId("rooms-rail").getByText("dusk-collective"),
@@ -102,11 +105,12 @@ test.describe("landing + routing", () => {
 
   test("delete button removes a room; deleting all returns to landing", async ({
     page,
-  }) => {
+  }, testInfo) => {
     await page.goto("/");
     // Join two rooms.
     await page.getByTestId("landing-input").fill("dusk-collective");
     await page.getByTestId("landing-input").press("Enter");
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("design-crit");
     await page.getByTestId("rooms-search").press("Enter");
     await expect(page).toHaveURL(/#design-crit$/);
@@ -114,6 +118,7 @@ test.describe("landing + routing", () => {
     // Delete the active room (design-crit). The rail's per-row delete
     // button is hidden until hover; force the click since the room-row
     // wrappers carry the hover-only styling.
+    await openRoomsDrawer(page, testInfo);
     await page
       .getByTestId("rooms-rail")
       .locator('.room-row', { hasText: "design-crit" })
@@ -126,6 +131,16 @@ test.describe("landing + routing", () => {
       page.getByTestId("rooms-rail").getByText("design-crit"),
     ).not.toBeVisible();
 
+    // On mobile the rooms drawer stays open after deletion. Reload the page to
+    // reset all in-memory state (drawer open/closed), then re-open the drawer.
+    await page.reload();
+    if (testInfo.project.name === "mobile-chrome") {
+      await expect(page.getByTestId("phone-header")).toBeVisible();
+    } else {
+      await expect(page.getByText("sunset", { exact: true })).toBeVisible();
+    }
+    await openRoomsDrawer(page, testInfo);
+
     // Delete the last remaining room → back to landing.
     await page
       .getByTestId("rooms-rail")
@@ -136,14 +151,16 @@ test.describe("landing + routing", () => {
     await expect(page.getByTestId("landing-view")).toBeVisible();
   });
 
-  test("selecting a room does not reorder the list", async ({ page }) => {
+  test("selecting a room does not reorder the list", async ({ page }, testInfo) => {
     // Join three rooms in a known order. Joins prepend so the
     // resulting top-to-bottom order is gamma → beta → alpha.
     await page.goto("/");
     await page.getByTestId("landing-input").fill("alpha");
     await page.getByTestId("landing-input").press("Enter");
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("beta");
     await page.getByTestId("rooms-search").press("Enter");
+    await openRoomsDrawer(page, testInfo);
     await page.getByTestId("rooms-search").fill("gamma");
     await page.getByTestId("rooms-search").press("Enter");
 
@@ -155,6 +172,7 @@ test.describe("landing + routing", () => {
           rows.map((r) => r.getAttribute("data-room-name") || ""),
         );
 
+    await openRoomsDrawer(page, testInfo);
     expect((await railOrder()).slice(0, 3)).toEqual([
       "gamma",
       "beta",
@@ -168,6 +186,7 @@ test.describe("landing + routing", () => {
       .click();
     await expect(page).toHaveURL(/#alpha$/);
 
+    await openRoomsDrawer(page, testInfo);
     expect((await railOrder()).slice(0, 3)).toEqual([
       "gamma",
       "beta",
@@ -226,5 +245,120 @@ test.describe("landing + routing", () => {
     // Reload — the order should survive.
     await page.reload();
     await expect.poll(railOrder).toEqual(["alpha", "gamma", "beta"]);
+  });
+
+  test.describe("phone — landing", () => {
+    test.beforeEach(async ({ page }, testInfo) => {
+      test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    });
+
+    test("landing fills the viewport edge-to-edge", async ({ page }) => {
+      await page.goto("/");
+      await expect(page.getByTestId("landing-view")).toBeVisible();
+      const input = page.getByTestId("landing-input");
+      await expect(input).toBeVisible();
+      const inputBox = await input.boundingBox();
+      const viewport = page.viewportSize();
+      // Input should be near full-width minus our 24px gutters.
+      expect(inputBox.width).toBeGreaterThan(viewport.width - 60);
+    });
+  });
+
+  test.describe("phone — touch drag-drop", () => {
+    test.beforeEach(async ({ page }, testInfo) => {
+      test.skip(testInfo.project.name !== "mobile-chrome", "phone-only test");
+    });
+
+    test("long-press + drag reorders rooms", async ({ page }) => {
+      // Add three rooms in known order via landing + sidebar search.
+      // Rooms-drawer navigation: toggle opens channels-drawer; tapping
+      // the room title inside opens rooms-drawer. Wait for each drawer
+      // to be visible before interacting (220ms CSS slide-in transition).
+      await page.goto("/");
+      await page.evaluate(() => { try { localStorage.clear(); } catch {} });
+      await page.goto("/");
+      await page.getByTestId("landing-input").fill("alpha");
+      await page.getByTestId("landing-input").press("Enter");
+
+      // Helper: wait for a drawer to finish sliding in (translateX(0)).
+      // Playwright's toBeVisible / toBeInViewport don't wait for the 220ms
+      // CSS transition to complete, so we poll the transform directly.
+      const waitForDrawerOpen = (testId) =>
+        page.waitForFunction((tid) => {
+          const el = document.querySelector(`[data-testid="${tid}"]`);
+          if (!el) return false;
+          const rect = el.getBoundingClientRect();
+          return rect.x >= -1; // fully in-viewport (or essentially so)
+        }, testId, { timeout: 3000 });
+
+      // Open channels → rooms, add beta.
+      await page.getByTestId("phone-rooms-toggle").click();
+      await waitForDrawerOpen("channels-drawer");
+      await page.getByTestId("channels-room-title").click();
+      await waitForDrawerOpen("rooms-drawer");
+      await page.getByTestId("rooms-drawer").getByTestId("rooms-search").fill("beta");
+      await page.getByTestId("rooms-drawer").getByTestId("rooms-search").press("Enter");
+
+      // Open channels → rooms, add gamma.
+      await page.getByTestId("phone-rooms-toggle").click();
+      await waitForDrawerOpen("channels-drawer");
+      await page.getByTestId("channels-room-title").click();
+      await waitForDrawerOpen("rooms-drawer");
+      await page.getByTestId("rooms-drawer").getByTestId("rooms-search").fill("gamma");
+      await page.getByTestId("rooms-drawer").getByTestId("rooms-search").press("Enter");
+
+      // Re-open the rooms drawer to read bounding boxes.
+      await page.getByTestId("phone-rooms-toggle").click();
+      await waitForDrawerOpen("channels-drawer");
+      await page.getByTestId("channels-room-title").click();
+      await waitForDrawerOpen("rooms-drawer");
+
+      const drawer = page.getByTestId("rooms-drawer");
+
+      await expect.poll(async () =>
+        drawer.locator("[data-room-row]").evaluateAll((rows) =>
+          rows.map((r) => r.getAttribute("data-room-row")),
+        ),
+      ).toEqual(["gamma", "beta", "alpha"]);
+
+      // Simulate touch long-press on alpha then drag onto gamma.
+      const alpha = drawer.locator('[data-room-row="alpha"]');
+      const gamma = drawer.locator('[data-room-row="gamma"]');
+      const aBox = await alpha.boundingBox();
+      const gBox = await gamma.boundingBox();
+
+      await page.evaluate(
+        ({ ax, ay, gx, gy }) => {
+          const fire = (type, x, y) => {
+            const ev = new PointerEvent(type, {
+              pointerType: "touch",
+              clientX: x,
+              clientY: y,
+              bubbles: true,
+              cancelable: true,
+            });
+            document.dispatchEvent(ev);
+          };
+          fire("pointerdown", ax, ay);
+          return new Promise((res) => setTimeout(() => {
+            fire("pointermove", gx, gy);
+            fire("pointerup", gx, gy);
+            res();
+          }, 450));
+        },
+        {
+          ax: aBox.x + aBox.width / 2,
+          ay: aBox.y + aBox.height / 2,
+          gx: gBox.x + gBox.width / 2,
+          gy: gBox.y + gBox.height / 2,
+        },
+      );
+
+      await expect.poll(async () =>
+        drawer.locator("[data-room-row]").evaluateAll((rows) =>
+          rows.map((r) => r.getAttribute("data-room-row")),
+        ),
+      ).toEqual(["alpha", "gamma", "beta"]);
+    });
   });
 });

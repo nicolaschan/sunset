@@ -31,6 +31,7 @@ export default defineConfig({
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "mobile-chrome", use: { ...devices["Pixel 7"] } },
   ],
   webServer: {
     // static-web-server serves the dist directory; --port is bound on
