@@ -1672,6 +1672,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunset-sync-webrtc-browser"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "js-sys",
+ "postcard",
+ "serde",
+ "sunset-store",
+ "sunset-sync",
+ "thiserror 2.0.18",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+]
+
+[[package]]
 name = "sunset-sync-ws-browser"
 version = "0.1.0"
 dependencies = [
