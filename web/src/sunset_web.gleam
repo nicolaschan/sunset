@@ -804,9 +804,9 @@ fn view(model: Model) -> Element(Msg) {
 }
 
 fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
-  let displayed_rooms = resolve_rooms(model.joined_rooms)
+  let displayed_rooms = resolve_rooms(model.joined_rooms, model.relay_status)
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
-  let active_room = lookup_room(displayed_rooms, current_name)
+  let active_room = lookup_room(displayed_rooms, current_name, model.relay_status)
 
   let raw_messages = model.messages
   let messages_with_live_reactions =
@@ -1025,39 +1025,47 @@ fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
 /// Resolve a list of joined room names to rich Room records. Names
 /// that match a fixture room reuse its mock data; anything else falls
 /// back to a synthetic Room so the rail still renders something useful.
-fn resolve_rooms(names: List(String)) -> List(Room) {
+fn resolve_rooms(names: List(String), relay_status: String) -> List(Room) {
   let fixture_rooms = fixture.rooms()
   list.map(names, fn(name) {
     case list.find(fixture_rooms, fn(r) { r.name == name }) {
-      Ok(r) -> Room(..r, id: RoomId(name))
-      Error(_) -> synthetic_room(name)
+      Ok(r) -> Room(..r, status: relay_status_to_conn(relay_status), id: RoomId(name))
+      Error(_) -> synthetic_room(name, relay_status)
     }
   })
 }
 
-fn lookup_room(rs: List(Room), name: String) -> Room {
+fn lookup_room(rs: List(Room), name: String, relay_status: String) -> Room {
   case list.find(rs, fn(r) { r.name == name }) {
     Ok(r) -> r
-    Error(_) -> synthetic_room(name)
+    Error(_) -> synthetic_room(name, relay_status)
   }
 }
 
 /// Default Room record for a name we have no fixture entry for. Reads
 /// like a freshly-joined room with no observed activity yet.
-fn synthetic_room(name: String) -> Room {
-  let _ = NoRelay
-  let _ = Reconnecting
+fn synthetic_room(name: String, relay_status: String) -> Room {
   Room(
     id: RoomId(name),
     name: name,
     members: 1,
     online: 1,
     in_call: 0,
-    status: domain.Connected,
+    status: relay_status_to_conn(relay_status),
     last_active: "now",
     unread: 0,
     bridge: NoBridge,
   )
+}
+
+fn relay_status_to_conn(relay_status: String) -> domain.ConnStatus {
+  case relay_status {
+    "connected" -> domain.Connected
+    "connecting" -> domain.Reconnecting
+    "error" -> domain.Offline
+    "disconnected" -> domain.Offline
+    _ -> domain.Connected
+  }
 }
 
 fn find_message(ms: List(Message), id: String) -> Option(Message) {
