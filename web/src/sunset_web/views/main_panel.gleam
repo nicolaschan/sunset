@@ -43,16 +43,25 @@ pub fn view(
   on_open_detail on_open_detail: fn(String) -> msg,
 ) -> Element(msg) {
   let ChannelId(channel_name) = cur
+  // On phone the host (shell.phone_view) gives this column a flex slot
+  // sized by the page's column layout; setting height: 100dvh here
+  // would overflow that slot and clip the composer behind the iOS URL
+  // bar. Use height: 100% to fill the slot. On desktop the column
+  // lives directly under the grid and needs the dvh anchor itself.
+  let height_props = case viewport {
+    domain.Phone -> [#("height", "100%"), #("min-height", "0")]
+    domain.Desktop -> [#("height", "100vh"), #("height", "100dvh")]
+  }
   html.main(
     [
-      ui.css([
-        #("height", "100vh"),
-        #("height", "100dvh"),
-        #("display", "flex"),
-        #("flex-direction", "column"),
-        #("background", p.surface),
-        #("min-width", "0"),
-      ]),
+      ui.css(
+        list.append(height_props, [
+          #("display", "flex"),
+          #("flex-direction", "column"),
+          #("background", p.surface),
+          #("min-width", "0"),
+        ]),
+      ),
     ],
     [
       channel_header(p, channel_name),

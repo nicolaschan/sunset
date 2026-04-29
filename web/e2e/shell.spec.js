@@ -429,6 +429,27 @@ test.describe("phone shell smoke", () => {
     await expect(page.getByTestId("phone-header").getByText("dusk-collective")).toBeVisible();
   });
 
+  test("composer input is reachable within the visible viewport", async ({
+    page,
+  }) => {
+    // Regression for the iOS URL bar issue: nested 100dvh containers
+    // were forcing the composer below the visible viewport, where the
+    // bottom URL bar covered it on iOS Safari. The composer's bottom
+    // edge must sit within the viewport's bottom edge.
+    const result = await page.evaluate(() => {
+      const input = document.querySelector("main input, main textarea");
+      if (!input) return { found: false };
+      const rect = input.getBoundingClientRect();
+      return {
+        found: true,
+        bottom: rect.bottom,
+        viewportHeight: window.innerHeight,
+      };
+    });
+    expect(result.found).toBe(true);
+    expect(result.bottom).toBeLessThanOrEqual(result.viewportHeight);
+  });
+
   test("tapping room title in channels drawer opens rooms drawer", async ({
     page,
   }) => {
