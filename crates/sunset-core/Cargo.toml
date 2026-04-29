@@ -8,12 +8,18 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-helpers = ["sunset-store/test-helpers", "sunset-sync/test-helpers"]
+
 [dependencies]
 argon2.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
+futures.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 postcard.workspace = true
@@ -23,6 +29,7 @@ sha2.workspace = true
 sunset-store.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
+tokio-stream = { workspace = true }
 zeroize.workspace = true
 
 [dev-dependencies]

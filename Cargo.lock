@@ -1530,10 +1530,13 @@ name = "sunset-core"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-stream",
+ "async-trait",
  "blake3",
  "bytes",
  "chacha20poly1305",
  "ed25519-dalek",
+ "futures",
  "hex",
  "hkdf",
  "postcard",
@@ -1545,6 +1548,7 @@ dependencies = [
  "sunset-sync",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "zeroize",
 ]
 
@@ -1661,6 +1665,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "ed25519-dalek",
  "futures",
  "postcard",
  "serde",
@@ -1891,6 +1896,17 @@ checksum = "bc343d3557ce02aa35bcf205e9770bdd684a6f9056b4da91fa3fbcc45ca64906"
 dependencies = [
  "crossbeam-channel",
  "rusqlite",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
  "tokio",
 ]
 

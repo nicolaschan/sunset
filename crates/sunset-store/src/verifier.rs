@@ -5,7 +5,7 @@
 //! encoding of the rest of the entry, made with `verifying_key`.
 
 use crate::error::Result;
-use crate::types::SignedKvEntry;
+use crate::types::{SignedKvEntry, VerifyingKey};
 
 pub trait SignatureVerifier: Send + Sync {
     /// Verify the structural validity of an entry's signature.
@@ -15,6 +15,21 @@ pub trait SignatureVerifier: Send + Sync {
     /// fields, made with `entry.verifying_key`. They must NOT make any
     /// application-context judgment (delegation chains, trust, etc.).
     fn verify(&self, entry: &SignedKvEntry) -> Result<()>;
+
+    /// Verify a raw `(verifying_key, payload, signature)` triple. Used by
+    /// callers outside the store layer (e.g. `sunset-sync`'s ephemeral
+    /// datagram path) that have already computed the canonical bytes the
+    /// signature is supposed to cover.
+    ///
+    /// Same semantics as `verify`: implementations must check only that
+    /// `signature` is mathematically valid for `payload` under
+    /// `verifying_key` — no identity-context judgment.
+    fn verify_raw(
+        &self,
+        verifying_key: &VerifyingKey,
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<()>;
 }
 
 /// A verifier that accepts everything. Used in tests and in scenarios where
@@ -24,6 +39,10 @@ pub struct AcceptAllVerifier;
 
 impl SignatureVerifier for AcceptAllVerifier {
     fn verify(&self, _entry: &SignedKvEntry) -> Result<()> {
+        Ok(())
+    }
+
+    fn verify_raw(&self, _vk: &VerifyingKey, _payload: &[u8], _sig: &[u8]) -> Result<()> {
         Ok(())
     }
 }

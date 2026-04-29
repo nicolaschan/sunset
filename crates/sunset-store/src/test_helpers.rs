@@ -54,6 +54,10 @@ impl SignatureVerifier for CountingVerifier {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
+    fn verify_raw(&self, _vk: &VerifyingKey, _payload: &[u8], _sig: &[u8]) -> Result<()> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// Drain a subscription stream until an event matching `predicate` is found.

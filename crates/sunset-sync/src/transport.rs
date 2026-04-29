@@ -43,8 +43,10 @@ pub trait Transport {
     async fn accept(&self) -> Result<Self::Connection>;
 }
 
-/// One peer connection. Carries a reliable channel (used by sunset-sync) and
-/// an unreliable channel (used by sunset-core for voice; a no-op for v1).
+/// One peer connection. Carries a reliable channel (used by sunset-sync for
+/// `EventDelivery`, blob transfer, digest exchange, etc.) and an unreliable
+/// channel (used by sunset-sync for `SyncMessage::EphemeralDelivery` —
+/// the Bus's ephemeral fan-out path — and by sunset-core for voice).
 #[async_trait(?Send)]
 pub trait TransportConnection {
     /// Send one message on the reliable channel. Whole-message framing is the
@@ -56,12 +58,15 @@ pub trait TransportConnection {
     async fn recv_reliable(&self) -> Result<Bytes>;
 
     /// Send one message on the unreliable channel (datagram-shaped).
-    /// Reserved for sunset-core voice; sunset-sync does not use it.
+    /// Used by the Bus's ephemeral delivery path. Transports that don't
+    /// support unreliable should return `Err`; the per-peer task drops
+    /// failed unreliable sends silently and keeps the peer alive.
     async fn send_unreliable(&self, bytes: Bytes) -> Result<()>;
 
     /// Receive one message from the unreliable channel. May return spurious
-    /// errors if datagrams are lost in transit; callers should not rely on
-    /// this for protocol state.
+    /// errors if datagrams are lost in transit OR if the transport doesn't
+    /// support unreliable. Callers (the per-peer task) drop on error and
+    /// continue — never use this for protocol state.
     async fn recv_unreliable(&self) -> Result<Bytes>;
 
     /// The peer's identity at the other end of this connection.

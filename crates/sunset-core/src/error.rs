@@ -30,6 +30,12 @@ pub enum Error {
 
     #[error("inner-signature payload too long for postcard encoding")]
     PayloadTooLarge,
+
+    #[error("store: {0}")]
+    Store(String),
+
+    #[error("sync: {0}")]
+    Sync(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
