@@ -163,15 +163,11 @@ impl VoiceEncoder {
 
         // Set bitrate to 24 000 bit/s.
         // Safety: `ptr` is a valid, non-null encoder state.
-        let rc =
-            unsafe { opus_encoder_ctl(ptr, OPUS_SET_BITRATE_REQUEST, 24_000) };
+        let rc = unsafe { opus_encoder_ctl(ptr, OPUS_SET_BITRATE_REQUEST, 24_000) };
         if rc != OPUS_OK {
             // Destroy the encoder before returning the error.
             unsafe { opus_encoder_destroy(ptr) };
-            return Err(Error::Opus(format!(
-                "set_bitrate: {}",
-                opus_err_string(rc)
-            )));
+            return Err(Error::Opus(format!("set_bitrate: {}", opus_err_string(rc))));
         }
 
         Ok(Self {
@@ -205,10 +201,7 @@ impl VoiceEncoder {
         };
 
         if n < 0 {
-            return Err(Error::Opus(format!(
-                "encode_float: {}",
-                opus_err_string(n)
-            )));
+            return Err(Error::Opus(format!("encode_float: {}", opus_err_string(n))));
         }
 
         out.truncate(n as usize);
@@ -248,13 +241,7 @@ impl VoiceDecoder {
         let mut err: i32 = OPUS_OK;
         // Safety: all arguments are valid constants; `err` is a local
         // out-parameter. The returned pointer is non-null on success.
-        let ptr = unsafe {
-            opus_decoder_create(
-                SAMPLE_RATE as i32,
-                CHANNELS as i32,
-                &mut err,
-            )
-        };
+        let ptr = unsafe { opus_decoder_create(SAMPLE_RATE as i32, CHANNELS as i32, &mut err) };
 
         if ptr.is_null() || err != OPUS_OK {
             return Err(Error::Opus(format!(
@@ -296,10 +283,7 @@ impl VoiceDecoder {
         };
 
         if n < 0 {
-            return Err(Error::Opus(format!(
-                "decode_float: {}",
-                opus_err_string(n)
-            )));
+            return Err(Error::Opus(format!("decode_float: {}", opus_err_string(n))));
         }
 
         out.truncate(n as usize);
@@ -327,7 +311,10 @@ mod tests {
         let result = enc.encode(&[0.0_f32; 480]);
         assert!(matches!(
             result,
-            Err(Error::BadFrameSize { expected: 960, got: 480 })
+            Err(Error::BadFrameSize {
+                expected: 960,
+                got: 480
+            })
         ));
     }
 

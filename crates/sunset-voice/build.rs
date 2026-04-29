@@ -197,11 +197,31 @@ fn main() {
         .flag_if_supported("-Wno-strict-prototypes")
         .files(all_sources.iter());
 
+    // Suppress cc::Build's automatic `cargo:rustc-link-lib=static=opus`
+    // emission so we can emit our own directive with the `+whole-archive`
+    // modifier (rustc rejects overriding modifiers on an existing
+    // link-lib directive).
+    build.cargo_metadata(false);
     build.compile("opus");
 
-    // Tell cargo where the compiled library is (cc::Build writes
-    // cargo:rustc-link-lib and cargo:rustc-link-search for us).
-    // We also need to rerun if the vendored source changes.
+    // Force-include all symbols from libopus.a into the final binary.
+    //
+    // On wasm32-unknown-unknown, wasm-ld treats static archives lazily —
+    // it pulls only symbols that are referenced by previously-seen
+    // objects in link order. Rust FFI declarations alone don't get
+    // wasm-ld to pull symbols out of the archive, so the unresolved
+    // symbols become `env` imports in the final wasm bundle and the
+    // page fails to load with "bare specifier 'env' not remapped".
+    //
+    // The `+whole-archive` modifier tells the linker to include every
+    // symbol from libopus.a regardless of whether it's referenced.
+    // For native targets this would bloat the binary; for wasm-ld it
+    // has no overhead because dead-code elimination happens after link.
+    let out_dir = env::var("OUT_DIR").unwrap();
+    println!("cargo:rustc-link-search=native={out_dir}");
+    println!("cargo:rustc-link-lib=static:+whole-archive=opus");
+
+    // Rerun if the vendored source changes.
     println!("cargo:rerun-if-changed=vendor/libopus");
     println!("cargo:rerun-if-changed=build.rs");
 }

@@ -43,9 +43,24 @@
 
       const log = (msg) => {
         const el = document.getElementById("log");
-        el.textContent += msg + "\n";
-        el.scrollTop = el.scrollHeight;
+        if (el) {
+          el.textContent += msg + "\n";
+          el.scrollTop = el.scrollHeight;
+        }
+        // eslint-disable-next-line no-console
+        console.log("[voice-demo]", msg);
       };
+
+      // Surface any uncaught errors / unhandled rejections to the on-page
+      // log so we don't silently fail before the user can see what broke.
+      window.addEventListener("error", (e) => {
+        log("uncaught error: " + (e.error?.stack || e.message));
+      });
+      window.addEventListener("unhandledrejection", (e) => {
+        log("unhandled rejection: " + (e.reason?.stack || e.reason));
+      });
+
+      log("module loaded; init=" + typeof init + " Client=" + typeof Client);
 
       let client = null;
       let audioCtx = null;
@@ -56,8 +71,11 @@
       async function start() {
         document.getElementById("start").disabled = true;
         try {
-          // 1. WASM bootstrap.
-          await init();
+          // 1. WASM bootstrap. Pass the .wasm URL explicitly — the
+          //    default import.meta.url-based lookup is unreliable
+          //    across some bundler/server combos (per the existing
+          //    Gleam FFI's comment).
+          await init("./build/dev/javascript/sunset_web_wasm_bg.wasm");
           log("wasm initialised");
 
           // 2. Construct a Client. The room name is irrelevant for
