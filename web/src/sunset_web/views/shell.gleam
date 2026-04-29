@@ -85,11 +85,14 @@ fn phone_view(
   let channels_open = drawer == option.Some(ChannelsDrawer)
   let members_open = drawer == option.Some(MembersDrawer)
 
+  // Natural flex layout (no position: fixed; inset: 0). With
+  // viewport-fit=cover, the fixed-inset combo lets iOS Safari paint
+  // the bottom URL bar over content (composer disappears behind it).
+  // height: 100dvh dynamically tracks the visible viewport — when the
+  // URL bar collapses on scroll, the shell grows accordingly.
   html.div(
     [
       ui.css([
-        #("position", "fixed"),
-        #("inset", "0"),
         #("background", palette.bg),
         #("color", palette.text),
         #("font-family", theme.font_sans),
@@ -97,6 +100,7 @@ fn phone_view(
         #("line-height", "1.45"),
         #("display", "flex"),
         #("flex-direction", "column"),
+        #("width", "100%"),
         #("height", "100vh"),
         #("height", "100dvh"),
         #("overflow", "hidden"),

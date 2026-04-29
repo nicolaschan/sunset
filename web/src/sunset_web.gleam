@@ -407,6 +407,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         _ -> {
           let was_new = !list.contains(model.joined_rooms, name)
           let new_rooms = ensure_joined(model.joined_rooms, name)
+          // On phone, picking a room from the rooms drawer should land
+          // the user in the channels drawer for the new room (so they
+          // can pick a channel). Otherwise close to chat as before.
+          let new_drawer = case model.viewport, model.drawer {
+            domain.Phone, Some(domain.RoomsDrawer) ->
+              Some(domain.ChannelsDrawer)
+            _, _ -> None
+          }
           let new_model =
             Model(
               ..model,
@@ -414,7 +422,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               view: RoomView(name),
               landing_input: "",
               sidebar_search: "",
-              drawer: None,
+              drawer: new_drawer,
             )
           let persist_eff = case was_new {
             True ->

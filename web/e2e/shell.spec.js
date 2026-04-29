@@ -440,22 +440,23 @@ test.describe("phone shell smoke", () => {
     await expect(page.getByTestId("rooms-drawer")).toBeVisible();
   });
 
-  test("rooms drawer closes after selecting a room", async ({ page }) => {
+  test("rooms drawer transitions to channels drawer after selecting a room", async ({ page }) => {
+    // On phone, picking a room from the rooms drawer should land the
+    // user in the channels drawer for the new room — not close all
+    // drawers — so they can pick a channel without reopening the nav.
     await page.getByTestId("phone-rooms-toggle").click();
     await page.getByTestId("channels-room-title").click();
-    // Sidebar search lives inside the rooms drawer.
-    const drawer = page.getByTestId("rooms-drawer");
-    await drawer.getByTestId("rooms-search").fill("design-crit");
-    await drawer.getByTestId("rooms-search").press("Enter");
+    const roomsDrawer = page.getByTestId("rooms-drawer");
+    await roomsDrawer.getByTestId("rooms-search").fill("design-crit");
+    await roomsDrawer.getByTestId("rooms-search").press("Enter");
 
-    // Either the drawer is closed (translateX(-100%)) or no longer visible.
-    // Simplest assertion: backdrop opacity is 0 (drawer closed).
-    // Three drawer-backdrop elements exist (channels/rooms/members); all should
-    // be at opacity 0 when no drawer is open. Check them individually.
-    for (const backdrop of await page.getByTestId("drawer-backdrop").all()) {
-      await expect(backdrop).toHaveCSS("opacity", "0");
-    }
     await expect(page).toHaveURL(/#design-crit$/);
+    // Rooms drawer slides off-left, channels drawer slides on for the new room.
+    await expect(roomsDrawer).toHaveCSS("transform", /matrix.*-/);
+    await expect(page.getByTestId("channels-drawer")).toHaveCSS(
+      "transform",
+      /matrix\(1, 0, 0, 1, 0, 0\)/,
+    );
   });
 
   test("phone has theme toggle in rooms drawer footer (and not as a fixed pill)", async ({

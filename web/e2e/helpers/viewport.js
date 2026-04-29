@@ -6,8 +6,34 @@ export function isMobile(testInfo) {
   return testInfo.project.name === "mobile-chrome";
 }
 
+// Read which drawer is currently rendered as open. Returns one of
+// "channels", "rooms", "members", or null. We probe the actual
+// transform CSS rather than the model state because the test only
+// has the DOM to work with.
+async function activeDrawer(page) {
+  for (const id of ["channels-drawer", "rooms-drawer", "members-drawer"]) {
+    const t = await page
+      .getByTestId(id)
+      .evaluate((el) => getComputedStyle(el).transform)
+      .catch(() => "");
+    if (t && t !== "none" && !t.includes("-")) {
+      // matrix(1,0,0,1,0,0) = translateX(0); any negative tx means offscreen.
+      return id.replace("-drawer", "");
+    }
+  }
+  return null;
+}
+
 export async function openChannelsDrawer(page, testInfo) {
   if (!isMobile(testInfo)) return;
+  const open = await activeDrawer(page);
+  if (open === "channels") return;
+  // The phone-rooms-toggle lives in the header (z-index 10). When a
+  // drawer is open (z-index 30) it covers the header — close it first.
+  if (open !== null) {
+    await page.getByTestId("drawer-backdrop").first().click({ force: true });
+    await page.waitForTimeout(260);
+  }
   await page.getByTestId("phone-rooms-toggle").click();
   // Wait for the drawer to finish its 220ms transition.
   await page.waitForTimeout(260);
@@ -15,8 +41,13 @@ export async function openChannelsDrawer(page, testInfo) {
 
 export async function openRoomsDrawer(page, testInfo) {
   if (!isMobile(testInfo)) return;
-  await openChannelsDrawer(page, testInfo);
-  // Tap the room title inside the channels drawer to swap to rooms.
+  const open = await activeDrawer(page);
+  if (open === "rooms") return;
+  // From channels we can swap directly via the room title; from any
+  // other state, open channels first.
+  if (open !== "channels") {
+    await openChannelsDrawer(page, testInfo);
+  }
   await page.getByTestId("channels-room-title").click();
   await page.waitForTimeout(260);
 }
