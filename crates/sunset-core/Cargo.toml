@@ -29,6 +29,7 @@ sha2.workspace = true
 sunset-store.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { workspace = true }
 zeroize.workspace = true
 
