@@ -38,9 +38,19 @@ pub fn view(
   mode mode: Mode,
   on_toggle_mode on_toggle_mode: msg,
 ) -> Element(msg) {
-  let width = case col {
-    True -> "54px"
-    False -> "260px"
+  // On phone the rail lives inside a 320px-wide drawer, so it should
+  // fill the drawer's width rather than the desktop 260px column.
+  let width = case viewport, col {
+    domain.Phone, _ -> "100%"
+    domain.Desktop, True -> "54px"
+    domain.Desktop, False -> "260px"
+  }
+  // The drawer wrapper draws its own border-right; suppress the rail's
+  // border-right on phone to avoid a doubled line and the 60px gap that
+  // appears when the rail is narrower than its drawer.
+  let border_right = case viewport {
+    domain.Phone -> "0"
+    domain.Desktop -> "1px solid " <> p.border
   }
   html.aside(
     [
@@ -53,7 +63,7 @@ pub fn view(
         #("display", "flex"),
         #("flex-direction", "column"),
         #("background", p.surface),
-        #("border-right", "1px solid " <> p.border),
+        #("border-right", border_right),
         #("transition", "width 220ms ease"),
         // Children sometimes have absolute-positioned bits (unread badges)
         // that hang outside their bounding box, plus the inline list rows
