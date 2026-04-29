@@ -182,7 +182,10 @@ impl Liveness {
 /// "subscribe registers vs broadcast fires" race is closed: a
 /// subscriber registered before the lock release sees this event;
 /// one registered after gets the next event but not this one.
-fn broadcast(subs: &mut Vec<mpsc::UnboundedSender<PeerLivenessChange>>, change: &PeerLivenessChange) {
+fn broadcast(
+    subs: &mut Vec<mpsc::UnboundedSender<PeerLivenessChange>>,
+    change: &PeerLivenessChange,
+) {
     subs.retain(|tx| tx.send(change.clone()).is_ok());
 }
 
