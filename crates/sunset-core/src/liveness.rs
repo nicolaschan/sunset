@@ -151,10 +151,9 @@ impl Liveness {
     /// The returned stream **does not replay existing state** — use
     /// `snapshot()` for the initial picture and the stream for changes.
     pub async fn subscribe(&self) -> LocalBoxStream<'static, PeerLivenessChange> {
-        use futures::stream::StreamExt;
         let (tx, rx) = mpsc::unbounded_channel::<PeerLivenessChange>();
         self.inner.lock().await.subscribers.push(tx);
-        Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|c| c))
+        Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
     }
 
     /// Read the current state of every tracked peer.
