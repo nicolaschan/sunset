@@ -71,11 +71,7 @@ struct Inner {
 /// The tracker. Cheap to clone via `Arc`; share one instance across
 /// all consumers that care about the same liveness window.
 pub struct Liveness {
-    // Used by run_sweep (Task 4); suppress dead_code until then.
-    #[allow(dead_code)]
     stale_after: Duration,
-    // Used by run_sweep (Task 4); suppress dead_code until then.
-    #[allow(dead_code)]
     clock: Arc<dyn Clock>,
     inner: Mutex<Inner>,
 }
@@ -103,12 +99,11 @@ impl Liveness {
     /// than our current `last_heard_at`) are ignored — liveness state
     /// never goes backwards from a single observation.
     pub async fn observe(&self, peer: PeerId, sender_time: SystemTime) {
+        let now = self.clock.now();
         let mut inner = self.inner.lock().await;
-        let change = match inner.peers.get_mut(&peer) {
-            Some(entry) if sender_time <= entry.last_heard_at => {
-                // Older or equal observation — ignore, no state change.
-                None
-            }
+        // First: process the new observation.
+        let observe_change = match inner.peers.get_mut(&peer) {
+            Some(entry) if sender_time <= entry.last_heard_at => None,
             Some(entry) => {
                 let was_live = entry.state == LivenessState::Live;
                 entry.last_heard_at = sender_time;
@@ -138,8 +133,34 @@ impl Liveness {
                 })
             }
         };
-        if let Some(c) = change {
-            broadcast(&mut inner.subscribers, &c);
+        // Second: sweep all OTHER peers and emit Stale for any timed out.
+        let stale_after = self.stale_after;
+        let mut stale_changes: Vec<PeerLivenessChange> = Vec::new();
+        for (other_peer, entry) in inner.peers.iter_mut() {
+            if other_peer == &peer {
+                continue;
+            }
+            if entry.state == LivenessState::Live
+                && now
+                    .duration_since(entry.last_heard_at)
+                    .ok()
+                    .is_some_and(|d| d > stale_after)
+            {
+                entry.state = LivenessState::Stale;
+                stale_changes.push(PeerLivenessChange {
+                    peer: other_peer.clone(),
+                    state: LivenessState::Stale,
+                    last_heard_at: entry.last_heard_at,
+                });
+            }
+        }
+        // Broadcast: stale events first, then the new observation.
+        // Order matches Task 4 test `observe_triggers_sweep_for_other_peers`.
+        for c in &stale_changes {
+            broadcast(&mut inner.subscribers, c);
+        }
+        if let Some(ref c) = observe_change {
+            broadcast(&mut inner.subscribers, c);
         }
     }
 
@@ -150,10 +171,65 @@ impl Liveness {
     ///
     /// The returned stream **does not replay existing state** — use
     /// `snapshot()` for the initial picture and the stream for changes.
-    pub async fn subscribe(&self) -> LocalBoxStream<'static, PeerLivenessChange> {
+    pub async fn subscribe(self: &Arc<Self>) -> LocalBoxStream<'static, PeerLivenessChange> {
         let (tx, rx) = mpsc::unbounded_channel::<PeerLivenessChange>();
         self.inner.lock().await.subscribers.push(tx);
-        Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+
+        let me = Arc::clone(self);
+        let sweep_period = self.stale_after / 2;
+        let stream = async_stream::stream! {
+            use futures::stream::StreamExt;
+            let mut rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+            let mut ticker = tokio::time::interval(sweep_period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the immediate first tick so we don't run a redundant
+            // sweep before any observation could have fired.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe_change = rx_stream.next() => {
+                        match maybe_change {
+                            Some(change) => yield change,
+                            None => break,
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        me.run_sweep().await;
+                    }
+                }
+            }
+        };
+        Box::pin(stream)
+    }
+
+    /// Sweep all peers and fire `Stale` events for any whose
+    /// `last_heard_at` exceeds `stale_after` relative to the clock's
+    /// current time AND whose current state is `Live`. Idempotent —
+    /// peers already in `Stale` are not re-emitted.
+    pub async fn run_sweep(&self) {
+        let now = self.clock.now();
+        let mut inner = self.inner.lock().await;
+        let stale_after = self.stale_after;
+        let mut to_emit: Vec<PeerLivenessChange> = Vec::new();
+        for (peer, entry) in inner.peers.iter_mut() {
+            if entry.state == LivenessState::Live
+                && now
+                    .duration_since(entry.last_heard_at)
+                    .ok()
+                    .is_some_and(|d| d > stale_after)
+            {
+                entry.state = LivenessState::Stale;
+                to_emit.push(PeerLivenessChange {
+                    peer: peer.clone(),
+                    state: LivenessState::Stale,
+                    last_heard_at: entry.last_heard_at,
+                });
+            }
+        }
+        for change in &to_emit {
+            broadcast(&mut inner.subscribers, change);
+        }
     }
 
     /// Read the current state of every tracked peer.
@@ -204,13 +280,10 @@ mod tests {
             })
         }
 
-        // Used by Task 4 stale-detection tests.
-        #[allow(dead_code)]
         pub fn set(&self, t: SystemTime) {
             *self.now.lock().unwrap() = t;
         }
 
-        // Used by Task 4 stale-detection tests.
         #[allow(dead_code)]
         pub fn advance(&self, d: Duration) {
             let mut g = self.now.lock().unwrap();
@@ -346,5 +419,98 @@ mod tests {
         let b = sub_b.next().await.expect("sub_b sees change");
         assert_eq!(a, b);
         assert_eq!(a.peer, pk(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_sweep_emits_stale_after_window() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock.clone());
+        let mut sub = liveness.subscribe().await;
+        liveness.observe(pk(1), t_secs(100)).await;
+        let live = sub.next().await.expect("live emitted");
+        assert_eq!(live.state, LivenessState::Live);
+
+        // Advance past the stale window (3s) and run sweep manually.
+        clock.set(t_secs(104));
+        liveness.run_sweep().await;
+
+        let stale = sub.next().await.expect("stale emitted");
+        assert_eq!(stale.peer, pk(1));
+        assert_eq!(stale.state, LivenessState::Stale);
+        assert_eq!(stale.last_heard_at, t_secs(100));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_triggers_sweep_for_other_peers() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock.clone());
+        let mut sub = liveness.subscribe().await;
+        liveness.observe(pk(1), t_secs(100)).await;
+        let _live1 = sub.next().await.unwrap();
+
+        // Advance time. Observing peer 2 should also trigger a sweep
+        // that fires Stale for peer 1.
+        clock.set(t_secs(105));
+        liveness.observe(pk(2), t_secs(105)).await;
+
+        // Two events should arrive: peer 2 Live AND peer 1 Stale.
+        // Order: stale-sweep fires before the new observation's broadcast,
+        // so we see Stale(1) then Live(2). Assert without depending on
+        // order by collecting both.
+        let mut got: Vec<PeerLivenessChange> = Vec::new();
+        got.push(sub.next().await.unwrap());
+        got.push(sub.next().await.unwrap());
+        assert!(
+            got.iter()
+                .any(|c| c.peer == pk(1) && c.state == LivenessState::Stale)
+        );
+        assert!(
+            got.iter()
+                .any(|c| c.peer == pk(2) && c.state == LivenessState::Live)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_to_live_transition_emits_live() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock.clone());
+        let mut sub = liveness.subscribe().await;
+        liveness.observe(pk(1), t_secs(100)).await;
+        let _live = sub.next().await.unwrap();
+
+        clock.set(t_secs(104));
+        liveness.run_sweep().await;
+        let stale = sub.next().await.unwrap();
+        assert_eq!(stale.state, LivenessState::Stale);
+
+        // Observe again — should fire Live.
+        liveness.observe(pk(1), t_secs(104)).await;
+        let live_again = sub.next().await.unwrap();
+        assert_eq!(live_again.peer, pk(1));
+        assert_eq!(live_again.state, LivenessState::Live);
+        assert_eq!(live_again.last_heard_at, t_secs(104));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_sweep_is_idempotent_for_already_stale_peer() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock.clone());
+        let mut sub = liveness.subscribe().await;
+        liveness.observe(pk(1), t_secs(100)).await;
+        let _live = sub.next().await.unwrap();
+
+        clock.set(t_secs(104));
+        liveness.run_sweep().await;
+        let _stale = sub.next().await.unwrap();
+
+        // Second sweep should NOT re-emit Stale.
+        liveness.run_sweep().await;
+
+        // Drive one more change so the stream yields, and verify the
+        // second sweep didn't sneak in anything.
+        liveness.observe(pk(2), t_secs(105)).await;
+        let next = sub.next().await.unwrap();
+        assert_eq!(next.peer, pk(2));
+        assert_eq!(next.state, LivenessState::Live);
     }
 }
