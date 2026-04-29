@@ -6,6 +6,7 @@
 //! `docs/superpowers/plans/2026-04-26-sunset-core-identity-and-encrypted-messages.md`
 //! for the scope of this layer.
 
+pub mod bus;
 pub mod canonical;
 pub mod crypto;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod identity;
 pub mod message;
 pub mod verifier;
 
+pub use bus::{Bus, BusEvent};
 pub use crypto::envelope::{EncryptedMessage, SignedMessage};
 pub use crypto::room::{Room, RoomFingerprint};
 pub use error::{Error, Result};
