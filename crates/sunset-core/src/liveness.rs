@@ -93,6 +93,51 @@ impl Liveness {
             }),
         })
     }
+
+    /// Record that we received a fresh event from `peer` claiming it
+    /// was produced at `sender_time`. Out-of-order observations (older
+    /// than our current `last_heard_at`) are ignored — liveness state
+    /// never goes backwards from a single observation.
+    pub async fn observe(&self, peer: PeerId, sender_time: SystemTime) {
+        let mut inner = self.inner.lock().await;
+        match inner.peers.get_mut(&peer) {
+            Some(entry) if sender_time <= entry.last_heard_at => {
+                // Older or equal observation — ignore.
+            }
+            Some(entry) => {
+                entry.last_heard_at = sender_time;
+                // State transitions land in Task 3; for now just record.
+            }
+            None => {
+                inner.peers.insert(
+                    peer,
+                    PeerEntry {
+                        last_heard_at: sender_time,
+                        state: LivenessState::Live,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Read the current state of every tracked peer.
+    pub async fn snapshot(&self) -> HashMap<PeerId, PeerLivenessChange> {
+        let inner = self.inner.lock().await;
+        inner
+            .peers
+            .iter()
+            .map(|(peer, entry)| {
+                (
+                    peer.clone(),
+                    PeerLivenessChange {
+                        peer: peer.clone(),
+                        state: entry.state,
+                        last_heard_at: entry.last_heard_at,
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +179,62 @@ mod tests {
         // Just checks the value type — Arc<Liveness>, with a clock and a
         // 3-second window. Behaviour is added in subsequent tasks.
         assert_eq!(liveness.stale_after, Duration::from_secs(3));
+    }
+
+    use bytes::Bytes;
+    use sunset_store::VerifyingKey;
+
+    fn pk(seed: u8) -> PeerId {
+        PeerId(VerifyingKey::new(Bytes::copy_from_slice(&[seed; 32])))
+    }
+
+    fn t_secs(s: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(s)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_records_peer_in_snapshot() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        liveness.observe(pk(1), t_secs(99)).await;
+        let snap = liveness.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        let entry = snap.get(&pk(1)).expect("peer 1 present");
+        assert_eq!(entry.state, LivenessState::Live);
+        assert_eq!(entry.last_heard_at, t_secs(99));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_out_of_order_is_ignored() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        liveness.observe(pk(1), t_secs(99)).await;
+        // Older sender_time than what we already have — must not regress.
+        liveness.observe(pk(1), t_secs(80)).await;
+        let snap = liveness.snapshot().await;
+        let entry = snap.get(&pk(1)).expect("peer 1 present");
+        assert_eq!(entry.last_heard_at, t_secs(99));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_newer_replaces_older() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        liveness.observe(pk(1), t_secs(99)).await;
+        liveness.observe(pk(1), t_secs(100)).await;
+        let snap = liveness.snapshot().await;
+        assert_eq!(snap.get(&pk(1)).unwrap().last_heard_at, t_secs(100));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_independent_per_peer() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        liveness.observe(pk(1), t_secs(99)).await;
+        liveness.observe(pk(2), t_secs(98)).await;
+        let snap = liveness.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap.get(&pk(1)).unwrap().last_heard_at, t_secs(99));
+        assert_eq!(snap.get(&pk(2)).unwrap().last_heard_at, t_secs(98));
     }
 }
