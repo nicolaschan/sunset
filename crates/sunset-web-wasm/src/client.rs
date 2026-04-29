@@ -306,7 +306,7 @@ impl Client {
 
     /// Submit one 20 ms frame of mono PCM (Float32Array of length 960
     /// at 48 kHz) for encoding + loopback delivery to the output handler.
-    pub fn voice_input(&self, pcm: js_sys::Float32Array) -> Result<(), JsError> {
+    pub fn voice_input(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
         crate::voice::voice_input(&self.voice, pcm)
     }
 

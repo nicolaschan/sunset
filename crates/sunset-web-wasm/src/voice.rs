@@ -70,7 +70,10 @@ pub(crate) fn voice_start(state: &VoiceCell, output_handler: Function) -> Result
         }
     });
 
-    *slot = Some(VoiceState { encoder, loopback_tx });
+    *slot = Some(VoiceState {
+        encoder,
+        loopback_tx,
+    });
     Ok(())
 }
 
@@ -82,9 +85,11 @@ pub(crate) fn voice_stop(state: &VoiceCell) -> Result<(), JsError> {
 }
 
 /// Submit one 20 ms frame of PCM. Length must be exactly 960.
-pub(crate) fn voice_input(state: &VoiceCell, pcm: Float32Array) -> Result<(), JsError> {
+pub(crate) fn voice_input(state: &VoiceCell, pcm: &Float32Array) -> Result<(), JsError> {
     let mut slot = state.borrow_mut();
-    let voice = slot.as_mut().ok_or_else(|| JsError::new("voice not started"))?;
+    let voice = slot
+        .as_mut()
+        .ok_or_else(|| JsError::new("voice not started"))?;
     let len = pcm.length() as usize;
     if len != FRAME_SAMPLES {
         return Err(JsError::new(&format!(
