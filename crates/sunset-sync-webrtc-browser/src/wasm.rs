@@ -156,20 +156,40 @@ impl RawTransport for WebRtcRawTransport {
         let mut peer_in_rx = self.register_peer(remote_peer.clone());
 
         let pc = build_peer_connection(&self.ice_urls)?;
+
+        // Reliable channel (existing behaviour, unchanged on the wire).
         let dc_init = RtcDataChannelInit::new();
         let dc = pc.create_data_channel_with_data_channel_dict("sunset-sync", &dc_init);
         dc.set_binary_type(RtcDataChannelType::Arraybuffer);
 
+        // Unreliable channel: unordered + zero retransmits. SCTP will
+        // chunk/reassemble each `send` but won't queue retransmissions
+        // and won't enforce ordering across messages.
+        let dc_unrel_init = RtcDataChannelInit::new();
+        dc_unrel_init.set_ordered(false);
+        dc_unrel_init.set_max_retransmits(0);
+        let dc_unrel =
+            pc.create_data_channel_with_data_channel_dict("sunset-sync-unrel", &dc_unrel_init);
+        dc_unrel.set_binary_type(RtcDataChannelType::Arraybuffer);
+
         let (ice_tx, ice_rx) = mpsc::unbounded::<String>();
         let (open_tx, open_rx) = oneshot::channel::<()>();
+        let (open_tx_unrel, open_rx_unrel) = oneshot::channel::<()>();
         let (msg_tx, msg_rx) = mpsc::unbounded::<Bytes>();
+        let (msg_tx_unrel, msg_rx_unrel) = mpsc::unbounded::<Bytes>();
 
         let on_ice = make_ice_closure(ice_tx);
         pc.set_onicecandidate(Some(on_ice.as_ref().unchecked_ref()));
+
         let on_open = make_open_closure(open_tx);
         dc.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         let on_msg = make_msg_closure(msg_tx);
         dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+
+        let on_open_unrel = make_open_closure(open_tx_unrel);
+        dc_unrel.set_onopen(Some(on_open_unrel.as_ref().unchecked_ref()));
+        let on_msg_unrel = make_msg_closure(msg_tx_unrel);
+        dc_unrel.set_onmessage(Some(on_msg_unrel.as_ref().unchecked_ref()));
 
         // Create offer + setLocalDescription.
         let offer = JsFuture::from(pc.create_offer())
@@ -207,11 +227,21 @@ impl RawTransport for WebRtcRawTransport {
         // the Answer is processed.
         let mut got_answer = false;
         let mut pending_ice: Vec<String> = Vec::new();
+        let mut opened_rel = false;
+        let mut opened_unrel = false;
         let open_fut = open_rx.fuse();
-        futures::pin_mut!(open_fut);
+        let open_fut_unrel = open_rx_unrel.fuse();
+        futures::pin_mut!(open_fut, open_fut_unrel);
         loop {
             futures::select! {
-                _ = open_fut.as_mut() => break,
+                _ = open_fut.as_mut() => {
+                    opened_rel = true;
+                    if opened_rel && opened_unrel { break; }
+                }
+                _ = open_fut_unrel.as_mut() => {
+                    opened_unrel = true;
+                    if opened_rel && opened_unrel { break; }
+                }
                 opt = peer_in_rx.next().fuse() => {
                     let kind = opt.ok_or_else(|| {
                         Error::Transport("signaling closed before open".into())
@@ -249,9 +279,13 @@ impl RawTransport for WebRtcRawTransport {
             _pc: pc,
             dc,
             rx: RefCell::new(msg_rx),
+            dc_unrel,
+            rx_unrel: RefCell::new(msg_rx_unrel),
             _on_ice: on_ice,
             _on_open: Some(on_open),
             _on_msg: Some(on_msg),
+            _on_open_unrel: Some(on_open_unrel),
+            _on_msg_unrel: Some(on_msg_unrel),
             _on_dc: None,
         })
     }
@@ -424,13 +458,23 @@ async fn run_accept_one(
     inner.borrow_mut().per_peer.remove(&from_peer);
 
     let dc = dc_opt.ok_or_else(|| Error::Transport("no inbound datachannel".into()))?;
+    // TASK-2 PLACEHOLDER: dc_unrel and rx_unrel are wired in Task 2 of
+    // the unreliable-datachannel plan. For now we clone the reliable
+    // channel handle into the unreliable slot and create an empty mpsc
+    // so the crate compiles. send_unreliable / recv_unreliable still
+    // return the v1 stub error during Task 1.
+    let (_msg_tx_unrel_placeholder, msg_rx_unrel_placeholder) = mpsc::unbounded::<Bytes>();
     Ok(WebRtcRawConnection {
         _pc: pc,
-        dc,
+        dc: dc.clone(),
         rx: RefCell::new(msg_rx),
+        dc_unrel: dc,
+        rx_unrel: RefCell::new(msg_rx_unrel_placeholder),
         _on_ice: on_ice,
         _on_open: None,
         _on_msg: None,
+        _on_open_unrel: None,
+        _on_msg_unrel: None,
         _on_dc: Some(on_dc),
     })
 }
@@ -439,12 +483,21 @@ pub struct WebRtcRawConnection {
     _pc: RtcPeerConnection,
     dc: RtcDataChannel,
     rx: RefCell<mpsc::UnboundedReceiver<Bytes>>,
+    /// Second datachannel: `ordered: false`, `maxRetransmits: 0`.
+    /// Used by `send_unreliable` / `recv_unreliable` for ephemeral
+    /// (e.g. voice) traffic.
+    dc_unrel: RtcDataChannel,
+    rx_unrel: RefCell<mpsc::UnboundedReceiver<Bytes>>,
     _on_ice: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
     /// Connect side keeps these on the connection. Accept side leaks them
     /// inside the `ondatachannel` handler (page lifetime), so these are
     /// `None` on the accept side.
     _on_open: Option<Closure<dyn FnMut(JsValue)>>,
     _on_msg: Option<Closure<dyn FnMut(MessageEvent)>>,
+    /// Connect side keeps these on the connection (mirrors `_on_open` /
+    /// `_on_msg` for the unreliable channel). `None` on the accept side.
+    _on_open_unrel: Option<Closure<dyn FnMut(JsValue)>>,
+    _on_msg_unrel: Option<Closure<dyn FnMut(MessageEvent)>>,
     /// Only set on the accept side.
     _on_dc: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
 }
