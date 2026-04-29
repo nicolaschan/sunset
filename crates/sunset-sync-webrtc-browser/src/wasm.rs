@@ -371,27 +371,57 @@ async fn run_accept_one(
     let (open_tx, open_rx) = oneshot::channel::<()>();
     let (msg_tx, msg_rx) = mpsc::unbounded::<Bytes>();
     let (dc_tx, dc_rx) = oneshot::channel::<RtcDataChannel>();
+    let (dc_tx_unrel, dc_rx_unrel) = oneshot::channel::<RtcDataChannel>();
+    let (open_tx_unrel, open_rx_unrel) = oneshot::channel::<()>();
+    let (msg_tx_unrel, msg_rx_unrel) = mpsc::unbounded::<Bytes>();
 
     let on_ice = make_ice_closure(ice_tx);
     pc.set_onicecandidate(Some(on_ice.as_ref().unchecked_ref()));
 
     let dc_tx_cell = Rc::new(RefCell::new(Some(dc_tx)));
     let open_tx_cell = Rc::new(RefCell::new(Some(open_tx)));
+    let dc_tx_unrel_cell = Rc::new(RefCell::new(Some(dc_tx_unrel)));
+    let open_tx_unrel_cell = Rc::new(RefCell::new(Some(open_tx_unrel)));
     let msg_tx_for_dc = msg_tx;
+    let msg_tx_for_dc_unrel = msg_tx_unrel;
     let on_dc = Closure::<dyn FnMut(RtcDataChannelEvent)>::new(move |ev: RtcDataChannelEvent| {
         let dc = ev.channel();
         dc.set_binary_type(RtcDataChannelType::Arraybuffer);
+        match dc.label().as_str() {
+            "sunset-sync" => {
+                let on_open = make_open_closure_from_cell(open_tx_cell.clone());
+                dc.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+                on_open.forget();
 
-        let on_open = make_open_closure_from_cell(open_tx_cell.clone());
-        dc.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-        on_open.forget();
+                let on_msg = make_msg_closure(msg_tx_for_dc.clone());
+                dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+                on_msg.forget();
 
-        let on_msg = make_msg_closure(msg_tx_for_dc.clone());
-        dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-        on_msg.forget();
+                if let Some(tx) = dc_tx_cell.borrow_mut().take() {
+                    let _ = tx.send(dc);
+                }
+            }
+            "sunset-sync-unrel" => {
+                let on_open = make_open_closure_from_cell(open_tx_unrel_cell.clone());
+                dc.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+                on_open.forget();
 
-        if let Some(tx) = dc_tx_cell.borrow_mut().take() {
-            let _ = tx.send(dc);
+                let on_msg = make_msg_closure(msg_tx_for_dc_unrel.clone());
+                dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+                on_msg.forget();
+
+                if let Some(tx) = dc_tx_unrel_cell.borrow_mut().take() {
+                    let _ = tx.send(dc);
+                }
+            }
+            other => {
+                // Unknown label: ignore. Future protocol versions may
+                // add channels; we don't want a typo in a peer's build
+                // to break the handshake here.
+                web_sys::console::warn_1(
+                    &format!("sunset-sync: ignoring unknown datachannel label '{}'", other).into(),
+                );
+            }
         }
     });
     pc.set_ondatachannel(Some(on_dc.as_ref().unchecked_ref()));
@@ -429,20 +459,31 @@ async fn run_accept_one(
     );
 
     let dc_fut = dc_rx.fuse();
+    let dc_fut_unrel = dc_rx_unrel.fuse();
     let open_fut = open_rx.fuse();
-    futures::pin_mut!(dc_fut, open_fut);
+    let open_fut_unrel = open_rx_unrel.fuse();
+    futures::pin_mut!(dc_fut, dc_fut_unrel, open_fut, open_fut_unrel);
     let mut dc_opt: Option<RtcDataChannel> = None;
+    let mut dc_opt_unrel: Option<RtcDataChannel> = None;
+    let mut opened_rel = false;
+    let mut opened_unrel = false;
     loop {
         futures::select! {
             got = dc_fut.as_mut() => {
                 dc_opt = Some(got.map_err(|_| {
-                    Error::Transport("peer connection dropped before ondatachannel".into())
+                    Error::Transport("peer connection dropped before reliable ondatachannel".into())
+                })?);
+            }
+            got = dc_fut_unrel.as_mut() => {
+                dc_opt_unrel = Some(got.map_err(|_| {
+                    Error::Transport("peer connection dropped before unreliable ondatachannel".into())
                 })?);
             }
             _ = open_fut.as_mut() => {
-                if dc_opt.is_some() {
-                    break;
-                }
+                opened_rel = true;
+            }
+            _ = open_fut_unrel.as_mut() => {
+                opened_unrel = true;
             }
             opt = peer_in_rx.next().fuse() => {
                 let kind = opt.ok_or_else(|| {
@@ -453,23 +494,22 @@ async fn run_accept_one(
                 }
             }
         }
+        if dc_opt.is_some() && dc_opt_unrel.is_some() && opened_rel && opened_unrel {
+            break;
+        }
     }
 
     inner.borrow_mut().per_peer.remove(&from_peer);
 
-    let dc = dc_opt.ok_or_else(|| Error::Transport("no inbound datachannel".into()))?;
-    // TASK-2 PLACEHOLDER: dc_unrel and rx_unrel are wired in Task 2 of
-    // the unreliable-datachannel plan. For now we clone the reliable
-    // channel handle into the unreliable slot and create an empty mpsc
-    // so the crate compiles. send_unreliable / recv_unreliable still
-    // return the v1 stub error during Task 1.
-    let (_msg_tx_unrel_placeholder, msg_rx_unrel_placeholder) = mpsc::unbounded::<Bytes>();
+    let dc = dc_opt.ok_or_else(|| Error::Transport("no inbound reliable datachannel".into()))?;
+    let dc_unrel =
+        dc_opt_unrel.ok_or_else(|| Error::Transport("no inbound unreliable datachannel".into()))?;
     Ok(WebRtcRawConnection {
         _pc: pc,
-        dc: dc.clone(),
+        dc,
         rx: RefCell::new(msg_rx),
-        dc_unrel: dc,
-        rx_unrel: RefCell::new(msg_rx_unrel_placeholder),
+        dc_unrel,
+        rx_unrel: RefCell::new(msg_rx_unrel),
         _on_ice: on_ice,
         _on_open: None,
         _on_msg: None,
