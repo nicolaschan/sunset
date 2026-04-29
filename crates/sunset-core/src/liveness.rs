@@ -232,6 +232,12 @@ impl Liveness {
         }
     }
 
+    /// Convenience: observe an event whose decoded payload knows its
+    /// own sender time. Equivalent to `observe(peer, ev.sender_time())`.
+    pub async fn observe_event<T: HasSenderTime>(&self, peer: PeerId, ev: &T) {
+        self.observe(peer, ev.sender_time()).await;
+    }
+
     /// Read the current state of every tracked peer.
     pub async fn snapshot(&self) -> HashMap<PeerId, PeerLivenessChange> {
         let inner = self.inner.lock().await;
@@ -512,5 +518,29 @@ mod tests {
         let next = sub.next().await.unwrap();
         assert_eq!(next.peer, pk(2));
         assert_eq!(next.state, LivenessState::Live);
+    }
+
+    struct DummyEvent {
+        sender_time: SystemTime,
+    }
+
+    impl HasSenderTime for DummyEvent {
+        fn sender_time(&self) -> SystemTime {
+            self.sender_time
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_event_equivalent_to_observe() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        let event = DummyEvent {
+            sender_time: t_secs(99),
+        };
+        liveness.observe_event(pk(1), &event).await;
+        let snap = liveness.snapshot().await;
+        let entry = snap.get(&pk(1)).expect("peer 1 present");
+        assert_eq!(entry.last_heard_at, t_secs(99));
+        assert_eq!(entry.state, LivenessState::Live);
     }
 }
