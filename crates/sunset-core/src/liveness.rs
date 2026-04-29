@@ -71,7 +71,11 @@ struct Inner {
 /// The tracker. Cheap to clone via `Arc`; share one instance across
 /// all consumers that care about the same liveness window.
 pub struct Liveness {
+    // Used by run_sweep (Task 4); suppress dead_code until then.
+    #[allow(dead_code)]
     stale_after: Duration,
+    // Used by run_sweep (Task 4); suppress dead_code until then.
+    #[allow(dead_code)]
     clock: Arc<dyn Clock>,
     inner: Mutex<Inner>,
 }
@@ -100,24 +104,57 @@ impl Liveness {
     /// never goes backwards from a single observation.
     pub async fn observe(&self, peer: PeerId, sender_time: SystemTime) {
         let mut inner = self.inner.lock().await;
-        match inner.peers.get_mut(&peer) {
+        let change = match inner.peers.get_mut(&peer) {
             Some(entry) if sender_time <= entry.last_heard_at => {
-                // Older or equal observation — ignore.
+                // Older or equal observation — ignore, no state change.
+                None
             }
             Some(entry) => {
+                let was_live = entry.state == LivenessState::Live;
                 entry.last_heard_at = sender_time;
-                // State transitions land in Task 3; for now just record.
+                entry.state = LivenessState::Live;
+                if was_live {
+                    None
+                } else {
+                    Some(PeerLivenessChange {
+                        peer: peer.clone(),
+                        state: LivenessState::Live,
+                        last_heard_at: sender_time,
+                    })
+                }
             }
             None => {
                 inner.peers.insert(
-                    peer,
+                    peer.clone(),
                     PeerEntry {
                         last_heard_at: sender_time,
                         state: LivenessState::Live,
                     },
                 );
+                Some(PeerLivenessChange {
+                    peer: peer.clone(),
+                    state: LivenessState::Live,
+                    last_heard_at: sender_time,
+                })
             }
+        };
+        if let Some(c) = change {
+            broadcast(&mut inner.subscribers, &c);
         }
+    }
+
+    /// Subscribe to state-change events. New peers fire `Live`; peers
+    /// that exceed `stale_after` since `last_heard_at` fire `Stale`
+    /// (Task 4); stale peers that observe again fire `Live`. No event
+    /// fires when a Live peer simply observes again.
+    ///
+    /// The returned stream **does not replay existing state** — use
+    /// `snapshot()` for the initial picture and the stream for changes.
+    pub async fn subscribe(&self) -> LocalBoxStream<'static, PeerLivenessChange> {
+        use futures::stream::StreamExt;
+        let (tx, rx) = mpsc::unbounded_channel::<PeerLivenessChange>();
+        self.inner.lock().await.subscribers.push(tx);
+        Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|c| c))
     }
 
     /// Read the current state of every tracked peer.
@@ -140,6 +177,15 @@ impl Liveness {
     }
 }
 
+/// Send `change` to every live subscriber, dropping any whose
+/// receiver has been closed. Caller must hold the inner lock so the
+/// "subscribe registers vs broadcast fires" race is closed: a
+/// subscriber registered before the lock release sees this event;
+/// one registered after gets the next event but not this one.
+fn broadcast(subs: &mut Vec<mpsc::UnboundedSender<PeerLivenessChange>>, change: &PeerLivenessChange) {
+    subs.retain(|tx| tx.send(change.clone()).is_ok());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,10 +202,14 @@ mod tests {
             })
         }
 
+        // Used by Task 4 stale-detection tests.
+        #[allow(dead_code)]
         pub fn set(&self, t: SystemTime) {
             *self.now.lock().unwrap() = t;
         }
 
+        // Used by Task 4 stale-detection tests.
+        #[allow(dead_code)]
         pub fn advance(&self, d: Duration) {
             let mut g = self.now.lock().unwrap();
             *g += d;
@@ -236,5 +286,63 @@ mod tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.get(&pk(1)).unwrap().last_heard_at, t_secs(99));
         assert_eq!(snap.get(&pk(2)).unwrap().last_heard_at, t_secs(98));
+    }
+
+    use futures::StreamExt;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_receives_live_on_first_observation() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        let mut sub = liveness.subscribe().await;
+        liveness.observe(pk(1), t_secs(100)).await;
+        let change = sub.next().await.expect("change emitted");
+        assert_eq!(change.peer, pk(1));
+        assert_eq!(change.state, LivenessState::Live);
+        assert_eq!(change.last_heard_at, t_secs(100));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_does_not_replay_existing_state() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        // Observe BEFORE subscribing — pre-existing peers should NOT
+        // be replayed to new subscribers. Use snapshot() for that.
+        liveness.observe(pk(1), t_secs(100)).await;
+        let mut sub = liveness.subscribe().await;
+        // Trigger one observation so the stream wakes up; that
+        // observation's change SHOULD be delivered.
+        liveness.observe(pk(2), t_secs(101)).await;
+        let change = sub.next().await.expect("peer 2 change emitted");
+        assert_eq!(change.peer, pk(2));
+        // We must NOT see a peer 1 event — it was registered before subscribe.
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_no_event_for_repeat_live_observation() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        let mut sub = liveness.subscribe().await;
+        liveness.observe(pk(1), t_secs(100)).await;
+        let _first = sub.next().await.expect("first change emitted");
+        liveness.observe(pk(1), t_secs(101)).await;
+        // Same peer, still Live — no second change. Trigger another peer
+        // so the stream yields and we can verify peer 1 didn't sneak in.
+        liveness.observe(pk(2), t_secs(102)).await;
+        let next = sub.next().await.expect("peer 2 change");
+        assert_eq!(next.peer, pk(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiple_subscribers_receive_same_event() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
+        let mut sub_a = liveness.subscribe().await;
+        let mut sub_b = liveness.subscribe().await;
+        liveness.observe(pk(1), t_secs(100)).await;
+        let a = sub_a.next().await.expect("sub_a sees change");
+        let b = sub_b.next().await.expect("sub_b sees change");
+        assert_eq!(a, b);
+        assert_eq!(a.peer, pk(1));
     }
 }
