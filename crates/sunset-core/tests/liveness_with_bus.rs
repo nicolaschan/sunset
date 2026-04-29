@@ -16,9 +16,7 @@ use futures::StreamExt as _;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
-use sunset_core::{
-    Bus, BusEvent, BusImpl, HasSenderTime, Identity, Liveness, LivenessState,
-};
+use sunset_core::{Bus, BusEvent, BusImpl, HasSenderTime, Identity, Liveness, LivenessState};
 use sunset_store::{AcceptAllVerifier, Filter};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::test_transport::TestNetwork;
@@ -156,13 +154,10 @@ async fn liveness_tracks_alice_via_bob_bus_subscription() {
 
             // Bob's Liveness should report Live for Alice within a
             // generous window.
-            let change = tokio::time::timeout(
-                Duration::from_millis(500),
-                state_changes.next(),
-            )
-            .await
-            .expect("change arrived in time")
-            .expect("subscriber stream open");
+            let change = tokio::time::timeout(Duration::from_millis(500), state_changes.next())
+                .await
+                .expect("change arrived in time")
+                .expect("subscriber stream open");
             assert_eq!(change.state, LivenessState::Live);
             assert_eq!(
                 change.peer.0.as_bytes(),
