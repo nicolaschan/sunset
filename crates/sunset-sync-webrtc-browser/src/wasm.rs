@@ -419,7 +419,11 @@ async fn run_accept_one(
                 // add channels; we don't want a typo in a peer's build
                 // to break the handshake here.
                 web_sys::console::warn_1(
-                    &format!("sunset-sync: ignoring unknown datachannel label '{}'", other).into(),
+                    &format!(
+                        "sunset-sync: ignoring unknown datachannel label '{}'",
+                        other
+                    )
+                    .into(),
                 );
             }
         }
