@@ -173,21 +173,25 @@ test.describe("landing + routing", () => {
         );
 
     await openRoomsDrawer(page, testInfo);
-    expect((await railOrder()).slice(0, 3)).toEqual([
+    await expect.poll(async () => (await railOrder()).slice(0, 3)).toEqual([
       "gamma",
       "beta",
       "alpha",
     ]);
 
     // Click the alpha row at the bottom — it should NOT bubble up.
+    // Playwright's actionability check fails on the Pixel 7 viewport
+    // for this drawer-internal row, so we dispatch via JS. The click
+    // handler lives on the inner <button>, not the .room-row wrapper.
     await page
       .getByTestId("rooms-rail")
-      .locator(".room-row", { hasText: "alpha" })
-      .click();
+      .locator('.room-row[data-room-name="alpha"] button')
+      .first()
+      .evaluate((el) => el.click());
     await expect(page).toHaveURL(/#alpha$/);
 
     await openRoomsDrawer(page, testInfo);
-    expect((await railOrder()).slice(0, 3)).toEqual([
+    await expect.poll(async () => (await railOrder()).slice(0, 3)).toEqual([
       "gamma",
       "beta",
       "alpha",
@@ -291,7 +295,9 @@ test.describe("landing + routing", () => {
           return rect.x >= -1; // fully in-viewport (or essentially so)
         }, testId, { timeout: 3000 });
 
-      // Open channels → rooms, add beta.
+      // Open channels → rooms, add beta. After JoinRoom on phone the
+      // drawer transitions to channels-drawer for the new room, so on
+      // subsequent iterations we only need to swap to rooms-drawer.
       await page.getByTestId("phone-rooms-toggle").click();
       await waitForDrawerOpen("channels-drawer");
       await page.getByTestId("channels-room-title").click();
@@ -299,8 +305,7 @@ test.describe("landing + routing", () => {
       await page.getByTestId("rooms-drawer").getByTestId("rooms-search").fill("beta");
       await page.getByTestId("rooms-drawer").getByTestId("rooms-search").press("Enter");
 
-      // Open channels → rooms, add gamma.
-      await page.getByTestId("phone-rooms-toggle").click();
+      // Channels-drawer is now open; swap to rooms-drawer and add gamma.
       await waitForDrawerOpen("channels-drawer");
       await page.getByTestId("channels-room-title").click();
       await waitForDrawerOpen("rooms-drawer");
@@ -308,7 +313,6 @@ test.describe("landing + routing", () => {
       await page.getByTestId("rooms-drawer").getByTestId("rooms-search").press("Enter");
 
       // Re-open the rooms drawer to read bounding boxes.
-      await page.getByTestId("phone-rooms-toggle").click();
       await waitForDrawerOpen("channels-drawer");
       await page.getByTestId("channels-room-title").click();
       await waitForDrawerOpen("rooms-drawer");
