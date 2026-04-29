@@ -176,12 +176,22 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let conn = conn.clone();
         async move {
             while let Some(msg) = outbound_rx.recv().await {
-                let result = match outbound_kind(&msg) {
-                    ChannelKind::Reliable => send_reliable_message(&*conn, &msg).await,
-                    ChannelKind::Unreliable => send_unreliable_message(&*conn, &msg).await,
-                };
-                if result.is_err() {
-                    break;
+                match outbound_kind(&msg) {
+                    ChannelKind::Reliable => {
+                        // Reliable failures indicate a real disconnect; tear down.
+                        if send_reliable_message(&*conn, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    ChannelKind::Unreliable => {
+                        // Unreliable is by-design lossy. A failure (transport
+                        // doesn't support unreliable, queue full, etc.) drops
+                        // the datagram but MUST NOT disconnect the peer —
+                        // peers who only have reliable transports (e.g.
+                        // WS-only) still need to function for chat traffic.
+                        // Per spec failure-mode table.
+                        let _ = send_unreliable_message(&*conn, &msg).await;
+                    }
                 }
             }
             let _ = send_reliable_message(&*conn, &SyncMessage::Goodbye {}).await;
@@ -243,9 +253,11 @@ async fn recv_unreliable_message<C: TransportConnection + ?Sized>(conn: &C) -> R
 #[cfg(all(test, feature = "test-helpers"))]
 mod tests {
     use super::*;
-    use crate::test_transport::TestNetwork;
-    use crate::transport::Transport;
+    use crate::error::Error;
+    use crate::test_transport::{TestConnection, TestNetwork};
+    use crate::transport::{Transport, TransportKind};
     use crate::types::PeerAddr;
+    use async_trait::async_trait;
     use bytes::Bytes;
     use sunset_store::VerifyingKey;
 
@@ -255,6 +267,40 @@ mod tests {
 
     fn peer_addr(s: &'static str) -> PeerAddr {
         PeerAddr::new(s)
+    }
+
+    /// Wraps a `TestConnection` but forces every `send_unreliable` call to
+    /// return `Err`. Models a transport (e.g. WebSocket) that doesn't support
+    /// unreliable datagrams.
+    struct FailingUnreliableConn {
+        inner: TestConnection,
+    }
+
+    #[async_trait(?Send)]
+    impl TransportConnection for FailingUnreliableConn {
+        async fn send_reliable(&self, bytes: Bytes) -> Result<()> {
+            self.inner.send_reliable(bytes).await
+        }
+        async fn recv_reliable(&self) -> Result<Bytes> {
+            self.inner.recv_reliable().await
+        }
+        async fn send_unreliable(&self, _bytes: Bytes) -> Result<()> {
+            Err(Error::Transport(
+                "websocket: unreliable channel unsupported".into(),
+            ))
+        }
+        async fn recv_unreliable(&self) -> Result<Bytes> {
+            self.inner.recv_unreliable().await
+        }
+        fn peer_id(&self) -> PeerId {
+            self.inner.peer_id()
+        }
+        fn kind(&self) -> TransportKind {
+            self.inner.kind()
+        }
+        async fn close(&self) -> Result<()> {
+            self.inner.close().await
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -313,6 +359,130 @@ mod tests {
                 // (run_peer passes the clone via PeerHello; the test's
                 // pattern-match above dropped it implicitly, so only the
                 // originals below keep the channels open.)
+                drop(a_out_tx);
+                drop(b_out_tx);
+            })
+            .await;
+    }
+
+    /// Regression test for the spec's failure-mode invariant: an unreliable
+    /// send failure must NOT tear down the per-peer task. Otherwise a peer
+    /// whose transport doesn't support unreliable (e.g. WS-only relay) would
+    /// be disconnected the moment anyone published an ephemeral matching
+    /// its filter.
+    ///
+    /// We wrap one side of a `TestConnection` pair in `FailingUnreliableConn`
+    /// (so every `send_unreliable` returns Err), do the Hello exchange,
+    /// push an `EphemeralDelivery` outbound (which would route to unreliable
+    /// and fail), then push a follow-up `EventDelivery` (reliable) and
+    /// confirm the peer task is still alive — i.e. the reliable message
+    /// arrives on the other side.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreliable_send_failure_does_not_disconnect_peer() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = net.transport(PeerId(vk(b"alice")), peer_addr("alice"));
+                let bob = net.transport(PeerId(vk(b"bob")), peer_addr("bob"));
+                let bob_accept =
+                    crate::spawn::spawn_local(async move { bob.accept().await.unwrap() });
+                let alice_conn = alice.connect(peer_addr("bob")).await.unwrap();
+                let bob_conn = bob_accept.await.unwrap();
+
+                // Wrap alice's side so every send_unreliable returns Err.
+                let alice_conn = FailingUnreliableConn { inner: alice_conn };
+
+                let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+                let (b_in_tx, mut b_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(alice_conn),
+                    PeerId(vk(b"alice")),
+                    1,
+                    a_out_tx.clone(),
+                    a_out_rx,
+                    a_in_tx,
+                ));
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(bob_conn),
+                    PeerId(vk(b"bob")),
+                    1,
+                    b_out_tx.clone(),
+                    b_out_rx,
+                    b_in_tx,
+                ));
+
+                // Drain the Hello on each side so the rest of the test
+                // sees only the messages it pushes.
+                match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { peer_id, .. } => {
+                        assert_eq!(peer_id, PeerId(vk(b"bob")));
+                    }
+                    other => panic!("expected Hello, got {other:?}"),
+                }
+                match b_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { peer_id, .. } => {
+                        assert_eq!(peer_id, PeerId(vk(b"alice")));
+                    }
+                    other => panic!("expected Hello, got {other:?}"),
+                }
+
+                // Push an EphemeralDelivery from alice → bob. Routing sends
+                // it on alice's unreliable channel, where send_unreliable
+                // returns Err. The OLD code would `break` the send_task;
+                // the NEW code drops the datagram silently.
+                let ephemeral = SyncMessage::EphemeralDelivery {
+                    datagram: sunset_store::SignedDatagram {
+                        verifying_key: vk(b"alice"),
+                        name: Bytes::from_static(b"room/voice/alice/0"),
+                        payload: Bytes::from_static(b"opus-frame"),
+                        signature: Bytes::from_static(&[0xab; 64]),
+                    },
+                };
+                a_out_tx.send(ephemeral).unwrap();
+
+                // Now push a reliable follow-up. If the per-peer task is
+                // still alive, bob will receive it. If the unreliable
+                // failure broke the send_task (the bug), this message
+                // never arrives and the recv times out / errors.
+                let followup = SyncMessage::EventDelivery {
+                    entries: vec![],
+                    blobs: vec![],
+                };
+                a_out_tx.send(followup.clone()).unwrap();
+
+                // Read events on bob's side. We tolerate spurious recv
+                // events (e.g. an unreliable arriving — though it
+                // shouldn't, since send_unreliable failed); the assertion
+                // is that we eventually see the EventDelivery.
+                let mut saw_event_delivery = false;
+                for _ in 0..4 {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        b_in_rx.recv(),
+                    )
+                    .await
+                    .expect("bob should still be receiving — peer task must not have died")
+                    {
+                        Some(InboundEvent::Message {
+                            message: SyncMessage::EventDelivery { .. },
+                            ..
+                        }) => {
+                            saw_event_delivery = true;
+                            break;
+                        }
+                        Some(_) => continue,
+                        None => panic!("bob's inbound channel closed prematurely"),
+                    }
+                }
+                assert!(
+                    saw_event_delivery,
+                    "reliable follow-up did not arrive — per-peer send_task likely died on the prior unreliable send failure"
+                );
+
                 drop(a_out_tx);
                 drop(b_out_tx);
             })
