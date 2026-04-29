@@ -85,14 +85,19 @@ fn phone_view(
   let channels_open = drawer == option.Some(ChannelsDrawer)
   let members_open = drawer == option.Some(MembersDrawer)
 
-  // Natural flex layout (no position: fixed; inset: 0). With
-  // viewport-fit=cover, the fixed-inset combo lets iOS Safari paint
-  // the bottom URL bar over content (composer disappears behind it).
-  // height: 100dvh dynamically tracks the visible viewport — when the
-  // URL bar collapses on scroll, the shell grows accordingly.
+  // Pin the shell to the visible viewport so iOS Safari can't auto-
+  // scroll the page when the keyboard opens (which would push the
+  // header off-screen). `top: 0; left: 0; right: 0` anchors three
+  // edges; `height: 100dvh` (with vh fallback) sizes the fourth so
+  // the bottom edge tracks the dynamic viewport — keeping the
+  // composer visible when the URL bar collapses.
   html.div(
     [
       ui.css([
+        #("position", "fixed"),
+        #("top", "0"),
+        #("left", "0"),
+        #("right", "0"),
         #("background", palette.bg),
         #("color", palette.text),
         #("font-family", theme.font_sans),
@@ -100,7 +105,6 @@ fn phone_view(
         #("line-height", "1.45"),
         #("display", "flex"),
         #("flex-direction", "column"),
-        #("width", "100%"),
         #("height", "100vh"),
         #("height", "100dvh"),
         #("overflow", "hidden"),
@@ -267,7 +271,13 @@ fn global_reset() -> Element(msg) {
        }
      }
      /* Stop page-bounce from rubber-banding the address bar. */
-     .scroll-area { overscroll-behavior: contain; }",
+     .scroll-area { overscroll-behavior: contain; }
+     /* Bottom-justify chat content: the first child claims any free
+        space above it, pinning messages to the bottom when sparse.
+        With many messages the auto margin shrinks to 0 and the
+        scroll-area scrolls normally. Requires the scroll-area to be
+        a flex column (which main_panel.messages_list already is). */
+     .scroll-area > :first-child { margin-top: auto; }",
   )
 }
 
