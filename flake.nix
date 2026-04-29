@@ -187,6 +187,9 @@
             pkgs.static-web-server
             pkgs.wasm-bindgen-cli
             pkgs.wasm-pack
+            pkgs.libopus
+            pkgs.pkg-config
+            pkgs.clang
           ];
           shellHook = ''
             ${if webHexDeps != null

@@ -1738,6 +1738,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunset-voice"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sunset-web-wasm"
 version = "0.1.0"
 dependencies = [
