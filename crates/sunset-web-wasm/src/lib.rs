@@ -17,6 +17,8 @@ mod messages;
 mod presence_publisher;
 #[cfg(target_arch = "wasm32")]
 mod relay_signaler;
+#[cfg(target_arch = "wasm32")]
+mod voice;
 
 #[cfg(target_arch = "wasm32")]
 pub use client::Client;

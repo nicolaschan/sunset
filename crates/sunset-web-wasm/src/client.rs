@@ -45,6 +45,7 @@ pub struct Client {
     relay_status: Rc<RefCell<String>>,
     presence_started: Rc<RefCell<bool>>,
     tracker_handles: Rc<crate::membership_tracker::TrackerHandles>,
+    voice: crate::voice::VoiceCell,
 }
 
 #[wasm_bindgen]
@@ -106,6 +107,7 @@ impl Client {
             tracker_handles: Rc::new(crate::membership_tracker::TrackerHandles::new(
                 "disconnected",
             )),
+            voice: crate::voice::new_voice_cell(),
         })
     }
 
@@ -287,6 +289,25 @@ impl Client {
     pub fn on_message(&self, callback: js_sys::Function) {
         *self.on_message.borrow_mut() = Some(callback);
         self.spawn_message_subscription();
+    }
+
+    /// Initialise the voice subsystem. Must be called before
+    /// `voice_input`. Spawns an in-process loopback decode loop;
+    /// `output_handler` is invoked with a Float32Array(960) for each
+    /// decoded 20 ms frame.
+    pub fn voice_start(&self, output_handler: js_sys::Function) -> Result<(), JsError> {
+        crate::voice::voice_start(&self.voice, output_handler)
+    }
+
+    /// Stop the voice subsystem and release its resources.
+    pub fn voice_stop(&self) -> Result<(), JsError> {
+        crate::voice::voice_stop(&self.voice)
+    }
+
+    /// Submit one 20 ms frame of mono PCM (Float32Array of length 960
+    /// at 48 kHz) for encoding + loopback delivery to the output handler.
+    pub fn voice_input(&self, pcm: js_sys::Float32Array) -> Result<(), JsError> {
+        crate::voice::voice_input(&self.voice, pcm)
     }
 
     fn spawn_message_subscription(&self) {
