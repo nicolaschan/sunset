@@ -562,16 +562,22 @@ impl RawConnection for WebRtcRawConnection {
         .await
     }
 
-    async fn send_unreliable(&self, _: Bytes) -> Result<()> {
-        Err(Error::Transport(
-            "webrtc: unreliable channel not implemented in v1".into(),
-        ))
+    async fn send_unreliable(&self, bytes: Bytes) -> Result<()> {
+        self.dc_unrel
+            .send_with_u8_array(&bytes)
+            .map_err(|e| Error::Transport(format!("dc_unrel.send: {e:?}")))
     }
 
     async fn recv_unreliable(&self) -> Result<Bytes> {
-        Err(Error::Transport(
-            "webrtc: unreliable channel not implemented in v1".into(),
-        ))
+        poll_fn(|cx| {
+            let mut rx = self.rx_unrel.borrow_mut();
+            match Stream::poll_next(Pin::new(&mut *rx), cx) {
+                Poll::Ready(Some(b)) => Poll::Ready(Ok(b)),
+                Poll::Ready(None) => Poll::Ready(Err(Error::Transport("dc_unrel closed".into()))),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
     }
 
     async fn close(&self) -> Result<()> {
