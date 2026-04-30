@@ -87,6 +87,46 @@ pub fn compose_message<R: CryptoRngCore + ?Sized>(
     Ok(ComposedMessage { entry, block })
 }
 
+/// Compose a chat text message. Convenience wrapper over
+/// `compose_message` with `MessageBody::Text`.
+pub fn compose_text<R: CryptoRngCore + ?Sized>(
+    identity: &Identity,
+    room: &Room,
+    epoch_id: u64,
+    sent_at_ms: u64,
+    text: &str,
+    rng: &mut R,
+) -> Result<ComposedMessage> {
+    compose_message(
+        identity,
+        room,
+        epoch_id,
+        sent_at_ms,
+        MessageBody::Text(text.to_owned()),
+        rng,
+    )
+}
+
+/// Compose a delivery receipt referencing the given `for_value_hash`
+/// (the `value_hash` of the original Text being acknowledged).
+pub fn compose_receipt<R: CryptoRngCore + ?Sized>(
+    identity: &Identity,
+    room: &Room,
+    epoch_id: u64,
+    sent_at_ms: u64,
+    for_value_hash: Hash,
+    rng: &mut R,
+) -> Result<ComposedMessage> {
+    compose_message(
+        identity,
+        room,
+        epoch_id,
+        sent_at_ms,
+        MessageBody::Receipt { for_value_hash },
+        rng,
+    )
+}
+
 pub fn decode_message(
     room: &Room,
     entry: &SignedKvEntry,
@@ -274,6 +314,26 @@ mod tests {
 
         let err = decode_message(&room, &forged.entry, &forged.block).unwrap_err();
         assert!(matches!(err, Error::Signature(_)));
+    }
+
+    #[test]
+    fn compose_receipt_roundtrips() {
+        let id = alice();
+        let room = general();
+        let target: Hash = blake3::hash(b"original message").into();
+        let composed = compose_receipt(&id, &room, 0, 1_700_000_000_000, target, &mut OsRng).unwrap();
+        let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
+        assert_eq!(decoded.body, MessageBody::Receipt { for_value_hash: target });
+        assert_eq!(decoded.author_key, id.public());
+    }
+
+    #[test]
+    fn compose_text_roundtrips() {
+        let id = alice();
+        let room = general();
+        let composed = compose_text(&id, &room, 0, 1_700_000_000_000, "hi", &mut OsRng).unwrap();
+        let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
+        assert_eq!(decoded.body, MessageBody::Text("hi".to_owned()));
     }
 
     #[test]
