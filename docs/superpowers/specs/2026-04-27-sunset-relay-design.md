@@ -13,7 +13,7 @@
 
 ## Non-goals (deferred)
 
-- **HTTP admin endpoint** (status / metrics / sync dashboard). Architecture spec calls for one; not in v0.
+- **HTTP admin endpoint with authentication / separate port.** A plaintext dashboard is served at `GET /dashboard` on the same port as the WebSocket listener (see Architecture). Full auth/metrics/admin UI is deferred to Plans 8+.
 - **Allowlists / rate limiting / per-room admission.** Open relay per the Plan C decision; defer to Plans 8+.
 - **TLS termination at the relay.** v0 listens on plain `ws://`. Operators front with nginx/Caddy/Cloudflare for `wss://` termination. (TLS is independent of the Noise inner layer that already protects payloads.)
 - **Multi-relay client-side redundancy logic.** Architecture spec mentions clients accepting several relay URLs in parallel; that's a client-side concern not the relay's. (The relay-to-relay federation in this plan IS the v0 redundancy story.)
@@ -31,9 +31,17 @@ sunset-relay binary
    │     (echo public key + ws://<listen_addr>#x25519=<hex> address to stdout)
    ├── open FsStore at <data_dir>/sqlite + <data_dir>/blobs
    │     (verifier = Arc::new(Ed25519Verifier))
-   ├── construct WebSocketRawTransport::listening_on(<listen_addr>)
+   ├── bind single TcpListener on <listen_addr>
+   ├── create mpsc channel (ws_tx / ws_rx)
+   ├── construct WebSocketRawTransport::external_streams(ws_rx)
+   │     (receives pre-classified WS connections from the router)
    ├── wrap with NoiseTransport::new(raw, identity_adapter)
    ├── construct SyncEngine::new(store, transport, config, peer_id, signer = identity)
+   ├── spawn router::dispatch(listener, ws_tx, status_ctx) on a local task
+   │     ┌── per connection: peek HTTP request line + headers
+   │     ├── GET /dashboard → status::serve_dashboard (plaintext status page)
+   │     ├── GET + Upgrade: websocket → send TcpStream to ws_tx (→ SyncEngine)
+   │     └── anything else → 404 Not Found
    ├── publish_subscription(<configured_filter>, ttl_long)
    ├── for each configured federated peer URL:
    │     SyncEngine::add_peer(peer_addr)         (handshake, push/pull starts)
@@ -53,6 +61,8 @@ crates/sunset-relay/
 │   ├── config.rs           # TOML config parsing + defaults
 │   ├── identity.rs         # load_or_generate at path; pretty-print address
 │   ├── relay.rs            # the Relay struct: setup + run loop
+│   ├── router.rs           # HTTP/WS multiplexer: /dashboard vs WS upgrade vs 404
+│   ├── status.rs           # plaintext dashboard page render + serve_dashboard
 │   └── main.rs             # CLI flag parsing, calls into lib
 └── tests/
     └── multi_relay.rs      # two-relay federation + failover tests
@@ -100,6 +110,7 @@ sunset-relay starting
   x25519:  <64-hex>
   listen:  ws://0.0.0.0:8443
   address: ws://0.0.0.0:8443#x25519=<64-hex>     ← share this with clients/peers
+  dashboard: http://0.0.0.0:8443/dashboard        ← plaintext status page
 ```
 
 That `address` line is what operators copy into client / peer-relay configs.

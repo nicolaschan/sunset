@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
@@ -65,6 +65,8 @@ pub struct WebSocketRawTransport {
 enum TransportMode {
     DialOnly,
     Listening { listener: Mutex<TcpListener> },
+    /// Accept pre-classified TcpStreams from an external dispatcher.
+    ExternalStreams { rx: Mutex<tokio::sync::mpsc::Receiver<TcpStream>> },
 }
 
 impl WebSocketRawTransport {
@@ -85,13 +87,29 @@ impl WebSocketRawTransport {
         })
     }
 
+    /// Accept already-classified TcpStreams from an external dispatcher.
+    /// The caller has bound the TcpListener and decided which connections
+    /// belong to WS (vs other protocols on the same port). When the
+    /// channel closes, `accept` returns an error and the engine treats it
+    /// as transport failure.
+    pub fn external_streams(rx: tokio::sync::mpsc::Receiver<TcpStream>) -> Self {
+        Self {
+            mode: TransportMode::ExternalStreams {
+                rx: Mutex::new(rx),
+            },
+        }
+    }
+
     /// Bound address (useful when binding to port 0).
+    ///
+    /// Returns `None` for `ExternalStreams` mode — the relay knows its own
+    /// bound address from the `TcpListener` it holds directly.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.mode {
             TransportMode::Listening { listener } => {
                 listener.try_lock().ok().and_then(|l| l.local_addr().ok())
             }
-            TransportMode::DialOnly => None,
+            TransportMode::DialOnly | TransportMode::ExternalStreams { .. } => None,
         }
     }
 }
@@ -117,18 +135,26 @@ impl RawTransport for WebSocketRawTransport {
     }
 
     async fn accept(&self) -> SyncResult<Self::Connection> {
-        let listener = match &self.mode {
-            TransportMode::Listening { listener } => listener,
+        let tcp = match &self.mode {
+            TransportMode::Listening { listener } => {
+                let listener = listener.lock().await;
+                let (tcp, _peer) = listener
+                    .accept()
+                    .await
+                    .map_err(|e| SyncError::Transport(format!("accept: {e}")))?;
+                tcp
+            }
+            TransportMode::ExternalStreams { rx } => {
+                let mut rx = rx.lock().await;
+                rx.recv()
+                    .await
+                    .ok_or_else(|| SyncError::Transport("external stream channel closed".into()))?
+            }
             TransportMode::DialOnly => {
                 std::future::pending::<()>().await;
                 unreachable!();
             }
         };
-        let listener = listener.lock().await;
-        let (tcp, _peer) = listener
-            .accept()
-            .await
-            .map_err(|e| SyncError::Transport(format!("accept: {e}")))?;
         let ws = tokio_tungstenite::accept_async(tcp)
             .await
             .map_err(|e| SyncError::Transport(format!("ws upgrade: {e}")))?;
