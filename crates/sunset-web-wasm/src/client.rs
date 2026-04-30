@@ -327,16 +327,7 @@ impl Client {
                 }
             };
 
-            // Build a seed from JS Math.random() — getrandom isn't a direct
-            // dep here and from_entropy needs the std feature. The nonce just
-            // needs to be unique enough to avoid CRDT key collisions.
-            let mut seed = [0u8; 32];
-            for chunk in seed.chunks_mut(8) {
-                let r = (js_sys::Math::random() * (u64::MAX as f64)) as u64;
-                let bytes = r.to_le_bytes();
-                chunk.copy_from_slice(&bytes[..chunk.len()]);
-            }
-            let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
+            let mut rng = rand_chacha::ChaCha20Rng::from_entropy();
 
             while let Some(ev) = events.next().await {
                 let entry = match ev {

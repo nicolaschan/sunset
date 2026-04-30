@@ -18,7 +18,7 @@ futures.workspace = true
 hex.workspace = true
 postcard.workspace = true
 rand_chacha.workspace = true
-rand_core.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
 sunset-core.workspace = true
 sunset-noise.workspace = true
 sunset-store.workspace = true
@@ -32,6 +32,10 @@ web-time.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# getrandom 0.2 with the "js" feature is required for rand_core's
+# "getrandom" feature to work on wasm32-unknown-unknown. (rand_core 0.6
+# depends on getrandom 0.2, which needs "js" to use the browser RNG.)
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 js-sys.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
