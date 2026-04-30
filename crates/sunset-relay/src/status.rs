@@ -1,8 +1,8 @@
 //! Plaintext HTTP status page for the relay.
 //!
-//! Serves a single body on any path. Minimal HTTP/1.1 framing — reads until
-//! `\r\n\r\n`, replies with `200 OK text/plain` and closes. Not a real HTTP
-//! server; just enough to render in a browser.
+//! Rendered at `GET /dashboard` on the relay's single WS port. The accept
+//! loop and routing live in `router.rs`; this module owns only the render
+//! logic and the per-connection response writer.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ use sunset_store_fs::FsStore;
 use sunset_sync::{PeerId, SyncEngine};
 use sunset_sync_ws_native::WebSocketRawTransport;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 use crate::error::Result;
 
@@ -36,36 +36,10 @@ pub(crate) struct StatusContext {
     pub listen_addr: SocketAddr,
 }
 
-/// Pre-bind a listener so the OS-assigned port is known before the accept
-/// loop starts (matters for `port = 0` and for tests).
-pub(crate) async fn bind(addr: SocketAddr) -> Result<TcpListener> {
-    Ok(TcpListener::bind(addr).await?)
-}
-
-/// Run the status accept loop on an already-bound listener. Returns only on
-/// fatal error; caller aborts the task at shutdown.
-pub(crate) async fn serve_on(listener: TcpListener, ctx: Rc<StatusContext>) -> Result<()> {
-    if let Ok(bound) = listener.local_addr() {
-        tracing::info!(address = %bound, "status page listening");
-    }
-    loop {
-        let (tcp, _peer) = match listener.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "status accept failed");
-                continue;
-            }
-        };
-        let ctx_for_conn = ctx.clone();
-        tokio::task::spawn_local(async move {
-            if let Err(e) = handle(tcp, ctx_for_conn).await {
-                tracing::debug!(error = %e, "status request handler error");
-            }
-        });
-    }
-}
-
-async fn handle(mut tcp: TcpStream, ctx: Rc<StatusContext>) -> Result<()> {
+/// Render the dashboard for a TcpStream that the router has already
+/// classified as a `GET /dashboard` request. Reads (and discards) the
+/// rest of the request, then writes the rendered body.
+pub(crate) async fn serve_dashboard(mut tcp: TcpStream, ctx: Rc<StatusContext>) -> Result<()> {
     drain_request(&mut tcp).await;
     let body = render(ctx).await;
     let head = format!(
