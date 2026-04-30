@@ -1,7 +1,7 @@
 # Connection Liveness & Supervision Design
 
 **Date:** 2026-04-29
-**Scope:** Two changes in `sunset-sync`: (1) per-connection heartbeat in `run_peer`, (2) a new `PeerSupervisor` module that maintains durable connection intents above the engine. Plus a thin rewire of `Client::add_relay` / `Client::connect_direct` in `sunset-web-wasm` to use the supervisor.
+**Scope:** Two changes in `sunset-sync`: (1) per-connection heartbeat in `run_peer` plus an upgraded send-side disconnect signal and engine-level de-duplication, (2) a new `PeerSupervisor` module that maintains durable connection intents above the engine. Plus a thin rewire of `Client::add_relay` / `Client::connect_direct` in `sunset-web-wasm` to use the supervisor.
 **Out of scope (explicit):** wire-format changes outside `SyncMessage` enum extension, transport-level changes (WS/WebRTC raw transports), multi-relay routing, peer presence (already handled by `sunset-core` `Liveness`).
 
 ## Goal
@@ -12,6 +12,8 @@ When the relay restarts, or a client device sleeps and resumes, the WebSocket re
 2. **Cleanly-closed connection with no redial.** The relay restarts, the socket closes properly, the engine emits `PeerRemoved`, and nothing reconnects.
 
 Both must be solved, and the solution must be **transport-agnostic** (works for WebSocket-via-relay, WebRTC direct datachannel, and any future transport that lands in `MultiTransport`) and keep the top-level API simple (`client.add_relay(url)` / `client.connect_direct(pubkey)` register a durable intent and never need re-arming).
+
+The detection budget is layered: an immediate signal when the OS/browser surfaces a closed socket (send-side error), a heartbeat-driven signal when it doesn't (15–45 s window), and a redial supervisor on top of both.
 
 ## Layered approach
 
@@ -90,6 +92,56 @@ When a `Pong { nonce }` arrives (delivered to the liveness task via a small in-t
 
 The liveness task uses `wasmtimer::tokio::sleep` on `wasm32` (matching the existing `anti_entropy` pattern at `crates/sunset-sync/src/engine.rs:269`), `tokio::time::sleep` on native.
 
+### Send-side disconnect signal
+
+The current `send_task` in `run_peer` already detects send failures — but only as a reason to `break` the loop:
+
+```rust
+if send_reliable_message(&*conn, &msg).await.is_err() {
+    break;
+}
+```
+
+This loses information. A failed reliable send is *immediate, definitive evidence* that the underlying transport is dead — `WebSocketRawConnection::send_reliable` only returns Err when `closed` is set or `web_sys::WebSocket::send` itself rejects (readyState CLOSING/CLOSED). For a transport that's gone bad in only one direction (uncommon but possible), this surfaces faster than the recv loop's `recv_reliable` future, which sits blocked indefinitely.
+
+More importantly, when paired with the heartbeat: a `Ping` is sent every `heartbeat_interval` (15 s default). If the connection has died in a way the OS / browser has noticed but the recv loop hasn't observed yet, the very next ping write will fail and we know within 15 s — not 45 s.
+
+We change the send-task to emit `Disconnected` on send failure:
+
+```rust
+ChannelKind::Reliable => {
+    if let Err(e) = send_reliable_message(&*conn, &msg).await {
+        let _ = inbound_tx.send(InboundEvent::Disconnected {
+            peer_id: peer_id.clone(),
+            reason: format!("send reliable: {e}"),
+        });
+        break;
+    }
+}
+```
+
+(`peer_id` is in scope post-Hello; we already have it.) Unreliable send failures remain silent per the existing failure-mode rule (drop the datagram, keep the peer alive) — only reliable-send failures are treated as definitive.
+
+### Disconnect de-duplication
+
+With four concurrent sub-tasks (`recv_reliable_task`, `recv_unreliable_task`, `send_task`, `liveness_task`) any of which can now emit `Disconnected`, the engine could see multiple disconnect events for the same peer in quick succession (e.g., heartbeat times out, then send fails, then recv errors). Without guarding, the engine would fire multiple `PeerRemoved` events and the supervisor would schedule multiple redials.
+
+Fix is one-line in `SyncEngine::handle_inbound_event` (`crates/sunset-sync/src/engine.rs:405`): only emit `PeerRemoved` if `peer_outbound.remove(peer_id)` returned `Some`. First disconnect wins; subsequent duplicates are silently dropped at the engine boundary.
+
+```rust
+InboundEvent::Disconnected { peer_id, reason } => {
+    eprintln!("sunset-sync: peer {peer_id:?} disconnected: {reason}");
+    let removed = {
+        let mut state = self.state.lock().await;
+        state.peer_kinds.remove(&peer_id);
+        state.peer_outbound.remove(&peer_id).is_some()
+    };
+    if removed {
+        self.emit_engine_event(EngineEvent::PeerRemoved { peer_id }).await;
+    }
+}
+```
+
 ### Engine handling
 
 `SyncEngine::handle_peer_message` (`crates/sunset-sync/src/engine.rs:442`) gets two new no-op arms — `Ping` and `Pong` are entirely handled by the per-peer task. Listing them (no wildcard) keeps the same compile-time-coverage discipline as the existing match.
@@ -98,10 +150,12 @@ The liveness task uses `wasmtimer::tokio::sleep` on `wasm32` (matching the exist
 
 | Scenario | Behaviour |
 |---|---|
-| Channel goes silent (sleep/resume, dead TCP) | Liveness times out after `heartbeat_timeout`; emits `Disconnected`; engine fires `PeerRemoved` like any other disconnect. |
+| Channel goes silent (sleep/resume, dead TCP, OS unaware) | Liveness times out after `heartbeat_timeout`; emits `Disconnected`; engine fires `PeerRemoved` like any other disconnect. Worst case ≈ 45 s. |
+| Channel dead, OS/browser noticed (relay restart, RST received) | The next reliable send (next user message OR next heartbeat ping, whichever is sooner) fails immediately. `send_task` emits `Disconnected` within ~15 s under idle, instantly under traffic. |
+| Multiple sub-tasks emit `Disconnected` for the same peer | Engine de-dupes via `peer_outbound.remove(...).is_some()`. First disconnect wins; subsequent duplicates are silently dropped. Exactly one `PeerRemoved` event reaches subscribers. |
 | One Ping or Pong dropped in transit | Tolerated: `heartbeat_timeout = 3 × heartbeat_interval` so 1–2 missed pings recover when the next pong arrives. |
 | Peer sends Ping but never Pong (or vice versa) | Asymmetric: each side runs its own liveness loop independently. If one side's pongs aren't arriving, that side disconnects on its own timer. The other side may still be receiving pongs; it disconnects when its own pings stop being answered. |
-| Reordered Pongs (nonce 5 arrives before nonce 4) | Both update `last_pong_at`; both removed from `pending`. State is correct. |
+| Reordered Pongs (nonce 5 arrives before nonce 4) | Each updates `last_pong_at`. State is correct (nonce isn't tracked beyond informational logging). |
 | Pong with unknown nonce (e.g., from a reset peer that lost state) | Dropped silently. Doesn't affect timeout. |
 | Send-task already torn down when liveness wants to send a Ping | The outbound channel is closed; `send` returns Err; liveness task exits. The reliable recv-task's own error path will independently emit `Disconnected`. |
 | Ping arrives before Hello | Cannot happen: `run_peer` blocks on Hello before starting the four concurrent loops. The liveness task only exists post-Hello. |
@@ -116,6 +170,8 @@ In `crates/sunset-sync/src/peer.rs` `mod tests`, all using `TestTransport` and `
 4. **Reordered Pongs accepted.** Wrapper buffers Pongs and releases them out of order. No `Disconnected`.
 5. **Unknown-nonce Pong dropped.** Inject a `Pong { nonce: u64::MAX }` directly into the recv channel (using a `TransportConnection` wrapper that prepends one); verify no `Disconnected` (handler is silent) and that the regular ping/pong loop still progresses.
 6. **Frozen-vector regression.** Test that `postcard::to_stdvec(&SyncMessage::Ping { nonce: 1 })` matches a hex-pinned byte string; same for `Pong { nonce: 1 }`.
+7. **Send-side disconnect.** Use a `TransportConnection` wrapper whose `send_reliable` returns Err after the Hello exchange (e.g., a `Mutex<bool>` flipped by the test). Verify a `Disconnected { reason: "send reliable: ..." }` is observed on `inbound_tx` from the send task without waiting for the heartbeat timeout.
+8. **Disconnect de-dup.** Drive two sources of `Disconnected` (e.g., trigger the send failure AND the heartbeat timeout overlap by holding the receiver's pong path closed). Subscribe to `EngineEvent::PeerRemoved` and verify exactly one event lands.
 
 ## Piece 2: `PeerSupervisor`
 
