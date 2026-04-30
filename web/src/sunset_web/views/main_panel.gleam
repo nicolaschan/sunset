@@ -208,12 +208,14 @@ fn message_view(
   on_toggle_selected: fn(String) -> msg,
   receipts: Dict(String, Set(String)),
 ) -> Element(msg) {
-  let pending = m.you && {
-    case dict.get(receipts, m.id) {
-      Ok(s) -> set.size(s) == 0
-      Error(_) -> True
+  let pending =
+    m.you
+    && {
+      case dict.get(receipts, m.id) {
+        Ok(s) -> set.size(s) == 0
+        Error(_) -> True
+      }
     }
-  }
   let opacity = case pending {
     True -> "0.55"
     False -> "1"
@@ -764,6 +766,7 @@ fn composer(
         [
           attach_button(p),
           html.input([
+            attribute.autofocus(True),
             attribute.value(draft),
             attribute.placeholder("Message #" <> channel_name),
             event.on_input(on_draft),
