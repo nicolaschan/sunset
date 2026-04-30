@@ -171,7 +171,7 @@ fn messages_list(
         #("gap", "0"),
       ]),
     ],
-    list.append(rendered, [typing_indicator(p)]),
+    rendered,
   )
 }
 
@@ -667,20 +667,6 @@ fn read_marker(p: Palette, seen_by: Int) -> Element(msg) {
         ],
       )
   }
-}
-
-fn typing_indicator(p: Palette) -> Element(msg) {
-  html.div(
-    [
-      ui.css([
-        #("padding", "8px 8px 0 8px"),
-        #("font-size", "14.375px"),
-        #("color", p.text_faint),
-        #("font-style", "italic"),
-      ]),
-    ],
-    [html.text("noor is typing…")],
-  )
 }
 
 fn composer(
