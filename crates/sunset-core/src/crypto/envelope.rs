@@ -202,6 +202,31 @@ mod tests {
         assert_eq!(decoded, body);
     }
 
+    #[test]
+    fn message_body_text_postcard_hex_pin() {
+        // Pin the postcard encoding so accidental drift breaks the build.
+        // postcard encodes: enum-tag (varint 0) + len-prefixed UTF-8 string.
+        let body = MessageBody::Text("hi".to_owned());
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        // 00 = Text variant tag; 02 = string length (varint); 6869 = "hi".
+        assert_eq!(hex, "00026869", "MessageBody::Text wire encoding drifted");
+    }
+
+    #[test]
+    fn message_body_receipt_postcard_hex_pin() {
+        // Receipt's payload is a 32-byte hash; pin a known input.
+        let h: sunset_store::Hash = blake3::hash(b"x").into();
+        let body = MessageBody::Receipt { for_value_hash: h };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        // 01 = Receipt variant tag; then 32 raw bytes of the hash.
+        assert_eq!(bytes[0], 0x01, "MessageBody::Receipt variant tag drifted");
+        assert_eq!(bytes.len(), 1 + 32, "Receipt should encode as tag + 32 bytes");
+        let hash_hex: String = bytes[1..].iter().map(|b| format!("{b:02x}")).collect();
+        let expected_hash: String = h.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hash_hex, expected_hash);
+    }
+
     /// Frozen wire-format vector for `EncryptedMessage`. Failing means the
     /// postcard encoding has drifted — bump the version before updating.
     #[test]
