@@ -218,3 +218,19 @@ export function presenceParamsFromUrl() {
   // Gleam tuple #(Int, Int, Int) is a 3-element JS array.
   return [interval, ttl, refresh];
 }
+
+// Delivery-receipt FFI.
+
+export function onReceipt(client, callback) {
+  client.on_receipt((incoming) => {
+    callback(incoming);
+  });
+}
+
+export function recForValueHashHex(rec) {
+  return rec.for_value_hash_hex;
+}
+
+export function recFromPubkey(rec) {
+  return new BitArray(rec.from_pubkey);
+}
