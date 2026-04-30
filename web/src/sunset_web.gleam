@@ -16,6 +16,7 @@ import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/set.{type Set}
 import gleam/string
 import lustre
 import lustre/attribute
@@ -89,6 +90,11 @@ pub type Model {
     /// right-rail (DetailsSheet → details_panel) and floating voice
     /// popover (VoiceSheet → voice_popover.view).
     sheet: Option(domain.Sheet),
+    /// Receipts received per outgoing message, keyed by message id
+    /// (value_hash hex). Each entry is the set of peer verifying-key
+    /// short-hex strings that have acknowledged. The bridge filters
+    /// self-receipts at the source so this dict never contains them.
+    receipts: Dict(String, Set(String)),
   )
 }
 
@@ -125,6 +131,7 @@ pub type Msg {
   RelayConnectResult(Result(Nil, String))
   SubscribePublishResult(Result(Nil, String))
   IncomingMsg(IncomingMessage)
+  IncomingReceipt(message_id: String, from_pubkey: String)
   SubmitDraft
   MessageSent(Result(String, String))
   MembersUpdated(List(domain.Member))
@@ -201,6 +208,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       viewport: initial_viewport,
       drawer: None,
       sheet: None,
+      receipts: dict.new(),
     )
 
   let subscribe_hash =
@@ -542,6 +550,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         effect.from(fn(dispatch) {
           sunset.on_message(client, fn(im) { dispatch(IncomingMsg(im)) })
         })
+      let on_receipt_eff =
+        effect.from(fn(dispatch) {
+          sunset.on_receipt(client, fn(r) {
+            dispatch(IncomingReceipt(
+              sunset.rec_for_value_hash_hex(r),
+              short_pubkey(sunset.rec_from_pubkey(r)),
+            ))
+          })
+        })
       // Presence wiring is in ClientReady (not RelayConnectResult) so
       // it kicks off even when there's no `?relay=` URL — the user
       // still sees themselves in the member list. Effect order within a
@@ -575,7 +592,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(
         Model(..model, client: Some(client), relay_status: new_status),
-        effect.batch([on_msg_eff, presence_eff, connect_eff]),
+        effect.batch([on_msg_eff, on_receipt_eff, presence_eff, connect_eff]),
       )
     }
     RelayConnectResult(Ok(_)) ->
@@ -637,6 +654,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     }
     MessageSent(_) -> #(model, effect.none())
+    IncomingReceipt(message_id, from_pubkey) -> {
+      let existing = case dict.get(model.receipts, message_id) {
+        Ok(s) -> s
+        Error(_) -> set.new()
+      }
+      let updated = set.insert(existing, from_pubkey)
+      #(
+        Model(..model, receipts: dict.insert(model.receipts, message_id, updated)),
+        effect.none(),
+      )
+    }
     MembersUpdated(ms) -> #(Model(..model, members: ms), effect.none())
     RelayStatusUpdated(s) -> #(Model(..model, relay_status: s), effect.none())
     ToggleReactionPicker(id) -> {
