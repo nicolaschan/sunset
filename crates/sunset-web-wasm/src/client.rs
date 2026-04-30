@@ -350,3 +350,33 @@ impl Client {
         });
     }
 }
+
+/// Compose and insert a Receipt for `for_value_hash` into the local
+/// store. Used by the auto-ack path in `spawn_message_subscription`.
+/// Errors are logged via `web_sys::console` and swallowed — receipts
+/// are best-effort; failing to ack is not fatal.
+#[allow(dead_code)]
+async fn send_receipt(
+    store: &std::sync::Arc<sunset_store_memory::MemoryStore>,
+    room: &sunset_core::Room,
+    identity: &sunset_core::Identity,
+    for_value_hash: sunset_store::Hash,
+    rng: &mut rand_chacha::ChaCha20Rng,
+) {
+    use sunset_store::Store as _;
+    let now_ms = js_sys::Date::now() as u64;
+    let composed = match sunset_core::compose_receipt(identity, room, 0, now_ms, for_value_hash, rng) {
+        Ok(c) => c,
+        Err(e) => {
+            web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "compose_receipt failed: {e}"
+            )));
+            return;
+        }
+    };
+    if let Err(e) = store.insert(composed.entry, Some(composed.block)).await {
+        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "store.insert(receipt) failed: {e}"
+        )));
+    }
+}
