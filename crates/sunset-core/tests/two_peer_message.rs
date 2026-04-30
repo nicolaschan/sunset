@@ -24,7 +24,8 @@ use rand_core::OsRng;
 
 use sunset_core::crypto::constants::test_fast_params;
 use sunset_core::{
-    ComposedMessage, Identity, Room, compose_message, decode_message, room_messages_filter,
+    ComposedMessage, Identity, MessageBody, Room, compose_message, decode_message,
+    room_messages_filter,
 };
 use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
@@ -129,7 +130,7 @@ async fn alice_encrypts_bob_decrypts() {
             let body = "hello bob, this is encrypted";
             let sent_at = 1_700_000_000_000u64;
             let ComposedMessage { entry, block } =
-                compose_message(&alice, &alice_room, 0, sent_at, body, &mut OsRng).unwrap();
+                compose_message(&alice, &alice_room, 0, sent_at, MessageBody::Text(body.to_owned()), &mut OsRng).unwrap();
             let expected_hash: Hash = block.hash();
 
             alice_store
@@ -182,7 +183,7 @@ async fn alice_encrypts_bob_decrypts() {
             assert_eq!(decoded.author_key, alice.public());
             assert_eq!(decoded.room_fingerprint, bob_room.fingerprint());
             assert_eq!(decoded.epoch_id, 0);
-            assert_eq!(decoded.body, body);
+            assert_eq!(decoded.body, MessageBody::Text(body.to_owned()));
             assert_eq!(decoded.sent_at_ms, sent_at);
 
             // ---- a third party who never joined cannot decrypt ----

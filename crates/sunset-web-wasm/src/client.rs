@@ -9,7 +9,7 @@ use rand_core::SeedableRng;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
-use sunset_core::{Ed25519Verifier, Identity, Room};
+use sunset_core::{Ed25519Verifier, Identity, MessageBody, Room};
 use sunset_noise::{NoiseIdentity, NoiseTransport};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::{MultiTransport, PeerId, Signer, SyncConfig, SyncEngine};
@@ -269,7 +269,7 @@ impl Client {
             &self.room,
             0u64,
             sent_at_ms as u64,
-            &body,
+            MessageBody::Text(body),
             &mut rng,
         )
         .map_err(|e| JsError::new(&format!("compose_message: {e}")))?;

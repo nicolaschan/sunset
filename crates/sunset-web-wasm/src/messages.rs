@@ -3,7 +3,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use sunset_core::DecodedMessage;
+use sunset_core::{DecodedMessage, MessageBody};
 
 /// JS-facing decoded message. Mirrors sunset-core's DecodedMessage but
 /// uses JS-friendly types (BigInt → f64 for timestamps, Vec<u8> → Uint8Array).
@@ -25,11 +25,15 @@ pub fn from_decoded(
     value_hash_hex: String,
     is_self: bool,
 ) -> IncomingMessage {
+    let body = match decoded.body {
+        MessageBody::Text(t) => t,
+        _ => String::new(),
+    };
     IncomingMessage {
         author_pubkey: decoded.author_key.as_bytes().to_vec(),
         epoch_id: decoded.epoch_id,
         sent_at_ms: decoded.sent_at_ms as f64,
-        body: decoded.body,
+        body,
         value_hash_hex,
         is_self,
     }

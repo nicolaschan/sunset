@@ -8,7 +8,7 @@ use rand_core::SeedableRng;
 use wasm_bindgen::prelude::*;
 
 use sunset_core::{
-    ComposedMessage as CoreComposedMessage, Ed25519Verifier, Identity, Room,
+    ComposedMessage as CoreComposedMessage, Ed25519Verifier, Identity, MessageBody, Room,
     compose_message as core_compose, decode_message as core_decode,
 };
 use sunset_store::{ContentBlock, SignatureVerifier, SignedKvEntry};
@@ -142,7 +142,7 @@ pub fn compose_message(
     let mut rng = ChaCha20Rng::from_seed(nonce_seed);
 
     let CoreComposedMessage { entry, block } =
-        core_compose(&identity, &room, epoch_id, sent_at_ms, body, &mut rng)
+        core_compose(&identity, &room, epoch_id, sent_at_ms, MessageBody::Text(body.to_owned()), &mut rng)
             .map_err(|e| js_err("compose_message", e))?;
 
     Ok(ComposedMessage {
@@ -179,11 +179,21 @@ pub fn decode_message(
 
     let decoded = core_decode(&room, &entry, &block).map_err(|e| js_err("decode_message", e))?;
 
+    let body_text = match decoded.body {
+        MessageBody::Text(t) => t,
+        other => {
+            return Err(JsError::new(&format!(
+                "sunset-core: decode_message: unsupported body variant: {:?}",
+                other
+            )));
+        }
+    };
+
     Ok(DecodedMessage {
         author_pubkey: decoded.author_key.as_bytes().to_vec(),
         epoch_id: decoded.epoch_id,
         sent_at_ms: decoded.sent_at_ms,
-        body: decoded.body,
+        body: body_text,
     })
 }
 
