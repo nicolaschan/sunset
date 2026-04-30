@@ -30,7 +30,6 @@ pub fn view(
   right_rail: Element(msg),
   overlay: Element(msg),
   phone_header_el: Element(msg),
-  voice_minibar: Element(msg),
   details_sheet: Element(msg),
   voice_sheet: Element(msg),
   reaction_sheet: Element(msg),
@@ -60,7 +59,6 @@ pub fn view(
         main,
         right_rail,
         phone_header_el,
-        voice_minibar,
         details_sheet,
         voice_sheet,
         reaction_sheet,
@@ -78,7 +76,6 @@ fn phone_view(
   main: Element(msg),
   right_rail: Element(msg),
   phone_header_el: Element(msg),
-  voice_minibar: Element(msg),
   details_sheet: Element(msg),
   voice_sheet: Element(msg),
   reaction_sheet: Element(msg),
@@ -115,7 +112,6 @@ fn phone_view(
     [
       global_reset(mode, palette),
       phone_header_el,
-      voice_minibar,
       html.main(
         [
           ui.css([

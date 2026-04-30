@@ -1049,6 +1049,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       receipts: model.receipts,
       selected_msg_id: model.selected_msg_id,
       on_toggle_selected: ToggleMessageSelected,
+      voice_minibar: voice_minibar_el,
     ),
     case model.viewport, detail_msg {
       domain.Desktop, Some(m) ->
@@ -1068,7 +1069,6 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_open_channels: OpenDrawer(domain.ChannelsDrawer),
       on_open_members: OpenDrawer(domain.MembersDrawer),
     ),
-    voice_minibar_el,
     details_sheet_el,
     voice_sheet_el,
     reaction_sheet_el,

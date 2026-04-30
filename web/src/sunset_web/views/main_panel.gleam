@@ -46,6 +46,11 @@ pub fn view(
   receipts receipts: Dict(String, Set(String)),
   selected_msg_id selected_msg_id: Option(String),
   on_toggle_selected on_toggle_selected: fn(String) -> msg,
+  // Slot rendered between the channel header and the message list.
+  // Used by the phone shell for the in-call voice mini-bar — voice
+  // chat is a per-channel concern, so the banner sits inside the
+  // channel's column. Pass `element.fragment([])` for none.
+  voice_minibar voice_minibar: Element(msg),
 ) -> Element(msg) {
   let ChannelId(channel_name) = cur
   // On phone the host (shell.phone_view) gives this column a flex slot
@@ -70,6 +75,7 @@ pub fn view(
     ],
     [
       channel_header(p, channel_name),
+      voice_minibar,
       messages_list(
         p,
         viewport,
