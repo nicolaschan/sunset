@@ -996,6 +996,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_toggle_reaction_picker: ToggleReactionPicker,
       on_add_reaction: AddReaction,
       on_open_detail: OpenDetail,
+      receipts: model.receipts,
     ),
     case model.viewport, detail_msg {
       domain.Desktop, Some(m) ->

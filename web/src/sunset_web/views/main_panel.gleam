@@ -9,10 +9,12 @@
 ////
 //// Image attachments are still deferred to a later plan.
 
+import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
+import gleam/set.{type Set}
 import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
@@ -41,6 +43,7 @@ pub fn view(
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
   on_open_detail on_open_detail: fn(String) -> msg,
+  receipts receipts: Dict(String, Set(String)),
 ) -> Element(msg) {
   let ChannelId(channel_name) = cur
   // On phone the host (shell.phone_view) gives this column a flex slot
@@ -74,6 +77,7 @@ pub fn view(
         on_react_toggle,
         on_add_reaction,
         on_open_detail,
+        receipts,
       ),
       composer(p, viewport, channel_name, draft, on_draft, on_submit, noop),
     ],
@@ -119,6 +123,7 @@ fn messages_list(
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
   on_open_detail: fn(String) -> msg,
+  receipts: Dict(String, Set(String)),
 ) -> Element(msg) {
   let last_seen_index = last_own_seen_index(ms)
   // Pair each message with its index AND its predecessor's author (for grouping).
@@ -153,6 +158,7 @@ fn messages_list(
         on_react_toggle,
         on_add_reaction,
         on_open_detail,
+        receipts,
       )
     })
 
@@ -186,8 +192,15 @@ fn message_view(
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
   on_open_detail: fn(String) -> msg,
+  receipts: Dict(String, Set(String)),
 ) -> Element(msg) {
-  let opacity = case m.pending {
+  let pending = m.you && {
+    case dict.get(receipts, m.id) {
+      Ok(s) -> set.size(s) == 0
+      Error(_) -> True
+    }
+  }
+  let opacity = case pending {
     True -> "0.55"
     False -> "1"
   }
@@ -219,6 +232,7 @@ fn message_view(
           #("padding", "2px 8px"),
           #("border-radius", "6px"),
           #("opacity", opacity),
+          #("transition", "opacity 220ms ease"),
           #("margin-top", margin_top),
           #("background", bg),
         ]),
