@@ -29,6 +29,7 @@ import sunset_web/domain.{
   NoRelay, Reaction, Reconnecting, Room, RoomId,
 }
 import sunset_web/fixture
+import sunset_web/scroll_anchor
 import sunset_web/storage
 import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
 import sunset_web/theme.{type Mode, Dark, Light}
@@ -143,6 +144,7 @@ pub type Msg {
 
 pub fn main() {
   storage.install_mobile_viewport_meta()
+  scroll_anchor.attach_chat_scroll_anchor()
   let app = lustre.application(init, update, view)
   let assert Ok(_) = lustre.start(app, "#app", Nil)
   Nil
