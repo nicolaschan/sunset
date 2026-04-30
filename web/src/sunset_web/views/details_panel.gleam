@@ -1,23 +1,27 @@
 //// Right-column message-details panel — replaces the members rail
 //// when a message's info button is clicked.
 ////
-//// Renders three sections:
-////   • sender / cryptographic provenance (id, prev hash, signature)
-////   • delivery path (hops list)
-////   • per-recipient read receipts with relay route + timestamp
+//// Renders up to four sections:
+////   • the quoted message body (always)
+////   • sender / cryptographic provenance (when full details are known)
+////   • delivery path (when full details are known)
+////   • read receipts (always; sourced from the live receipts dict so
+////     even messages without crypto provenance show acks as they
+////     arrive)
 ////
-//// Closes via the X button in the top-right or the Close button at
-//// the bottom.
+//// Closes via the X button in the top-right.
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/set.{type Set}
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Message, type MessageDetails, type Receipt, type RelayStatus, BridgeRelay,
-  Direct, HasDetails, NoDetails, NoRelay, OneHop, SelfRelay, TwoHop, ViaPeer,
+  type Member, type Message, type MessageDetails, type RelayStatus, BridgeRelay,
+  Direct, HasDetails, MemberId, NoDetails, NoRelay, OneHop, SelfRelay, TwoHop,
+  ViaPeer,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -25,20 +29,15 @@ import sunset_web/ui
 pub fn view(
   palette p: Palette,
   message m: Message,
+  receipts r: Set(String),
+  members ms: List(Member),
   on_close on_close: msg,
 ) -> Element(msg) {
-  case m.details {
-    HasDetails(d) -> rendered(p, m, d, on_close)
-    NoDetails -> empty(p, on_close)
+  let detail_section = case m.details {
+    HasDetails(d) ->
+      element.fragment([sender_section(p, d), delivery_section(p, d)])
+    NoDetails -> element.fragment([])
   }
-}
-
-fn rendered(
-  p: Palette,
-  m: Message,
-  d: MessageDetails,
-  on_close: msg,
-) -> Element(msg) {
   html.aside(
     [
       attribute.attribute("data-testid", "details-panel"),
@@ -69,42 +68,8 @@ fn rendered(
         ],
         [
           message_quote(p, m),
-          sender_section(p, d),
-          delivery_section(p, d),
-          receipts_section(p, d.receipts),
-        ],
-      ),
-    ],
-  )
-}
-
-fn empty(p: Palette, on_close: msg) -> Element(msg) {
-  html.aside(
-    [
-      attribute.attribute("data-testid", "details-panel"),
-      ui.css([
-        #("height", "100vh"),
-        #("height", "100dvh"),
-        #("display", "flex"),
-        #("flex-direction", "column"),
-        #("background", p.surface),
-        #("border-left", "1px solid " <> p.border),
-      ]),
-    ],
-    [
-      header(p, on_close),
-      html.div(
-        [
-          ui.css([
-            #("padding", "20px"),
-            #("color", p.text_muted),
-            #("font-size", "15.625px"),
-          ]),
-        ],
-        [
-          html.text(
-            "Crypto chain and delivery info aren't yet available for this message — usually only own outgoing messages carry full provenance in v1.",
-          ),
+          detail_section,
+          receipts_section(p, m, r, ms),
         ],
       ),
     ],
@@ -320,9 +285,32 @@ fn arrow(p: Palette) -> Element(msg) {
   ])
 }
 
-fn receipts_section(p: Palette, rs: List(Receipt)) -> Element(msg) {
+fn receipts_section(
+  p: Palette,
+  m: Message,
+  r: Set(String),
+  ms: List(Member),
+) -> Element(msg) {
+  // Order: matches member-rail order so receipts read consistently
+  // across panels. Pubkeys not in the member list (peer left, never
+  // seen, etc.) get appended at the end.
+  let from_members =
+    list.filter_map(ms, fn(member) {
+      let MemberId(pk) = member.id
+      case set.contains(r, pk) {
+        True -> Ok(#(pk, member.name, member.relay))
+        False -> Error(Nil)
+      }
+    })
+  let known_pks =
+    list.fold(from_members, set.new(), fn(acc, t) { set.insert(acc, t.0) })
+  let stragglers =
+    set.to_list(set.difference(r, known_pks))
+    |> list.map(fn(pk) { #(pk, pk, NoRelay) })
+  let rows = list.append(from_members, stragglers)
+
   section(p, "Read by", [
-    case rs {
+    case rows {
       [] ->
         html.div(
           [
@@ -332,7 +320,7 @@ fn receipts_section(p: Palette, rs: List(Receipt)) -> Element(msg) {
               #("font-style", "italic"),
             ]),
           ],
-          [html.text("No reads yet.")],
+          [html.text(empty_state_text(m))],
         )
       _ ->
         html.div(
@@ -343,20 +331,39 @@ fn receipts_section(p: Palette, rs: List(Receipt)) -> Element(msg) {
               #("gap", "8px"),
             ]),
           ],
-          list.map(rs, fn(r) { receipt_row(p, r) }),
+          list.map(rows, fn(row) {
+            let #(pk, name, relay) = row
+            receipt_row(p, pk, name, relay)
+          }),
         )
     },
   ])
 }
 
-fn receipt_row(p: Palette, r: Receipt) -> Element(msg) {
+/// Receipts only flow back for our own outgoing messages — peers don't
+/// emit acks for messages they sent. Tell the reader which case applies
+/// instead of just "no reads yet" everywhere.
+fn empty_state_text(m: Message) -> String {
+  case m.you {
+    True -> "No reads yet."
+    False -> "Receipts are only tracked for messages you sent."
+  }
+}
+
+fn receipt_row(
+  p: Palette,
+  _pk: String,
+  name: String,
+  relay: RelayStatus,
+) -> Element(msg) {
   html.div(
     [
       attribute.attribute("data-testid", "receipt-row"),
       ui.css([
         #("display", "flex"),
-        #("flex-direction", "column"),
-        #("gap", "2px"),
+        #("align-items", "baseline"),
+        #("justify-content", "space-between"),
+        #("gap", "8px"),
         #("padding", "6px 8px"),
         #("border", "1px solid " <> p.border_soft),
         #("border-radius", "6px"),
@@ -364,39 +371,28 @@ fn receipt_row(p: Palette, r: Receipt) -> Element(msg) {
       ]),
     ],
     [
-      html.div(
+      html.span(
         [
           ui.css([
-            #("display", "flex"),
-            #("align-items", "baseline"),
-            #("justify-content", "space-between"),
-            #("gap", "8px"),
+            #("font-weight", "600"),
+            #("color", p.text),
+            #("font-family", theme.font_mono),
+            #("font-size", "13.75px"),
+            #("overflow", "hidden"),
+            #("text-overflow", "ellipsis"),
           ]),
         ],
-        [
-          html.span([ui.css([#("font-weight", "600"), #("color", p.text)])], [
-            html.text(r.name),
-          ]),
-          html.span(
-            [
-              ui.css([
-                #("color", p.text_faint),
-                #("font-size", "12.5px"),
-                #("white-space", "nowrap"),
-              ]),
-            ],
-            [html.text(r.time)],
-          ),
-        ],
+        [html.text(name)],
       ),
       html.span(
         [
           ui.css([
-            #("font-size", "13.125px"),
+            #("font-size", "12.5px"),
             #("color", p.text_muted),
+            #("white-space", "nowrap"),
           ]),
         ],
-        [html.text(relay_label(r.relay))],
+        [html.text(relay_label(relay))],
       ),
     ],
   )

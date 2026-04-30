@@ -719,22 +719,38 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(new_model, effect.none())
     }
     OpenDetail(id) -> #(
+      // Opening the details panel pins selection on the same id so the
+      // row's action toolbar stays visible while the panel is open and
+      // no other row's hover affordance can sneak in alongside it
+      // (the global stylesheet's :has() rule keys off .is-selected).
       Model(
         ..model,
         sheet: Some(domain.DetailsSheet(message_id: id)),
         reacting_to: None,
+        selected_msg_id: Some(id),
       ),
       effect.none(),
     )
-    CloseDetail -> #(
+    CloseDetail -> {
       // Only close if the active sheet is the details one — guards against
       // a Voice sheet being opened concurrently and accidentally dismissed.
-      Model(..model, sheet: case model.sheet {
-        Some(domain.DetailsSheet(_)) -> None
-        other -> other
-      }),
-      effect.none(),
-    )
+      // When closing, drop the matching selection so the toolbar collapses
+      // back to its default state.
+      let #(next_sheet, next_selected) = case model.sheet {
+        Some(domain.DetailsSheet(message_id: id)) -> #(
+          None,
+          case model.selected_msg_id {
+            Some(open) if open == id -> None
+            other -> other
+          },
+        )
+        other -> #(other, model.selected_msg_id)
+      }
+      #(
+        Model(..model, sheet: next_sheet, selected_msg_id: next_selected),
+        effect.none(),
+      )
+    }
     OpenVoicePopover(name) -> #(
       Model(
         ..model,
@@ -906,6 +922,8 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
             content: details_panel.view(
               palette: palette,
               message: m,
+              receipts: receipts_for(model.receipts, m.id),
+              members: model.members,
               on_close: CloseDetail,
             ),
           )
@@ -1034,7 +1052,13 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     ),
     case model.viewport, detail_msg {
       domain.Desktop, Some(m) ->
-        details_panel.view(palette: palette, message: m, on_close: CloseDetail)
+        details_panel.view(
+          palette: palette,
+          message: m,
+          receipts: receipts_for(model.receipts, m.id),
+          members: model.members,
+          on_close: CloseDetail,
+        )
       _, _ -> members.view(palette: palette, members: model.members)
     },
     voice_popover_overlay(palette, model),
@@ -1135,6 +1159,13 @@ fn relay_status_to_conn(relay_status: String) -> domain.ConnStatus {
 fn find_message(ms: List(Message), id: String) -> Option(Message) {
   list.find(ms, fn(m) { m.id == id })
   |> option.from_result
+}
+
+fn receipts_for(receipts: Dict(String, Set(String)), id: String) -> Set(String) {
+  case dict.get(receipts, id) {
+    Ok(s) -> s
+    Error(_) -> set.new()
+  }
 }
 
 fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {

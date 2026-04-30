@@ -21,8 +21,8 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, ChannelId, HasBridge, HasDetails,
-  Minecraft, NoBridge, NoDetails,
+  type ChannelId, type Message, type Reaction, ChannelId, HasBridge, Minecraft,
+  NoBridge,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -234,14 +234,13 @@ fn message_view(
     True -> p.surface_alt
     False -> "transparent"
   }
-  // Row class accumulates state markers: `is-active` while the
-  // details panel is open for this message, `is-selected` while the
-  // user has tapped/clicked it. Either pins the action toolbar
-  // visible (see shell.gleam global stylesheet).
-  let row_class = case detail_open, selected {
-    True, _ -> "msg-row is-active is-selected"
-    False, True -> "msg-row is-selected"
-    False, False -> "msg-row"
+  // Row class: `is-selected` whenever this row should pin its action
+  // toolbar visible. Opening the details panel sets selection too
+  // (see OpenDetail in sunset_web.gleam), so we don't need a separate
+  // `.is-active` marker for that case anymore.
+  let row_class = case selected {
+    True -> "msg-row is-selected"
+    False -> "msg-row"
   }
 
   // Wrap header + body + reactions in an inner clickable div so a
@@ -325,10 +324,6 @@ fn actions_toolbar(
   _on_add_reaction: fn(String, String) -> msg,
   on_open_detail: fn(String) -> msg,
 ) -> Element(msg) {
-  let info_disabled = case m.details {
-    HasDetails(_) -> False
-    NoDetails -> True
-  }
   html.div(
     [
       attribute.class("msg-actions"),
@@ -354,12 +349,15 @@ fn actions_toolbar(
         False,
         on_react_toggle(m.id),
       ),
+      // Info is always enabled — the panel still has useful content
+      // (the message body and any read receipts) even when the row
+      // doesn't carry full crypto provenance.
       action_button(
         p,
         "Message details",
         info_icon(),
         False,
-        info_disabled,
+        False,
         on_open_detail(m.id),
       ),
     ],

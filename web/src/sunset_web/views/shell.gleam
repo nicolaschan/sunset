@@ -238,14 +238,22 @@ fn global_reset() -> Element(msg) {
     "html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
      #app { height: 100%; }
      *, *::before, *::after { box-sizing: border-box; }
+     /* Action toolbar visibility is single-source: at most one row's
+        toolbar is visible at a time. .is-selected mirrors the model's
+        Option(String) selection. The desktop hover affordance is
+        suppressed via :has() whenever any row is selected so a
+        selection + hover-elsewhere never produces two visible toolbars
+        at once. No fade transition — instant swap avoids the brief
+        overlap that fast taps used to expose. */
      .msg-row .msg-actions {
        opacity: 0;
        pointer-events: none;
-       transition: opacity 120ms ease;
      }
-     .msg-row:hover .msg-actions,
-     .msg-row.is-active .msg-actions,
      .msg-row.is-selected .msg-actions {
+       opacity: 1;
+       pointer-events: auto;
+     }
+     .scroll-area:not(:has(.msg-row.is-selected)) .msg-row:hover .msg-actions {
        opacity: 1;
        pointer-events: auto;
      }
