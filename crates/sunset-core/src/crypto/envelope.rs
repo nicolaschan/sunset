@@ -128,6 +128,21 @@ impl EncryptedMessage {
     }
 }
 
+/// Discriminator for the inner plaintext of a chat-room entry. Both
+/// variants ride the same `<room_fp>/msg/<value_hash>` namespace and
+/// share the AEAD envelope; only the plaintext shape differs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageBody {
+    /// A user-authored chat message.
+    Text(String),
+    /// An acknowledgement that the author of this entry decoded the
+    /// referenced `Text` message. The author of the receipt is the
+    /// receiver of the original message.
+    Receipt {
+        for_value_hash: sunset_store::Hash,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +183,23 @@ mod tests {
         assert_ne!(a, c);
         assert_ne!(a, d);
         assert_ne!(a, e);
+    }
+
+    #[test]
+    fn message_body_text_roundtrips_via_postcard() {
+        let body = MessageBody::Text("hello".to_owned());
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn message_body_receipt_roundtrips_via_postcard() {
+        let h: sunset_store::Hash = blake3::hash(b"target message").into();
+        let body = MessageBody::Receipt { for_value_hash: h };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, body);
     }
 
     /// Frozen wire-format vector for `EncryptedMessage`. Failing means the
