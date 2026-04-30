@@ -46,6 +46,17 @@ pub fn palette_for(mode: Mode) -> Palette {
   }
 }
 
+/// CSS `color-scheme` keyword for the active mode. Setting this on the
+/// root tells the UA to render its default chrome (scrollbars, form
+/// controls, the iOS "below the page" gap) in tones that match the
+/// app, instead of flashing the opposite-theme default.
+pub fn color_scheme(mode: Mode) -> String {
+  case mode {
+    Light -> "light"
+    Dark -> "dark"
+  }
+}
+
 fn light() -> Palette {
   Palette(
     bg: "#f7f5f1",

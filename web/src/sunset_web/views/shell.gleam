@@ -51,6 +51,7 @@ pub fn view(
       )
     Phone ->
       phone_view(
+        mode,
         palette,
         drawer,
         on_close_drawer,
@@ -68,6 +69,7 @@ pub fn view(
 }
 
 fn phone_view(
+  mode: Mode,
   palette: Palette,
   drawer: option.Option(Drawer),
   on_close_drawer: msg,
@@ -111,7 +113,7 @@ fn phone_view(
       ]),
     ],
     [
-      global_reset(),
+      global_reset(mode, palette),
       phone_header_el,
       voice_minibar,
       html.main(
@@ -196,7 +198,7 @@ fn desktop_view(
       ]),
     ],
     [
-      global_reset(),
+      global_reset(mode, palette),
       html.div(
         [
           ui.css([
@@ -232,11 +234,23 @@ fn desktop_view(
 /// Also defines a couple of hover-state rules — Lustre's inline `style`
 /// attributes can't express :hover, so the rules live here and views
 /// opt in via `attribute.class("...")`.
-fn global_reset() -> Element(msg) {
+fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
+  // html/body get the palette background so the area exposed when iOS
+  // Safari pushes the page up for the soft keyboard (or the bounce-
+  // scroll area on rubber-banding) matches the app instead of flashing
+  // white. color-scheme tells the UA to render default form-control
+  // chrome and scrollbars in the right tone for the active theme.
   html.style(
     [],
-    "html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
-     #app { height: 100%; }
+    "html, body {
+       margin: 0;
+       padding: 0;
+       height: 100%;
+       overflow: hidden;
+       background: " <> palette.bg <> ";
+       color-scheme: " <> theme.color_scheme(mode) <> ";
+     }
+     #app { height: 100%; background: " <> palette.bg <> "; }
      *, *::before, *::after { box-sizing: border-box; }
      /* Action toolbar visibility is single-source: at most one row's
         toolbar is visible at a time. .is-selected mirrors the model's
