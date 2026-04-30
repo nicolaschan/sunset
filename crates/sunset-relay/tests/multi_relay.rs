@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use sunset_core::crypto::constants::test_fast_params;
 use sunset_core::{
-    ComposedMessage, Ed25519Verifier, Identity, Room, compose_message, decode_message,
+    ComposedMessage, Ed25519Verifier, Identity, MessageBody, Room, compose_message, decode_message,
     room_messages_filter,
 };
 use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret};
@@ -182,7 +182,7 @@ async fn alice_to_bob_via_two_relays() {
             let body = "hello bob across two relays";
             let sent_at = 1_700_000_000_000u64;
             let ComposedMessage { entry, block } =
-                compose_message(&alice, &alice_room, 0, sent_at, body, &mut OsRng).unwrap();
+                compose_message(&alice, &alice_room, 0, sent_at, MessageBody::Text(body.to_owned()), &mut OsRng).unwrap();
             let expected_hash: Hash = block.hash();
             alice_store
                 .insert(entry.clone(), Some(block.clone()))
@@ -237,7 +237,7 @@ async fn alice_to_bob_via_two_relays() {
                 .unwrap();
             let decoded = decode_message(&bob_room, &bob_entry, &bob_block).unwrap();
             assert_eq!(decoded.author_key, alice.public());
-            assert_eq!(decoded.body, body);
+            assert_eq!(decoded.body, MessageBody::Text(body.to_owned()));
         })
         .await;
 }
@@ -317,7 +317,7 @@ async fn failover_when_relay_a_dies() {
                 &alice_room,
                 0,
                 1,
-                "msg-1 (both relays alive)",
+                MessageBody::Text("msg-1 (both relays alive)".to_owned()),
                 &mut OsRng,
             )
             .unwrap();
@@ -353,7 +353,7 @@ async fn failover_when_relay_a_dies() {
                 &alice_room,
                 0,
                 2,
-                "msg-2 (after relay A killed)",
+                MessageBody::Text("msg-2 (after relay A killed)".to_owned()),
                 &mut OsRng,
             )
             .unwrap();

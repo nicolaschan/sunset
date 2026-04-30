@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 
 use sunset_core::crypto::constants::test_fast_params;
 use sunset_core::{
-    ComposedMessage, Ed25519Verifier, Identity, Room, compose_message, decode_message,
+    ComposedMessage, Ed25519Verifier, Identity, MessageBody, Room, compose_message, decode_message,
     room_messages_filter,
 };
 use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret};
@@ -140,7 +140,7 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             let body = "hello bob via real ws + noise";
             let sent_at = 1_700_000_000_000u64;
             let ComposedMessage { entry, block } =
-                compose_message(&alice, &alice_room, 0, sent_at, body, &mut OsRng).unwrap();
+                compose_message(&alice, &alice_room, 0, sent_at, MessageBody::Text(body.to_owned()), &mut OsRng).unwrap();
             let expected_hash: Hash = block.hash();
             alice_store
                 .insert(entry.clone(), Some(block.clone()))
@@ -189,7 +189,7 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
                 .unwrap();
             let decoded = decode_message(&bob_room, &bob_entry, &bob_block).unwrap();
             assert_eq!(decoded.author_key, alice.public());
-            assert_eq!(decoded.body, body);
+            assert_eq!(decoded.body, MessageBody::Text(body.to_owned()));
 
             alice_run.abort();
             bob_run.abort();

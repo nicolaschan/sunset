@@ -100,7 +100,18 @@ export async function sendMessage(client, body, sentAtMs, callback) {
 
 export function onMessage(client, callback) {
   client.on_message((incoming) => {
-    callback(incoming);
+    // Copy fields into a plain JS object so we can free the wasm-bindgen
+    // wrapper immediately and avoid GC-delayed memory accumulation.
+    const plain = {
+      author_pubkey: incoming.author_pubkey,
+      epoch_id: incoming.epoch_id,
+      sent_at_ms: incoming.sent_at_ms,
+      body: incoming.body,
+      value_hash_hex: incoming.value_hash_hex,
+      is_self: incoming.is_self,
+    };
+    incoming.free();
+    callback(plain);
   });
 }
 
@@ -217,4 +228,27 @@ export function presenceParamsFromUrl() {
   const refresh = parseOr("presence_refresh", 5000);
   // Gleam tuple #(Int, Int, Int) is a 3-element JS array.
   return [interval, ttl, refresh];
+}
+
+// Delivery-receipt FFI.
+
+export function onReceipt(client, callback) {
+  client.on_receipt((incoming) => {
+    // Copy fields into a plain JS object so we can free the wasm-bindgen
+    // wrapper immediately and avoid GC-delayed memory accumulation.
+    const plain = {
+      for_value_hash_hex: incoming.for_value_hash_hex,
+      from_pubkey: incoming.from_pubkey,
+    };
+    incoming.free();
+    callback(plain);
+  });
+}
+
+export function recForValueHashHex(rec) {
+  return rec.for_value_hash_hex;
+}
+
+export function recFromPubkey(rec) {
+  return new BitArray(rec.from_pubkey);
 }

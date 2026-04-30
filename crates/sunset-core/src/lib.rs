@@ -17,7 +17,7 @@ pub mod message;
 pub mod verifier;
 
 pub use bus::{Bus, BusEvent, BusImpl};
-pub use crypto::envelope::{EncryptedMessage, SignedMessage};
+pub use crypto::envelope::{EncryptedMessage, MessageBody, SignedMessage};
 pub use crypto::room::{Room, RoomFingerprint};
 pub use error::{Error, Result};
 pub use filters::{room_filter, room_messages_filter};
@@ -25,5 +25,5 @@ pub use identity::{Identity, IdentityKey};
 pub use liveness::{
     Clock, HasSenderTime, Liveness, LivenessState, PeerLivenessChange, SystemClock,
 };
-pub use message::{ComposedMessage, DecodedMessage, compose_message, decode_message};
+pub use message::{ComposedMessage, DecodedMessage, compose_message, compose_receipt, compose_text, decode_message};
 pub use verifier::Ed25519Verifier;

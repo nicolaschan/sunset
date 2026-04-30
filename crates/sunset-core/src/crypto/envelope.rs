@@ -82,7 +82,7 @@ impl<'de> Deserialize<'de> for Signature {
 pub struct SignedMessage {
     pub inner_signature: Signature,
     pub sent_at_ms: u64,
-    pub body: String,
+    pub body: MessageBody,
 }
 
 /// What the inner Ed25519 signature covers. Bound to room + epoch so a valid
@@ -92,14 +92,14 @@ pub struct InnerSigPayload<'a> {
     pub room_fingerprint: &'a [u8; 32],
     pub epoch_id: u64,
     pub sent_at_ms: u64,
-    pub body: &'a str,
+    pub body: &'a MessageBody,
 }
 
 pub fn inner_sig_payload_bytes(
     room_fp: &RoomFingerprint,
     epoch_id: u64,
     sent_at_ms: u64,
-    body: &str,
+    body: &MessageBody,
 ) -> Vec<u8> {
     postcard::to_stdvec(&InnerSigPayload {
         room_fingerprint: room_fp.as_bytes(),
@@ -128,6 +128,21 @@ impl EncryptedMessage {
     }
 }
 
+/// Discriminator for the inner plaintext of a chat-room entry. Both
+/// variants ride the same `<room_fp>/msg/<value_hash>` namespace and
+/// share the AEAD envelope; only the plaintext shape differs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageBody {
+    /// A user-authored chat message.
+    Text(String),
+    /// An acknowledgement that the author of this entry decoded the
+    /// referenced `Text` message. The author of the receipt is the
+    /// receiver of the original message.
+    Receipt {
+        for_value_hash: sunset_store::Hash,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,7 +152,7 @@ mod tests {
         let m = SignedMessage {
             inner_signature: Signature([9u8; 64]),
             sent_at_ms: 1_700_000_000_000,
-            body: "hello".into(),
+            body: MessageBody::Text("hello".to_owned()),
         };
         let bytes = postcard::to_stdvec(&m).unwrap();
         let back: SignedMessage = postcard::from_bytes(&bytes).unwrap();
@@ -159,15 +174,57 @@ mod tests {
     #[test]
     fn inner_sig_payload_changes_with_each_field() {
         let fp = RoomFingerprint([1u8; 32]);
-        let a = inner_sig_payload_bytes(&fp, 0, 100, "hi");
-        let b = inner_sig_payload_bytes(&fp, 1, 100, "hi"); // epoch differs
-        let c = inner_sig_payload_bytes(&fp, 0, 101, "hi"); // sent_at differs
-        let d = inner_sig_payload_bytes(&fp, 0, 100, "hello"); // body differs
-        let e = inner_sig_payload_bytes(&RoomFingerprint([2u8; 32]), 0, 100, "hi"); // room differs
+        let a = inner_sig_payload_bytes(&fp, 0, 100, &MessageBody::Text("hi".to_owned()));
+        let b = inner_sig_payload_bytes(&fp, 1, 100, &MessageBody::Text("hi".to_owned())); // epoch differs
+        let c = inner_sig_payload_bytes(&fp, 0, 101, &MessageBody::Text("hi".to_owned())); // sent_at differs
+        let d = inner_sig_payload_bytes(&fp, 0, 100, &MessageBody::Text("hello".to_owned())); // body differs
+        let e = inner_sig_payload_bytes(&RoomFingerprint([2u8; 32]), 0, 100, &MessageBody::Text("hi".to_owned())); // room differs
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);
         assert_ne!(a, e);
+    }
+
+    #[test]
+    fn message_body_text_roundtrips_via_postcard() {
+        let body = MessageBody::Text("hello".to_owned());
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn message_body_receipt_roundtrips_via_postcard() {
+        let h: sunset_store::Hash = blake3::hash(b"target message").into();
+        let body = MessageBody::Receipt { for_value_hash: h };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn message_body_text_postcard_hex_pin() {
+        // Pin the postcard encoding so accidental drift breaks the build.
+        // postcard encodes: enum-tag (varint 0) + len-prefixed UTF-8 string.
+        let body = MessageBody::Text("hi".to_owned());
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        // 00 = Text variant tag; 02 = string length (varint); 6869 = "hi".
+        assert_eq!(hex, "00026869", "MessageBody::Text wire encoding drifted");
+    }
+
+    #[test]
+    fn message_body_receipt_postcard_hex_pin() {
+        // Receipt's payload is a 32-byte hash; pin a known input.
+        let h: sunset_store::Hash = blake3::hash(b"x").into();
+        let body = MessageBody::Receipt { for_value_hash: h };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        // 01 = Receipt variant tag; then 32 raw bytes of the hash.
+        assert_eq!(bytes[0], 0x01, "MessageBody::Receipt variant tag drifted");
+        assert_eq!(bytes.len(), 1 + 32, "Receipt should encode as tag + 32 bytes");
+        let hash_hex: String = bytes[1..].iter().map(|b| format!("{b:02x}")).collect();
+        let expected_hash: String = h.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hash_hex, expected_hash);
     }
 
     /// Frozen wire-format vector for `EncryptedMessage`. Failing means the

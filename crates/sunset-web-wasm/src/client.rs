@@ -9,7 +9,7 @@ use rand_core::SeedableRng;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
-use sunset_core::{Ed25519Verifier, Identity, Room};
+use sunset_core::{Ed25519Verifier, Identity, MessageBody, Room};
 use sunset_noise::{NoiseIdentity, NoiseTransport};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::{MultiTransport, PeerId, Signer, SyncConfig, SyncEngine};
@@ -42,6 +42,7 @@ pub struct Client {
     store: Arc<MemoryStore>,
     engine: Rc<Engine>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
+    on_receipt: Rc<RefCell<Option<js_sys::Function>>>,
     relay_status: Rc<RefCell<String>>,
     presence_started: Rc<RefCell<bool>>,
     tracker_handles: Rc<crate::membership_tracker::TrackerHandles>,
@@ -101,6 +102,7 @@ impl Client {
             store,
             engine,
             on_message: Rc::new(RefCell::new(None)),
+            on_receipt: Rc::new(RefCell::new(None)),
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
             presence_started: Rc::new(RefCell::new(false)),
             tracker_handles: Rc::new(crate::membership_tracker::TrackerHandles::new(
@@ -269,7 +271,7 @@ impl Client {
             &self.room,
             0u64,
             sent_at_ms as u64,
-            &body,
+            MessageBody::Text(body),
             &mut rng,
         )
         .map_err(|e| JsError::new(&format!("compose_message: {e}")))?;
@@ -289,16 +291,32 @@ impl Client {
         self.spawn_message_subscription();
     }
 
+    pub fn on_receipt(&self, callback: js_sys::Function) {
+        *self.on_receipt.borrow_mut() = Some(callback);
+        // No new subscription needed — spawn_message_subscription handles
+        // both Text and Receipt variants.
+    }
+
     fn spawn_message_subscription(&self) {
         let store = self.store.clone();
         let room = self.room.clone();
+        let identity = self.identity.clone();
         let identity_pub = self.identity.public();
         let on_message = self.on_message.clone();
+        let on_receipt = self.on_receipt.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             use futures::StreamExt;
-            use sunset_core::{decode_message, room_messages_filter};
+            use std::collections::HashSet;
+            use sunset_core::{decode_message, room_messages_filter, MessageBody};
             use sunset_store::{Event, Replay, Store as _};
+
+            // Session-only dedup: which Text value-hashes have we already
+            // acked since this subscription started? Replay::All will
+            // redeliver them on page load; this set keeps us from writing
+            // a fresh receipt every time. Cross-session dedup is out of
+            // scope for v1.
+            let mut acked: HashSet<sunset_store::Hash> = HashSet::new();
 
             let filter = room_messages_filter(&room);
             let mut events = match store.subscribe(filter, Replay::All).await {
@@ -308,6 +326,8 @@ impl Client {
                     return;
                 }
             };
+
+            let mut rng = rand_chacha::ChaCha20Rng::from_entropy();
 
             while let Some(ev) = events.next().await {
                 let entry = match ev {
@@ -340,13 +360,74 @@ impl Client {
                 };
 
                 let is_self = decoded.author_key == identity_pub;
-                let value_hash_hex = entry.value_hash.to_hex();
-                let incoming = crate::messages::from_decoded(decoded, value_hash_hex, is_self);
 
-                if let Some(cb) = on_message.borrow().as_ref() {
-                    let _ = cb.call1(&JsValue::NULL, &JsValue::from(incoming));
+                match decoded.body.clone() {
+                    MessageBody::Text(text) => {
+                        // Deliver to the FE on_message callback.
+                        let value_hash_hex = entry.value_hash.to_hex();
+                        let incoming = crate::messages::from_decoded_text(
+                            decoded,
+                            text,
+                            value_hash_hex,
+                            is_self,
+                        );
+                        if let Some(cb) = on_message.borrow().as_ref() {
+                            let _ = cb.call1(&JsValue::NULL, &JsValue::from(incoming));
+                        }
+
+                        // Auto-ack: only for non-self texts, only once per session.
+                        if !is_self && !acked.contains(&entry.value_hash) {
+                            acked.insert(entry.value_hash);
+                            send_receipt(&store, &room, &identity, entry.value_hash, &mut rng)
+                                .await;
+                        }
+                    }
+                    MessageBody::Receipt { for_value_hash } => {
+                        // Drop self-Receipts at the bridge (see spec:
+                        // auto-ack never produces them, so anything here
+                        // is from manual composition / future protocol
+                        // changes — the FE doesn't need a redundant check).
+                        if is_self {
+                            continue;
+                        }
+                        let for_hex = for_value_hash.to_hex();
+                        let from_pub = decoded.author_key;
+                        let incoming = crate::messages::receipt_to_js(for_hex, from_pub);
+                        if let Some(cb) = on_receipt.borrow().as_ref() {
+                            let _ = cb.call1(&JsValue::NULL, &JsValue::from(incoming));
+                        }
+                    }
                 }
             }
         });
+    }
+}
+
+/// Compose and insert a Receipt for `for_value_hash` into the local
+/// store. Used by the auto-ack path in `spawn_message_subscription`.
+/// Errors are logged via `web_sys::console` and swallowed — receipts
+/// are best-effort; failing to ack is not fatal.
+async fn send_receipt(
+    store: &std::sync::Arc<sunset_store_memory::MemoryStore>,
+    room: &sunset_core::Room,
+    identity: &sunset_core::Identity,
+    for_value_hash: sunset_store::Hash,
+    rng: &mut rand_chacha::ChaCha20Rng,
+) {
+    use sunset_store::Store as _;
+    let now_ms = js_sys::Date::now() as u64;
+    let composed = match sunset_core::compose_receipt(identity, room, 0, now_ms, for_value_hash, rng) {
+        Ok(c) => c,
+        Err(e) => {
+            web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "compose_receipt failed: {e}"
+            )));
+            return;
+        }
+    };
+    if let Err(e) = store.insert(composed.entry, Some(composed.block)).await {
+        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "store.insert(receipt) failed: {e}"
+        )));
     }
 }

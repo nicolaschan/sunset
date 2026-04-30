@@ -143,3 +143,23 @@ pub fn mem_is_self(m: MemberJs) -> Bool
 /// Returns `#(interval_ms, ttl_ms, refresh_ms)`. Defaults: 30000/60000/5000.
 @external(javascript, "./sunset.ffi.mjs", "presenceParamsFromUrl")
 pub fn presence_params_from_url() -> #(Int, Int, Int)
+
+/// JS-side IncomingReceipt object, opaque to Gleam.
+pub type IncomingReceipt
+
+/// Subscribe to delivery receipts. The callback fires once per receipt
+/// authored by a peer other than us; self-receipts are dropped at the
+/// bridge layer.
+@external(javascript, "./sunset.ffi.mjs", "onReceipt")
+pub fn on_receipt(
+  client: ClientHandle,
+  callback: fn(IncomingReceipt) -> Nil,
+) -> Nil
+
+/// Hex-encoded value_hash of the Text that this Receipt acknowledges.
+@external(javascript, "./sunset.ffi.mjs", "recForValueHashHex")
+pub fn rec_for_value_hash_hex(r: IncomingReceipt) -> String
+
+/// Verifying key of the peer who authored this Receipt.
+@external(javascript, "./sunset.ffi.mjs", "recFromPubkey")
+pub fn rec_from_pubkey(r: IncomingReceipt) -> BitArray
