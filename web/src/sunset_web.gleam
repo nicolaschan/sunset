@@ -592,7 +592,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(
         Model(..model, client: Some(client), relay_status: new_status),
-        effect.batch([on_msg_eff, on_receipt_eff, presence_eff, connect_eff]),
+        effect.batch([on_receipt_eff, on_msg_eff, presence_eff, connect_eff]),
       )
     }
     RelayConnectResult(Ok(_)) ->
