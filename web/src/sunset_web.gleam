@@ -670,7 +670,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       let updated = set.insert(existing, from_pubkey)
       #(
-        Model(..model, receipts: dict.insert(model.receipts, message_id, updated)),
+        Model(
+          ..model,
+          receipts: dict.insert(model.receipts, message_id, updated),
+        ),
         effect.none(),
       )
     }
@@ -861,7 +864,8 @@ fn view(model: Model) -> Element(Msg) {
 fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
   let displayed_rooms = resolve_rooms(model.joined_rooms, model.relay_status)
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
-  let active_room = lookup_room(displayed_rooms, current_name, model.relay_status)
+  let active_room =
+    lookup_room(displayed_rooms, current_name, model.relay_status)
 
   let raw_messages = model.messages
   let messages_with_live_reactions =
@@ -987,6 +991,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
       viewport: model.viewport,
+      members: model.members,
       mode: model.mode,
       on_toggle_mode: ToggleMode,
     ),
@@ -1087,7 +1092,8 @@ fn resolve_rooms(names: List(String), relay_status: String) -> List(Room) {
   let fixture_rooms = fixture.rooms()
   list.map(names, fn(name) {
     case list.find(fixture_rooms, fn(r) { r.name == name }) {
-      Ok(r) -> Room(..r, status: relay_status_to_conn(relay_status), id: RoomId(name))
+      Ok(r) ->
+        Room(..r, status: relay_status_to_conn(relay_status), id: RoomId(name))
       Error(_) -> synthetic_room(name, relay_status)
     }
   })

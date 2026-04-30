@@ -35,6 +35,7 @@ pub fn view(
   on_drag_end on_drag_end: msg,
   toggle toggle: msg,
   viewport viewport: domain.Viewport,
+  members members: List(domain.Member),
   mode mode: Mode,
   on_toggle_mode on_toggle_mode: msg,
 ) -> Element(msg) {
@@ -52,6 +53,11 @@ pub fn view(
     domain.Phone -> "0"
     domain.Desktop -> "1px solid " <> p.border
   }
+  // The current user
+  let you =
+    members
+    |> list.find(fn(m) { m.you })
+    |> option.from_result
   html.aside(
     [
       attribute.attribute("data-testid", "rooms-rail"),
@@ -94,7 +100,7 @@ pub fn view(
         on_drop,
         on_drag_end,
       ),
-      you_row(p, col),
+      you_row(you, p, col),
       case viewport {
         domain.Phone -> phone_theme_toggle_row(p, mode, on_toggle_mode)
         domain.Desktop -> element.fragment([])
@@ -726,7 +732,11 @@ fn unread_pill(p: Palette, n: Int) -> Element(msg) {
   )
 }
 
-fn you_row(p: Palette, collapsed: Bool) -> Element(msg) {
+fn you_row(
+  you: Option(domain.Member),
+  p: Palette,
+  collapsed: Bool,
+) -> Element(msg) {
   // Pinned at the bottom of the rooms rail. The fixed 64px height +
   // border-top is shared by the channels-rail self-bar and the main
   // panel composer so all three column-bottom rows visually align.
@@ -738,6 +748,7 @@ fn you_row(p: Palette, collapsed: Bool) -> Element(msg) {
     True -> "center"
     False -> "flex-start"
   }
+  let your_name = you |> option.map(fn(a) { a.name }) |> option.unwrap("?")
   html.div(
     [
       ui.css([
@@ -789,7 +800,7 @@ fn you_row(p: Palette, collapsed: Bool) -> Element(msg) {
                     #("color", p.text_faint),
                   ]),
                 ],
-                [html.text("8f3c…a2")],
+                [html.text(your_name)],
               ),
             ],
           )
