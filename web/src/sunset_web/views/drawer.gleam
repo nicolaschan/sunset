@@ -64,7 +64,6 @@ pub fn view(
             Right -> "1px solid " <> p.border
             Left -> "0"
           }),
-          #("box-shadow", p.shadow_lg),
           #("z-index", "30"),
           #("transform", transform),
           #("transition", "transform 220ms ease"),
