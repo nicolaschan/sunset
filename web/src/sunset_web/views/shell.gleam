@@ -113,6 +113,7 @@ fn phone_view(
     [
       global_reset(),
       phone_header_el,
+      voice_minibar,
       html.main(
         [
           ui.css([
@@ -125,7 +126,6 @@ fn phone_view(
         ],
         [main],
       ),
-      voice_minibar,
       drawer_module.view(
         palette: palette,
         open: channels_open,
