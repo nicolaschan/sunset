@@ -96,6 +96,11 @@ pub type Model {
     /// short-hex strings that have acknowledged. The bridge filters
     /// self-receipts at the source so this dict never contains them.
     receipts: Dict(String, Set(String)),
+    /// Message currently "selected" — its action toolbar (react / info)
+    /// stays visible. On mobile (no hover) this is the only way to
+    /// reveal those buttons; on desktop it pins the row even after the
+    /// pointer leaves. Tap/click anywhere on the message body toggles.
+    selected_msg_id: Option(String),
   )
 }
 
@@ -116,6 +121,7 @@ pub type Msg {
   SelectChannel(ChannelId)
   ToggleRoomsRail
   UpdateDraft(String)
+  ToggleMessageSelected(String)
   ToggleReactionPicker(String)
   AddReaction(String, String)
   OpenDetail(String)
@@ -211,6 +217,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       drawer: None,
       sheet: None,
       receipts: dict.new(),
+      selected_msg_id: None,
     )
 
   let subscribe_hash =
@@ -669,6 +676,24 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     MembersUpdated(ms) -> #(Model(..model, members: ms), effect.none())
     RelayStatusUpdated(s) -> #(Model(..model, relay_status: s), effect.none())
+    ToggleMessageSelected(id) -> {
+      // Tap/click on a message body. Toggle selection — same id
+      // deselects, different id replaces. Closing also dismisses any
+      // open reaction picker for the previously-selected message so
+      // the UI doesn't end up with a phantom picker on a hidden row.
+      let next = case model.selected_msg_id {
+        Some(open) if open == id -> None
+        _ -> Some(id)
+      }
+      let next_picker = case next {
+        None -> None
+        Some(_) -> model.reacting_to
+      }
+      #(
+        Model(..model, selected_msg_id: next, reacting_to: next_picker),
+        effect.none(),
+      )
+    }
     ToggleReactionPicker(id) -> {
       let next = case model.reacting_to {
         Some(open) if open == id -> None
@@ -999,6 +1024,8 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_add_reaction: AddReaction,
       on_open_detail: OpenDetail,
       receipts: model.receipts,
+      selected_msg_id: model.selected_msg_id,
+      on_toggle_selected: ToggleMessageSelected,
     ),
     case model.viewport, detail_msg {
       domain.Desktop, Some(m) ->

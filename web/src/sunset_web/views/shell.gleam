@@ -244,7 +244,8 @@ fn global_reset() -> Element(msg) {
        transition: opacity 120ms ease;
      }
      .msg-row:hover .msg-actions,
-     .msg-row.is-active .msg-actions {
+     .msg-row.is-active .msg-actions,
+     .msg-row.is-selected .msg-actions {
        opacity: 1;
        pointer-events: auto;
      }
@@ -262,9 +263,13 @@ fn global_reset() -> Element(msg) {
      @media (max-width: 767px) {
        input, textarea, select { font-size: 16px; }
      }
-     /* Touch devices: hover-only affordances are always visible. */
+     /* Touch devices: room-row delete is hover-only on desktop, but
+        on touch it's always visible. .msg-actions are NOT
+        always-visible on touch — they reveal only when the user
+        taps a message (.is-selected) or its details panel is open
+        (.is-active). The selectors above already cover that for
+        both viewports. */
      @media (hover: none) {
-       .msg-row .msg-actions,
        .room-row .room-delete {
          opacity: 1;
          pointer-events: auto;

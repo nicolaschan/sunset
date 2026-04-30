@@ -44,6 +44,8 @@ pub fn view(
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
   on_open_detail on_open_detail: fn(String) -> msg,
   receipts receipts: Dict(String, Set(String)),
+  selected_msg_id selected_msg_id: Option(String),
+  on_toggle_selected on_toggle_selected: fn(String) -> msg,
 ) -> Element(msg) {
   let ChannelId(channel_name) = cur
   // On phone the host (shell.phone_view) gives this column a flex slot
@@ -78,6 +80,8 @@ pub fn view(
         on_add_reaction,
         on_open_detail,
         receipts,
+        selected_msg_id,
+        on_toggle_selected,
       ),
       composer(p, viewport, channel_name, draft, on_draft, on_submit, noop),
     ],
@@ -124,6 +128,8 @@ fn messages_list(
   on_add_reaction: fn(String, String) -> msg,
   on_open_detail: fn(String) -> msg,
   receipts: Dict(String, Set(String)),
+  selected_msg_id: Option(String),
+  on_toggle_selected: fn(String) -> msg,
 ) -> Element(msg) {
   let last_seen_index = last_own_seen_index(ms)
   // Pair each message with its index AND its predecessor's author (for grouping).
@@ -147,6 +153,10 @@ fn messages_list(
         Some(id) if id == m.id -> True
         _ -> False
       }
+      let selected = case selected_msg_id {
+        Some(id) if id == m.id -> True
+        _ -> False
+      }
       message_view(
         p,
         viewport,
@@ -155,9 +165,11 @@ fn messages_list(
         i == last_seen_index,
         picker_open,
         detail_open,
+        selected,
         on_react_toggle,
         on_add_reaction,
         on_open_detail,
+        on_toggle_selected,
         receipts,
       )
     })
@@ -189,9 +201,11 @@ fn message_view(
   show_read_marker: Bool,
   picker_open: Bool,
   detail_open: Bool,
+  selected: Bool,
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
   on_open_detail: fn(String) -> msg,
+  on_toggle_selected: fn(String) -> msg,
   receipts: Dict(String, Set(String)),
 ) -> Element(msg) {
   let pending = m.you && {
@@ -218,11 +232,22 @@ fn message_view(
     True -> p.surface_alt
     False -> "transparent"
   }
-  let row_class = case detail_open {
-    True -> "msg-row is-active"
-    False -> "msg-row"
+  // Row class accumulates state markers: `is-active` while the
+  // details panel is open for this message, `is-selected` while the
+  // user has tapped/clicked it. Either pins the action toolbar
+  // visible (see shell.gleam global stylesheet).
+  let row_class = case detail_open, selected {
+    True, _ -> "msg-row is-active is-selected"
+    False, True -> "msg-row is-selected"
+    False, False -> "msg-row"
   }
 
+  // Wrap header + body + reactions in an inner clickable div so a
+  // tap toggles selection. The actions_toolbar lives as a sibling of
+  // this wrapper (still a child of .msg-row, absolutely positioned),
+  // so clicks on action buttons bubble to .msg-row but never through
+  // the body wrapper — the React/Info buttons can't accidentally
+  // toggle the selection.
   html.div([], [
     html.div(
       [
@@ -238,22 +263,33 @@ fn message_view(
         ]),
       ],
       [
-        header,
         html.div(
           [
+            event.on_click(on_toggle_selected(m.id)),
             ui.css([
-              #("font-size", "16.875px"),
-              #("color", p.text),
-              #("white-space", "pre-wrap"),
-              #("word-break", "break-word"),
+              #("display", "flex"),
+              #("flex-direction", "column"),
             ]),
           ],
-          [html.text(m.body)],
+          [
+            header,
+            html.div(
+              [
+                ui.css([
+                  #("font-size", "16.875px"),
+                  #("color", p.text),
+                  #("white-space", "pre-wrap"),
+                  #("word-break", "break-word"),
+                ]),
+              ],
+              [html.text(m.body)],
+            ),
+            case m.reactions {
+              [] -> element.fragment([])
+              rs -> reactions_row(p, rs)
+            },
+          ],
         ),
-        case m.reactions {
-          [] -> element.fragment([])
-          rs -> reactions_row(p, rs)
-        },
         actions_toolbar(
           p,
           m,
