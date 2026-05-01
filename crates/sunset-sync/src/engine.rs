@@ -97,9 +97,9 @@ pub enum EngineEvent {
 /// `conn_id` is checked when handling `InboundEvent::Disconnected` so a
 /// stale event from a defunct connection can't tear down a fresh one.
 pub(crate) struct PeerOutbound {
-    // Stored now (Task 5); read by Task 6's stale-Disconnected filter.
-    // Suppress dead_code until Task 6 lands.
-    #[allow(dead_code)]
+    /// Identifies the connection generation that owns this outbound channel.
+    /// Compared against `InboundEvent::Disconnected.conn_id` to filter stale
+    /// disconnects from defunct generations (see `handle_inbound_event`).
     pub(crate) conn_id: ConnectionId,
     pub(crate) tx: mpsc::UnboundedSender<SyncMessage>,
 }
@@ -464,17 +464,25 @@ where
             }
             InboundEvent::Disconnected {
                 peer_id,
-                conn_id: _,
+                conn_id,
                 reason,
             } => {
-                eprintln!("sunset-sync: peer {peer_id:?} disconnected: {reason}");
-                {
+                eprintln!("sunset-sync: peer {peer_id:?} disconnected ({conn_id}): {reason}");
+                let removed = {
                     let mut state = self.state.lock().await;
-                    state.peer_outbound.remove(&peer_id);
-                    state.peer_kinds.remove(&peer_id);
+                    match state.peer_outbound.get(&peer_id) {
+                        Some(po) if po.conn_id == conn_id => {
+                            state.peer_kinds.remove(&peer_id);
+                            state.peer_outbound.remove(&peer_id);
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if removed {
+                    self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
+                        .await;
                 }
-                self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
-                    .await;
             }
         }
     }
@@ -1283,6 +1291,166 @@ mod tests {
                 // outside. Abort the task to terminate run().
                 h.abort();
                 let _ = h.await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_disconnected_from_old_connection_is_filtered() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                // Simulate two generations: register peer with conn_id=1,
+                // then replace with conn_id=2, then deliver a stale
+                // Disconnected for conn_id=1.
+                let peer = PeerId(vk(b"bob"));
+
+                // Generation 1.
+                let (tx1, _rx1) = mpsc::unbounded_channel::<SyncMessage>();
+                let conn1 = ConnectionId::for_test(1);
+                engine.state.lock().await.peer_outbound.insert(
+                    peer.clone(),
+                    PeerOutbound {
+                        conn_id: conn1,
+                        tx: tx1,
+                    },
+                );
+
+                // Replace with generation 2 (simulating a fresh PeerHello).
+                let (tx2, mut rx2) = mpsc::unbounded_channel::<SyncMessage>();
+                let conn2 = ConnectionId::for_test(2);
+                engine.state.lock().await.peer_outbound.insert(
+                    peer.clone(),
+                    PeerOutbound {
+                        conn_id: conn2,
+                        tx: tx2,
+                    },
+                );
+
+                // Subscribe to engine events to assert NO PeerRemoved fires.
+                let mut events = engine.subscribe_engine_events().await;
+
+                // Deliver a stale Disconnected for the old generation.
+                engine
+                    .handle_inbound_event(InboundEvent::Disconnected {
+                        peer_id: peer.clone(),
+                        conn_id: conn1,
+                        reason: "stale".into(),
+                    })
+                    .await;
+
+                // No PeerRemoved should arrive within a short timeout.
+                let got =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await;
+                assert!(
+                    got.is_err(),
+                    "stale Disconnected for old conn must NOT emit PeerRemoved"
+                );
+
+                // The fresh sender (gen 2) must still be live: a manual
+                // send through it should succeed.
+                let state = engine.state.lock().await;
+                let po = state.peer_outbound.get(&peer).expect("gen2 still present");
+                assert_eq!(po.conn_id, conn2);
+                let _ = po.tx.send(SyncMessage::Goodbye {});
+                drop(state);
+                let received = rx2.recv().await.expect("gen2 sender still alive");
+                assert!(matches!(received, SyncMessage::Goodbye { .. }));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn matching_disconnected_removes_peer_and_emits_removed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let peer = PeerId(vk(b"bob"));
+
+                let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let conn = ConnectionId::for_test(7);
+                engine
+                    .state
+                    .lock()
+                    .await
+                    .peer_outbound
+                    .insert(peer.clone(), PeerOutbound { conn_id: conn, tx });
+
+                let mut events = engine.subscribe_engine_events().await;
+
+                engine
+                    .handle_inbound_event(InboundEvent::Disconnected {
+                        peer_id: peer.clone(),
+                        conn_id: conn,
+                        reason: "matching".into(),
+                    })
+                    .await;
+
+                match tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                    .await
+                    .expect("PeerRemoved should fire")
+                    .expect("event channel open")
+                {
+                    EngineEvent::PeerRemoved { peer_id } => assert_eq!(peer_id, peer),
+                    other => panic!("expected PeerRemoved, got {other:?}"),
+                }
+
+                assert!(!engine.state.lock().await.peer_outbound.contains_key(&peer));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_disconnected_for_same_conn_emits_only_once() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let peer = PeerId(vk(b"bob"));
+
+                let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let conn = ConnectionId::for_test(7);
+                engine
+                    .state
+                    .lock()
+                    .await
+                    .peer_outbound
+                    .insert(peer.clone(), PeerOutbound { conn_id: conn, tx });
+
+                let mut events = engine.subscribe_engine_events().await;
+
+                // First Disconnected → emits PeerRemoved.
+                engine
+                    .handle_inbound_event(InboundEvent::Disconnected {
+                        peer_id: peer.clone(),
+                        conn_id: conn,
+                        reason: "first".into(),
+                    })
+                    .await;
+
+                // Second Disconnected for the SAME conn — should NOT emit again.
+                engine
+                    .handle_inbound_event(InboundEvent::Disconnected {
+                        peer_id: peer.clone(),
+                        conn_id: conn,
+                        reason: "duplicate".into(),
+                    })
+                    .await;
+
+                // Drain: expect exactly one PeerRemoved then nothing.
+                let first =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                        .await
+                        .expect("first PeerRemoved arrives")
+                        .expect("channel open");
+                assert!(matches!(first, EngineEvent::PeerRemoved { .. }));
+
+                let second =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await;
+                assert!(second.is_err(), "no second PeerRemoved");
             })
             .await;
     }

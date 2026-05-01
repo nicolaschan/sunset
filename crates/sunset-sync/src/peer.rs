@@ -33,9 +33,9 @@ pub(crate) enum InboundEvent {
     /// in `peer_outbound[peer_id]`.
     Disconnected {
         peer_id: PeerId,
-        // Plumbed through but not yet read; Task 6 uses it to filter
-        // stale disconnects from defunct connection generations.
-        #[allow(dead_code)]
+        /// Identifies the connection generation that died. The engine
+        /// compares this against `peer_outbound[peer_id].conn_id` and
+        /// drops stale events from defunct generations.
         conn_id: crate::engine::ConnectionId,
         reason: String,
     },
