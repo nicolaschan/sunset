@@ -236,9 +236,7 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
   // scroll area on rubber-banding) matches the app instead of flashing
   // white. color-scheme tells the UA to render default form-control
   // chrome and scrollbars in the right tone for the active theme.
-  html.style(
-    [],
-    "html, body {
+  html.style([], "html, body {
        margin: 0;
        padding: 0;
        height: 100%;
@@ -300,8 +298,7 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
         With many messages the auto margin shrinks to 0 and the
         scroll-area scrolls normally. Requires the scroll-area to be
         a flex column (which main_panel.messages_list already is). */
-     .scroll-area > :first-child { margin-top: auto; }",
-  )
+     .scroll-area > :first-child { margin-top: auto; }")
 }
 
 fn theme_toggle(mode: Mode, palette: Palette, toggle_mode: msg) -> Element(msg) {
