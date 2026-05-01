@@ -44,8 +44,7 @@ impl BackoffPolicy {
     /// Compute the delay for the `n`-th attempt (0-indexed). Includes
     /// multiplicative jitter `1.0 ± self.jitter` (uniformly sampled).
     pub fn delay(&self, attempt: u32, rng: &mut impl rand_core::RngCore) -> Duration {
-        let base = self.initial.as_secs_f64()
-            * (self.multiplier as f64).powi(attempt as i32);
+        let base = self.initial.as_secs_f64() * (self.multiplier as f64).powi(attempt as i32);
         let capped = base.min(self.max.as_secs_f64());
         let jitter_lo = 1.0 - self.jitter as f64;
         let jitter_hi = 1.0 + self.jitter as f64;
@@ -264,8 +263,7 @@ where
                             // counter starts at the *current* attempt; the
                             // dial-failure handler increments).
                             let delay = self.policy.delay(entry.attempt, _rng);
-                            entry.next_attempt_at =
-                                Some(std::time::SystemTime::now() + delay);
+                            entry.next_attempt_at = Some(std::time::SystemTime::now() + delay);
                         }
                     }
                 }
@@ -313,11 +311,7 @@ where
                             let cancelled = {
                                 let mut s = state.borrow_mut();
                                 match s.intents.get_mut(&addr_for_dial) {
-                                    Some(entry)
-                                        if entry.state == IntentState::Cancelled =>
-                                    {
-                                        true
-                                    }
+                                    Some(entry) if entry.state == IntentState::Cancelled => true,
                                     Some(entry) => {
                                         entry.state = IntentState::Connected;
                                         entry.peer_id = Some(peer_id.clone());
@@ -387,10 +381,7 @@ where
         let _ = rng; // silence unused
     }
 
-    async fn fire_due_backoffs(
-        self: Rc<Self>,
-        rng: &mut rand_chacha::ChaCha20Rng,
-    ) {
+    async fn fire_due_backoffs(self: Rc<Self>, rng: &mut rand_chacha::ChaCha20Rng) {
         let now = std::time::SystemTime::now();
         // Collect addrs whose backoff has fired.
         let due: Vec<PeerAddr> = {
@@ -455,10 +446,8 @@ where
                                 // the parent's RNG.
                                 let mut local_rng =
                                     rand_chacha::ChaCha20Rng::seed_from_u64(next_seed);
-                                let delay =
-                                    policy.delay(entry.attempt, &mut local_rng);
-                                entry.next_attempt_at =
-                                    Some(std::time::SystemTime::now() + delay);
+                                let delay = policy.delay(entry.attempt, &mut local_rng);
+                                entry.next_attempt_at = Some(std::time::SystemTime::now() + delay);
                                 None
                             }
                         }
@@ -656,7 +645,12 @@ mod tests {
 
                 // Engine no longer has bob in peer_outbound.
                 let connected = alice.connected_peers().await;
-                assert!(connected.iter().find(|p| p.0.as_bytes() == b"bob").is_none());
+                assert!(
+                    connected
+                        .iter()
+                        .find(|p| p.0.as_bytes() == b"bob")
+                        .is_none()
+                );
             })
             .await;
     }
