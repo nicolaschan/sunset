@@ -146,6 +146,26 @@ impl RelayHandle {
         self.local_address.clone()
     }
 
+    async fn dial_configured_peers(&self) {
+        use sunset_relay_resolver::Resolver;
+        let resolver = Resolver::new(crate::resolver_adapter::ReqwestFetch::default());
+        for peer_url in &self.peers {
+            let canonical = match resolver.resolve(peer_url).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(peer = %peer_url, error = %e, "peer resolve failed");
+                    continue;
+                }
+            };
+            let addr = PeerAddr::new(Bytes::from(canonical));
+            if let Err(e) = self.engine.add_peer(addr).await {
+                tracing::warn!(peer = %peer_url, error = %e, "federated peer dial failed");
+            } else {
+                tracing::info!(peer = %peer_url, "federated peer dialed");
+            }
+        }
+    }
+
     /// Drive the engine, dial federated peers, then run until shutdown.
     pub async fn run(mut self) -> Result<()> {
         let engine_clone = self.engine.clone();
@@ -158,15 +178,7 @@ impl RelayHandle {
             .await?;
         tracing::info!("published broad subscription");
 
-        for peer_url in &self.peers {
-            let addr = PeerAddr::new(Bytes::from(peer_url.clone()));
-            match self.engine.add_peer(addr).await {
-                Ok(()) => tracing::info!(peer = %peer_url, "federated peer dialed"),
-                Err(e) => {
-                    tracing::warn!(peer = %peer_url, error = %e, "federated peer dial failed (continuing)")
-                }
-            }
-        }
+        self.dial_configured_peers().await;
 
         #[cfg(unix)]
         {
@@ -225,12 +237,7 @@ impl RelayHandle {
             .publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))
             .await?;
 
-        for peer_url in &self.peers {
-            let addr = PeerAddr::new(Bytes::from(peer_url.clone()));
-            if let Err(e) = self.engine.add_peer(addr).await {
-                tracing::warn!(peer = %peer_url, error = %e, "federated peer dial failed (test)");
-            }
-        }
+        self.dial_configured_peers().await;
 
         Ok(engine_task)
     }

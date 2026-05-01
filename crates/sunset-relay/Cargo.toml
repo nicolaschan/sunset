@@ -16,6 +16,7 @@ name = "sunset-relay"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
 curve25519-dalek.workspace = true
@@ -23,8 +24,10 @@ futures.workspace = true
 hex.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
+reqwest.workspace = true
 sunset-core.workspace = true
 sunset-noise.workspace = true
+sunset-relay-resolver.workspace = true
 sunset-store.workspace = true
 sunset-store-fs.workspace = true
 sunset-sync.workspace = true
