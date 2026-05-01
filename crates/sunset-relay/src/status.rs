@@ -57,6 +57,42 @@ pub(crate) async fn serve_dashboard(mut tcp: TcpStream, ctx: Rc<StatusContext>) 
     Ok(())
 }
 
+/// Render the JSON identity descriptor for `GET /` (without a WS
+/// upgrade). The same URL serves the WebSocket endpoint when an
+/// `Upgrade: websocket` header is present — the router decides which
+/// way to go.
+pub(crate) async fn serve_identity(mut tcp: TcpStream, ctx: Rc<StatusContext>) -> Result<()> {
+    drain_request(&mut tcp).await;
+    let body = identity_json(&ctx.ed25519_public, &ctx.x25519_public, &ctx.dial_url);
+    let head = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    tcp.write_all(head.as_bytes()).await.ok();
+    tcp.write_all(body.as_bytes()).await.ok();
+    tcp.shutdown().await.ok();
+    Ok(())
+}
+
+fn identity_json(ed25519: &[u8; 32], x25519: &[u8; 32], dial_url: &str) -> String {
+    // Hex-only field values, so plain string interpolation is safe —
+    // no characters that need JSON escaping. Keeping the writer
+    // hand-rolled avoids pulling serde_json in for three fields. The
+    // dial_url is a relay-controlled string we already trust to be
+    // ASCII (`ws://host:port` shape from config + listen addr).
+    format!(
+        "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"{}\"}}\n",
+        hex::encode(ed25519),
+        hex::encode(x25519),
+        dial_url,
+    )
+}
+
 /// Read whatever the client sent until we see `\r\n\r\n` or 8 KiB cap or 2s.
 async fn drain_request(tcp: &mut TcpStream) {
     let mut buf = [0u8; 8192];
@@ -362,4 +398,22 @@ fn dir_size(root: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_json_has_expected_shape() {
+        let ed = [0xab; 32];
+        let xx = [0xcd; 32];
+        let json = identity_json(&ed, &xx, "ws://relay.example:8443");
+        assert_eq!(
+            json,
+            "{\"ed25519\":\"abababababababababababababababababababababababababababababababab\",\
+             \"x25519\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\
+             \"address\":\"ws://relay.example:8443\"}\n"
+        );
+    }
 }

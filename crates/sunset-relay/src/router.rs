@@ -1,6 +1,7 @@
 //! HTTP/WS multiplexer for the relay's single TCP listener. Peeks the
-//! incoming request to route it: `/dashboard` → status page; WS upgrade
-//! → forward the TcpStream to the WebSocketRawTransport via a channel;
+//! incoming request to route it: `/dashboard` → status page; `GET /`
+//! without a WS upgrade → JSON identity descriptor; WS upgrade →
+//! forward the TcpStream to the WebSocketRawTransport via a channel;
 //! anything else → 404.
 
 use std::rc::Rc;
@@ -23,6 +24,10 @@ const PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 enum Route {
     Dashboard,
+    /// `GET /` without a WebSocket upgrade — returns the relay's
+    /// public-key identity as JSON. Same path/port as the WS endpoint;
+    /// the upgrade header is what disambiguates.
+    Identity,
     WebSocket,
     NotFound,
 }
@@ -70,6 +75,11 @@ async fn handle_connection(
         Route::Dashboard => {
             if let Err(e) = status::serve_dashboard(tcp, status_ctx).await {
                 tracing::debug!(error = %e, "dashboard render failed");
+            }
+        }
+        Route::Identity => {
+            if let Err(e) = status::serve_identity(tcp, status_ctx).await {
+                tracing::debug!(error = %e, "identity render failed");
             }
         }
         Route::WebSocket => {
@@ -168,10 +178,15 @@ fn classify(prologue: &[u8]) -> Route {
         lower.starts_with("upgrade:") && lower.contains("websocket")
     });
     if is_ws_upgrade {
-        Route::WebSocket
-    } else {
-        Route::NotFound
+        return Route::WebSocket;
     }
+    // GET / (with or without query) and no upgrade header → JSON
+    // identity. Other plain GETs are still 404 so the relay isn't a
+    // generic web server.
+    if path_only == "/" {
+        return Route::Identity;
+    }
+    Route::NotFound
 }
 
 #[cfg(test)]
@@ -198,8 +213,7 @@ mod tests {
 
     #[test]
     fn classify_ws_upgrade() {
-        let req =
-            b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
         assert!(matches!(classify(req), Route::WebSocket));
     }
 
@@ -213,6 +227,26 @@ mod tests {
     fn classify_other_path_with_no_upgrade_is_404() {
         let req = b"GET /random HTTP/1.1\r\nHost: x\r\n\r\n";
         assert!(matches!(classify(req), Route::NotFound));
+    }
+
+    #[test]
+    fn classify_root_get_no_upgrade_is_identity() {
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert!(matches!(classify(req), Route::Identity));
+    }
+
+    #[test]
+    fn classify_root_get_with_query_no_upgrade_is_identity() {
+        let req = b"GET /?pretty=1 HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert!(matches!(classify(req), Route::Identity));
+    }
+
+    #[test]
+    fn classify_root_with_upgrade_still_routes_to_websocket() {
+        // Browsers (and our own client) hit ws://host/ to open the WS.
+        // The upgrade header must take precedence over the identity route.
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        assert!(matches!(classify(req), Route::WebSocket));
     }
 
     #[test]
