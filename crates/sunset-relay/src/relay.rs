@@ -153,13 +153,13 @@ impl RelayHandle {
             let canonical = match resolver.resolve(peer_url).await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(peer = %peer_url, error = %e, "peer resolve failed");
+                    tracing::warn!(peer = %peer_url, error = %e, "peer resolve failed, skipping");
                     continue;
                 }
             };
             let addr = PeerAddr::new(Bytes::from(canonical));
             if let Err(e) = self.engine.add_peer(addr).await {
-                tracing::warn!(peer = %peer_url, error = %e, "federated peer dial failed");
+                tracing::warn!(peer = %peer_url, error = %e, "federated peer dial failed, continuing");
             } else {
                 tracing::info!(peer = %peer_url, "federated peer dialed");
             }

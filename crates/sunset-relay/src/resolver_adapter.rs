@@ -7,12 +7,12 @@ use async_trait::async_trait;
 
 use sunset_relay_resolver::{Error, HttpFetch, Result};
 
-pub struct ReqwestFetch {
+pub(crate) struct ReqwestFetch {
     client: reqwest::Client,
 }
 
 impl ReqwestFetch {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
         }
