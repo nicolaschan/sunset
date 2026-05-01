@@ -52,6 +52,17 @@ pub enum SyncMessage {
         datagram: sunset_store::SignedDatagram,
     },
     Goodbye {},
+    /// Liveness probe sent by the per-peer task at heartbeat_interval.
+    /// The receiver replies with `Pong { nonce: <same nonce> }`. Carried
+    /// over the reliable channel so it inherits Noise AEAD authenticity.
+    Ping {
+        nonce: u64,
+    },
+    /// Reply to `Ping`. Receiving any `Pong` updates the local
+    /// `last_pong_at`; the nonce is informational.
+    Pong {
+        nonce: u64,
+    },
 }
 
 impl SyncMessage {
@@ -149,5 +160,29 @@ mod tests {
             "313e80dd346c26e06cc1cc6288a1446b87a162dce603061ae97194cc44bbe019",
             "If this fails the EphemeralDelivery wire format has drifted — DO NOT update this hex without bumping the wire-format version.",
         );
+    }
+
+    #[test]
+    fn ping_postcard_vector_frozen() {
+        // Pin the wire bytes for `Ping { nonce: 1 }` so accidental
+        // wire-format drift surfaces in CI. Update only by deliberate
+        // protocol change.
+        let bytes = SyncMessage::Ping { nonce: 1 }.encode().unwrap();
+        // postcard varint enum tag 8 + varint u64 nonce 1
+        assert_eq!(bytes.as_ref(), &[0x08, 0x01]);
+    }
+
+    #[test]
+    fn pong_postcard_vector_frozen() {
+        let bytes = SyncMessage::Pong { nonce: 1 }.encode().unwrap();
+        assert_eq!(bytes.as_ref(), &[0x09, 0x01]);
+    }
+
+    #[test]
+    fn ping_round_trip() {
+        let msg = SyncMessage::Ping { nonce: 0xdead_beef };
+        let bytes = msg.encode().unwrap();
+        let decoded = SyncMessage::decode(&bytes).unwrap();
+        assert_eq!(msg, decoded);
     }
 }
