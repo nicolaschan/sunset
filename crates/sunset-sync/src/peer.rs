@@ -18,10 +18,9 @@ pub(crate) enum InboundEvent {
     /// `out_tx` is the outbound sender to register under `peer_id`.
     PeerHello {
         peer_id: PeerId,
-        // Plumbed through but not yet read; Task 5 stores it alongside
-        // the per-peer outbound sender, Task 6 uses it for stale-event
-        // filtering. Suppress dead_code until those tasks land.
-        #[allow(dead_code)]
+        // Stored alongside the per-peer outbound sender so Task 6 can
+        // filter stale Disconnected events from defunct connection
+        // generations (cross-checks against `peer_outbound[peer_id].conn_id`).
         conn_id: crate::engine::ConnectionId,
         kind: crate::transport::TransportKind,
         out_tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>,

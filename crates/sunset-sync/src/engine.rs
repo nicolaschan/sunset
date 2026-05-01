@@ -93,13 +93,24 @@ pub enum EngineEvent {
     },
 }
 
+/// Sender + connection identity for one peer's currently-active connection.
+/// `conn_id` is checked when handling `InboundEvent::Disconnected` so a
+/// stale event from a defunct connection can't tear down a fresh one.
+pub(crate) struct PeerOutbound {
+    // Stored now (Task 5); read by Task 6's stale-Disconnected filter.
+    // Suppress dead_code until Task 6 lands.
+    #[allow(dead_code)]
+    pub(crate) conn_id: ConnectionId,
+    pub(crate) tx: mpsc::UnboundedSender<SyncMessage>,
+}
+
 /// Mutable state inside the engine. Held under a `tokio::sync::Mutex` so
 /// command processing and per-peer task callbacks can both update it.
 pub(crate) struct EngineState {
     pub trust: TrustSet,
     pub registry: SubscriptionRegistry,
-    /// Per-peer outbound message senders.
-    pub peer_outbound: HashMap<PeerId, mpsc::UnboundedSender<SyncMessage>>,
+    /// Per-peer outbound message senders, keyed by `(peer_id, conn_id)`.
+    pub peer_outbound: HashMap<PeerId, PeerOutbound>,
     /// Per-peer transport kind (Primary vs Secondary). Updated in
     /// lockstep with `peer_outbound` so callers can snapshot
     /// `(peer, kind)` after subscribing late and missing the
@@ -231,8 +242,8 @@ where
             .registry
             .peers_matching(&datagram.verifying_key, &datagram.name)
         {
-            if let Some(tx) = state.peer_outbound.get(&peer) {
-                let _ = tx.send(msg.clone());
+            if let Some(po) = state.peer_outbound.get(&peer) {
+                let _ = po.tx.send(msg.clone());
             }
         }
         Ok(())
@@ -357,8 +368,8 @@ where
             bloom: bloom.to_bytes(),
         };
         let state = self.state.lock().await;
-        for tx in state.peer_outbound.values() {
-            let _ = tx.send(msg.clone());
+        for po in state.peer_outbound.values() {
+            let _ = po.tx.send(msg.clone());
         }
     }
 
@@ -421,7 +432,7 @@ where
         match event {
             InboundEvent::PeerHello {
                 peer_id,
-                conn_id: _,
+                conn_id,
                 kind,
                 out_tx,
             } => {
@@ -431,7 +442,13 @@ where
                 // the same set as the live subscription stream.
                 {
                     let mut state = self.state.lock().await;
-                    state.peer_outbound.insert(peer_id.clone(), out_tx);
+                    state.peer_outbound.insert(
+                        peer_id.clone(),
+                        PeerOutbound {
+                            conn_id,
+                            tx: out_tx,
+                        },
+                    );
                     state.peer_kinds.insert(peer_id.clone(), kind);
                 }
                 self.emit_engine_event(EngineEvent::PeerAdded {
@@ -481,8 +498,8 @@ where
             bloom: bloom.to_bytes(),
         };
         let state = self.state.lock().await;
-        if let Some(tx) = state.peer_outbound.get(to) {
-            let _ = tx.send(msg);
+        if let Some(po) = state.peer_outbound.get(to) {
+            let _ = po.tx.send(msg);
         }
     }
 
@@ -552,8 +569,8 @@ where
             blobs,
         };
         let state = self.state.lock().await;
-        if let Some(tx) = state.peer_outbound.get(&from) {
-            let _ = tx.send(msg);
+        if let Some(po) = state.peer_outbound.get(&from) {
+            let _ = po.tx.send(msg);
         }
     }
 
@@ -564,8 +581,8 @@ where
             _ => return,
         };
         let state = self.state.lock().await;
-        if let Some(tx) = state.peer_outbound.get(&from) {
-            let _ = tx.send(SyncMessage::BlobResponse { block });
+        if let Some(po) = state.peer_outbound.get(&from) {
+            let _ = po.tx.send(SyncMessage::BlobResponse { block });
         }
     }
 
@@ -628,8 +645,8 @@ where
                     .is_some();
                 if !have {
                     let state = self.state.lock().await;
-                    if let Some(tx) = state.peer_outbound.get(&from) {
-                        let _ = tx.send(SyncMessage::BlobRequest {
+                    if let Some(po) = state.peer_outbound.get(&from) {
+                        let _ = po.tx.send(SyncMessage::BlobRequest {
                             hash: entry.value_hash,
                         });
                     }
@@ -676,8 +693,8 @@ where
             .registry
             .peers_matching(&entry.verifying_key, &entry.name)
         {
-            if let Some(tx) = state.peer_outbound.get(&peer) {
-                let _ = tx.send(msg.clone());
+            if let Some(po) = state.peer_outbound.get(&peer) {
+                let _ = po.tx.send(msg.clone());
             }
         }
     }
@@ -953,12 +970,13 @@ mod tests {
 
                 // Pre-register a fake outbound channel so handle_blob_request has somewhere to send.
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine
-                    .state
-                    .lock()
-                    .await
-                    .peer_outbound
-                    .insert(PeerId(vk(b"requester")), tx);
+                engine.state.lock().await.peer_outbound.insert(
+                    PeerId(vk(b"requester")),
+                    PeerOutbound {
+                        conn_id: ConnectionId::for_test(99),
+                        tx,
+                    },
+                );
 
                 engine
                     .handle_blob_request(PeerId(vk(b"requester")), hash)
@@ -1021,12 +1039,13 @@ mod tests {
                     .unwrap();
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine
-                    .state
-                    .lock()
-                    .await
-                    .peer_outbound
-                    .insert(PeerId(vk(b"remote")), tx);
+                engine.state.lock().await.peer_outbound.insert(
+                    PeerId(vk(b"remote")),
+                    PeerOutbound {
+                        conn_id: ConnectionId::for_test(99),
+                        tx,
+                    },
+                );
 
                 // Remote sends an empty bloom over a filter that matches the entry.
                 let empty = BloomFilter::new(4096, 4);
