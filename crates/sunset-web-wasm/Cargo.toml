@@ -26,6 +26,7 @@ sunset-store-memory.workspace = true
 sunset-sync.workspace = true
 sunset-sync-webrtc-browser.workspace = true
 sunset-sync-ws-browser.workspace = true
+sunset-voice = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 web-time.workspace = true

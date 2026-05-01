@@ -1740,6 +1740,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunset-voice"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sunset-web-wasm"
 version = "0.1.0"
 dependencies = [
@@ -1759,6 +1766,7 @@ dependencies = [
  "sunset-sync",
  "sunset-sync-webrtc-browser",
  "sunset-sync-ws-browser",
+ "sunset-voice",
  "thiserror 2.0.18",
  "tokio",
  "wasm-bindgen",
