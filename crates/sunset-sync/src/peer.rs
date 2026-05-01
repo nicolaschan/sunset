@@ -737,4 +737,126 @@ mod tests {
             })
             .await;
     }
+
+    /// Wraps a `TestConnection` and silently swallows every `SyncMessage::Pong`
+    /// the host tries to send. Used to simulate a peer whose pongs never
+    /// reach the wire (or arrive at us).
+    struct DropPongsConn {
+        inner: TestConnection,
+    }
+
+    #[async_trait(?Send)]
+    impl TransportConnection for DropPongsConn {
+        async fn send_reliable(&self, bytes: Bytes) -> Result<()> {
+            // Decode; if Pong, drop. Otherwise forward.
+            if let Ok(SyncMessage::Pong { .. }) = SyncMessage::decode(&bytes) {
+                return Ok(());
+            }
+            self.inner.send_reliable(bytes).await
+        }
+        async fn recv_reliable(&self) -> Result<Bytes> {
+            self.inner.recv_reliable().await
+        }
+        async fn send_unreliable(&self, bytes: Bytes) -> Result<()> {
+            self.inner.send_unreliable(bytes).await
+        }
+        async fn recv_unreliable(&self) -> Result<Bytes> {
+            self.inner.recv_unreliable().await
+        }
+        fn peer_id(&self) -> PeerId {
+            self.inner.peer_id()
+        }
+        fn kind(&self) -> crate::transport::TransportKind {
+            self.inner.kind()
+        }
+        async fn close(&self) -> Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn heartbeat_timeout_emits_disconnected() {
+        use crate::types::SyncConfig;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = net.transport(PeerId(vk(b"alice")), peer_addr("alice"));
+                let bob = net.transport(PeerId(vk(b"bob")), peer_addr("bob"));
+                let bob_accept =
+                    crate::spawn::spawn_local(async move { bob.accept().await.unwrap() });
+                let alice_conn = alice.connect(peer_addr("bob")).await.unwrap();
+                let bob_conn = bob_accept.await.unwrap();
+
+                // Wrap bob's side so its outbound Pongs are dropped: alice
+                // never gets pongs, alice times out.
+                let bob_conn = DropPongsConn { inner: bob_conn };
+
+                let cfg = SyncConfig::default();
+
+                let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+                let (b_in_tx, mut b_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(alice_conn),
+                    PeerId(vk(b"alice")),
+                    1,
+                    crate::engine::ConnectionId::for_test(1),
+                    a_out_tx.clone(),
+                    a_out_rx,
+                    a_in_tx,
+                    None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
+                ));
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(bob_conn),
+                    PeerId(vk(b"bob")),
+                    1,
+                    crate::engine::ConnectionId::for_test(2),
+                    b_out_tx.clone(),
+                    b_out_rx,
+                    b_in_tx,
+                    None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
+                ));
+
+                // Drain Hellos.
+                let _ = a_in_rx.recv().await.unwrap();
+                let _ = b_in_rx.recv().await.unwrap();
+
+                // Advance well past heartbeat_timeout.
+                tokio::time::advance(cfg.heartbeat_timeout * 2).await;
+                tokio::task::yield_now().await;
+
+                // Alice should observe a heartbeat timeout disconnect.
+                loop {
+                    match a_in_rx.recv().await {
+                        Some(InboundEvent::Disconnected { reason, .. })
+                            if reason.contains("heartbeat timeout") =>
+                        {
+                            break;
+                        }
+                        Some(InboundEvent::Disconnected { reason, .. }) => {
+                            // Could also fail via send error after channel
+                            // drops; either is acceptable for this test.
+                            assert!(
+                                reason.contains("send reliable") || reason.contains("recv reliable"),
+                                "unexpected disconnect reason: {reason}"
+                            );
+                            break;
+                        }
+                        Some(_) => continue,
+                        None => panic!("inbound channel closed before disconnect"),
+                    }
+                }
+
+                drop(a_out_tx);
+                drop(b_out_tx);
+            })
+            .await;
+    }
 }
