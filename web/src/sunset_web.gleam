@@ -47,6 +47,11 @@ import sunset_web/views/touch_drag
 import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
 
+/// Relays the client dials at startup when the URL has no
+/// `?relay=…` query parameter. Each entry is fed through
+/// `sunset-relay-resolver`, so bare hostnames work.
+const default_relays: List(String) = ["relay.sunset.chat"]
+
 pub type View {
   LandingView
   RoomView(name: String)
@@ -586,18 +591,25 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             dispatch(RelayStatusUpdated(s))
           })
         })
-      let connect_eff = case sunset.relay_url_param() {
-        Ok(url) ->
-          effect.from(fn(dispatch) {
+      // Default relays the client dials when no `?relay=…` query
+      // parameter is supplied. The query param, when present, replaces
+      // (does not extend) this list — pasting an explicit relay opts
+      // out of the defaults.
+      let relays = case sunset.relay_url_param() {
+        Ok(url) -> [url]
+        Error(_) -> default_relays
+      }
+      let connect_eff =
+        effect.from(fn(dispatch) {
+          list.each(relays, fn(url) {
             sunset.add_relay(client, url, fn(r) {
               dispatch(RelayConnectResult(r))
             })
           })
-        Error(_) -> effect.none()
-      }
-      let new_status = case sunset.relay_url_param() {
-        Ok(_) -> "connecting"
-        Error(_) -> "disconnected"
+        })
+      let new_status = case relays {
+        [] -> "disconnected"
+        _ -> "connecting"
       }
       #(
         Model(..model, client: Some(client), relay_status: new_status),
