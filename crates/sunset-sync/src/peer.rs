@@ -58,6 +58,7 @@ pub(crate) enum InboundEvent {
 /// can register it under the Hello-declared peer_id (not the transport-level
 /// peer_id, which may differ in schemes that separate routing identity from
 /// application identity, e.g. X25519 routing + Ed25519 application keys).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     conn: Rc<C>,
     local_peer: PeerId,
@@ -66,6 +67,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     out_tx: mpsc::UnboundedSender<SyncMessage>,
     mut outbound_rx: mpsc::UnboundedReceiver<SyncMessage>,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
+    hello_done: Option<tokio::sync::oneshot::Sender<Result<PeerId>>>,
 ) {
     let local_kind = conn.kind();
     // Send our Hello.
@@ -74,10 +76,14 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         peer_id: local_peer.clone(),
     };
     if let Err(e) = send_reliable_message(&*conn, &our_hello).await {
+        let err_str = format!("send hello: {e}");
+        if let Some(s) = hello_done {
+            let _ = s.send(Err(crate::error::Error::Transport(err_str.clone())));
+        }
         let _ = inbound_tx.send(InboundEvent::Disconnected {
             peer_id: conn.peer_id(),
             conn_id,
-            reason: format!("send hello: {e}"),
+            reason: err_str,
         });
         return;
     }
@@ -89,13 +95,17 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             peer_id,
         }) => {
             if protocol_version != local_protocol_version {
+                let err_str = format!(
+                    "protocol version mismatch: ours {} theirs {}",
+                    local_protocol_version, protocol_version
+                );
+                if let Some(s) = hello_done {
+                    let _ = s.send(Err(crate::error::Error::Transport(err_str.clone())));
+                }
                 let _ = inbound_tx.send(InboundEvent::Disconnected {
                     peer_id,
                     conn_id,
-                    reason: format!(
-                        "protocol version mismatch: ours {} theirs {}",
-                        local_protocol_version, protocol_version
-                    ),
+                    reason: err_str,
                 });
                 return;
             }
@@ -105,21 +115,32 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                 kind: local_kind,
                 out_tx,
             });
+            if let Some(s) = hello_done {
+                let _ = s.send(Ok(peer_id.clone()));
+            }
             peer_id
         }
         Ok(other) => {
+            let err_str = format!("expected Hello, got {:?}", other);
+            if let Some(s) = hello_done {
+                let _ = s.send(Err(crate::error::Error::Transport(err_str.clone())));
+            }
             let _ = inbound_tx.send(InboundEvent::Disconnected {
                 peer_id: conn.peer_id(),
                 conn_id,
-                reason: format!("expected Hello, got {:?}", other),
+                reason: err_str,
             });
             return;
         }
         Err(e) => {
+            let err_str = format!("recv hello: {e}");
+            if let Some(s) = hello_done {
+                let _ = s.send(Err(crate::error::Error::Transport(err_str.clone())));
+            }
             let _ = inbound_tx.send(InboundEvent::Disconnected {
                 peer_id: conn.peer_id(),
                 conn_id,
-                reason: format!("recv hello: {e}"),
+                reason: err_str,
             });
             return;
         }
@@ -355,6 +376,7 @@ mod tests {
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
+                    None,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
@@ -364,6 +386,7 @@ mod tests {
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
+                    None,
                 ));
 
                 // Each side observes the other's Hello.
@@ -432,6 +455,7 @@ mod tests {
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
+                    None,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
@@ -441,6 +465,7 @@ mod tests {
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
+                    None,
                 ));
 
                 // Drain the Hello on each side so the rest of the test

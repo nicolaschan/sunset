@@ -54,11 +54,12 @@ fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     proto: u32,
     conn_id: ConnectionId,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
+    hello_done: Option<oneshot::Sender<Result<PeerId>>>,
 ) {
     let conn = Rc::new(conn);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
     crate::spawn::spawn_local(run_peer(
-        conn, local_peer, proto, conn_id, out_tx, out_rx, inbound_tx,
+        conn, local_peer, proto, conn_id, out_tx, out_rx, inbound_tx, hello_done,
     ));
 }
 
@@ -66,7 +67,7 @@ fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
 pub(crate) enum EngineCommand {
     AddPeer {
         addr: PeerAddr,
-        ack: oneshot::Sender<Result<()>>,
+        ack: oneshot::Sender<Result<PeerId>>,
     },
     PublishSubscription {
         filter: Filter,
@@ -188,7 +189,7 @@ where
 
     /// Initiate an outbound connection to `addr`. Returns when the connection
     /// is established + Hello-exchanged, or fails.
-    pub async fn add_peer(&self, addr: PeerAddr) -> Result<()> {
+    pub async fn add_peer(&self, addr: PeerAddr) -> Result<PeerId> {
         let (ack, rx) = oneshot::channel();
         self.cmd_tx
             .send(EngineCommand::AddPeer { addr, ack })
@@ -392,10 +393,24 @@ where
                 let inbound_tx = inbound_tx.clone();
                 let conn_id = self.alloc_conn_id().await;
                 crate::spawn::spawn_local(async move {
-                    let r = match transport.connect(addr).await {
+                    let connect_res = transport.connect(addr).await;
+                    let r = match connect_res {
                         Ok(conn) => {
-                            spawn_run_peer(conn, local_peer, proto, conn_id, inbound_tx);
-                            Ok(())
+                            let (hello_tx, hello_rx) = oneshot::channel::<Result<PeerId>>();
+                            spawn_run_peer(
+                                conn,
+                                local_peer,
+                                proto,
+                                conn_id,
+                                inbound_tx,
+                                Some(hello_tx),
+                            );
+                            // Wait for the Hello exchange to complete.
+                            match hello_rx.await {
+                                Ok(Ok(peer_id)) => Ok(peer_id),
+                                Ok(Err(e)) => Err(e),
+                                Err(_) => Err(Error::Closed),
+                            }
                         }
                         Err(e) => Err(e),
                     };
@@ -425,6 +440,7 @@ where
             self.config.protocol_version,
             conn_id,
             inbound_tx,
+            None,
         );
     }
 

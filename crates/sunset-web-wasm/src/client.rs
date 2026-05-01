@@ -138,7 +138,7 @@ impl Client {
 
         let addr = sunset_sync::PeerAddr::new(Bytes::from(canonical));
         match self.engine.add_peer(addr).await {
-            Ok(()) => {
+            Ok(_peer_id) => {
                 *self.relay_status.borrow_mut() = "connected".to_owned();
                 Ok(())
             }
