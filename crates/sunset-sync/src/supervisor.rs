@@ -77,7 +77,7 @@ pub(crate) struct IntentEntry {
     pub attempt: u32,
     pub peer_id: Option<PeerId>,
     /// Earliest moment the next dial attempt may run. None when not in Backoff.
-    pub next_attempt_at: Option<std::time::SystemTime>,
+    pub next_attempt_at: Option<web_time::SystemTime>,
 }
 
 pub(crate) struct SupervisorState {
@@ -177,8 +177,8 @@ where
         // Seed RNG. We use a simple counter-based seed so this works
         // identically on wasm32 and native without pulling in OsRng.
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0),
         );
@@ -228,7 +228,7 @@ where
             .filter(|e| e.state == IntentState::Backoff)
             .filter_map(|e| e.next_attempt_at)
             .min()?;
-        let now = std::time::SystemTime::now();
+        let now = web_time::SystemTime::now();
         Some(earliest.duration_since(now).unwrap_or(Duration::ZERO))
     }
 
@@ -263,7 +263,7 @@ where
                             // counter starts at the *current* attempt; the
                             // dial-failure handler increments).
                             let delay = self.policy.delay(entry.attempt, _rng);
-                            entry.next_attempt_at = Some(std::time::SystemTime::now() + delay);
+                            entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
                         }
                     }
                 }
@@ -382,7 +382,7 @@ where
     }
 
     async fn fire_due_backoffs(self: Rc<Self>, rng: &mut rand_chacha::ChaCha20Rng) {
-        let now = std::time::SystemTime::now();
+        let now = web_time::SystemTime::now();
         // Collect addrs whose backoff has fired.
         let due: Vec<PeerAddr> = {
             let state = self.state.borrow();
@@ -447,7 +447,7 @@ where
                                 let mut local_rng =
                                     rand_chacha::ChaCha20Rng::seed_from_u64(next_seed);
                                 let delay = policy.delay(entry.attempt, &mut local_rng);
-                                entry.next_attempt_at = Some(std::time::SystemTime::now() + delay);
+                                entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
                                 None
                             }
                         }
