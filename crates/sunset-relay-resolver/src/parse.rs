@@ -230,6 +230,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_http_scheme_uses_http() {
+        let parsed = parse_input("http://relay.sunset.chat:8443").unwrap();
+        assert_eq!(
+            parsed,
+            ParsedInput::Lookup(LookupTarget {
+                http_url: "http://relay.sunset.chat:8443/".into(),
+                ws_url: "ws://relay.sunset.chat:8443".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn trailing_slash_is_accepted() {
+        let parsed = parse_input("wss://relay.sunset.chat/").unwrap();
+        assert_eq!(
+            parsed,
+            ParsedInput::Lookup(LookupTarget {
+                http_url: "https://relay.sunset.chat/".into(),
+                ws_url: "wss://relay.sunset.chat".into(),
+            })
+        );
+    }
+
+    #[test]
     fn empty_input_rejected() {
         assert!(matches!(parse_input(""), Err(Error::MalformedInput(_))));
         assert!(matches!(parse_input("   "), Err(Error::MalformedInput(_))));
