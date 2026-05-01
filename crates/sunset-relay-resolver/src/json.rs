@@ -3,6 +3,15 @@
 //! `{"ed25519":"<hex>","x25519":"<hex>","address":"<url>"}` — three
 //! fields, hex-only values, no nested objects. We hand-roll a tiny
 //! scanner so this crate doesn't have to pull in serde_json.
+//!
+//! The scanner finds the first occurrence of the literal substring
+//! `"x25519"` in the body. This is safe for the flat schema above: a
+//! field name like `"prev_x25519"` is preceded by `_`, not `"`, so it
+//! doesn't match; a value containing `x25519` (e.g. inside
+//! `"address":"…#x25519=…"`) lacks the leading double-quote. If the
+//! relay ever grows nested objects with their own `"x25519"` keys,
+//! this scanner would extract the first one regardless of depth — at
+//! that point we should switch to a real JSON parser.
 
 use crate::error::{Error, Result};
 
@@ -126,5 +135,34 @@ mod tests {
             extract_x25519_from_json(&body),
             Err(Error::BadX25519(_))
         ));
+    }
+
+    #[test]
+    fn x25519_in_other_field_name_does_not_confuse_scanner() {
+        // A future relay might add a "prev_x25519" field. The scanner
+        // must still find the real "x25519" key — it's preceded by an
+        // underscore there, not a double-quote, so the substring
+        // search skips past it.
+        let real = "ab".repeat(32);
+        let body = format!(
+            "{{\"prev_x25519\":\"00\",\"x25519\":\"{}\",\"address\":\"ws://x:1\"}}",
+            real,
+        );
+        let bytes = extract_x25519_from_json(&body).unwrap();
+        assert_eq!(bytes, [0xab; 32]);
+    }
+
+    #[test]
+    fn x25519_inside_address_value_does_not_confuse_scanner() {
+        // The relay's "address" field already contains a `#x25519=…`
+        // fragment in its value. The scanner must look for the JSON
+        // *key* (preceded by an opening quote), not the bare token.
+        let real = "cd".repeat(32);
+        let body = format!(
+            "{{\"address\":\"ws://x:1#x25519=00\",\"x25519\":\"{}\",\"ed25519\":\"00\"}}",
+            real,
+        );
+        let bytes = extract_x25519_from_json(&body).unwrap();
+        assert_eq!(bytes, [0xcd; 32]);
     }
 }
