@@ -14,6 +14,7 @@ pub mod signaler;
 pub mod signer;
 pub mod spawn;
 pub mod subscription_registry;
+pub mod supervisor;
 pub mod transport;
 pub mod types;
 
@@ -29,5 +30,6 @@ pub use message::{DigestRange, SyncMessage};
 pub use multi_transport::{MultiConnection, MultiTransport};
 pub use signaler::{SignalMessage, Signaler};
 pub use signer::Signer;
+pub use supervisor::{BackoffPolicy, IntentSnapshot, IntentState, PeerSupervisor};
 pub use transport::{RawConnection, RawTransport, Transport, TransportConnection, TransportKind};
 pub use types::{PeerAddr, PeerId, SyncConfig, TrustSet};

@@ -1,7 +1,7 @@
 # Connection Liveness & Supervision Design
 
 **Date:** 2026-04-29
-**Scope:** Two changes in `sunset-sync`: (1) per-connection heartbeat in `run_peer`, (2) a new `PeerSupervisor` module that maintains durable connection intents above the engine. Plus a thin rewire of `Client::add_relay` / `Client::connect_direct` in `sunset-web-wasm` to use the supervisor.
+**Scope:** Two changes in `sunset-sync`: (1) per-connection heartbeat in `run_peer` plus an upgraded send-side disconnect signal and a per-connection `ConnectionId` so the engine filters stale events by generation rather than by presence, (2) a new `PeerSupervisor` module that maintains durable connection intents above the engine. Plus a thin rewire of `Client::add_relay` / `Client::connect_direct` in `sunset-web-wasm` to use the supervisor.
 **Out of scope (explicit):** wire-format changes outside `SyncMessage` enum extension, transport-level changes (WS/WebRTC raw transports), multi-relay routing, peer presence (already handled by `sunset-core` `Liveness`).
 
 ## Goal
@@ -12,6 +12,8 @@ When the relay restarts, or a client device sleeps and resumes, the WebSocket re
 2. **Cleanly-closed connection with no redial.** The relay restarts, the socket closes properly, the engine emits `PeerRemoved`, and nothing reconnects.
 
 Both must be solved, and the solution must be **transport-agnostic** (works for WebSocket-via-relay, WebRTC direct datachannel, and any future transport that lands in `MultiTransport`) and keep the top-level API simple (`client.add_relay(url)` / `client.connect_direct(pubkey)` register a durable intent and never need re-arming).
+
+The detection budget is layered: an immediate signal when the OS/browser surfaces a closed socket (send-side error), a heartbeat-driven signal when it doesn't (15–45 s window), and a redial supervisor on top of both.
 
 ## Layered approach
 
@@ -90,6 +92,137 @@ When a `Pong { nonce }` arrives (delivered to the liveness task via a small in-t
 
 The liveness task uses `wasmtimer::tokio::sleep` on `wasm32` (matching the existing `anti_entropy` pattern at `crates/sunset-sync/src/engine.rs:269`), `tokio::time::sleep` on native.
 
+### Send-side disconnect signal
+
+The current `send_task` in `run_peer` already detects send failures — but only as a reason to `break` the loop:
+
+```rust
+if send_reliable_message(&*conn, &msg).await.is_err() {
+    break;
+}
+```
+
+This loses information. A failed reliable send is *immediate, definitive evidence* that the underlying transport is dead — `WebSocketRawConnection::send_reliable` only returns Err when `closed` is set or `web_sys::WebSocket::send` itself rejects (readyState CLOSING/CLOSED). For a transport that's gone bad in only one direction (uncommon but possible), this surfaces faster than the recv loop's `recv_reliable` future, which sits blocked indefinitely.
+
+More importantly, when paired with the heartbeat: a `Ping` is sent every `heartbeat_interval` (15 s default). If the connection has died in a way the OS / browser has noticed but the recv loop hasn't observed yet, the very next ping write will fail and we know within 15 s — not 45 s.
+
+We change the send-task to emit `Disconnected` on send failure:
+
+```rust
+ChannelKind::Reliable => {
+    if let Err(e) = send_reliable_message(&*conn, &msg).await {
+        let _ = inbound_tx.send(InboundEvent::Disconnected {
+            peer_id: peer_id.clone(),
+            conn_id,
+            reason: format!("send reliable: {e}"),
+        });
+        break;
+    }
+}
+```
+
+(`peer_id` is in scope post-Hello; `conn_id` is the per-task `ConnectionId` allocated by the engine and threaded into `run_peer` — see "Connection identity" below.) Unreliable send failures remain silent per the existing failure-mode rule (drop the datagram, keep the peer alive) — only reliable-send failures are treated as definitive.
+
+The same `conn_id` is also stamped on the `Disconnected` events the recv-tasks and the heartbeat-task emit — every `InboundEvent::Disconnected` from a given per-peer task carries the same id.
+
+### Connection identity and stale-event filtering
+
+With four concurrent sub-tasks per connection (`recv_reliable_task`, `recv_unreliable_task`, `send_task`, `liveness_task`) any of which can now emit `Disconnected`, two distinct correctness problems appear:
+
+1. **Within one connection**, multiple sub-tasks can emit `Disconnected` for the same peer in quick succession.
+2. **Across reconnections**, a delayed `Disconnected` from a defunct connection can race with the `PeerHello` of a fresh connection to the same peer. A naive "remove if present" guard would unregister the *new* connection — destroying live state.
+
+A simple `is_some` check fixes (1) but breaks on (2). The right primitive is **per-connection identity**: each `Disconnected` event names which connection died, and the engine only acts on it if that connection is still the current one for the peer.
+
+Each per-peer task is 1:1 with one Noise handshake — there's already a unique connection there. We surface it as a small private token:
+
+```rust
+// Internal to sunset-sync. Not in the public EngineEvent API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionId(u64);
+```
+
+The engine holds a monotonic counter (`RefCell<u64>` — single-threaded; no atomics needed) and allocates a fresh `ConnectionId` for every per-peer task it spawns, on both the `add_peer` (outbound) and `accept` (inbound) paths.
+
+`InboundEvent` carries it on the two variants where it matters:
+
+```rust
+pub(crate) enum InboundEvent {
+    PeerHello {
+        peer_id: PeerId,
+        conn_id: ConnectionId,        // NEW
+        kind: TransportKind,
+        out_tx: mpsc::UnboundedSender<SyncMessage>,
+    },
+    Message { from: PeerId, message: SyncMessage },
+    Disconnected {
+        peer_id: PeerId,
+        conn_id: ConnectionId,        // NEW
+        reason: String,
+    },
+}
+```
+
+`peer_outbound` stores the conn_id alongside the sender so the engine can check whether an arriving `Disconnected` matches the current generation:
+
+```rust
+struct PeerOutbound {
+    conn_id: ConnectionId,
+    tx: mpsc::UnboundedSender<SyncMessage>,
+}
+
+// In EngineState:
+peer_outbound: HashMap<PeerId, PeerOutbound>,
+```
+
+`Disconnected` handling:
+
+```rust
+InboundEvent::Disconnected { peer_id, conn_id, reason } => {
+    eprintln!("sunset-sync: peer {peer_id:?} disconnected (conn {conn_id:?}): {reason}");
+    let removed = {
+        let mut state = self.state.lock().await;
+        match state.peer_outbound.get(&peer_id) {
+            Some(po) if po.conn_id == conn_id => {
+                state.peer_kinds.remove(&peer_id);
+                state.peer_outbound.remove(&peer_id);
+                true
+            }
+            _ => false,  // already removed, or replaced by a newer connection
+        }
+    };
+    if removed {
+        self.emit_engine_event(EngineEvent::PeerRemoved { peer_id }).await;
+    }
+}
+```
+
+This handles both problems cleanly:
+
+- **Same-connection duplicates**: first `Disconnected` removes; subsequent ones see `peer_outbound.get(&peer_id) == None` (or a future-conn_id from a replacement) and drop silently.
+- **Cross-generation stale events**: a delayed `Disconnected(conn=1)` arriving after `PeerHello(conn=2)` has already executed sees `peer_outbound[P].conn_id == 2 ≠ 1` and drops silently. The live `conn=2` survives.
+
+`PeerHello` handling stores the conn_id and replaces any existing entry:
+
+```rust
+InboundEvent::PeerHello { peer_id, conn_id, kind, out_tx } => {
+    {
+        let mut state = self.state.lock().await;
+        // Replacing an existing entry is intentional: dropping the old
+        // sender closes its outbound mpsc → the old send_task drains,
+        // sends Goodbye, and closes the old conn. The old conn's tasks
+        // will eventually emit Disconnected(old_conn_id) which the
+        // conn_id check above safely ignores.
+        state.peer_outbound.insert(peer_id.clone(), PeerOutbound { conn_id, tx: out_tx });
+        state.peer_kinds.insert(peer_id.clone(), kind);
+    }
+    self.emit_engine_event(EngineEvent::PeerAdded { peer_id, kind }).await;
+    self.send_bootstrap_digest(&peer_id).await;
+}
+```
+
+The public `EngineEvent` API does **not** expose `ConnectionId`. Subscribers (membership tracker, supervisor) continue to work in terms of `peer_id`. The conn_id is purely an internal correlation token; it never escapes `sunset-sync`'s private event plumbing.
+
 ### Engine handling
 
 `SyncEngine::handle_peer_message` (`crates/sunset-sync/src/engine.rs:442`) gets two new no-op arms — `Ping` and `Pong` are entirely handled by the per-peer task. Listing them (no wildcard) keeps the same compile-time-coverage discipline as the existing match.
@@ -98,10 +231,14 @@ The liveness task uses `wasmtimer::tokio::sleep` on `wasm32` (matching the exist
 
 | Scenario | Behaviour |
 |---|---|
-| Channel goes silent (sleep/resume, dead TCP) | Liveness times out after `heartbeat_timeout`; emits `Disconnected`; engine fires `PeerRemoved` like any other disconnect. |
+| Channel goes silent (sleep/resume, dead TCP, OS unaware) | Liveness times out after `heartbeat_timeout`; emits `Disconnected`; engine fires `PeerRemoved` like any other disconnect. Worst case ≈ 45 s. |
+| Channel dead, OS/browser noticed (relay restart, RST received) | The next reliable send (next user message OR next heartbeat ping, whichever is sooner) fails immediately. `send_task` emits `Disconnected` within ~15 s under idle, instantly under traffic. |
+| Multiple sub-tasks of one connection emit `Disconnected` | All carry the same `conn_id`. First matches `peer_outbound[peer_id].conn_id` and removes; subsequent ones see no entry (or a newer conn_id from a replacement) and drop silently. Exactly one `PeerRemoved` reaches subscribers per connection. |
+| Stale `Disconnected` from defunct connection arrives after redial | Event's `conn_id` doesn't match the new connection's `conn_id` in `peer_outbound`; engine drops the event silently. The live new connection is unaffected. This is the load-bearing correctness property — see test 9. |
+| Two connections to the same peer briefly coexist (e.g., relay accepts a duplicate before the old one's tasks notice) | The newer `PeerHello` overwrites `peer_outbound[peer_id]`. Dropping the old sender closes its outbound mpsc, which causes the old send-task to send Goodbye and tear down the old connection. The old connection's eventual `Disconnected(old_conn_id)` is filtered out by the conn_id check. |
 | One Ping or Pong dropped in transit | Tolerated: `heartbeat_timeout = 3 × heartbeat_interval` so 1–2 missed pings recover when the next pong arrives. |
 | Peer sends Ping but never Pong (or vice versa) | Asymmetric: each side runs its own liveness loop independently. If one side's pongs aren't arriving, that side disconnects on its own timer. The other side may still be receiving pongs; it disconnects when its own pings stop being answered. |
-| Reordered Pongs (nonce 5 arrives before nonce 4) | Both update `last_pong_at`; both removed from `pending`. State is correct. |
+| Reordered Pongs (nonce 5 arrives before nonce 4) | Each updates `last_pong_at`. State is correct (nonce isn't tracked beyond informational logging). |
 | Pong with unknown nonce (e.g., from a reset peer that lost state) | Dropped silently. Doesn't affect timeout. |
 | Send-task already torn down when liveness wants to send a Ping | The outbound channel is closed; `send` returns Err; liveness task exits. The reliable recv-task's own error path will independently emit `Disconnected`. |
 | Ping arrives before Hello | Cannot happen: `run_peer` blocks on Hello before starting the four concurrent loops. The liveness task only exists post-Hello. |
@@ -116,6 +253,15 @@ In `crates/sunset-sync/src/peer.rs` `mod tests`, all using `TestTransport` and `
 4. **Reordered Pongs accepted.** Wrapper buffers Pongs and releases them out of order. No `Disconnected`.
 5. **Unknown-nonce Pong dropped.** Inject a `Pong { nonce: u64::MAX }` directly into the recv channel (using a `TransportConnection` wrapper that prepends one); verify no `Disconnected` (handler is silent) and that the regular ping/pong loop still progresses.
 6. **Frozen-vector regression.** Test that `postcard::to_stdvec(&SyncMessage::Ping { nonce: 1 })` matches a hex-pinned byte string; same for `Pong { nonce: 1 }`.
+7. **Send-side disconnect.** Use a `TransportConnection` wrapper whose `send_reliable` returns Err after the Hello exchange (e.g., a `Mutex<bool>` flipped by the test). Verify a `Disconnected { reason: "send reliable: ..." }` is observed on `inbound_tx` from the send task without waiting for the heartbeat timeout.
+8. **Disconnect de-dup within one connection.** Drive two sources of `Disconnected` for the same connection (e.g., trigger the send failure AND let the heartbeat timeout fire by holding the receiver's pong path closed). Subscribe to `EngineEvent::PeerRemoved` and verify exactly one event lands.
+9. **Cross-generation stale event filtered.** The race the conn_id design exists to prevent. Build it explicitly:
+   1. Connect peer P over conn=1; observe `PeerAdded`.
+   2. Capture an `InboundEvent::Disconnected { peer_id: P, conn_id: 1, .. }` for replay later (e.g., obtain a sender clone of `inbound_tx` via a test-only accessor, or use a custom `TransportConnection` wrapper that synthesizes the event).
+   3. Tear down conn=1 cleanly; observe `PeerRemoved`.
+   4. Reconnect P over a fresh conn=2 (which the engine allocates a new `ConnectionId` for); observe `PeerAdded` for conn=2.
+   5. Replay the captured `Disconnected(conn_id=1)` event into `inbound_tx`.
+   6. Assert: NO `PeerRemoved` event is observed within a generous timeout, and conn=2 still has a working outbound channel (a follow-up `EventDelivery` round-trips). Without the conn_id guard this test fails — the live conn=2 would be torn down.
 
 ## Piece 2: `PeerSupervisor`
 
@@ -358,6 +504,7 @@ The existing `relay_status` field and `on_relay_status_changed` callback continu
 ## Review summary
 
 - **Placeholders:** none.
-- **Internal consistency:** heartbeat lives in `peer.rs` and emits standard `InboundEvent::Disconnected`; supervisor consumes the resulting `EngineEvent::PeerRemoved` via the existing public API. No new event channels. The first-dial vs. transient-error distinction is consistent across `add()`, the failure-mode table, and the test list.
+- **Internal consistency:** heartbeat lives in `peer.rs` and emits `InboundEvent::Disconnected` carrying the per-task `ConnectionId`; engine filters by `(peer_id, conn_id)` so cross-generation stale events are impossible by construction. Supervisor consumes `EngineEvent::PeerRemoved` via the existing public API and never sees `ConnectionId`. No new event channels.
 - **Scope:** two focused modules (`peer.rs` extension, new `supervisor.rs`) plus a thin rewire of two `Client` methods. Everything else is unchanged. Suitable for a single implementation plan.
+- **Race-freedom by construction:** the `ConnectionId` design eliminates the post-hoc `is_some` dedup approach in favor of a generation check that handles both same-connection duplicates and cross-generation stale events with the same primitive. Test 9 specifically exercises the cross-generation race.
 - **Ambiguity:** "first-dial vs transient" semantics for `add()` is the obvious place for misinterpretation; called out explicitly in the API doc, the failure-mode table, and the test list. The intentional distinction between channel-level heartbeat (this design) and application-level `Liveness` (sunset-core) is called out in "Out of scope."

@@ -47,6 +47,14 @@ pub struct SyncConfig {
     /// Filter used for the bootstrap digest exchange (always
     /// `_sunset-sync/subscribe` namespace).
     pub bootstrap_filter: Filter,
+    /// Cadence at which each per-peer task sends `SyncMessage::Ping`.
+    /// Default 15 s. Three intervals must elapse without a `Pong`
+    /// before the connection is declared dead.
+    pub heartbeat_interval: Duration,
+    /// If no `Pong` arrives within this window, the per-peer task emits
+    /// `Disconnected { reason: "heartbeat timeout" }`. Default 45 s
+    /// (= 3 × `heartbeat_interval`).
+    pub heartbeat_timeout: Duration,
 }
 
 impl Default for SyncConfig {
@@ -57,6 +65,8 @@ impl Default for SyncConfig {
             bloom_size_bits: 4096,
             bloom_hash_fns: 4,
             bootstrap_filter: Filter::Namespace(reserved::SUBSCRIBE_NAME.into()),
+            heartbeat_interval: Duration::from_secs(15),
+            heartbeat_timeout: Duration::from_secs(45),
         }
     }
 }
@@ -110,5 +120,12 @@ mod tests {
         assert_eq!(c.protocol_version, 1);
         assert_eq!(c.bloom_size_bits, 4096);
         assert_eq!(c.bloom_hash_fns, 4);
+    }
+
+    #[test]
+    fn default_heartbeat_settings() {
+        let c = SyncConfig::default();
+        assert_eq!(c.heartbeat_interval, std::time::Duration::from_secs(15));
+        assert_eq!(c.heartbeat_timeout, std::time::Duration::from_secs(45));
     }
 }

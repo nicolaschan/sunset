@@ -41,6 +41,7 @@ pub struct Client {
     room: Rc<Room>,
     store: Arc<MemoryStore>,
     engine: Rc<Engine>,
+    supervisor: Rc<sunset_sync::PeerSupervisor<MemoryStore, MultiTransport<WsT, RtcT>>>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     on_receipt: Rc<RefCell<Option<js_sys::Function>>>,
     relay_status: Rc<RefCell<String>>,
@@ -96,11 +97,19 @@ impl Client {
             }
         });
 
+        let supervisor =
+            sunset_sync::PeerSupervisor::new(engine.clone(), sunset_sync::BackoffPolicy::default());
+        wasm_bindgen_futures::spawn_local({
+            let s = supervisor.clone();
+            async move { s.run().await }
+        });
+
         Ok(Client {
             identity,
             room,
             store,
             engine,
+            supervisor,
             on_message: Rc::new(RefCell::new(None)),
             on_receipt: Rc::new(RefCell::new(None)),
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
@@ -137,7 +146,7 @@ impl Client {
         };
 
         let addr = sunset_sync::PeerAddr::new(Bytes::from(canonical));
-        match self.engine.add_peer(addr).await {
+        match self.supervisor.add(addr).await {
             Ok(()) => {
                 *self.relay_status.borrow_mut() = "connected".to_owned();
                 Ok(())
@@ -163,8 +172,8 @@ impl Client {
             .map_err(|e| JsError::new(&format!("x25519 derive: {e}")))?;
         let addr_str = format!("webrtc://{}#x25519={}", hex::encode(pk), hex::encode(x_pub));
         let addr = sunset_sync::PeerAddr::new(Bytes::from(addr_str));
-        self.engine
-            .add_peer(addr)
+        self.supervisor
+            .add(addr)
             .await
             .map_err(|e| JsError::new(&format!("connect_direct: {e}")))?;
         Ok(())
@@ -321,7 +330,7 @@ impl Client {
         wasm_bindgen_futures::spawn_local(async move {
             use futures::StreamExt;
             use std::collections::HashSet;
-            use sunset_core::{decode_message, room_messages_filter, MessageBody};
+            use sunset_core::{MessageBody, decode_message, room_messages_filter};
             use sunset_store::{Event, Replay, Store as _};
 
             // Session-only dedup: which Text value-hashes have we already
@@ -429,15 +438,16 @@ async fn send_receipt(
 ) {
     use sunset_store::Store as _;
     let now_ms = js_sys::Date::now() as u64;
-    let composed = match sunset_core::compose_receipt(identity, room, 0, now_ms, for_value_hash, rng) {
-        Ok(c) => c,
-        Err(e) => {
-            web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "compose_receipt failed: {e}"
-            )));
-            return;
-        }
-    };
+    let composed =
+        match sunset_core::compose_receipt(identity, room, 0, now_ms, for_value_hash, rng) {
+            Ok(c) => c,
+            Err(e) => {
+                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "compose_receipt failed: {e}"
+                )));
+                return;
+            }
+        };
     if let Err(e) = store.insert(composed.entry, Some(composed.block)).await {
         web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
             "store.insert(receipt) failed: {e}"
