@@ -15,3 +15,4 @@ pub mod parse;
 pub mod resolver;
 
 pub use error::{Error, Result};
+pub use parse::{LookupTarget, ParsedInput, parse_input};
