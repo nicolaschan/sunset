@@ -220,7 +220,9 @@ fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
         | SyncMessage::BlobResponse { .. }
         | SyncMessage::DigestExchange { .. }
         | SyncMessage::Fetch { .. }
-        | SyncMessage::Goodbye {} => ChannelKind::Reliable,
+        | SyncMessage::Goodbye {}
+        | SyncMessage::Ping { .. }
+        | SyncMessage::Pong { .. } => ChannelKind::Reliable,
     }
 }
 
