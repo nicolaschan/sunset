@@ -176,34 +176,28 @@ test("chat resumes after relay restart without page reload", async ({ browser })
   expect(restarted.addr).toBe(relayAddress);
 
   // Wait for the supervisor on each side to detect the disconnect and
-  // reconnect. With default heartbeat (15s interval, 45s timeout) and 1s
-  // initial backoff, total worst-case is ~50s. We wait up to 75s.
+  // reconnect. Design budget:
+  //   - send-side detection on next heartbeat tick: ≤ heartbeat_interval (15s default)
+  //   - supervisor backoff: ~1s initial (with ±20% jitter)
+  //   - re-dial connect + Hello handshake: <1s on localhost
+  // Typical total: ~17s. We wait 25s as a tight bound — anything slower
+  // than this is a regression in the supervisor's reconnect path itself.
   //
-  // We probe by polling the supervisor's intent state via a small JS
-  // hook installed by the wasm bindings (see Client.relay_status — it
-  // stays "connected" while the supervisor's intent is Connected, and
-  // would flip to "reconnecting" / "error" in the membership tracker
-  // path; here we just wait via a SLEEP because relay_status doesn't
-  // round-trip through supervisor state in v1).
-  //
-  // Pragmatic wait: 60s.
-  await new Promise((r) => setTimeout(r, 60_000));
+  // (Messages sent during the gap can be dropped because the engine has
+  // no per-peer message queue. Sending AFTER reconnect avoids that
+  // separate concern, which has its own anti-entropy story.)
+  await new Promise((r) => setTimeout(r, 25_000));
 
-  // Send a message after the supervisor has had time to reconnect.
-  // Because messages sent BEFORE reconnect-detection wouldn't fan out
-  // (the engine has no per-peer message queue or replay path; only the
-  // anti-entropy timer covers post-reconnect catch-up, and only for the
-  // bootstrap_filter — chat namespace is NOT in that filter in v1), we
-  // send the post-restart message AFTER the supervisor should have
-  // reconnected so it goes out fresh on the live channel.
+  // Send a message — should arrive promptly on the freshly-redialed
+  // connection.
   const msgPost = `post-restart from A — ${Date.now()}`;
   await inputA.fill(msgPost);
   await inputA.press("Enter");
-  await expect(pageB.getByText(msgPost)).toBeVisible({ timeout: 30_000 });
+  await expect(pageB.getByText(msgPost)).toBeVisible({ timeout: 15_000 });
 
   // Bidirectional sanity: B → A also works after redial.
   const msgPostB = `post-restart from B — ${Date.now()}`;
   await inputB.fill(msgPostB);
   await inputB.press("Enter");
-  await expect(pageA.getByText(msgPostB)).toBeVisible({ timeout: 30_000 });
+  await expect(pageA.getByText(msgPostB)).toBeVisible({ timeout: 15_000 });
 });

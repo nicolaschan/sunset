@@ -332,6 +332,17 @@ where
         // Channel for per-peer tasks to talk back to us.
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
 
+        // Rebuild the in-memory subscription_registry from existing
+        // `SUBSCRIBE_NAME` entries on disk. Persistent backends (e.g.
+        // `sunset-store-fs` used by the relay) hold these across process
+        // restarts; the registry must reflect that state before we start
+        // routing chat traffic. Without this step, after a relay restart
+        // the relay would receive forwarded chat messages but find no
+        // peers to fan them out to (registry is empty), and clients would
+        // never see each other's messages until they happened to publish
+        // a fresh subscribe entry.
+        self.replay_existing_subscriptions().await?;
+
         // Local store subscription. Match every entry (an empty NamePrefix
         // matches all names): the engine needs to see both subscribe-
         // namespace entries (to maintain the registry) and any application
@@ -548,6 +559,42 @@ where
                 }
             }
         }
+    }
+
+    /// Walk the local store for existing `_sunset-sync/subscribe` entries
+    /// and seed the in-memory `subscription_registry`. Called once at the
+    /// top of `run()` so that persistent backends survive process restart
+    /// without losing their routing state. Pure "read existing entries
+    /// and update local in-memory state" — does NOT push events to peers
+    /// (that's the live `local_sub` path's job, only for *new* inserts).
+    async fn replay_existing_subscriptions(&self) -> Result<()> {
+        let filter = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
+        let mut entries = self.store.iter(filter).await.map_err(Error::Store)?;
+        while let Some(item) = entries.next().await {
+            let entry = match item {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("sunset-sync: replay_existing_subscriptions: {e}");
+                    continue;
+                }
+            };
+            let block = match self.store.get_content(&entry.value_hash).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("sunset-sync: replay_existing_subscriptions: {e}");
+                    continue;
+                }
+            };
+            if let Ok(parsed_filter) = parse_subscription_entry(&entry, &block) {
+                self.state
+                    .lock()
+                    .await
+                    .registry
+                    .insert(entry.verifying_key, parsed_filter);
+            }
+        }
+        Ok(())
     }
 
     async fn send_bootstrap_digest(&self, to: &PeerId) {
