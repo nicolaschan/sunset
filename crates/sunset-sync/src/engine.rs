@@ -19,6 +19,31 @@ use crate::subscription_registry::{SubscriptionRegistry, parse_subscription_entr
 use crate::transport::Transport;
 use crate::types::{PeerAddr, PeerId, SyncConfig, TrustSet};
 
+/// Per-connection identity used to filter stale events from defunct
+/// connections (a delayed `Disconnected` from generation N must not kill
+/// a freshly-established generation N+1 connection to the same peer).
+///
+/// Allocated by the engine when a new per-peer task is spawned (both
+/// `add_peer` and `accept` paths). Never escapes the crate — public
+/// `EngineEvent` carries only `PeerId`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ConnectionId(u64);
+
+impl std::fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "conn#{}", self.0)
+    }
+}
+
+impl ConnectionId {
+    /// `pub(crate)` constructor used only by tests in adjacent modules.
+    /// Production allocation goes through `SyncEngine::alloc_conn_id`.
+    #[cfg(test)]
+    pub(crate) fn for_test(id: u64) -> Self {
+        ConnectionId(id)
+    }
+}
+
 /// Free helper that spins up the outbound channel + spawns the per-peer
 /// task. Extracted from `SyncEngine::spawn_peer` so the AddPeer command
 /// handler can call it from a `'static` spawned task without holding
@@ -27,12 +52,13 @@ fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     conn: C,
     local_peer: PeerId,
     proto: u32,
+    conn_id: ConnectionId,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
 ) {
     let conn = Rc::new(conn);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
     crate::spawn::spawn_local(run_peer(
-        conn, local_peer, proto, out_tx, out_rx, inbound_tx,
+        conn, local_peer, proto, conn_id, out_tx, out_rx, inbound_tx,
     ));
 }
 
@@ -103,6 +129,10 @@ pub struct SyncEngine<S: Store, T: Transport> {
     /// Held inside `run()`. `new()` creates the (tx, rx) pair; `run()`
     /// takes the rx out via Mutex<Option<...>>.
     pub(crate) cmd_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<EngineCommand>>>>,
+    /// Monotonic counter for allocating `ConnectionId`s. Single-threaded
+    /// (`?Send`); a `RefCell<u64>` would also work, but `Arc<Mutex<…>>` keeps
+    /// the same shape as the rest of the engine state.
+    pub(crate) next_conn_id: Arc<Mutex<u64>>,
 }
 
 impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T>
@@ -133,7 +163,16 @@ where
             })),
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
+            next_conn_id: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Allocate a fresh `ConnectionId`. Single-writer, monotonic.
+    pub(crate) async fn alloc_conn_id(&self) -> ConnectionId {
+        let mut next = self.next_conn_id.lock().await;
+        let id = *next;
+        *next += 1;
+        ConnectionId(id)
     }
 
     /// Initiate an outbound connection to `addr`. Returns when the connection
@@ -340,10 +379,11 @@ where
                 let local_peer = self.local_peer.clone();
                 let proto = self.config.protocol_version;
                 let inbound_tx = inbound_tx.clone();
+                let conn_id = self.alloc_conn_id().await;
                 crate::spawn::spawn_local(async move {
                     let r = match transport.connect(addr).await {
                         Ok(conn) => {
-                            spawn_run_peer(conn, local_peer, proto, inbound_tx);
+                            spawn_run_peer(conn, local_peer, proto, conn_id, inbound_tx);
                             Ok(())
                         }
                         Err(e) => Err(e),
@@ -367,10 +407,12 @@ where
         conn: T::Connection,
         inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     ) {
+        let conn_id = self.alloc_conn_id().await;
         spawn_run_peer(
             conn,
             self.local_peer.clone(),
             self.config.protocol_version,
+            conn_id,
             inbound_tx,
         );
     }
@@ -379,6 +421,7 @@ where
         match event {
             InboundEvent::PeerHello {
                 peer_id,
+                conn_id: _,
                 kind,
                 out_tx,
             } => {
@@ -402,7 +445,11 @@ where
             InboundEvent::Message { from, message } => {
                 self.handle_peer_message(from, message).await;
             }
-            InboundEvent::Disconnected { peer_id, reason } => {
+            InboundEvent::Disconnected {
+                peer_id,
+                conn_id: _,
+                reason,
+            } => {
                 eprintln!("sunset-sync: peer {peer_id:?} disconnected: {reason}");
                 {
                     let mut state = self.state.lock().await;

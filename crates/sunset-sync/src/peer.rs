@@ -18,13 +18,28 @@ pub(crate) enum InboundEvent {
     /// `out_tx` is the outbound sender to register under `peer_id`.
     PeerHello {
         peer_id: PeerId,
+        // Plumbed through but not yet read; Task 5 stores it alongside
+        // the per-peer outbound sender, Task 6 uses it for stale-event
+        // filtering. Suppress dead_code until those tasks land.
+        #[allow(dead_code)]
+        conn_id: crate::engine::ConnectionId,
         kind: crate::transport::TransportKind,
         out_tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>,
     },
     /// A SyncMessage arrived (other than Hello).
     Message { from: PeerId, message: SyncMessage },
-    /// The peer's connection closed (graceful or error).
-    Disconnected { peer_id: PeerId, reason: String },
+    /// The peer's connection closed (graceful or error). The `conn_id`
+    /// identifies *which* connection died; the engine filters stale
+    /// disconnects whose `conn_id` no longer matches the current entry
+    /// in `peer_outbound[peer_id]`.
+    Disconnected {
+        peer_id: PeerId,
+        // Plumbed through but not yet read; Task 6 uses it to filter
+        // stale disconnects from defunct connection generations.
+        #[allow(dead_code)]
+        conn_id: crate::engine::ConnectionId,
+        reason: String,
+    },
 }
 
 /// Drive a single peer's connection.
@@ -48,6 +63,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     conn: Rc<C>,
     local_peer: PeerId,
     local_protocol_version: u32,
+    conn_id: crate::engine::ConnectionId,
     out_tx: mpsc::UnboundedSender<SyncMessage>,
     mut outbound_rx: mpsc::UnboundedReceiver<SyncMessage>,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
@@ -61,6 +77,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     if let Err(e) = send_reliable_message(&*conn, &our_hello).await {
         let _ = inbound_tx.send(InboundEvent::Disconnected {
             peer_id: conn.peer_id(),
+            conn_id,
             reason: format!("send hello: {e}"),
         });
         return;
@@ -75,6 +92,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             if protocol_version != local_protocol_version {
                 let _ = inbound_tx.send(InboundEvent::Disconnected {
                     peer_id,
+                    conn_id,
                     reason: format!(
                         "protocol version mismatch: ours {} theirs {}",
                         local_protocol_version, protocol_version
@@ -84,6 +102,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             }
             let _ = inbound_tx.send(InboundEvent::PeerHello {
                 peer_id: peer_id.clone(),
+                conn_id,
                 kind: local_kind,
                 out_tx,
             });
@@ -92,6 +111,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         Ok(other) => {
             let _ = inbound_tx.send(InboundEvent::Disconnected {
                 peer_id: conn.peer_id(),
+                conn_id,
                 reason: format!("expected Hello, got {:?}", other),
             });
             return;
@@ -99,6 +119,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         Err(e) => {
             let _ = inbound_tx.send(InboundEvent::Disconnected {
                 peer_id: conn.peer_id(),
+                conn_id,
                 reason: format!("recv hello: {e}"),
             });
             return;
@@ -120,6 +141,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                     Ok(SyncMessage::Goodbye {}) => {
                         let _ = inbound_tx.send(InboundEvent::Disconnected {
                             peer_id: peer_id.clone(),
+                            conn_id,
                             reason: "peer goodbye".into(),
                         });
                         break;
@@ -138,6 +160,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                     Err(e) => {
                         let _ = inbound_tx.send(InboundEvent::Disconnected {
                             peer_id: peer_id.clone(),
+                            conn_id,
                             reason: format!("recv reliable: {e}"),
                         });
                         break;
@@ -329,6 +352,7 @@ mod tests {
                     Rc::new(alice_conn),
                     PeerId(vk(b"alice")),
                     1,
+                    crate::engine::ConnectionId::for_test(1),
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
@@ -337,6 +361,7 @@ mod tests {
                     Rc::new(bob_conn),
                     PeerId(vk(b"bob")),
                     1,
+                    crate::engine::ConnectionId::for_test(2),
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
@@ -404,6 +429,7 @@ mod tests {
                     Rc::new(alice_conn),
                     PeerId(vk(b"alice")),
                     1,
+                    crate::engine::ConnectionId::for_test(3),
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
@@ -412,6 +438,7 @@ mod tests {
                     Rc::new(bob_conn),
                     PeerId(vk(b"bob")),
                     1,
+                    crate::engine::ConnectionId::for_test(4),
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
