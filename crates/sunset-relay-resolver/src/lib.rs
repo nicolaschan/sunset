@@ -4,7 +4,7 @@
 //! identity endpoint.
 //!
 //! This crate ships no HTTP implementation: callers supply an
-//! [`HttpFetch`] impl. `sunset-relay` uses a `reqwest`-based one;
+//! `HttpFetch` impl. `sunset-relay` uses a `reqwest`-based one;
 //! `sunset-web-wasm` uses a `web-sys::fetch`-based one. The pure
 //! parsing / JSON-extraction code is unit-testable without any HTTP
 //! dependency.
