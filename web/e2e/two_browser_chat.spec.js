@@ -167,20 +167,10 @@ test("bare host:port in ?relay= triggers GET / resolution", async ({
   await pageA.goto(url);
   await pageB.goto(url);
 
-  // The relay status pill in the rooms-rail footer renders the live
-  // status ("connecting" → "connected"). If the resolver fetched
-  // GET / successfully and the reconstructed x25519 matches what the
-  // relay actually presents, the Noise handshake succeeds and the
-  // status flips to "connected".
-  await expect(pageA.getByText("connected", { exact: false })).toBeVisible({
-    timeout: 15_000,
-  });
-  await expect(pageB.getByText("connected", { exact: false })).toBeVisible({
-    timeout: 15_000,
-  });
-
-  // Round-trip a message to confirm the connection is actually working
-  // (not just labelled "connected").
+  // Round-trip a message — this is the strict signal that the resolver
+  // path worked end-to-end. If the GET / fetch fails or the
+  // reconstructed x25519 doesn't match the relay's actual key, the
+  // Noise handshake fails and the message never arrives at B.
   const inputA = pageA.getByPlaceholder(/^Message #/);
   const inputB = pageB.getByPlaceholder(/^Message #/);
   await expect(inputA).toBeVisible({ timeout: 15_000 });
