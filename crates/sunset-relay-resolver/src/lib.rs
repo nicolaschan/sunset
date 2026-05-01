@@ -9,10 +9,10 @@
 //! parsing / JSON-extraction code is unit-testable without any HTTP
 //! dependency.
 
-pub mod error;
-pub mod json;
-pub mod parse;
-pub mod resolver;
+mod error;
+mod json;
+mod parse;
+mod resolver;
 
 pub use error::{Error, Result};
 pub use json::extract_x25519_from_json;

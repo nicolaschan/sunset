@@ -107,6 +107,14 @@ fn host_without_port(host_port: &str) -> &str {
             return &host_port[..=close];
         }
     }
+    // Bare IPv6 (no brackets) — RFC 3986 says URLs must bracket IPv6,
+    // but a user might still type `::1` directly into a config. The
+    // presence of `::` is unambiguous: if found, treat the whole
+    // string as the host (no port to split off — port-bearing forms
+    // require brackets).
+    if host_port.contains("::") {
+        return host_port;
+    }
     host_port
         .rsplit_once(':')
         .map(|(h, _)| h)
@@ -195,6 +203,20 @@ mod tests {
             ParsedInput::Lookup(LookupTarget {
                 http_url: "http://[::1]:8443/".into(),
                 ws_url: "ws://[::1]:8443".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn loopback_ipv6_bare_defaults_to_plain() {
+        // Unbracketed IPv6 is not a valid URL host, but users may type
+        // it. We detect the `::` and route it correctly.
+        let parsed = parse_input("::1").unwrap();
+        assert_eq!(
+            parsed,
+            ParsedInput::Lookup(LookupTarget {
+                http_url: "http://::1/".into(),
+                ws_url: "ws://::1".into(),
             })
         );
     }

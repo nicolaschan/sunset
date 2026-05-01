@@ -45,7 +45,7 @@ A new workspace crate with no HTTP implementation. Ships:
 
 **WASM-compat:** the crate itself has no native-only deps. `HttpFetch` is `#[async_trait(?Send)]` to match the codebase's WASM convention.
 
-**Cargo.toml:** depends on `bytes`, `hex`, `thiserror`, `async-trait`. No `serde_json` (the JSON shape is fixed and tiny).
+**Cargo.toml:** depends on `hex`, `thiserror`, `async-trait`. No `serde_json` (the JSON shape is fixed and tiny).
 
 ## Consumers
 
