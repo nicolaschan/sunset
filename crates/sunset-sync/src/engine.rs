@@ -78,6 +78,10 @@ pub(crate) enum EngineCommand {
         trust: TrustSet,
         ack: oneshot::Sender<Result<()>>,
     },
+    RemovePeer {
+        peer_id: PeerId,
+        ack: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Lifecycle events emitted by the engine. Subscribers receive
@@ -193,6 +197,19 @@ where
         let (ack, rx) = oneshot::channel();
         self.cmd_tx
             .send(EngineCommand::AddPeer { addr, ack })
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Tear down the connection to `peer_id` if one exists. Drops the
+    /// outbound channel; the per-peer task's send-loop drains, sends
+    /// Goodbye, and closes the underlying connection. The corresponding
+    /// `Disconnected` event then triggers the standard `PeerRemoved`
+    /// fan-out. No-op if the peer isn't connected.
+    pub async fn remove_peer(&self, peer_id: PeerId) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::RemovePeer { peer_id, ack })
             .map_err(|_| Error::Closed)?;
         rx.await.map_err(|_| Error::Closed)?
     }
@@ -423,6 +440,18 @@ where
             }
             EngineCommand::SetTrust { trust, ack } => {
                 self.state.lock().await.trust = trust;
+                let _ = ack.send(Ok(()));
+            }
+            EngineCommand::RemovePeer { peer_id, ack } => {
+                let removed = {
+                    let mut state = self.state.lock().await;
+                    state.peer_kinds.remove(&peer_id);
+                    state.peer_outbound.remove(&peer_id).is_some()
+                };
+                if removed {
+                    self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
+                        .await;
+                }
                 let _ = ack.send(Ok(()));
             }
         }
@@ -1467,6 +1496,59 @@ mod tests {
                 let second =
                     tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await;
                 assert!(second.is_err(), "no second PeerRemoved");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_peer_drops_outbound_and_emits_removed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let peer = PeerId(vk(b"bob"));
+
+                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let conn = ConnectionId::for_test(1);
+                engine.state.lock().await.peer_outbound.insert(
+                    peer.clone(),
+                    PeerOutbound { conn_id: conn, tx },
+                );
+                engine
+                    .state
+                    .lock()
+                    .await
+                    .peer_kinds
+                    .insert(peer.clone(), crate::transport::TransportKind::Unknown);
+
+                let mut events = engine.subscribe_engine_events().await;
+
+                // run() handles commands; spawn it.
+                let h = crate::spawn::spawn_local({
+                    let engine = engine.clone();
+                    async move { engine.run().await }
+                });
+
+                engine.remove_peer(peer.clone()).await.unwrap();
+
+                // PeerRemoved fires.
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    events.recv(),
+                )
+                .await
+                .expect("PeerRemoved arrives")
+                .expect("channel open")
+                {
+                    EngineEvent::PeerRemoved { peer_id } => assert_eq!(peer_id, peer),
+                    other => panic!("expected PeerRemoved, got {other:?}"),
+                }
+
+                // The outbound sender was dropped; the receiver sees None.
+                assert!(rx.recv().await.is_none());
+
+                h.abort();
+                let _ = h.await;
             })
             .await;
     }
