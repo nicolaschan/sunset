@@ -123,7 +123,20 @@ impl Client {
 
     pub async fn add_relay(&self, url_with_fragment: String) -> Result<(), JsError> {
         *self.relay_status.borrow_mut() = "connecting".to_owned();
-        let addr = sunset_sync::PeerAddr::new(Bytes::from(url_with_fragment));
+
+        // Resolve user input (bare host, host:port, wss://, or fully
+        // canonical wss://host#x25519=hex). Canonical forms short-circuit;
+        // others fetch GET / from the relay to learn its x25519 key.
+        let resolver = sunset_relay_resolver::Resolver::new(crate::resolver_adapter::WebSysFetch);
+        let canonical = match resolver.resolve(&url_with_fragment).await {
+            Ok(s) => s,
+            Err(e) => {
+                *self.relay_status.borrow_mut() = "error".to_owned();
+                return Err(JsError::new(&format!("add_relay resolve: {e}")));
+            }
+        };
+
+        let addr = sunset_sync::PeerAddr::new(Bytes::from(canonical));
         match self.engine.add_peer(addr).await {
             Ok(()) => {
                 *self.relay_status.borrow_mut() = "connected".to_owned();

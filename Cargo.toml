@@ -49,6 +49,10 @@ web-sys = { version = "0.3", features = [
   "RtcPeerConnectionIceEvent",
   "RtcOfferOptions",
   "RtcAnswerOptions",
+  "Request",
+  "RequestInit",
+  "Response",
+  "Window",
 ] }
 zeroize = { version = "1", default-features = false, features = ["alloc", "derive"] }
 futures = "0.3"
