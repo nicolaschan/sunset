@@ -468,6 +468,9 @@ where
             SyncMessage::Hello { .. } | SyncMessage::Goodbye { .. } => {
                 // Handled by the per-peer task; engine ignores.
             }
+            SyncMessage::Ping { .. } | SyncMessage::Pong { .. } => {
+                // Handled by the per-peer task's liveness loop; engine ignores.
+            }
         }
     }
 
