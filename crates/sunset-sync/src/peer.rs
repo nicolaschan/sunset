@@ -844,7 +844,8 @@ mod tests {
                             // Could also fail via send error after channel
                             // drops; either is acceptable for this test.
                             assert!(
-                                reason.contains("send reliable") || reason.contains("recv reliable"),
+                                reason.contains("send reliable")
+                                    || reason.contains("recv reliable"),
                                 "unexpected disconnect reason: {reason}"
                             );
                             break;
@@ -853,6 +854,145 @@ mod tests {
                         None => panic!("inbound channel closed before disconnect"),
                     }
                 }
+
+                drop(a_out_tx);
+                drop(b_out_tx);
+            })
+            .await;
+    }
+
+    /// Wraps a `TestConnection` and starts returning Err from
+    /// `send_reliable` after a flag is flipped. Used to simulate a
+    /// transport that detects an OS-level closed socket on the next
+    /// write attempt.
+    struct PoisonableSendConn {
+        inner: TestConnection,
+        poisoned: Rc<std::cell::RefCell<bool>>,
+    }
+
+    #[async_trait(?Send)]
+    impl TransportConnection for PoisonableSendConn {
+        async fn send_reliable(&self, bytes: Bytes) -> Result<()> {
+            if *self.poisoned.borrow() {
+                return Err(Error::Transport("simulated close".into()));
+            }
+            self.inner.send_reliable(bytes).await
+        }
+        async fn recv_reliable(&self) -> Result<Bytes> {
+            self.inner.recv_reliable().await
+        }
+        async fn send_unreliable(&self, bytes: Bytes) -> Result<()> {
+            self.inner.send_unreliable(bytes).await
+        }
+        async fn recv_unreliable(&self) -> Result<Bytes> {
+            self.inner.recv_unreliable().await
+        }
+        fn peer_id(&self) -> PeerId {
+            self.inner.peer_id()
+        }
+        fn kind(&self) -> crate::transport::TransportKind {
+            self.inner.kind()
+        }
+        async fn close(&self) -> Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn send_reliable_failure_emits_disconnected_with_conn_id() {
+        use crate::types::SyncConfig;
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = net.transport(PeerId(vk(b"alice")), peer_addr("alice"));
+                let bob = net.transport(PeerId(vk(b"bob")), peer_addr("bob"));
+                let bob_accept =
+                    crate::spawn::spawn_local(async move { bob.accept().await.unwrap() });
+                let alice_conn_inner = alice.connect(peer_addr("bob")).await.unwrap();
+                let bob_conn = bob_accept.await.unwrap();
+
+                let poisoned = Rc::new(RefCell::new(false));
+                let alice_conn = PoisonableSendConn {
+                    inner: alice_conn_inner,
+                    poisoned: poisoned.clone(),
+                };
+
+                let cfg = SyncConfig::default();
+
+                let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+                let (b_in_tx, _b_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+
+                let alice_conn_id = crate::engine::ConnectionId::for_test(42);
+
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(alice_conn),
+                    PeerId(vk(b"alice")),
+                    1,
+                    alice_conn_id,
+                    a_out_tx.clone(),
+                    a_out_rx,
+                    a_in_tx,
+                    None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
+                ));
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(bob_conn),
+                    PeerId(vk(b"bob")),
+                    1,
+                    crate::engine::ConnectionId::for_test(43),
+                    b_out_tx.clone(),
+                    b_out_rx,
+                    b_in_tx,
+                    None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
+                ));
+
+                // Drain Hello.
+                let _ = a_in_rx.recv().await.unwrap();
+
+                // Poison alice's send_reliable: next reliable send fails.
+                *poisoned.borrow_mut() = true;
+
+                // Send a reliable message — alice's send_task will fail.
+                a_out_tx
+                    .send(SyncMessage::EventDelivery {
+                        entries: vec![],
+                        blobs: vec![],
+                    })
+                    .unwrap();
+
+                // Expect Disconnected with reason starting with "send reliable"
+                // and matching conn_id, well before heartbeat_timeout elapses.
+                tokio::task::yield_now().await;
+
+                let got = tokio::time::timeout(cfg.heartbeat_timeout / 4, async {
+                    loop {
+                        match a_in_rx.recv().await {
+                            Some(InboundEvent::Disconnected {
+                                conn_id, reason, ..
+                            }) => {
+                                return (conn_id, reason);
+                            }
+                            Some(_) => continue,
+                            None => panic!("inbound channel closed"),
+                        }
+                    }
+                })
+                .await
+                .expect("disconnect should arrive before heartbeat timeout");
+
+                assert_eq!(got.0, alice_conn_id);
+                assert!(
+                    got.1.contains("send reliable"),
+                    "expected send-side reason, got {}",
+                    got.1
+                );
 
                 drop(a_out_tx);
                 drop(b_out_tx);
