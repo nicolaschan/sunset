@@ -41,6 +41,7 @@ pub struct Client {
     room: Rc<Room>,
     store: Arc<MemoryStore>,
     engine: Rc<Engine>,
+    supervisor: Rc<sunset_sync::PeerSupervisor<MemoryStore, MultiTransport<WsT, RtcT>>>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     on_receipt: Rc<RefCell<Option<js_sys::Function>>>,
     relay_status: Rc<RefCell<String>>,
@@ -96,11 +97,21 @@ impl Client {
             }
         });
 
+        let supervisor = sunset_sync::PeerSupervisor::new(
+            engine.clone(),
+            sunset_sync::BackoffPolicy::default(),
+        );
+        wasm_bindgen_futures::spawn_local({
+            let s = supervisor.clone();
+            async move { s.run().await }
+        });
+
         Ok(Client {
             identity,
             room,
             store,
             engine,
+            supervisor,
             on_message: Rc::new(RefCell::new(None)),
             on_receipt: Rc::new(RefCell::new(None)),
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
@@ -137,8 +148,8 @@ impl Client {
         };
 
         let addr = sunset_sync::PeerAddr::new(Bytes::from(canonical));
-        match self.engine.add_peer(addr).await {
-            Ok(_peer_id) => {
+        match self.supervisor.add(addr).await {
+            Ok(()) => {
                 *self.relay_status.borrow_mut() = "connected".to_owned();
                 Ok(())
             }
@@ -163,8 +174,8 @@ impl Client {
             .map_err(|e| JsError::new(&format!("x25519 derive: {e}")))?;
         let addr_str = format!("webrtc://{}#x25519={}", hex::encode(pk), hex::encode(x_pub));
         let addr = sunset_sync::PeerAddr::new(Bytes::from(addr_str));
-        self.engine
-            .add_peer(addr)
+        self.supervisor
+            .add(addr)
             .await
             .map_err(|e| JsError::new(&format!("connect_direct: {e}")))?;
         Ok(())
