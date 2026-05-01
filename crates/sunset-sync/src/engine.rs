@@ -48,6 +48,7 @@ impl ConnectionId {
 /// task. Extracted from `SyncEngine::spawn_peer` so the AddPeer command
 /// handler can call it from a `'static` spawned task without holding
 /// `&self`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     conn: C,
     local_peer: PeerId,
@@ -55,11 +56,22 @@ fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     conn_id: ConnectionId,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     hello_done: Option<oneshot::Sender<Result<PeerId>>>,
+    heartbeat_interval: std::time::Duration,
+    heartbeat_timeout: std::time::Duration,
 ) {
     let conn = Rc::new(conn);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
     crate::spawn::spawn_local(run_peer(
-        conn, local_peer, proto, conn_id, out_tx, out_rx, inbound_tx, hello_done,
+        conn,
+        local_peer,
+        proto,
+        conn_id,
+        out_tx,
+        out_rx,
+        inbound_tx,
+        hello_done,
+        heartbeat_interval,
+        heartbeat_timeout,
     ));
 }
 
@@ -407,6 +419,8 @@ where
                 let transport = self.transport.clone();
                 let local_peer = self.local_peer.clone();
                 let proto = self.config.protocol_version;
+                let hb_int = self.config.heartbeat_interval;
+                let hb_to = self.config.heartbeat_timeout;
                 let inbound_tx = inbound_tx.clone();
                 let conn_id = self.alloc_conn_id().await;
                 crate::spawn::spawn_local(async move {
@@ -421,6 +435,8 @@ where
                                 conn_id,
                                 inbound_tx,
                                 Some(hello_tx),
+                                hb_int,
+                                hb_to,
                             );
                             // Wait for the Hello exchange to complete.
                             match hello_rx.await {
@@ -470,6 +486,8 @@ where
             conn_id,
             inbound_tx,
             None,
+            self.config.heartbeat_interval,
+            self.config.heartbeat_timeout,
         );
     }
 
@@ -1510,10 +1528,12 @@ mod tests {
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(1);
-                engine.state.lock().await.peer_outbound.insert(
-                    peer.clone(),
-                    PeerOutbound { conn_id: conn, tx },
-                );
+                engine
+                    .state
+                    .lock()
+                    .await
+                    .peer_outbound
+                    .insert(peer.clone(), PeerOutbound { conn_id: conn, tx });
                 engine
                     .state
                     .lock()
@@ -1532,13 +1552,10 @@ mod tests {
                 engine.remove_peer(peer.clone()).await.unwrap();
 
                 // PeerRemoved fires.
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    events.recv(),
-                )
-                .await
-                .expect("PeerRemoved arrives")
-                .expect("channel open")
+                match tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                    .await
+                    .expect("PeerRemoved arrives")
+                    .expect("channel open")
                 {
                     EngineEvent::PeerRemoved { peer_id } => assert_eq!(peer_id, peer),
                     other => panic!("expected PeerRemoved, got {other:?}"),

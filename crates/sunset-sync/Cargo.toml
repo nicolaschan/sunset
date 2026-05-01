@@ -29,7 +29,7 @@ wasmtimer.workspace = true
 ed25519-dalek = { workspace = true }
 sunset-store = { workspace = true, features = ["test-helpers"] }
 sunset-store-memory.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "test-util"] }
 
 [features]
 test-helpers = []

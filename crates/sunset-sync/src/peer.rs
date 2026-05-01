@@ -68,8 +68,16 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     mut outbound_rx: mpsc::UnboundedReceiver<SyncMessage>,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     hello_done: Option<tokio::sync::oneshot::Sender<Result<PeerId>>>,
+    heartbeat_interval: std::time::Duration,
+    heartbeat_timeout: std::time::Duration,
 ) {
     let local_kind = conn.kind();
+    // Clone of the outbound sender used by the recv-side Pong responder
+    // and the liveness Ping sender. The original `out_tx` is moved into
+    // the `PeerHello` event so the engine can register it under the
+    // peer-declared `peer_id`; both background tasks need an additional
+    // handle to enqueue messages on the same per-peer outbound channel.
+    let out_tx_clone = out_tx.clone();
     // Send our Hello.
     let our_hello = SyncMessage::Hello {
         protocol_version: local_protocol_version,
@@ -146,6 +154,11 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         }
     };
 
+    // Pong delivery channel: recv_reliable_task forwards every observed
+    // Pong here so the liveness_task can update last_pong_at without
+    // sharing mutable state across tasks.
+    let (pong_tx, mut pong_rx) = mpsc::unbounded_channel::<()>();
+
     // Concurrent recv loops — reliable and unreliable channels are
     // independent; each drains its own physical channel and routes the
     // decoded SyncMessage into the same `inbound_tx`. The engine's
@@ -155,6 +168,8 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let conn = conn.clone();
         let inbound_tx = inbound_tx.clone();
         let peer_id = peer_id.clone();
+        let out_tx_for_pong = out_tx_clone.clone();
+        let pong_tx = pong_tx.clone();
         async move {
             loop {
                 match recv_reliable_message(&*conn).await {
@@ -165,6 +180,16 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                             reason: "peer goodbye".into(),
                         });
                         break;
+                    }
+                    Ok(SyncMessage::Ping { nonce }) => {
+                        // Respond via the outbound channel; never call
+                        // conn.send_reliable directly to avoid concurrent
+                        // writes (NoiseTransport tracks nonces per send).
+                        let _ = out_tx_for_pong.send(SyncMessage::Pong { nonce });
+                    }
+                    Ok(SyncMessage::Pong { .. }) => {
+                        // Notify liveness_task. nonce is informational.
+                        let _ = pong_tx.send(());
                     }
                     Ok(message) => {
                         if inbound_tx
@@ -217,12 +242,21 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
 
     let send_task = {
         let conn = conn.clone();
+        let inbound_tx = inbound_tx.clone();
+        let peer_id = peer_id.clone();
         async move {
             while let Some(msg) = outbound_rx.recv().await {
                 match outbound_kind(&msg) {
                     ChannelKind::Reliable => {
-                        // Reliable failures indicate a real disconnect; tear down.
-                        if send_reliable_message(&*conn, &msg).await.is_err() {
+                        // Reliable failures indicate a real disconnect; emit
+                        // Disconnected so the engine learns about it faster
+                        // than the heartbeat timeout would, then tear down.
+                        if let Err(e) = send_reliable_message(&*conn, &msg).await {
+                            let _ = inbound_tx.send(InboundEvent::Disconnected {
+                                peer_id: peer_id.clone(),
+                                conn_id,
+                                reason: format!("send reliable: {e}"),
+                            });
                             break;
                         }
                     }
@@ -242,7 +276,73 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         }
     };
 
-    tokio::join!(recv_reliable_task, recv_unreliable_task, send_task);
+    let liveness_task = {
+        let inbound_tx = inbound_tx.clone();
+        let peer_id = peer_id.clone();
+        let out_tx_for_ping = out_tx_clone.clone();
+        async move {
+            let mut next_nonce: u64 = 1;
+
+            // last_pong_at uses the appropriate Instant for the platform.
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut last_pong_at = tokio::time::Instant::now();
+            #[cfg(target_arch = "wasm32")]
+            let mut last_pong_at = wasmtimer::std::Instant::now();
+
+            loop {
+                #[cfg(not(target_arch = "wasm32"))]
+                let tick = tokio::time::sleep(heartbeat_interval);
+                #[cfg(target_arch = "wasm32")]
+                let tick = wasmtimer::tokio::sleep(heartbeat_interval);
+
+                tokio::select! {
+                    _ = tick => {
+                        // Send Ping. If channel is closed, peer is gone.
+                        if out_tx_for_ping
+                            .send(SyncMessage::Ping { nonce: next_nonce })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        next_nonce = next_nonce.wrapping_add(1);
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let now = tokio::time::Instant::now();
+                        #[cfg(target_arch = "wasm32")]
+                        let now = wasmtimer::std::Instant::now();
+
+                        if now.duration_since(last_pong_at) > heartbeat_timeout {
+                            let _ = inbound_tx.send(InboundEvent::Disconnected {
+                                peer_id: peer_id.clone(),
+                                conn_id,
+                                reason: "heartbeat timeout".into(),
+                            });
+                            return;
+                        }
+                    }
+                    Some(()) = pong_rx.recv() => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        { last_pong_at = tokio::time::Instant::now(); }
+                        #[cfg(target_arch = "wasm32")]
+                        { last_pong_at = wasmtimer::std::Instant::now(); }
+                    }
+                    else => return,
+                }
+            }
+        }
+    };
+
+    // Drop the local pong_tx so the channel closes when recv_reliable_task
+    // exits — otherwise the liveness_task's `pong_rx.recv()` would never
+    // complete after recv exits.
+    drop(pong_tx);
+
+    tokio::join!(
+        recv_reliable_task,
+        recv_unreliable_task,
+        send_task,
+        liveness_task
+    );
 }
 
 /// Which physical channel a SyncMessage flows over.
@@ -361,6 +461,8 @@ mod tests {
                 let alice_conn = alice.connect(peer_addr("bob")).await.unwrap();
                 let bob_conn = bob_accept.await.unwrap();
 
+                let cfg = crate::types::SyncConfig::default();
+
                 let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
@@ -377,6 +479,8 @@ mod tests {
                     a_out_rx,
                     a_in_tx,
                     None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
@@ -387,6 +491,8 @@ mod tests {
                     b_out_rx,
                     b_in_tx,
                     None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
                 ));
 
                 // Each side observes the other's Hello.
@@ -442,6 +548,8 @@ mod tests {
                 // Wrap alice's side so every send_unreliable returns Err.
                 let alice_conn = FailingUnreliableConn { inner: alice_conn };
 
+                let cfg = crate::types::SyncConfig::default();
+
                 let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
@@ -456,6 +564,8 @@ mod tests {
                     a_out_rx,
                     a_in_tx,
                     None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
@@ -466,6 +576,8 @@ mod tests {
                     b_out_rx,
                     b_in_tx,
                     None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
                 ));
 
                 // Drain the Hello on each side so the rest of the test
@@ -535,6 +647,90 @@ mod tests {
                     saw_event_delivery,
                     "reliable follow-up did not arrive — per-peer send_task likely died on the prior unreliable send failure"
                 );
+
+                drop(a_out_tx);
+                drop(b_out_tx);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn heartbeat_keeps_connection_alive_under_normal_traffic() {
+        use crate::types::SyncConfig;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = net.transport(PeerId(vk(b"alice")), peer_addr("alice"));
+                let bob = net.transport(PeerId(vk(b"bob")), peer_addr("bob"));
+                let bob_accept =
+                    crate::spawn::spawn_local(async move { bob.accept().await.unwrap() });
+                let alice_conn = alice.connect(peer_addr("bob")).await.unwrap();
+                let bob_conn = bob_accept.await.unwrap();
+
+                let cfg = SyncConfig::default();
+
+                let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+                let (b_in_tx, mut b_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(alice_conn),
+                    PeerId(vk(b"alice")),
+                    1,
+                    crate::engine::ConnectionId::for_test(1),
+                    a_out_tx.clone(),
+                    a_out_rx,
+                    a_in_tx,
+                    None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
+                ));
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(bob_conn),
+                    PeerId(vk(b"bob")),
+                    1,
+                    crate::engine::ConnectionId::for_test(2),
+                    b_out_tx.clone(),
+                    b_out_rx,
+                    b_in_tx,
+                    None,
+                    cfg.heartbeat_interval,
+                    cfg.heartbeat_timeout,
+                ));
+
+                // Drain Hellos.
+                let _ = a_in_rx.recv().await.unwrap();
+                let _ = b_in_rx.recv().await.unwrap();
+
+                // Advance time across 5 ping intervals, one interval at a
+                // time, yielding between each so the Ping/Pong round-trip
+                // can complete before the next tick fires. Under
+                // `tokio::time::pause`, advancing by N*interval in a single
+                // call jumps `Instant::now()` past the heartbeat deadline
+                // before any Pong has had a chance to update
+                // `last_pong_at`, which would spuriously trip the timeout.
+                for _ in 0..5 {
+                    tokio::time::advance(cfg.heartbeat_interval).await;
+                    // Yield several times so the round-trip
+                    // (Ping → send_task → wire → bob recv → Pong →
+                    // bob send_task → wire → alice recv → pong_tx) can
+                    // make full progress before the next interval ticks.
+                    for _ in 0..16 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+
+                let got =
+                    tokio::time::timeout(std::time::Duration::from_millis(10), a_in_rx.recv())
+                        .await;
+                match got {
+                    Ok(Some(InboundEvent::Disconnected { reason, .. })) => {
+                        panic!("unexpected disconnect: {reason}");
+                    }
+                    _ => { /* good */ }
+                }
 
                 drop(a_out_tx);
                 drop(b_out_tx);
