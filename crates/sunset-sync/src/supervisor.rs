@@ -471,3 +471,193 @@ where
         }
     }
 }
+
+#[cfg(all(test, feature = "test-helpers"))]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use sunset_store::VerifyingKey;
+    use sunset_store_memory::MemoryStore;
+
+    use crate::engine::SyncEngine;
+    use crate::test_transport::{TestNetwork, TestTransport};
+    use crate::types::SyncConfig;
+
+    fn vk(b: &[u8]) -> VerifyingKey {
+        VerifyingKey::new(Bytes::copy_from_slice(b))
+    }
+
+    struct StubSigner(VerifyingKey);
+    impl crate::Signer for StubSigner {
+        fn verifying_key(&self) -> VerifyingKey {
+            self.0.clone()
+        }
+        fn sign(&self, _: &[u8]) -> Bytes {
+            Bytes::from_static(&[0u8; 64])
+        }
+    }
+
+    fn engine_with_addr(
+        net: &TestNetwork,
+        peer_label: &[u8],
+        addr: &str,
+    ) -> Rc<SyncEngine<MemoryStore, TestTransport>> {
+        let store = Arc::new(MemoryStore::with_accept_all());
+        let local_peer = PeerId(vk(peer_label));
+        let transport = net.transport(
+            local_peer.clone(),
+            PeerAddr::new(Bytes::copy_from_slice(addr.as_bytes())),
+        );
+        let signer = Arc::new(StubSigner(local_peer.0.clone()));
+        Rc::new(SyncEngine::new(
+            store,
+            transport,
+            SyncConfig::default(),
+            local_peer,
+            signer,
+        ))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_dial_success() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob = engine_with_addr(&net, b"bob", "bob");
+
+                // Start both engines.
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob.clone();
+                    async move { b.run().await }
+                });
+
+                // Supervisor on alice's side.
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                sup.add(bob_addr.clone()).await.unwrap();
+
+                let snap = sup.snapshot().await;
+                assert_eq!(snap.len(), 1);
+                assert_eq!(snap[0].state, IntentState::Connected);
+                assert_eq!(snap[0].attempt, 0);
+                assert!(snap[0].peer_id.is_some());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_dial_failure_returns_err_and_clears_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                // No engine listening at "ghost".
+                let ghost = PeerAddr::new(Bytes::from_static(b"ghost"));
+                let res = sup.add(ghost.clone()).await;
+                assert!(res.is_err());
+
+                // No zombie intent.
+                let snap = sup.snapshot().await;
+                assert!(snap.iter().find(|s| s.addr == ghost).is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idempotent_add() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", "bob");
+
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                sup.add(bob_addr.clone()).await.unwrap();
+                sup.add(bob_addr.clone()).await.unwrap();
+                sup.add(bob_addr.clone()).await.unwrap();
+
+                let snap = sup.snapshot().await;
+                assert_eq!(snap.len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_cancels_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob = engine_with_addr(&net, b"bob", "bob");
+
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob.clone();
+                    async move { b.run().await }
+                });
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                sup.add(bob_addr.clone()).await.unwrap();
+                sup.remove(bob_addr.clone()).await;
+
+                let snap = sup.snapshot().await;
+                assert!(snap.is_empty());
+
+                // Engine no longer has bob in peer_outbound.
+                let connected = alice.connected_peers().await;
+                assert!(connected.iter().find(|p| p.0.as_bytes() == b"bob").is_none());
+            })
+            .await;
+    }
+}
