@@ -6,6 +6,8 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
+use crate::json::extract_x25519_from_json;
+use crate::parse::{ParsedInput, parse_input};
 
 /// Returns the body of `GET <url>` as a string, or an [`Error::Http`]
 /// describing the failure.
@@ -31,8 +33,6 @@ impl<F: HttpFetch> Resolver<F> {
     /// already carry an `#x25519=…` fragment are returned unchanged
     /// without an HTTP fetch.
     pub async fn resolve(&self, input: &str) -> Result<String> {
-        use crate::json::extract_x25519_from_json;
-        use crate::parse::{ParsedInput, parse_input};
         match parse_input(input)? {
             ParsedInput::Canonical(s) => Ok(s),
             ParsedInput::Lookup(target) => {
@@ -83,15 +83,7 @@ mod tests {
             self.seen.borrow_mut().push(url.into());
             for (u, r) in self.responses.borrow().iter() {
                 if u == url {
-                    return match r {
-                        Ok(body) => Ok(body.clone()),
-                        Err(e) => Err(match e {
-                            Error::Http(s) => Error::Http(s.clone()),
-                            Error::BadJson(s) => Error::BadJson(s.clone()),
-                            Error::BadX25519(s) => Error::BadX25519(s.clone()),
-                            Error::MalformedInput(s) => Error::MalformedInput(s.clone()),
-                        }),
-                    };
+                    return r.clone();
                 }
             }
             Err(Error::Http(format!("no fake response for {url}")))
