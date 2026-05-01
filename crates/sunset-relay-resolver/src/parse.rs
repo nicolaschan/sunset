@@ -107,7 +107,10 @@ fn host_without_port(host_port: &str) -> &str {
             return &host_port[..=close];
         }
     }
-    host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port)
+    host_port
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_port)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -120,16 +123,20 @@ mod tests {
 
     #[test]
     fn canonical_passes_through() {
-        let input =
-            "wss://relay.example.com:443#x25519=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert_eq!(parse_input(input).unwrap(), ParsedInput::Canonical(input.to_string()));
+        let input = "wss://relay.example.com:443#x25519=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_input(input).unwrap(),
+            ParsedInput::Canonical(input.to_string())
+        );
     }
 
     #[test]
     fn canonical_with_ws_scheme_passes_through() {
-        let input =
-            "ws://127.0.0.1:8443#x25519=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert_eq!(parse_input(input).unwrap(), ParsedInput::Canonical(input.to_string()));
+        let input = "ws://127.0.0.1:8443#x25519=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_input(input).unwrap(),
+            ParsedInput::Canonical(input.to_string())
+        );
     }
 
     #[test]

@@ -44,8 +44,7 @@ pub fn extract_x25519_from_json(body: &str) -> Result<[u8; 32]> {
             "non-hex chars in x25519: {hex_str}"
         )));
     }
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| Error::BadX25519(format!("hex decode: {e}")))?;
+    let bytes = hex::decode(hex_str).map_err(|e| Error::BadX25519(format!("hex decode: {e}")))?;
     bytes
         .as_slice()
         .try_into()

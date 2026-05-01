@@ -100,8 +100,7 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_input_does_not_fetch() {
-        let canonical =
-            "wss://relay.example.com:443#x25519=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let canonical = "wss://relay.example.com:443#x25519=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let fake = FakeFetch::new();
         let resolver = Resolver::new(fake);
         let out = resolver.resolve(canonical).await.unwrap();
