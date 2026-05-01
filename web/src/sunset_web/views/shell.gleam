@@ -246,24 +246,27 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
      }
      #app { height: 100%; background: " <> palette.bg <> "; }
      *, *::before, *::after { box-sizing: border-box; }
-     /* Action toolbar visibility is single-source: at most one row's
-        toolbar is visible at a time. .is-selected mirrors the model's
-        Option(String) selection. The desktop hover affordance is
-        suppressed via :has() whenever any row is selected so a
-        selection + hover-elsewhere never produces two visible toolbars
-        at once. No fade transition — instant swap avoids the brief
-        overlap that fast taps used to expose. */
+     /* Action toolbar visibility splits cleanly by input modality:
+        pointer devices use :hover (the toolbar follows the cursor —
+        always the most recently hovered row, never a stuck previous
+        click), and touch devices use .is-selected (the model's
+        Option(String) selection, set by tap). At most one row matches
+        at a time on either side. */
      .msg-row .msg-actions {
        opacity: 0;
        pointer-events: none;
      }
-     .msg-row.is-selected .msg-actions {
-       opacity: 1;
-       pointer-events: auto;
+     @media (hover: hover) {
+       .msg-row:hover .msg-actions {
+         opacity: 1;
+         pointer-events: auto;
+       }
      }
-     .scroll-area:not(:has(.msg-row.is-selected)) .msg-row:hover .msg-actions {
-       opacity: 1;
-       pointer-events: auto;
+     @media (hover: none) {
+       .msg-row.is-selected .msg-actions {
+         opacity: 1;
+         pointer-events: auto;
+       }
      }
      .room-row .room-delete {
        opacity: 0;
@@ -280,11 +283,8 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
        input, textarea, select { font-size: 16px; }
      }
      /* Touch devices: room-row delete is hover-only on desktop, but
-        on touch it's always visible. .msg-actions are NOT
-        always-visible on touch — they reveal only when the user
-        taps a message (.is-selected) or its details panel is open
-        (.is-active). The selectors above already cover that for
-        both viewports. */
+        on touch it's always visible. (.msg-actions visibility on
+        touch is the .is-selected rule above.) */
      @media (hover: none) {
        .room-row .room-delete {
          opacity: 1;
