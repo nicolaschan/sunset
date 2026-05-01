@@ -71,6 +71,14 @@ async fn get_root_returns_identity_json() {
                 response.contains("Content-Type: application/json"),
                 "expected json content-type: {response}"
             );
+            // Browsers fetching this from a different origin (the
+            // sunset-web client served from elsewhere) must be able to
+            // read the body. The response is public identity info; no
+            // credentials are honored.
+            assert!(
+                response.contains("Access-Control-Allow-Origin: *"),
+                "expected CORS header on identity response: {response}"
+            );
             // Body is after the blank line.
             let body = response
                 .split_once("\r\n\r\n")

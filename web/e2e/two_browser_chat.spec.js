@@ -132,3 +132,62 @@ test("two browsers exchange a message via relay", async ({ browser }) => {
   await inputB.press("Enter");
   await expect(pageA.getByText(msg2)).toBeVisible({ timeout: 15_000 });
 });
+
+test("bare host:port in ?relay= triggers GET / resolution", async ({
+  browser,
+}) => {
+  // Strip the canonical `ws://host:port#x25519=hex` down to bare
+  // `host:port`. The Gleam UI passes this string straight to
+  // `Client::add_relay`, which routes it through `sunset-relay-resolver`
+  // → `WebSysFetch::get` → relay's `GET /` JSON → reconstructed
+  // canonical PeerAddr → Noise IK handshake. If any link in that chain
+  // is broken, the relay status never reaches "connected".
+  const hostPort = relayAddress
+    .replace(/^ws:\/\//, "")
+    .split("#")[0]
+    .replace(/\/$/, "");
+  const url = `/?relay=${encodeURIComponent(hostPort)}#sunset-resolver-test`;
+
+  const ctxA = await browser.newContext();
+  const ctxB = await browser.newContext();
+  const pageA = await ctxA.newPage();
+  const pageB = await ctxB.newPage();
+
+  for (const [name, page] of [["A", pageA], ["B", pageB]]) {
+    page.on("pageerror", (err) =>
+      process.stderr.write(`[${name} pageerror] ${err.stack || err}\n`),
+    );
+    page.on("console", (msg) => {
+      if (msg.type() === "error") {
+        process.stderr.write(`[${name} console] ${msg.text()}\n`);
+      }
+    });
+  }
+
+  await pageA.goto(url);
+  await pageB.goto(url);
+
+  // The relay status pill in the rooms-rail footer renders the live
+  // status ("connecting" → "connected"). If the resolver fetched
+  // GET / successfully and the reconstructed x25519 matches what the
+  // relay actually presents, the Noise handshake succeeds and the
+  // status flips to "connected".
+  await expect(pageA.getByText("connected", { exact: false })).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(pageB.getByText("connected", { exact: false })).toBeVisible({
+    timeout: 15_000,
+  });
+
+  // Round-trip a message to confirm the connection is actually working
+  // (not just labelled "connected").
+  const inputA = pageA.getByPlaceholder(/^Message #/);
+  const inputB = pageB.getByPlaceholder(/^Message #/);
+  await expect(inputA).toBeVisible({ timeout: 15_000 });
+  await expect(inputB).toBeVisible({ timeout: 15_000 });
+
+  const msg = `bare hostname dial works — ${Date.now()}`;
+  await inputA.fill(msg);
+  await inputA.press("Enter");
+  await expect(pageB.getByText(msg)).toBeVisible({ timeout: 15_000 });
+});

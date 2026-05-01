@@ -61,6 +61,12 @@ pub(crate) async fn serve_dashboard(mut tcp: TcpStream, ctx: Rc<StatusContext>) 
 /// upgrade). The same URL serves the WebSocket endpoint when an
 /// `Upgrade: websocket` header is present — the router decides which
 /// way to go.
+///
+/// Sends `Access-Control-Allow-Origin: *` so the sunset-web client can
+/// fetch this from any served origin to bootstrap a connection. The
+/// payload is the relay's public identity (its advertised pubkeys) —
+/// nothing here is sensitive. The relay does not honor cookies or
+/// other ambient credentials.
 pub(crate) async fn serve_identity(mut tcp: TcpStream, ctx: Rc<StatusContext>) -> Result<()> {
     drain_request(&mut tcp).await;
     let body = identity_json(&ctx.ed25519_public, &ctx.x25519_public, &ctx.dial_url);
@@ -69,6 +75,7 @@ pub(crate) async fn serve_identity(mut tcp: TcpStream, ctx: Rc<StatusContext>) -
          Content-Type: application/json; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
+         Access-Control-Allow-Origin: *\r\n\
          Connection: close\r\n\
          \r\n",
         body.len()
