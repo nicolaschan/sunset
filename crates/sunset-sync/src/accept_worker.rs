@@ -24,9 +24,19 @@ use std::time::Duration;
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
-#[allow(unused_imports)]
 use crate::error::{Error, Result};
 use crate::spawn::spawn_local;
+
+async fn with_timeout<F: Future>(timeout: Duration, fut: F) -> Option<F::Output> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::time::timeout(timeout, fut).await.ok()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasmtimer::tokio::timeout(timeout, fut).await.ok()
+    }
+}
 
 /// Spawn one task per item from `inbound`; each task runs
 /// `handshake_fn(item)` under the given `timeout` and inside a
@@ -47,7 +57,6 @@ where
 {
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Result<C>>();
     let _ = max_inflight;
-    let _ = timeout;
 
     spawn_local(async move {
         futures::pin_mut!(inbound);
@@ -55,7 +64,12 @@ where
             let fut = handshake_fn(item);
             let out_tx = out_tx.clone();
             spawn_local(async move {
-                let result = fut.await;
+                let result = match with_timeout(timeout, fut).await {
+                    Some(r) => r,
+                    None => Err(Error::Transport(format!(
+                        "inbound handshake exceeded {timeout:?}"
+                    ))),
+                };
                 let _ = out_tx.send(result);
             });
         }
@@ -86,6 +100,38 @@ mod tests {
                 drop(tx);
                 let got = out.recv().await.expect("one result").expect("ok");
                 assert_eq!(got, 14);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_drops_a_stuck_task() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::unbounded_channel::<()>();
+                let inbound = UnboundedReceiverStream::new(rx);
+                let mut out = spawn_accept_worker(
+                    inbound,
+                    Duration::from_millis(50),
+                    16,
+                    |()| async move {
+                        // Never completes.
+                        std::future::pending::<()>().await;
+                        unreachable!();
+                        #[allow(unreachable_code)]
+                        Ok::<(), Error>(())
+                    },
+                );
+                tx.send(()).unwrap();
+                let start = tokio::time::Instant::now();
+                let got = out.recv().await.expect("a result").expect_err("expected timeout err");
+                let elapsed = start.elapsed();
+                assert!(matches!(got, Error::Transport(_)), "got: {got:?}");
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "timeout should have fired well under 1s, took {elapsed:?}"
+                );
             })
             .await;
     }
