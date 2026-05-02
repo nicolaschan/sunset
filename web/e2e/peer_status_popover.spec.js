@@ -13,6 +13,7 @@ import { spawn } from "child_process";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { openMembersDrawer } from "./helpers/viewport.js";
 
 let relayProcess = null;
 let relayAddress = null;
@@ -79,7 +80,7 @@ test.afterAll(async () => {
 });
 
 test.setTimeout(60_000);
-test("clicking a peer row opens the status popover with live age", async ({ browser }) => {
+test("clicking a peer row opens the status popover with live age", async ({ browser }, testInfo) => {
   // Use a faster presence cadence so the test sees a heartbeat and an
   // age tick within the test timeout.
   const url = `/?relay=${encodeURIComponent(relayAddress)}` +
@@ -119,6 +120,11 @@ test("clicking a peer row opens the status popover with live age", async ({ brow
   await expect(pageA.locator('[data-testid="member-row"]')).toHaveCount(2, {
     timeout: 20_000,
   });
+
+  // On mobile-chrome the members rail lives behind a drawer; tapping
+  // phone-members-toggle is the real-user path to reaching member rows.
+  // No-op on desktop.
+  await openMembersDrawer(pageA, testInfo);
 
   // Identify the non-self row (the second one, since self is sorted first).
   const otherRow = pageA.locator('[data-testid="member-row"]').nth(1);

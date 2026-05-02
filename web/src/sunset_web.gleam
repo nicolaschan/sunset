@@ -1011,6 +1011,28 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _, _ -> element.fragment([])
   }
 
+  let peer_status_sheet_el = case model.viewport, model.peer_status_popover {
+    domain.Phone, Some(member_id) ->
+      case list.find(model.members, fn(m) { m.id == member_id }) {
+        Ok(m) ->
+          bottom_sheet.view(
+            palette: palette,
+            open: True,
+            on_close: ClosePeerStatusPopover,
+            test_id: "peer-status-sheet",
+            content: peer_status_popover.view(
+              palette: palette,
+              member: m,
+              now_ms: model.now_ms,
+              placement: peer_status_popover.InSheet,
+              on_close: ClosePeerStatusPopover,
+            ),
+          )
+        Error(_) -> element.fragment([])
+      }
+    _, _ -> element.fragment([])
+  }
+
   let user_in_call = list.any(fixture.members(), fn(m) { m.you && m.in_call })
 
   let active_voice_channel_name =
@@ -1132,6 +1154,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     ),
     details_sheet_el,
     voice_sheet_el,
+    peer_status_sheet_el,
     reaction_sheet_el,
   )
 }
@@ -1159,26 +1182,24 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
   }
 }
 
+/// Floating popover for desktop. The phone path renders through
+/// `peer_status_sheet_el` (a `bottom_sheet.view` wrapper), matching the
+/// voice popover convention.
 fn peer_status_popover_overlay(palette, model: Model) -> Element(Msg) {
-  case model.peer_status_popover {
-    None -> element.fragment([])
-    Some(member_id) ->
+  case model.viewport, model.peer_status_popover {
+    domain.Desktop, Some(member_id) ->
       case list.find(model.members, fn(m) { m.id == member_id }) {
         Error(_) -> element.fragment([])
-        Ok(m) -> {
-          let placement = case model.viewport {
-            domain.Phone -> peer_status_popover.InSheet
-            _ -> peer_status_popover.Floating
-          }
+        Ok(m) ->
           peer_status_popover.view(
             palette: palette,
             member: m,
             now_ms: model.now_ms,
-            placement: placement,
+            placement: peer_status_popover.Floating,
             on_close: ClosePeerStatusPopover,
           )
-        }
       }
+    _, _ -> element.fragment([])
   }
 }
 

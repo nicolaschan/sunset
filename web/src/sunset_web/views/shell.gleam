@@ -32,6 +32,7 @@ pub fn view(
   phone_header_el: Element(msg),
   details_sheet: Element(msg),
   voice_sheet: Element(msg),
+  peer_status_sheet: Element(msg),
   reaction_sheet: Element(msg),
 ) -> Element(msg) {
   case viewport {
@@ -61,6 +62,7 @@ pub fn view(
         phone_header_el,
         details_sheet,
         voice_sheet,
+        peer_status_sheet,
         reaction_sheet,
       )
   }
@@ -78,6 +80,7 @@ fn phone_view(
   phone_header_el: Element(msg),
   details_sheet: Element(msg),
   voice_sheet: Element(msg),
+  peer_status_sheet: Element(msg),
   reaction_sheet: Element(msg),
 ) -> Element(msg) {
   let rooms_open = drawer == option.Some(RoomsDrawer)
@@ -153,6 +156,7 @@ fn phone_view(
       ),
       details_sheet,
       voice_sheet,
+      peer_status_sheet,
       reaction_sheet,
     ],
   )
