@@ -25,7 +25,6 @@ use futures::stream::{Stream, StreamExt};
 use futures::task::Poll;
 use js_sys::{ArrayBuffer, Reflect, Uint8Array};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -59,11 +58,7 @@ pub struct WebRtcRawTransport {
     /// Holds completed inbound connections produced by the background
     /// accept worker. Lazily filled on first `accept()` call after the
     /// worker is spawned by `ensure_accept_worker`.
-    completed_rx: Rc<
-        Mutex<
-            Option<tokio::sync::mpsc::UnboundedReceiver<sunset_sync::Result<WebRtcRawConnection>>>,
-        >,
-    >,
+    completed_rx: RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<sunset_sync::Result<WebRtcRawConnection>>>>,
 }
 
 struct Inner {
@@ -104,7 +99,7 @@ impl WebRtcRawTransport {
                 accept_handshake_timeout,
                 accept_max_inflight,
             })),
-            completed_rx: Rc::new(Mutex::new(None)),
+            completed_rx: RefCell::new(None),
         }
     }
 
@@ -303,13 +298,23 @@ impl RawTransport for WebRtcRawTransport {
     async fn accept(&self) -> Result<Self::Connection> {
         self.ensure_dispatcher();
         self.ensure_accept_worker();
-        let mut completed = self.completed_rx.lock().await;
-        let rx = completed
-            .as_mut()
-            .ok_or_else(|| Error::Transport("accept worker never initialized".into()))?;
-        rx.recv()
-            .await
-            .ok_or_else(|| Error::Transport("accept worker terminated".into()))?
+        futures::future::poll_fn(|cx| {
+            let mut slot = self.completed_rx.borrow_mut();
+            let rx = match slot.as_mut() {
+                Some(r) => r,
+                None => {
+                    return std::task::Poll::Ready(Err(Error::Transport(
+                        "accept worker never initialized".into(),
+                    )));
+                }
+            };
+            rx.poll_recv(cx).map(|opt| {
+                opt.unwrap_or_else(|| {
+                    Err(Error::Transport("accept worker terminated".into()))
+                })
+            })
+        })
+        .await
     }
 }
 
@@ -355,7 +360,7 @@ impl WebRtcRawTransport {
         );
 
         // Stash the completed receiver so accept() can drain it.
-        *self.completed_rx.try_lock().expect("first init") = Some(completed);
+        *self.completed_rx.borrow_mut() = Some(completed);
     }
 }
 

@@ -71,6 +71,7 @@ impl Client {
         let signaler = RelaySignaler::new(identity.clone(), room_fp_hex.clone(), &store);
         let local_peer = PeerId(identity.store_verifying_key());
         let signaler_dyn: Rc<dyn sunset_sync::Signaler> = signaler;
+        // TODO(Task 8): replace these literals with sync_config.accept_handshake_timeout / accept_max_inflight.
         let rtc_raw = WebRtcRawTransport::new(
             signaler_dyn,
             local_peer.clone(),
