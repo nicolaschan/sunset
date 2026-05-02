@@ -17,8 +17,6 @@
 //!     budgets. Items wait for a permit before spawning.
 
 use std::future::Future;
-#[allow(unused_imports)]
-use std::rc::Rc;
 use std::time::Duration;
 
 use futures::stream::{Stream, StreamExt};
@@ -86,6 +84,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
     use tokio_stream::wrappers::UnboundedReceiverStream;
 
     #[tokio::test(flavor = "current_thread")]
