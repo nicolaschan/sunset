@@ -73,9 +73,19 @@ impl MemberJs {
     pub fn is_self(&self) -> bool {
         self.is_self
     }
+    /// Heartbeat timestamp as `f64` (JS Number), or `-1` for "no
+    /// heartbeat observed" (i.e. self, or a peer we've heard nothing
+    /// from). We expose `f64` rather than `Option<u64>` because
+    /// wasm-bindgen serializes `Option<u64>` as `bigint | undefined`
+    /// in JS — the BigInt half then doesn't mix with regular Number
+    /// arithmetic on the Gleam side. `f64` round-trips unix-ms
+    /// exactly out to ~285616 AD, which is plenty for our purposes.
     #[wasm_bindgen(getter)]
-    pub fn last_heartbeat_ms(&self) -> Option<u64> {
-        self.last_heartbeat_ms
+    pub fn last_heartbeat_ms(&self) -> f64 {
+        match self.last_heartbeat_ms {
+            Some(ms) => ms as f64,
+            None => -1.0,
+        }
     }
 }
 
