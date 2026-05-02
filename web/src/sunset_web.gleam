@@ -1072,7 +1072,12 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
           members: model.members,
           on_close: CloseDetail,
         )
-      _, _ -> members.view(palette: palette, members: model.members)
+      _, _ ->
+        members.view(
+          palette: palette,
+          members: model.members,
+          on_open_status: OpenPeerStatusPopover,
+        )
     },
     voice_popover_overlay(palette, model),
     phone_header.view(

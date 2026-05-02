@@ -3,15 +3,21 @@
 
 import gleam/int
 import gleam/list
+import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
+import lustre/event
 import sunset_web/domain.{
   type Member, Away, HasBridge, MutedP, NoBridge, OfflineP, Online, Speaking,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
-pub fn view(palette p: Palette, members ms: List(Member)) -> Element(msg) {
+pub fn view(
+  palette p: Palette,
+  members ms: List(Member),
+  on_open_status on_open: fn(domain.MemberId) -> msg,
+) -> Element(msg) {
   let in_call_others = ms |> list.filter(fn(m) { m.in_call && !m.you })
   let online_not_in_call =
     ms
@@ -50,8 +56,8 @@ pub fn view(palette p: Palette, members ms: List(Member)) -> Element(msg) {
     ],
     list.flatten([
       [section_title(p, "Online — " <> int.to_string(online_count))],
-      list.map(in_call_others, fn(m) { member_row(p, m, False) }),
-      list.map(online_not_in_call, fn(m) { member_row(p, m, False) }),
+      list.map(in_call_others, fn(m) { member_row(p, m, on_open, False) }),
+      list.map(online_not_in_call, fn(m) { member_row(p, m, on_open, False) }),
       case offline_count {
         0 -> []
         _ ->
@@ -67,7 +73,7 @@ pub fn view(palette p: Palette, members ms: List(Member)) -> Element(msg) {
               ),
               section_title(p, "Offline — " <> int.to_string(offline_count)),
             ],
-            list.map(offline_members, fn(m) { member_row(p, m, True) }),
+            list.map(offline_members, fn(m) { member_row(p, m, on_open, True) }),
           ])
       },
     ]),
@@ -90,7 +96,12 @@ fn section_title(p: Palette, label: String) -> Element(msg) {
   )
 }
 
-fn member_row(p: Palette, m: Member, dim: Bool) -> Element(msg) {
+fn member_row(
+  p: Palette,
+  m: Member,
+  on_open: fn(domain.MemberId) -> msg,
+  dim: Bool,
+) -> Element(msg) {
   let dot_color = case m.status {
     Speaking -> p.live
     Online -> p.live
@@ -110,16 +121,32 @@ fn member_row(p: Palette, m: Member, dim: Bool) -> Element(msg) {
     Speaking -> p.text
     _ -> p.text_muted
   }
+
+  // Click anywhere on the row opens the per-peer status popover.
+  // Self isn't actionable — no handler, no cursor change.
+  let click_attrs = case m.you {
+    True -> []
+    False -> [
+      event.on_click(on_open(m.id)),
+      ui.css([#("cursor", "pointer")]),
+    ]
+  }
+
   html.div(
-    [
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("gap", "8px"),
-        #("padding", "5px 10px"),
-        #("opacity", opacity),
-      ]),
-    ],
+    list.append(
+      [
+        attribute.attribute("data-testid", "member-row"),
+        attribute.attribute("data-member-id", member_id_str(m.id)),
+        ui.css([
+          #("display", "flex"),
+          #("align-items", "center"),
+          #("gap", "8px"),
+          #("padding", "5px 10px"),
+          #("opacity", opacity),
+        ]),
+      ],
+      click_attrs,
+    ),
     list.flatten([
       [
         html.span(
@@ -149,6 +176,7 @@ fn member_row(p: Palette, m: Member, dim: Bool) -> Element(msg) {
           ],
           [html.text(m.name)],
         ),
+        transport_icon(p, m.relay),
       ],
       case m.bridge {
         HasBridge(_) -> [bridge_tag(p)]
@@ -156,6 +184,37 @@ fn member_row(p: Palette, m: Member, dim: Bool) -> Element(msg) {
       },
     ]),
   )
+}
+
+/// Return a small Unicode glyph indicating the transport route for this
+/// peer. `↔` for direct WebRTC, `⤴` for via-relay; nothing for self or
+/// unknown topologies (deferred multi-hop / bridge variants).
+fn transport_icon(p: Palette, r: domain.RelayStatus) -> Element(msg) {
+  let glyph = case r {
+    domain.Direct -> "↔"
+    domain.OneHop -> "⤴"
+    _ -> ""
+  }
+  case glyph {
+    "" -> element.fragment([])
+    g ->
+      html.span(
+        [
+          attribute.attribute("data-testid", "member-transport-icon"),
+          ui.css([
+            #("font-size", "12px"),
+            #("color", p.text_faint),
+            #("flex-shrink", "0"),
+          ]),
+        ],
+        [html.text(g)],
+      )
+  }
+}
+
+fn member_id_str(id: domain.MemberId) -> String {
+  let domain.MemberId(s) = id
+  s
 }
 
 fn bridge_tag(p: Palette) -> Element(msg) {
