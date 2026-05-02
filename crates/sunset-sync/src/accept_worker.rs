@@ -243,4 +243,30 @@ mod tests {
             })
             .await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn source_close_terminates_output_when_drained() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::unbounded_channel::<u32>();
+                let inbound = UnboundedReceiverStream::new(rx);
+                let mut out = spawn_accept_worker(
+                    inbound,
+                    Duration::from_secs(5),
+                    16,
+                    |n: u32| async move { Ok::<u32, Error>(n) },
+                );
+                for i in 0..3u32 {
+                    tx.send(i).unwrap();
+                }
+                drop(tx);
+                for _ in 0..3 {
+                    out.recv().await.expect("one of three").expect("ok");
+                }
+                let extra = out.recv().await;
+                assert!(extra.is_none(), "expected None after source closed; got {extra:?}");
+            })
+            .await;
+    }
 }
