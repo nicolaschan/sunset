@@ -81,7 +81,7 @@ Two non-obvious correctness rules that exist because the wrong shape is easy to 
 
 ## Workflow notes
 
-- Worktrees live under `.worktrees/` (gitignored). Plans are typically executed via the superpowers subagent-driven-development flow with two-stage review (spec compliance → code quality).
+- **Use git worktrees for all implementation work.** Use the `superpowers:using-git-worktrees` skill before starting any feature or plan execution. Worktrees live under `.worktrees/` (gitignored). Plans are executed via the superpowers subagent-driven-development flow with two-stage review (spec compliance → code quality).
 - Cargo.lock is committed (workspace will eventually ship binaries — relay, TUI).
 - Commits must include a `Co-Authored-By` trailer naming the actual model used (e.g. `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>` when running Sonnet 4.6, `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` when running Opus 4.7).
 - Use `gh pr create` (GitHub CLI) to open pull requests — not the API or any other method.
