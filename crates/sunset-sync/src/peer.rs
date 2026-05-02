@@ -24,6 +24,16 @@ pub(crate) enum InboundEvent {
         conn_id: crate::engine::ConnectionId,
         kind: crate::transport::TransportKind,
         out_tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>,
+        /// One-shot fired by the engine after `peer_outbound` is
+        /// populated, to wake the `add_peer().await` caller. Threading
+        /// the signal through the inbound event (rather than firing it
+        /// directly from the per-peer task on Hello receipt) is what
+        /// makes `add_peer().await` returning imply the peer is fully
+        /// routable: a caller that immediately publishes / inserts
+        /// won't drop the entry on the floor against an empty
+        /// `peer_outbound`. Inbound peers (server-side accept) pass
+        /// `None`.
+        registered: Option<tokio::sync::oneshot::Sender<crate::error::Result<PeerId>>>,
     },
     /// A SyncMessage arrived (other than Hello).
     Message { from: PeerId, message: SyncMessage },
@@ -117,15 +127,17 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                 });
                 return;
             }
+            // Pass `hello_done` through the inbound event. The engine
+            // fires it after `peer_outbound` is populated, so the
+            // `add_peer().await` caller can rely on the peer being
+            // routable when the call returns.
             let _ = inbound_tx.send(InboundEvent::PeerHello {
                 peer_id: peer_id.clone(),
                 conn_id,
                 kind: local_kind,
                 out_tx,
+                registered: hello_done,
             });
-            if let Some(s) = hello_done {
-                let _ = s.send(Ok(peer_id.clone()));
-            }
             peer_id
         }
         Ok(other) => {
