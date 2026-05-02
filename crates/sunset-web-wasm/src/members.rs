@@ -48,6 +48,11 @@ pub struct MemberJs {
     pub(crate) presence: String,
     pub(crate) connection_mode: String,
     pub(crate) is_self: bool,
+    /// Unix-ms timestamp of the last app-level presence heartbeat we
+    /// observed for this peer. `None` for self (we don't track our own
+    /// presence) and for any peer we've heard nothing from. The Gleam
+    /// popover computes age = now_ms - last_heartbeat_ms.
+    pub(crate) last_heartbeat_ms: Option<u64>,
 }
 
 #[wasm_bindgen]
@@ -68,6 +73,10 @@ impl MemberJs {
     pub fn is_self(&self) -> bool {
         self.is_self
     }
+    #[wasm_bindgen(getter)]
+    pub fn last_heartbeat_ms(&self) -> Option<u64> {
+        self.last_heartbeat_ms
+    }
 }
 
 /// Pure derivation: given the current state, return the rendered
@@ -87,6 +96,7 @@ pub fn derive_members(
         presence: Presence::Online.as_str().to_owned(),
         connection_mode: "self".to_owned(),
         is_self: true,
+        last_heartbeat_ms: None,
     });
     // Others, sorted by pubkey for stable ordering.
     let mut others: Vec<(&PeerId, &u64)> = presence_map
@@ -126,6 +136,7 @@ pub fn derive_members(
             presence: presence.as_str().to_owned(),
             connection_mode,
             is_self: false,
+            last_heartbeat_ms: Some(*last_ms),
         });
     }
     out
@@ -238,5 +249,43 @@ mod tests {
         let s1 = members_signature(&derive_members(500, 1000, 3000, &me, &presence, &kinds));
         let s2 = members_signature(&derive_members(1500, 1000, 3000, &me, &presence, &kinds));
         assert_ne!(s1, s2, "Online → Away should change signature");
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn derive_members_includes_last_heartbeat_for_others() {
+        use std::collections::HashMap;
+        let me = pk(0);
+        let bob = pk(1);
+        let mut presence = HashMap::new();
+        presence.insert(bob.clone(), 12_345_u64);
+        let kinds = HashMap::new();
+        let out = derive_members(20_000, 30_000, 60_000, &me, &presence, &kinds);
+        // Self is index 0 (always present); Bob is index 1.
+        assert_eq!(out[0].is_self, true);
+        assert_eq!(out[0].last_heartbeat_ms, None);
+        assert_eq!(out[1].is_self, false);
+        assert_eq!(out[1].last_heartbeat_ms, Some(12_345_u64));
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn signature_ignores_heartbeat_timestamp() {
+        // Two member lists differing ONLY in last_heartbeat_ms must
+        // produce equal signatures, otherwise the membership tracker
+        // would re-emit on every age tick.
+        let m1 = MemberJs {
+            pubkey: vec![1; 32],
+            presence: "online".to_owned(),
+            connection_mode: "via_relay".to_owned(),
+            is_self: false,
+            last_heartbeat_ms: Some(100),
+        };
+        let m2 = MemberJs {
+            pubkey: vec![1; 32],
+            presence: "online".to_owned(),
+            connection_mode: "via_relay".to_owned(),
+            is_self: false,
+            last_heartbeat_ms: Some(200),
+        };
+        assert_eq!(members_signature(&[m1]), members_signature(&[m2]));
     }
 }
