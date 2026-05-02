@@ -214,6 +214,13 @@ export function memConnectionMode(m) {
 export function memIsSelf(m) {
   return m.is_self;
 }
+export function memLastHeartbeatMs(m) {
+  // wasm-bindgen Option<u64> getter returns undefined for None and a
+  // number for Some. Gleam decodes null → option.None and number →
+  // option.Some(number), so normalize undefined → null here.
+  const v = m.last_heartbeat_ms;
+  return v === undefined ? null : v;
+}
 
 export function presenceParamsFromUrl() {
   const params = new URLSearchParams(window.location.search);
@@ -251,4 +258,18 @@ export function recForValueHashHex(rec) {
 
 export function recFromPubkey(rec) {
   return new BitArray(rec.from_pubkey);
+}
+
+/// Schedule a recurring callback every `ms` milliseconds. Returns
+/// nothing — there is no cancel handle in v1; the ticker runs for the
+/// page lifetime. Use only for cheap, idempotent dispatches.
+export function setIntervalMs(ms, callback) {
+  setInterval(callback, ms);
+}
+
+/// Wall-clock unix-ms snapshot. Used by the popover ticker to update
+/// the "heard from N seconds ago" readout between membership-tracker
+/// emits.
+export function nowMs() {
+  return Date.now();
 }
