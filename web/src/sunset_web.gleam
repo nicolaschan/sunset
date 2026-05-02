@@ -26,7 +26,7 @@ import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
   type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
-  NoRelay, Reaction, Reconnecting, Room, RoomId,
+  Reaction, Room, RoomId,
 }
 import sunset_web/fixture
 import sunset_web/scroll_anchor
