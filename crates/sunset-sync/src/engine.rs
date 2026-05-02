@@ -905,6 +905,19 @@ where
             .any(|(k, _)| k == vk)
     }
 
+    /// Snapshot the verifying keys currently in the subscription registry.
+    /// Test-only — used to debug missing-subscription failures.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn registered_subscribers(&self) -> Vec<sunset_store::VerifyingKey> {
+        self.state
+            .lock()
+            .await
+            .registry
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// Fan-out an event to every live subscriber. Drops senders whose
     /// receivers have been dropped (lazy GC).
     async fn emit_engine_event(&self, ev: EngineEvent) {
