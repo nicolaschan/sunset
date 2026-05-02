@@ -2,6 +2,15 @@
 //! transport.
 //!
 //! See `docs/superpowers/specs/2026-04-25-sunset-store-and-sync-design.md` for design.
+//!
+//! ## Inbound handshake concurrency
+//!
+//! Transports that accept inbound peers (TCP listener, WebRTC
+//! offers, etc.) can use [`crate::spawn_accept_worker`] to run handshakes
+//! concurrently with a per-task timeout and a semaphore-bounded
+//! inflight cap. See `accept_worker.rs` for the abstraction; the
+//! relay (`sunset-relay`) and the browser WebRTC transport
+//! (`sunset-sync-webrtc-browser`) are the two reference adopters.
 
 pub mod accept_worker;
 pub mod digest;
