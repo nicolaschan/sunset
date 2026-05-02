@@ -36,6 +36,15 @@ pub struct TrackerHandles {
     pub on_relay_status: Rc<RefCell<Option<js_sys::Function>>>,
     pub last_relay_status: Rc<RefCell<String>>,
     pub peer_kinds: Rc<RefCell<HashMap<PeerId, TransportKind>>>,
+    /// Per-member signature of the most recent fire. Lives on the
+    /// handle (not as a tracker-task local) so `on_members_changed`
+    /// can clear it on (re-)registration: the next `maybe_fire` then
+    /// sees signature ≠ stored signature and fires the callback with
+    /// the current state. Without this, a callback registered after
+    /// the system has stabilized would never see anything until the
+    /// next presence transition (which can be never if heartbeats
+    /// land before the refresh tick crosses `interval_ms`).
+    pub last_signature: Rc<RefCell<MemberSig>>,
 }
 
 impl TrackerHandles {
@@ -45,6 +54,7 @@ impl TrackerHandles {
             on_relay_status: Rc::new(RefCell::new(None)),
             last_relay_status: Rc::new(RefCell::new(initial_relay_status.to_owned())),
             peer_kinds: Rc::new(RefCell::new(HashMap::new())),
+            last_signature: Rc::new(RefCell::new(Vec::new())),
         }
     }
 }
@@ -89,7 +99,6 @@ pub fn spawn_tracker(
         let mut presence_sub = presence_sub.fuse();
         let mut refresh_rx = refresh_rx.fuse();
         let presence_map: Rc<RefCell<HashMap<PeerId, u64>>> = Rc::new(RefCell::new(HashMap::new()));
-        let last_signature: Rc<RefCell<MemberSig>> = Rc::new(RefCell::new(Vec::new()));
         let prefix = format!("{room_fp_hex}/presence/");
 
         loop {
@@ -116,7 +125,7 @@ pub fn spawn_tracker(
                         &self_peer,
                         &presence_map.borrow(),
                         &handles.peer_kinds.borrow(),
-                        &last_signature,
+                        &handles.last_signature,
                         handles.on_members.borrow().as_ref(),
                     );
                 }
@@ -131,12 +140,14 @@ pub fn spawn_tracker(
                         &self_peer,
                         &presence_map.borrow(),
                         &handles.peer_kinds.borrow(),
-                        &last_signature,
+                        &handles.last_signature,
                         handles.on_members.borrow().as_ref(),
                     );
                 }
                 _ = refresh_rx.next() => {
-                    // Periodic re-derive (catches Online↔Away threshold crossings).
+                    // Periodic re-derive (catches Online↔Away threshold crossings,
+                    // and is the path that fires the callback for free shortly after
+                    // `Client::on_members_changed` clears `last_signature`).
                     maybe_fire(
                         now_ms(),
                         interval_ms,
@@ -144,7 +155,7 @@ pub fn spawn_tracker(
                         &self_peer,
                         &presence_map.borrow(),
                         &handles.peer_kinds.borrow(),
-                        &last_signature,
+                        &handles.last_signature,
                         handles.on_members.borrow().as_ref(),
                     );
                 }
