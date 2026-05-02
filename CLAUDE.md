@@ -94,8 +94,34 @@ Before touching a failing test, evaluate it from UX and API-contract perspective
 
 If a unit test requires workarounds for edge cases a caller would never expect to hit, that signals an API design problem — fix the API, not the test.
 
+**You cannot fix a correct test by modifying the test.** A test is correct iff it expresses what a real API user would write and expect. If a correct test fails, the bug is in the code under test — full stop. Modifying a correct test to make it pass is *camouflage*, not a fix; the bug still ships, and the next caller hits it. The following ALL count as patching the test, not fixing the bug:
+
+- Adding `wait_for(...)` polls on engine-internal state (e.g. registries, queues, handshake completion) so a basic API call works "deterministically".
+- Calling test-only inspector methods (`knows_*`, `has_*`, `is_*_complete`) to gate a user-level action that the documented API doesn't ask the user to gate.
+- Inserting `tokio::time::sleep` to mask a race.
+- Adding extra `assert!` checks for engine-internal state framed as "hardening preconditions" — a real user has no way to establish those preconditions, so the test was never racy from the user's perspective; the *engine* was racy.
+- Replacing the user's straight-line action sequence with a sequence of waits + checks the user couldn't perform.
+
+Litmus test: *would a real caller, reading only the public API docs, write the test the new way?* If no, you're patching the test.
+
+**Decision flow when a test fails:**
+
+1. Read the test as if you were the API's user. Ignore implementation. What does it claim the system does?
+2. Would a real user, reading only the public API, reasonably write this test and expect it to pass? If yes, the test is correct.
+3. The fix is in the code under test, not in the test.
+4. If the fix is architectural (new abstractions, protocol changes, contract revisions, public API semantics), stop and **propose the fix to the user explicitly** via `superpowers:brainstorming` / `superpowers:writing-plans`. *Do not silently fall back to a test-side workaround "because it's lower-risk" or "needs user confirmation per rule 3."* "Needs confirmation" means **ask**, not retreat.
+5. Lower-risk-to-CI ≠ lower-risk-to-users. A test workaround that hides a real race is *higher* risk: the race still fires in production, just without a tripwire.
+
+**Forbidden rationalizations** — if you catch yourself thinking these, stop and re-read this section:
+
+- "The test is just making preconditions deterministic." → If the API contract requires a precondition the user can't establish, the API is broken.
+- "It's lower-risk to fix the test." → Risk to whom? Test-side patches keep the bug live for users.
+- "The architectural fix needs user confirmation, so I'll do the test-side fix in the meantime." → Then *ask* about the architectural fix. Do not paper over.
+- "I'll note the engine race in the commit/PR description as a follow-up." → Follow-ups don't get done; the bug ships.
+- "Adding a `wait_for` isn't disabling or increasing the test's timeout." → It's adding setup the user can't perform. Same category.
+
 **Debugging process:**
 
 1. Use the `superpowers:systematic-debugging` skill to understand the bug before proposing any fix.
 2. Step back from the immediate symptom and reason about how the broader architecture *should* solve the problem.
-3. If the fix requires architectural decisions (new abstractions, protocol changes, contract revisions), stop and confirm with the user via the `superpowers:brainstorming` and `superpowers:writing-plans` skills before writing any code.
+3. If the fix requires architectural decisions (new abstractions, protocol changes, contract revisions), stop and confirm with the user via the `superpowers:brainstorming` and `superpowers:writing-plans` skills before writing any code. Confirming means proposing the architectural change and asking; it does **not** mean choosing the test-side workaround as a default.

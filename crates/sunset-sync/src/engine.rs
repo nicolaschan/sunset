@@ -553,6 +553,7 @@ where
                 conn_id,
                 kind,
                 out_tx,
+                registered,
             } => {
                 // Register the outbound sender + transport kind under the
                 // Hello-declared peer_id. peer_outbound + peer_kinds move
@@ -574,6 +575,13 @@ where
                     kind,
                 })
                 .await;
+                // Wake the `add_peer().await` caller now that
+                // `peer_outbound` is populated, so an immediately-
+                // following `publish_subscription` / `insert` lands a
+                // peer to push to.
+                if let Some(s) = registered {
+                    let _ = s.send(Ok(peer_id.clone()));
+                }
                 // Fire bootstrap digest exchange on the subscribe namespace.
                 self.send_bootstrap_digest(&peer_id).await;
             }
@@ -839,7 +847,22 @@ where
             }
         }
 
-        // Push flow: route to peers whose filter matches.
+        // Push flow.
+        //
+        // Self-authored entries are broadcast to every currently-connected
+        // peer regardless of registry filter. The registry-driven push is
+        // only safe once bootstrap-digest has primed the registry with the
+        // peer's filter; for an entry inserted right after `add_peer`
+        // returns (e.g., the very first `publish_subscription` of a
+        // freshly-connected client), the registry may still be empty and
+        // a registry-filtered push would lose the entry on the floor
+        // until anti-entropy (default 30 s) caught up. My own entries
+        // going to my own peers don't need filter consent — the receiving
+        // peer is free to route or drop based on its own rules.
+        //
+        // Forwarded entries (authored by someone else) keep registry-
+        // filtered semantics: a relay MUST NOT broadcast a third party's
+        // chat traffic to peers whose subscription doesn't match.
         let blob = self
             .store
             .get_content(&entry.value_hash)
@@ -851,12 +874,18 @@ where
             blobs: blob.into_iter().collect(),
         };
         let state = self.state.lock().await;
-        for peer in state
-            .registry
-            .peers_matching(&entry.verifying_key, &entry.name)
-        {
-            if let Some(po) = state.peer_outbound.get(&peer) {
+        if entry.verifying_key == self.local_peer.0 {
+            for po in state.peer_outbound.values() {
                 let _ = po.tx.send(msg.clone());
+            }
+        } else {
+            for peer in state
+                .registry
+                .peers_matching(&entry.verifying_key, &entry.name)
+            {
+                if let Some(po) = state.peer_outbound.get(&peer) {
+                    let _ = po.tx.send(msg.clone());
+                }
             }
         }
     }
