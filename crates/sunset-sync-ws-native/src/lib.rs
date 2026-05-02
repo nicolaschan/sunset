@@ -14,6 +14,9 @@ use sunset_sync::{
     Error as SyncError, PeerAddr, RawConnection, RawTransport, Result as SyncResult,
 };
 
+#[cfg(feature = "axum")]
+pub mod axum_integration;
+
 // ---- split sink type ----
 
 enum WsSink {
