@@ -3,6 +3,7 @@
 //// Once sunset-core lands and the chat-domain → KV mapping is decided,
 //// these factories become decoders over `Store` events / blob payloads.
 
+import gleam/option
 import sunset_web/domain.{
   type Channel, type Member, type Message, type Room, Away, Bridge, BridgeRelay,
   Channel, ChannelId, Connected, Direct, HasBridge, HasDetails, HasRole, Member,
@@ -148,6 +149,7 @@ pub fn members() -> List(Member) {
       in_call: True,
       bridge: NoBridge,
       role: HasRole("host"),
+      last_heartbeat_ms: option.None,
     ),
     Member(
       id: MemberId("u2"),
@@ -159,6 +161,7 @@ pub fn members() -> List(Member) {
       in_call: True,
       bridge: NoBridge,
       role: NoRole,
+      last_heartbeat_ms: option.None,
     ),
     Member(
       id: MemberId("u3"),
@@ -170,6 +173,7 @@ pub fn members() -> List(Member) {
       in_call: True,
       bridge: NoBridge,
       role: NoRole,
+      last_heartbeat_ms: option.None,
     ),
     Member(
       id: MemberId("u4"),
@@ -181,6 +185,7 @@ pub fn members() -> List(Member) {
       in_call: True,
       bridge: NoBridge,
       role: NoRole,
+      last_heartbeat_ms: option.None,
     ),
     Member(
       id: MemberId("u5"),
@@ -192,6 +197,7 @@ pub fn members() -> List(Member) {
       in_call: False,
       bridge: HasBridge(Minecraft),
       role: NoRole,
+      last_heartbeat_ms: option.None,
     ),
     Member(
       id: MemberId("u6"),
@@ -203,6 +209,7 @@ pub fn members() -> List(Member) {
       in_call: False,
       bridge: NoBridge,
       role: NoRole,
+      last_heartbeat_ms: option.None,
     ),
     Member(
       id: MemberId("u7"),
@@ -214,6 +221,7 @@ pub fn members() -> List(Member) {
       in_call: False,
       bridge: NoBridge,
       role: NoRole,
+      last_heartbeat_ms: option.None,
     ),
     Member(
       id: MemberId("u8"),
@@ -225,6 +233,7 @@ pub fn members() -> List(Member) {
       in_call: False,
       bridge: NoBridge,
       role: NoRole,
+      last_heartbeat_ms: option.None,
     ),
   ]
 }

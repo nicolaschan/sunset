@@ -1193,6 +1193,7 @@ fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
       in_call: False,
       bridge: domain.NoBridge,
       role: domain.NoRole,
+      last_heartbeat_ms: sunset.mem_last_heartbeat_ms(m),
     )
   })
 }
