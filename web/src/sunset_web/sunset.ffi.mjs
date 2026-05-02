@@ -3,6 +3,7 @@
 // Gleam externals call.
 
 import { BitArray, Ok, Error as GError, toList } from "../../prelude.mjs";
+import { Some, None } from "../../gleam_stdlib/gleam/option.mjs";
 import init, { Client } from "../../sunset_web_wasm.js";
 
 let initPromise = null;
@@ -183,6 +184,7 @@ export function onMembersChanged(client, callback) {
         presence: m.presence,            // String getter -> string
         connection_mode: m.connection_mode,
         is_self: m.is_self,
+        last_heartbeat_ms: m.last_heartbeat_ms,  // f64; -1 sentinel for "no heartbeat"
       }));
       Array.from(members).forEach((m) => m.free());
       callback(toList(copied));
@@ -213,6 +215,18 @@ export function memConnectionMode(m) {
 }
 export function memIsSelf(m) {
   return m.is_self;
+}
+export function memLastHeartbeatMs(m) {
+  // The wasm-bindgen getter returns `f64`, with `-1` sentinel for
+  // "no heartbeat observed" (self or never-heard-from peer).
+  // See `MemberJs::last_heartbeat_ms` on the Rust side for why this
+  // shape (Option<u64> serializes to `bigint | undefined`, which
+  // doesn't play well with Number arithmetic on the Gleam side).
+  // Gleam pattern matches on `Some/None` instances — return the
+  // actual constructors, not bare values.
+  const v = m.last_heartbeat_ms;
+  if (v < 0) return new None();
+  return new Some(v);
 }
 
 export function presenceParamsFromUrl() {
@@ -251,4 +265,18 @@ export function recForValueHashHex(rec) {
 
 export function recFromPubkey(rec) {
   return new BitArray(rec.from_pubkey);
+}
+
+/// Schedule a recurring callback every `ms` milliseconds. Returns
+/// nothing — there is no cancel handle in v1; the ticker runs for the
+/// page lifetime. Use only for cheap, idempotent dispatches.
+export function setIntervalMs(ms, callback) {
+  setInterval(callback, ms);
+}
+
+/// Wall-clock unix-ms snapshot. Used by the popover ticker to update
+/// the "heard from N seconds ago" readout between membership-tracker
+/// emits.
+export function nowMs() {
+  return Date.now();
 }

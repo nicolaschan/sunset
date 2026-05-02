@@ -7,6 +7,8 @@
 //// lands these become aliases over the real `(verifying_key, name)`
 //// pairs, and the field shapes shouldn't shift.
 
+import gleam/option
+
 pub type RoomId {
   RoomId(String)
 }
@@ -90,6 +92,10 @@ pub type Member {
     in_call: Bool,
     bridge: BridgeOpt,
     role: RoleOpt,
+    /// Unix-ms timestamp of the last app-level presence heartbeat we
+    /// received from this peer. `None` for self or peers we have not
+    /// heard from. The popover renders age as `now_ms - this`.
+    last_heartbeat_ms: option.Option(Int),
   )
 }
 

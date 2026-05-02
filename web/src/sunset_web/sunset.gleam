@@ -2,6 +2,8 @@
 //// engine lifecycle, message send/recv. Uses callback-based externals so
 //// Lustre effects can wrap each async operation.
 
+import gleam/option
+
 pub type ClientHandle
 
 pub type IncomingMessage
@@ -139,10 +141,22 @@ pub fn mem_connection_mode(m: MemberJs) -> String
 @external(javascript, "./sunset.ffi.mjs", "memIsSelf")
 pub fn mem_is_self(m: MemberJs) -> Bool
 
+@external(javascript, "./sunset.ffi.mjs", "memLastHeartbeatMs")
+pub fn mem_last_heartbeat_ms(m: MemberJs) -> option.Option(Int)
+
 /// Read presence-cadence params from `?presence_interval=&presence_ttl=&presence_refresh=`.
 /// Returns `#(interval_ms, ttl_ms, refresh_ms)`. Defaults: 30000/60000/5000.
 @external(javascript, "./sunset.ffi.mjs", "presenceParamsFromUrl")
 pub fn presence_params_from_url() -> #(Int, Int, Int)
+
+/// Schedule a recurring callback every `ms` milliseconds. Used by the
+/// popover ticker; runs for the page lifetime, no cancel handle in v1.
+@external(javascript, "./sunset.ffi.mjs", "setIntervalMs")
+pub fn set_interval_ms(ms: Int, callback: fn() -> Nil) -> Nil
+
+/// Wall-clock unix-ms snapshot via JS `Date.now()`.
+@external(javascript, "./sunset.ffi.mjs", "nowMs")
+pub fn now_ms() -> Int
 
 /// JS-side IncomingReceipt object, opaque to Gleam.
 pub type IncomingReceipt

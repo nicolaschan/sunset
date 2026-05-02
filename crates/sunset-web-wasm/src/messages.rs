@@ -34,7 +34,7 @@ pub struct IncomingReceipt {
 /// separately so the caller can pattern-match `MessageBody` upstream
 /// and pass only the inner String.
 pub fn from_decoded_text(
-    decoded: DecodedMessage,
+    decoded: &DecodedMessage,
     text: String,
     value_hash_hex: String,
     is_self: bool,
@@ -50,7 +50,7 @@ pub fn from_decoded_text(
 }
 
 /// Build an IncomingReceipt JS object.
-pub fn receipt_to_js(for_value_hash_hex: String, from_pubkey: IdentityKey) -> IncomingReceipt {
+pub fn receipt_to_js(for_value_hash_hex: String, from_pubkey: &IdentityKey) -> IncomingReceipt {
     IncomingReceipt {
         for_value_hash_hex,
         from_pubkey: from_pubkey.as_bytes().to_vec(),

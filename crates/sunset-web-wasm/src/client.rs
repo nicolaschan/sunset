@@ -414,7 +414,7 @@ impl Client {
                         // Deliver to the FE on_message callback.
                         let value_hash_hex = entry.value_hash.to_hex();
                         let incoming = crate::messages::from_decoded_text(
-                            decoded,
+                            &decoded,
                             text,
                             value_hash_hex,
                             is_self,
@@ -440,7 +440,7 @@ impl Client {
                         }
                         let for_hex = for_value_hash.to_hex();
                         let from_pub = decoded.author_key;
-                        let incoming = crate::messages::receipt_to_js(for_hex, from_pub);
+                        let incoming = crate::messages::receipt_to_js(for_hex, &from_pub);
                         if let Some(cb) = on_receipt.borrow().as_ref() {
                             let _ = cb.call1(&JsValue::NULL, &JsValue::from(incoming));
                         }
