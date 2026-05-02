@@ -56,14 +56,19 @@ where
     Fut: Future<Output = Result<C>> + 'static,
 {
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Result<C>>();
-    let _ = max_inflight;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_inflight));
 
     spawn_local(async move {
         futures::pin_mut!(inbound);
         while let Some(item) = inbound.next().await {
             let fut = handshake_fn(item);
             let out_tx = out_tx.clone();
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break, // semaphore closed; shutting down
+            };
             spawn_local(async move {
+                let _permit = permit;
                 let result = match with_timeout(timeout, fut).await {
                     Some(r) => r,
                     None => Err(Error::Transport(format!(
@@ -173,6 +178,67 @@ mod tests {
                 assert!(
                     elapsed < Duration::from_secs(1),
                     "timeout should have fired well under 1s, took {elapsed:?}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semaphore_caps_inflight() {
+        use std::cell::Cell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let cap = 2usize;
+                let inflight: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+                let max_seen: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+
+                let (tx, rx) = mpsc::unbounded_channel::<u32>();
+                let inbound = UnboundedReceiverStream::new(rx);
+
+                let inflight_for_fn = inflight.clone();
+                let max_for_fn = max_seen.clone();
+                let mut out = spawn_accept_worker(
+                    inbound,
+                    Duration::from_secs(5),
+                    cap,
+                    move |_n: u32| {
+                        let inflight = inflight_for_fn.clone();
+                        let max_seen = max_for_fn.clone();
+                        async move {
+                            inflight.set(inflight.get() + 1);
+                            let now = inflight.get();
+                            if now > max_seen.get() {
+                                max_seen.set(now);
+                            }
+                            // Hold long enough that bursts pile up.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            inflight.set(inflight.get() - 1);
+                            Ok::<(), Error>(())
+                        }
+                    },
+                );
+
+                for i in 0..10u32 {
+                    tx.send(i).unwrap();
+                }
+                drop(tx);
+
+                let mut received = 0;
+                while received < 10 {
+                    out.recv().await.expect("more").expect("ok");
+                    received += 1;
+                }
+
+                assert!(
+                    max_seen.get() <= cap,
+                    "inflight peaked at {} exceeding cap {cap}",
+                    max_seen.get()
+                );
+                assert!(
+                    max_seen.get() >= 1,
+                    "expected at least 1 inflight; saw {}",
+                    max_seen.get()
                 );
             })
             .await;
