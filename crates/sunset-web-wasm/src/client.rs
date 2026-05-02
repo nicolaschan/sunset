@@ -256,6 +256,15 @@ impl Client {
 
     pub fn on_members_changed(&self, callback: js_sys::Function) {
         *self.tracker_handles.on_members.borrow_mut() = Some(callback);
+        // Clear the debounce signature so the next `maybe_fire` (within
+        // `presence_refresh_ms` via the periodic refresh tick) fires the
+        // newly-registered callback with the current member list.
+        // Without this, a callback registered after the system has
+        // stabilized may never fire — `last_signature` already matches
+        // the steady state from the previous callback's last fire, and
+        // signature changes only happen on heartbeat-vs-refresh-tick
+        // jitter, which can be absent.
+        self.tracker_handles.last_signature.borrow_mut().clear();
     }
 
     pub fn on_relay_status_changed(&self, callback: js_sys::Function) {
