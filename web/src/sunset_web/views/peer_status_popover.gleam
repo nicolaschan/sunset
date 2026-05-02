@@ -16,9 +16,7 @@ import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
-import sunset_web/domain.{
-  type Member, Direct, NoRelay, OneHop, SelfRelay,
-}
+import sunset_web/domain.{type Member, Direct, NoRelay, OneHop, SelfRelay}
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
@@ -194,6 +192,7 @@ pub fn short_pubkey_display(m: Member) -> String {
   let domain.MemberId(s) = m.id
   case string.length(s) {
     n if n <= 16 -> s
-    _ -> string.slice(s, 0, 8) <> "…" <> string.slice(s, string.length(s) - 8, 8)
+    _ ->
+      string.slice(s, 0, 8) <> "…" <> string.slice(s, string.length(s) - 8, 8)
   }
 }

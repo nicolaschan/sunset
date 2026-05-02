@@ -24,7 +24,7 @@ pub fn humanize_age_minutes_test() {
 }
 
 pub fn humanize_age_hours_test() {
-  peer_status_popover.humanize_age(7200_000, option.Some(0))
+  peer_status_popover.humanize_age(7_200_000, option.Some(0))
   |> should.equal("2h ago")
 }
 
