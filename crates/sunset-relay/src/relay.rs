@@ -88,7 +88,12 @@ impl Relay {
         let local_address = format!("ws://{}#x25519={}", bound, hex::encode(x25519_public));
 
         let (ws_tx, ws_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(32);
-        let raw = WebSocketRawTransport::external_streams(ws_rx);
+        let sync_config = SyncConfig::default();
+        let raw = WebSocketRawTransport::external_streams_with(
+            ws_rx,
+            sync_config.accept_handshake_timeout,
+            sync_config.accept_max_inflight,
+        );
         let noise = NoiseTransport::new(raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
 
         // 4. SyncEngine.
@@ -97,7 +102,7 @@ impl Relay {
         let engine = Rc::new(SyncEngine::new(
             store.clone(),
             noise,
-            SyncConfig::default(),
+            sync_config.clone(),
             local_peer,
             signer,
         ));
