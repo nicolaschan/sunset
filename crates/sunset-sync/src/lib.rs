@@ -25,6 +25,7 @@ pub mod test_transport;
 #[cfg(test)]
 mod test_fixtures;
 
+pub use crate::accept_worker::spawn_accept_worker;
 pub use engine::{EngineEvent, SyncEngine};
 pub use error::{Error, Result};
 pub use message::{DigestRange, SyncMessage};
