@@ -3,6 +3,7 @@
 //!
 //! See `docs/superpowers/specs/2026-04-25-sunset-store-and-sync-design.md` for design.
 
+pub mod accept_worker;
 pub mod digest;
 pub mod engine;
 pub mod error;
