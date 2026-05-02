@@ -31,7 +31,13 @@ sunset-sync.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { workspace = true }
+web-time.workspace = true
 zeroize.workspace = true
+
+# Wasm needs a setTimeout-backed `tokio::time::sleep` drop-in; the
+# `membership` module's refresh ticker uses it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasmtimer.workspace = true
 
 [dev-dependencies]
 rand_core = { workspace = true, features = ["getrandom"] }

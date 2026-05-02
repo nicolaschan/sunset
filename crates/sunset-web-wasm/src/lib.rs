@@ -10,8 +10,6 @@ mod identity;
 #[cfg(target_arch = "wasm32")]
 mod members;
 #[cfg(target_arch = "wasm32")]
-mod membership_tracker;
-#[cfg(target_arch = "wasm32")]
 mod messages;
 #[cfg(target_arch = "wasm32")]
 mod presence_publisher;
