@@ -105,6 +105,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn n_slow_items_complete_concurrently() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = mpsc::unbounded_channel::<u32>();
+                let inbound = UnboundedReceiverStream::new(rx);
+                let per_item = Duration::from_millis(200);
+                let mut out = spawn_accept_worker(
+                    inbound,
+                    Duration::from_secs(5),
+                    16,
+                    move |n: u32| async move {
+                        tokio::time::sleep(per_item).await;
+                        Ok::<u32, Error>(n)
+                    },
+                );
+
+                let n = 8u32;
+                for i in 0..n {
+                    tx.send(i).unwrap();
+                }
+                drop(tx);
+
+                let start = tokio::time::Instant::now();
+                let mut received = 0u32;
+                while received < n {
+                    out.recv().await.expect("more results").expect("ok");
+                    received += 1;
+                }
+                let elapsed = start.elapsed();
+
+                // Sequentially this would take >=N*per_item = 1.6s.
+                // With concurrent spawning it should finish near per_item.
+                assert!(
+                    elapsed < per_item * 3,
+                    "expected concurrent execution; took {elapsed:?} for {n} items at {per_item:?} each"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn timeout_drops_a_stuck_task() {
         let local = tokio::task::LocalSet::new();
         local
