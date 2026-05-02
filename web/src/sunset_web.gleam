@@ -40,6 +40,7 @@ import sunset_web/views/details_panel
 import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
+import sunset_web/views/peer_status_popover
 import sunset_web/views/phone_header
 import sunset_web/views/rooms
 import sunset_web/views/shell
@@ -106,6 +107,12 @@ pub type Model {
     /// reveal those buttons; on desktop it pins the row even after the
     /// pointer leaves. Tap/click anywhere on the message body toggles.
     selected_msg_id: Option(String),
+    /// Currently-open peer status popover, if any. `Some(member_id)`
+    /// when open, `None` when closed.
+    peer_status_popover: Option(domain.MemberId),
+    /// Wall-clock unix-ms snapshot. Updated every second by the
+    /// `Tick(now_ms)` message so the popover's age readout stays live.
+    now_ms: Int,
   )
 }
 
@@ -133,6 +140,9 @@ pub type Msg {
   CloseDetail
   OpenVoicePopover(String)
   CloseVoicePopover
+  OpenPeerStatusPopover(domain.MemberId)
+  ClosePeerStatusPopover
+  Tick(Int)
   SetMemberVolume(String, Int)
   ToggleMemberDenoise(String)
   ToggleMemberDeafen(String)
@@ -223,6 +233,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       sheet: None,
       receipts: dict.new(),
       selected_msg_id: None,
+      peer_status_popover: None,
+      now_ms: 0,
     )
 
   let subscribe_hash =
@@ -278,6 +290,11 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       )
     })
 
+  let ticker_eff =
+    effect.from(fn(dispatch) {
+      sunset.set_interval_ms(1000, fn() { dispatch(Tick(sunset.now_ms())) })
+    })
+
   #(
     model,
     effect.batch([
@@ -287,6 +304,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       bootstrap,
       subscribe_viewport,
       subscribe_touch_drag,
+      ticker_eff,
     ]),
   )
 }
@@ -689,7 +707,21 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         effect.none(),
       )
     }
-    MembersUpdated(ms) -> #(Model(..model, members: ms), effect.none())
+    MembersUpdated(ms) -> {
+      // If the open popover's target left, close it.
+      let next_popover = case model.peer_status_popover {
+        None -> None
+        Some(target) ->
+          case list.find(ms, fn(m) { m.id == target }) {
+            Ok(_) -> Some(target)
+            Error(_) -> None
+          }
+      }
+      #(
+        Model(..model, members: ms, peer_status_popover: next_popover),
+        effect.none(),
+      )
+    }
     RelayStatusUpdated(s) -> #(Model(..model, relay_status: s), effect.none())
     ToggleMessageSelected(id) -> {
       // Tap/click on a message body. Toggle selection — same id
@@ -778,6 +810,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }),
       effect.none(),
     )
+    OpenPeerStatusPopover(member_id) -> #(
+      Model(..model, peer_status_popover: Some(member_id)),
+      effect.none(),
+    )
+    ClosePeerStatusPopover -> #(
+      Model(..model, peer_status_popover: None),
+      effect.none(),
+    )
+    Tick(now) -> #(Model(..model, now_ms: now), effect.none())
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, volume: value)
@@ -1079,7 +1120,10 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
           on_open_status: OpenPeerStatusPopover,
         )
     },
-    voice_popover_overlay(palette, model),
+    element.fragment([
+      voice_popover_overlay(palette, model),
+      peer_status_popover_overlay(palette, model),
+    ]),
     phone_header.view(
       palette: palette,
       room: active_room,
@@ -1112,6 +1156,29 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
           )
       }
     _, _ -> element.fragment([])
+  }
+}
+
+fn peer_status_popover_overlay(palette, model: Model) -> Element(Msg) {
+  case model.peer_status_popover {
+    None -> element.fragment([])
+    Some(member_id) ->
+      case list.find(model.members, fn(m) { m.id == member_id }) {
+        Error(_) -> element.fragment([])
+        Ok(m) -> {
+          let placement = case model.viewport {
+            domain.Phone -> peer_status_popover.InSheet
+            _ -> peer_status_popover.Floating
+          }
+          peer_status_popover.view(
+            palette: palette,
+            member: m,
+            now_ms: model.now_ms,
+            placement: placement,
+            on_close: ClosePeerStatusPopover,
+          )
+        }
+      }
   }
 }
 
