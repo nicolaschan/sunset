@@ -22,6 +22,8 @@ pub mod axum_integration;
 enum WsSink {
     Client(SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>),
     Server(SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>),
+    #[cfg(feature = "axum")]
+    Axum(SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>),
 }
 
 impl WsSink {
@@ -29,6 +31,24 @@ impl WsSink {
         match self {
             WsSink::Client(s) => s.send(msg).await,
             WsSink::Server(s) => s.send(msg).await,
+            #[cfg(feature = "axum")]
+            WsSink::Axum(s) => {
+                // Translate tungstenite::Message → axum::extract::ws::Message.
+                // We only ever send Binary in the data plane; close translates
+                // into axum's Close. Anything else is a bug.
+                let axum_msg = match msg {
+                    Message::Binary(b) => axum::extract::ws::Message::Binary(b),
+                    Message::Close(_) => axum::extract::ws::Message::Close(None),
+                    _ => return Err(tokio_tungstenite::tungstenite::Error::Protocol(
+                        tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                    )),
+                };
+                s.send(axum_msg)
+                    .await
+                    .map_err(|e| tokio_tungstenite::tungstenite::Error::Io(
+                        std::io::Error::other(format!("axum ws send: {e}")),
+                    ))
+            }
         }
     }
 
@@ -40,6 +60,10 @@ impl WsSink {
             WsSink::Server(s) => {
                 s.close().await.ok();
             }
+            #[cfg(feature = "axum")]
+            WsSink::Axum(s) => {
+                s.close().await.ok();
+            }
         }
     }
 }
@@ -49,6 +73,8 @@ impl WsSink {
 enum WsStream {
     Client(SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
     Server(SplitStream<WebSocketStream<tokio::net::TcpStream>>),
+    #[cfg(feature = "axum")]
+    Axum(SplitStream<axum::extract::ws::WebSocket>),
 }
 
 impl WsStream {
@@ -56,6 +82,21 @@ impl WsStream {
         match self {
             WsStream::Client(s) => s.next().await,
             WsStream::Server(s) => s.next().await,
+            #[cfg(feature = "axum")]
+            WsStream::Axum(s) => {
+                let item = s.next().await?;
+                Some(item
+                    .map(|m| match m {
+                        axum::extract::ws::Message::Binary(b) => Message::Binary(b),
+                        axum::extract::ws::Message::Text(t) => Message::Text(t),
+                        axum::extract::ws::Message::Ping(b) => Message::Ping(b),
+                        axum::extract::ws::Message::Pong(b) => Message::Pong(b),
+                        axum::extract::ws::Message::Close(_) => Message::Close(None),
+                    })
+                    .map_err(|e| tokio_tungstenite::tungstenite::Error::Io(
+                        std::io::Error::other(format!("axum ws recv: {e}")),
+                    )))
+            }
         }
     }
 }
