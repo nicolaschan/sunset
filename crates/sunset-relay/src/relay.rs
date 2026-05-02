@@ -94,7 +94,12 @@ impl Relay {
             sync_config.accept_handshake_timeout,
             sync_config.accept_max_inflight,
         );
-        let noise = NoiseTransport::new(raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
+        let noise = NoiseTransport::new_with_worker(
+            raw,
+            Arc::new(IdentityNoiseAdapter(identity.clone())),
+            sync_config.accept_handshake_timeout,
+            sync_config.accept_max_inflight,
+        );
 
         // 4. SyncEngine.
         let local_peer = PeerId(VerifyingKey::new(Bytes::copy_from_slice(&ed25519_public)));

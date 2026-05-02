@@ -13,6 +13,7 @@ async-trait.workspace = true
 bytes.workspace = true
 curve25519-dalek.workspace = true
 ed25519-dalek.workspace = true
+futures.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 sha2.workspace = true
@@ -20,10 +21,13 @@ snow.workspace = true
 sunset-store.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
+tokio-stream.workspace = true
 zeroize.workspace = true
 
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+zeroize = { workspace = true }
