@@ -93,6 +93,23 @@ impl RawTransport for WebSocketRawTransport {
         });
         ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
+        // Wrap the WS + closures in the connection struct *before* the
+        // open wait, so the Drop impl handles cleanup uniformly across
+        // every err-path below. Without this, dropping the closures
+        // while the JS WebSocket still has live `.on*` handlers
+        // pointing at them causes wasm-bindgen to panic
+        // ("closure invoked recursively or after being dropped") the
+        // first time the dying socket fires another close/error event.
+        let conn = WebSocketRawConnection {
+            ws,
+            rx: RefCell::new(msg_rx),
+            closed,
+            _on_open: on_open,
+            _on_message: on_message,
+            _on_error: on_error,
+            _on_close: on_close,
+        };
+
         // Wait for open OR error OR close (whichever fires first).
         futures::select! {
             maybe_open = open_rx.next() => {
@@ -110,15 +127,7 @@ impl RawTransport for WebSocketRawTransport {
             }
         }
 
-        Ok(WebSocketRawConnection {
-            ws,
-            rx: RefCell::new(msg_rx),
-            closed,
-            _on_open: on_open,
-            _on_message: on_message,
-            _on_error: on_error,
-            _on_close: on_close,
-        })
+        Ok(conn)
     }
 
     async fn accept(&self) -> Result<Self::Connection> {
@@ -147,11 +156,32 @@ pub struct WebSocketRawConnection {
     closed: Rc<RefCell<bool>>,
 
     // Hold JS-side closures alive while the WebSocket exists. Dropping
-    // these while `ws` is still receiving callbacks would cause UB.
+    // these while `ws` is still receiving callbacks would cause UB —
+    // see `Drop` impl below, which detaches the handlers first.
     _on_open: Closure<dyn FnMut(Event)>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_error: Closure<dyn FnMut(Event)>,
     _on_close: Closure<dyn FnMut(CloseEvent)>,
+}
+
+impl Drop for WebSocketRawConnection {
+    fn drop(&mut self) {
+        // Detach JS handlers BEFORE the Closure fields drop. A live
+        // close/error event firing after the Closure is freed panics
+        // wasm-bindgen with "closure invoked recursively or after
+        // being dropped" — and once that throws, subsequent wasm
+        // calls (including any reconnect attempt) trip the same
+        // poisoned state. Clearing the .on* properties first means
+        // any in-flight events have nowhere to go.
+        self.ws.set_onopen(None);
+        self.ws.set_onmessage(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
+        // Best-effort close — no-op if the socket already
+        // CLOSING/CLOSED. We don't surface the error: nothing
+        // useful to do in Drop.
+        let _ = self.ws.close();
+    }
 }
 
 #[async_trait(?Send)]
