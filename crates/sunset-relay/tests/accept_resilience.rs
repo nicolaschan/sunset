@@ -226,3 +226,80 @@ async fn relay_accept_loop_survives_a_failed_ws_handshake() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn relay_handshakes_run_concurrently() {
+    // Open many rude clients in parallel — each completes the WS
+    // upgrade and then sits silent (never sends Noise IK). With the
+    // concurrent accept worker the relay should accept a healthy
+    // client in well under (N × accept_handshake_timeout); with a
+    // serialized accept loop it would take ≥ N × 15 s.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut relay = Relay::new(relay_config(dir.path()))
+                .await
+                .expect("relay new");
+            let dial_addr = relay.dial_address();
+            let host_port = extract_host_port(&dial_addr);
+            let _engine_task = relay.run_for_test().await.expect("relay run");
+
+            // Open 8 rude WS clients in parallel.
+            let n = 8usize;
+            let mut held = Vec::with_capacity(n);
+            for _ in 0..n {
+                let bad_url = format!("ws://{host_port}/");
+                let (ws, _resp) = tokio_tungstenite::connect_async(&bad_url)
+                    .await
+                    .expect("rude WS upgrade");
+                held.push(ws);
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Healthy dial. With concurrent accept this should land
+            // promptly (well under one handshake timeout); with a
+            // serialized accept loop it'd take n × 15 s.
+            let alice = Identity::generate(&mut OsRng);
+            let store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
+            let raw = WebSocketRawTransport::dial_only();
+            let noise = NoiseTransport::new(raw, Arc::new(IdentityAdapter(alice.clone())));
+            let signer: Arc<dyn Signer> = Arc::new(alice.clone());
+            let engine = Rc::new(SyncEngine::new(
+                store,
+                noise,
+                SyncConfig::default(),
+                PeerId(alice.store_verifying_key()),
+                signer,
+            ));
+            let engine_clone = engine.clone();
+            tokio::task::spawn_local(async move {
+                let _ = engine_clone.run().await;
+            });
+
+            let start = tokio::time::Instant::now();
+            let dial = tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.add_peer(PeerAddr::new(Bytes::from(dial_addr))),
+            )
+            .await;
+            let elapsed = start.elapsed();
+
+            match dial {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("healthy dial failed: {e:?}"),
+                Err(_) => panic!(
+                    "healthy dial timed out — handshakes are still serialized somewhere \
+                     (took ≥5s for one healthy client behind {n} rude ones)"
+                ),
+            }
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "healthy dial took {elapsed:?} — handshakes are not properly concurrent"
+            );
+
+            drop(held);
+        })
+        .await;
+}
