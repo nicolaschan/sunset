@@ -95,12 +95,10 @@ mod tests {
             .run_until(async {
                 let (tx, rx) = mpsc::unbounded_channel::<u32>();
                 let inbound = UnboundedReceiverStream::new(rx);
-                let mut out = spawn_accept_worker(
-                    inbound,
-                    Duration::from_secs(5),
-                    16,
-                    |n: u32| async move { Ok::<u32, Error>(n * 2) },
-                );
+                let mut out =
+                    spawn_accept_worker(inbound, Duration::from_secs(5), 16, |n: u32| async move {
+                        Ok::<u32, Error>(n * 2)
+                    });
                 tx.send(7).unwrap();
                 drop(tx);
                 let got = out.recv().await.expect("one result").expect("ok");
@@ -158,21 +156,21 @@ mod tests {
             .run_until(async {
                 let (tx, rx) = mpsc::unbounded_channel::<()>();
                 let inbound = UnboundedReceiverStream::new(rx);
-                let mut out = spawn_accept_worker(
-                    inbound,
-                    Duration::from_millis(50),
-                    16,
-                    |()| async move {
+                let mut out =
+                    spawn_accept_worker(inbound, Duration::from_millis(50), 16, |()| async move {
                         // Never completes.
                         std::future::pending::<()>().await;
                         unreachable!();
                         #[allow(unreachable_code)]
                         Ok::<(), Error>(())
-                    },
-                );
+                    });
                 tx.send(()).unwrap();
                 let start = tokio::time::Instant::now();
-                let got = out.recv().await.expect("a result").expect_err("expected timeout err");
+                let got = out
+                    .recv()
+                    .await
+                    .expect("a result")
+                    .expect_err("expected timeout err");
                 let elapsed = start.elapsed();
                 assert!(matches!(got, Error::Transport(_)), "got: {got:?}");
                 assert!(
@@ -198,11 +196,8 @@ mod tests {
 
                 let inflight_for_fn = inflight.clone();
                 let max_for_fn = max_seen.clone();
-                let mut out = spawn_accept_worker(
-                    inbound,
-                    Duration::from_secs(5),
-                    cap,
-                    move |_n: u32| {
+                let mut out =
+                    spawn_accept_worker(inbound, Duration::from_secs(5), cap, move |_n: u32| {
                         let inflight = inflight_for_fn.clone();
                         let max_seen = max_for_fn.clone();
                         async move {
@@ -216,8 +211,7 @@ mod tests {
                             inflight.set(inflight.get() - 1);
                             Ok::<(), Error>(())
                         }
-                    },
-                );
+                    });
 
                 for i in 0..10u32 {
                     tx.send(i).unwrap();
@@ -251,12 +245,10 @@ mod tests {
             .run_until(async {
                 let (tx, rx) = mpsc::unbounded_channel::<u32>();
                 let inbound = UnboundedReceiverStream::new(rx);
-                let mut out = spawn_accept_worker(
-                    inbound,
-                    Duration::from_secs(5),
-                    16,
-                    |n: u32| async move { Ok::<u32, Error>(n) },
-                );
+                let mut out =
+                    spawn_accept_worker(inbound, Duration::from_secs(5), 16, |n: u32| async move {
+                        Ok::<u32, Error>(n)
+                    });
                 for i in 0..3u32 {
                     tx.send(i).unwrap();
                 }
@@ -265,7 +257,10 @@ mod tests {
                     out.recv().await.expect("one of three").expect("ok");
                 }
                 let extra = out.recv().await;
-                assert!(extra.is_none(), "expected None after source closed; got {extra:?}");
+                assert!(
+                    extra.is_none(),
+                    "expected None after source closed; got {extra:?}"
+                );
             })
             .await;
     }
