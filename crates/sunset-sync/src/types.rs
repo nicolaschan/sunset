@@ -61,6 +61,12 @@ pub struct SyncConfig {
     /// sends the Noise IK initiator message. On timeout, the connection
     /// is dropped and the engine continues accepting. Default 15 s.
     pub accept_handshake_timeout: Duration,
+    /// Bound on concurrent in-flight inbound handshakes for transports
+    /// that adopt `spawn_accept_worker`. Past this, new inbound items
+    /// wait for a permit before spawning a handshake task. Default 256
+    /// — large enough for hobby-scale traffic, small enough that a
+    /// flood of bad probes can't exhaust task / FD budgets.
+    pub accept_max_inflight: usize,
 }
 
 impl Default for SyncConfig {
@@ -74,6 +80,7 @@ impl Default for SyncConfig {
             heartbeat_interval: Duration::from_secs(15),
             heartbeat_timeout: Duration::from_secs(45),
             accept_handshake_timeout: Duration::from_secs(15),
+            accept_max_inflight: 256,
         }
     }
 }
