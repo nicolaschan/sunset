@@ -45,3 +45,4 @@ sunset-store-memory.workspace = true
 sunset-sync = { workspace = true, features = ["test-helpers"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "signal", "fs", "sync", "net"] }
+tokio-tungstenite.workspace = true
