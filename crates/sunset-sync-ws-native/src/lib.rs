@@ -64,16 +64,9 @@ pub struct WebSocketRawTransport {
 
 enum TransportMode {
     DialOnly,
-    Listening {
-        listener: Mutex<TcpListener>,
-    },
-    /// Accept already-WS-upgraded server-side connections from a
-    /// background worker.
-    HandshookExternal {
-        rx: Mutex<
-            tokio::sync::mpsc::UnboundedReceiver<sunset_sync::Result<WebSocketRawConnection>>,
-        >,
-    },
+    Listening { listener: Mutex<TcpListener> },
+    /// Accept pre-classified TcpStreams from an external dispatcher.
+    ExternalStreams { rx: Mutex<tokio::sync::mpsc::Receiver<TcpStream>> },
 }
 
 impl WebSocketRawTransport {
@@ -94,48 +87,29 @@ impl WebSocketRawTransport {
         })
     }
 
-    /// Accept pre-classified TCPs from a router; spawn one WS-upgrade
-    /// task per TCP under the given timeout and inflight cap. The
-    /// trait's `accept()` then dequeues completed `WebSocketRawConnection`s.
-    pub fn external_streams_with(
-        rx: tokio::sync::mpsc::Receiver<TcpStream>,
-        accept_handshake_timeout: std::time::Duration,
-        accept_max_inflight: usize,
-    ) -> Self {
-        use tokio_stream::wrappers::ReceiverStream;
-        let inbound = ReceiverStream::new(rx);
-        let completed = sunset_sync::spawn_accept_worker(
-            inbound,
-            accept_handshake_timeout,
-            accept_max_inflight,
-            |tcp: TcpStream| async move {
-                let ws = tokio_tungstenite::accept_async(tcp)
-                    .await
-                    .map_err(|e| sunset_sync::Error::Transport(format!("ws upgrade: {e}")))?;
-                let (sink, stream) = ws.split();
-                Ok(WebSocketRawConnection::new(
-                    WsSink::Server(sink),
-                    WsStream::Server(stream),
-                ))
-            },
-        );
+    /// Accept already-classified TcpStreams from an external dispatcher.
+    /// The caller has bound the TcpListener and decided which connections
+    /// belong to WS (vs other protocols on the same port). When the
+    /// channel closes, `accept` returns an error and the engine treats it
+    /// as transport failure.
+    pub fn external_streams(rx: tokio::sync::mpsc::Receiver<TcpStream>) -> Self {
         Self {
-            mode: TransportMode::HandshookExternal {
-                rx: Mutex::new(completed),
+            mode: TransportMode::ExternalStreams {
+                rx: Mutex::new(rx),
             },
         }
     }
 
     /// Bound address (useful when binding to port 0).
     ///
-    /// Returns `None` for `HandshookExternal` mode — the relay knows its own
+    /// Returns `None` for `ExternalStreams` mode — the relay knows its own
     /// bound address from the `TcpListener` it holds directly.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.mode {
             TransportMode::Listening { listener } => {
                 listener.try_lock().ok().and_then(|l| l.local_addr().ok())
             }
-            TransportMode::DialOnly | TransportMode::HandshookExternal { .. } => None,
+            TransportMode::DialOnly | TransportMode::ExternalStreams { .. } => None,
         }
     }
 }
@@ -161,33 +135,34 @@ impl RawTransport for WebSocketRawTransport {
     }
 
     async fn accept(&self) -> SyncResult<Self::Connection> {
-        match &self.mode {
+        let tcp = match &self.mode {
             TransportMode::Listening { listener } => {
                 let listener = listener.lock().await;
                 let (tcp, _peer) = listener
                     .accept()
                     .await
                     .map_err(|e| SyncError::Transport(format!("accept: {e}")))?;
-                let ws = tokio_tungstenite::accept_async(tcp)
-                    .await
-                    .map_err(|e| SyncError::Transport(format!("ws upgrade: {e}")))?;
-                let (sink, stream) = ws.split();
-                Ok(WebSocketRawConnection::new(
-                    WsSink::Server(sink),
-                    WsStream::Server(stream),
-                ))
+                tcp
             }
-            TransportMode::HandshookExternal { rx } => {
+            TransportMode::ExternalStreams { rx } => {
                 let mut rx = rx.lock().await;
                 rx.recv()
                     .await
-                    .ok_or_else(|| SyncError::Transport("accept worker terminated".into()))?
+                    .ok_or_else(|| SyncError::Transport("external stream channel closed".into()))?
             }
             TransportMode::DialOnly => {
                 std::future::pending::<()>().await;
                 unreachable!();
             }
-        }
+        };
+        let ws = tokio_tungstenite::accept_async(tcp)
+            .await
+            .map_err(|e| SyncError::Transport(format!("ws upgrade: {e}")))?;
+        let (sink, stream) = ws.split();
+        Ok(WebSocketRawConnection::new(
+            WsSink::Server(sink),
+            WsStream::Server(stream),
+        ))
     }
 }
 

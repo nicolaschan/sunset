@@ -15,7 +15,6 @@ futures-util.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "net"] }
-tokio-stream.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
 
@@ -29,5 +28,4 @@ sunset-sync = { workspace = true, features = ["test-helpers"] }
 sunset-noise.workspace = true
 sunset-core.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "net"] }
-tokio-tungstenite = { workspace = true, features = ["connect"] }
 zeroize.workspace = true

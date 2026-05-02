@@ -33,13 +33,7 @@ impl Signaler for StubSignaler {
 fn webrtc_transport_constructs() {
     let signaler: Rc<dyn Signaler> = Rc::new(StubSignaler);
     let local = PeerId(VerifyingKey::new(Bytes::from_static(&[1u8; 32])));
-    let t = WebRtcRawTransport::new(
-        signaler,
-        local,
-        vec!["stun:stun.l.google.com:19302".into()],
-        std::time::Duration::from_secs(15),
-        256,
-    );
+    let t = WebRtcRawTransport::new(signaler, local, vec!["stun:stun.l.google.com:19302".into()]);
     let _: &dyn TraitMarker = &t;
 }
 

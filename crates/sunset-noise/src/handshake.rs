@@ -3,7 +3,6 @@
 //! Wraps any `sunset_sync::RawTransport` with the
 //! `Noise_IK_25519_XChaChaPoly_BLAKE2b` pattern via `snow`.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,94 +20,22 @@ use crate::error::{Error, Result};
 use crate::identity::{NoiseIdentity, ed25519_seed_to_x25519_secret};
 use crate::pattern::NOISE_PATTERN;
 
-/// Receiver side of the worker-backed accept queue (see
-/// `NoiseTransport::new_with_worker`).
-type AcceptRx<C> =
-    tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<sunset_sync::Result<C>>>>;
-
 /// A `Transport` decorator that runs the Noise IK handshake on each
 /// connection and exposes the result as an authenticated, encrypted
 /// `TransportConnection`.
 pub struct NoiseTransport<R: RawTransport> {
-    raw: Rc<R>,
+    raw: R,
     local: Arc<dyn NoiseIdentity>,
-    /// When constructed via `new_with_worker`, holds completed Noise
-    /// responder results. When constructed via plain `new`, this is
-    /// `None` and `accept()` falls back to the inline (serial) path.
-    accept_rx: AcceptRx<NoiseConnection<R::Connection>>,
 }
 
-impl<R: RawTransport + 'static> NoiseTransport<R>
-where
-    R::Connection: 'static,
-{
+impl<R: RawTransport> NoiseTransport<R> {
     pub fn new(raw: R, local: Arc<dyn NoiseIdentity>) -> Self {
-        Self {
-            raw: Rc::new(raw),
-            local,
-            accept_rx: tokio::sync::Mutex::new(None),
-        }
-    }
-
-    /// Like `new`, but spawns a background worker that drives
-    /// `raw.accept()` repeatedly and runs the Noise responder for
-    /// each result on its own `spawn_local` task. Each responder is
-    /// bounded by `accept_handshake_timeout`; total concurrent
-    /// responders are bounded by `accept_max_inflight`. The trait's
-    /// `accept()` then dequeues completed `NoiseConnection`s.
-    pub fn new_with_worker(
-        raw: R,
-        local: Arc<dyn NoiseIdentity>,
-        accept_handshake_timeout: std::time::Duration,
-        accept_max_inflight: usize,
-    ) -> Self {
-        let raw = Rc::new(raw);
-
-        // Build a stream that yields `R::Connection`s by repeatedly
-        // calling `raw.accept()`. Errors from the inner accept are
-        // logged and skipped (matches the `eprintln!` pattern used
-        // elsewhere in sunset-sync).
-        let raw_clone = raw.clone();
-        let inbound = futures::stream::unfold((), move |()| {
-            let raw = raw_clone.clone();
-            async move {
-                loop {
-                    match raw.accept().await {
-                        Ok(c) => return Some((c, ())),
-                        Err(e) => {
-                            eprintln!("sunset-noise: inner accept failed; continuing: {e}");
-                            continue;
-                        }
-                    }
-                }
-            }
-        });
-
-        let local_for_fn = local.clone();
-        let completed = sunset_sync::spawn_accept_worker(
-            Box::pin(inbound),
-            accept_handshake_timeout,
-            accept_max_inflight,
-            move |raw_conn: R::Connection| {
-                let local = local_for_fn.clone();
-                async move {
-                    do_handshake_responder(raw_conn, local)
-                        .await
-                        .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
-                }
-            },
-        );
-
-        Self {
-            raw,
-            local,
-            accept_rx: tokio::sync::Mutex::new(Some(completed)),
-        }
+        Self { raw, local }
     }
 }
 
 #[async_trait(?Send)]
-impl<R: RawTransport + 'static> Transport for NoiseTransport<R>
+impl<R: RawTransport> Transport for NoiseTransport<R>
 where
     R::Connection: 'static,
 {
@@ -124,15 +51,6 @@ where
     }
 
     async fn accept(&self) -> SyncResult<Self::Connection> {
-        let mut guard = self.accept_rx.lock().await;
-        if let Some(rx) = guard.as_mut() {
-            return rx.recv().await.ok_or_else(|| {
-                sunset_sync::Error::Transport("noise accept worker terminated".into())
-            })?;
-        }
-        // Fallback: serial inline path for callers that constructed
-        // via `new` (preserved for compatibility — used by tests).
-        drop(guard);
         let raw = self.raw.accept().await?;
         do_handshake_responder(raw, self.local.clone())
             .await

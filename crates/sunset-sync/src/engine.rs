@@ -393,20 +393,21 @@ where
                     match maybe_conn {
                         Some(Ok(conn)) => self.spawn_peer(conn, inbound_tx.clone()).await,
                         Some(Err(e)) => {
-                            // Backstop only — transports that adopt
-                            // `spawn_accept_worker` enforce their own
-                            // per-task timeout and never reach this
-                            // arm via timeout. This branch still
-                            // catches transport-construction errors
-                            // and any inline-accept transport that
-                            // bypassed the worker abstraction.
+                            // A single accept failure (e.g. a malformed
+                            // WS upgrade from a public-internet probe)
+                            // must not tear down the engine — otherwise
+                            // every subsequent connection on this
+                            // listener hangs forever because nothing
+                            // drains the dispatch channel. Log and
+                            // keep accepting.
                             eprintln!("sunset-sync: transport accept failed; continuing: {e}");
                         }
                         None => {
-                            // Backstop only; see comment on Some(Err)
-                            // above. With the worker abstraction in
-                            // place this should never fire on the
-                            // relay or browser code paths.
+                            // Per-handshake timeout. The misbehaving
+                            // peer (e.g. completed WS upgrade but
+                            // never sent Noise IK) had its TCP
+                            // dropped when the future was cancelled;
+                            // the loop continues.
                             eprintln!(
                                 "sunset-sync: transport accept timed out after {:?}; continuing",
                                 self.config.accept_handshake_timeout
@@ -903,19 +904,6 @@ where
             .registry
             .iter()
             .any(|(k, _)| k == vk)
-    }
-
-    /// Snapshot the verifying keys currently in the subscription registry.
-    /// Test-only — used to debug missing-subscription failures.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn registered_subscribers(&self) -> Vec<sunset_store::VerifyingKey> {
-        self.state
-            .lock()
-            .await
-            .registry
-            .iter()
-            .map(|(k, _)| k.clone())
-            .collect()
     }
 
     /// Fan-out an event to every live subscriber. Drops senders whose

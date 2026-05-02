@@ -71,13 +71,10 @@ impl Client {
         let signaler = RelaySignaler::new(identity.clone(), room_fp_hex.clone(), &store);
         let local_peer = PeerId(identity.store_verifying_key());
         let signaler_dyn: Rc<dyn sunset_sync::Signaler> = signaler;
-        let sync_config = SyncConfig::default();
         let rtc_raw = WebRtcRawTransport::new(
             signaler_dyn,
             local_peer.clone(),
             vec!["stun:stun.l.google.com:19302".into()],
-            sync_config.accept_handshake_timeout,
-            sync_config.accept_max_inflight,
         );
         let rtc_noise =
             NoiseTransport::new(rtc_raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
@@ -88,7 +85,7 @@ impl Client {
         let engine = Rc::new(SyncEngine::new(
             store.clone(),
             multi,
-            sync_config,
+            SyncConfig::default(),
             local_peer,
             signer,
         ));

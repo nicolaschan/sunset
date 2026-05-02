@@ -143,24 +143,6 @@ async fn alice_to_bob_via_two_relays() {
             let (alice_store, alice_engine) = make_client(alice.clone(), &relay_a_addr).await;
             let (bob_store, bob_engine) = make_client(bob.clone(), &relay_b_addr).await;
 
-            // Bob must know relay B's broad subscription before publishing —
-            // otherwise his push-routing iterates an empty peer set and
-            // the SUBSCRIBE entry never leaves bob's local store.
-            // add_peer returns when Hello completes; the bootstrap digest
-            // exchange that populates bob's registry happens *after*,
-            // asynchronously.
-            let relay_b_vk_inner = VerifyingKey::new(Bytes::copy_from_slice(&relay_b.ed25519_public));
-            let bob_bootstrapped = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async { bob_engine.knows_peer_subscription(&relay_b_vk_inner).await },
-            )
-            .await;
-            assert!(
-                bob_bootstrapped,
-                "bob's engine did not bootstrap relay B's subscription"
-            );
-
             // Bob declares interest.
             bob_engine
                 .publish_subscription(room_messages_filter(&bob_room), Duration::from_secs(60))
@@ -196,49 +178,11 @@ async fn alice_to_bob_via_two_relays() {
                 "alice did not learn relay B's subscription (federation not established)"
             );
 
-            // Wait for relay B to learn bob's room subscription. This is
-            // the load-bearing event for push routing: when alice inserts
-            // msg-1, the chain is alice → relay A → relay B → bob. Bob is
-            // only connected to relay B, so relay B must have bob's
-            // SUBSCRIBE entry registered for B's push routing to send
-            // msg-1 to bob. `bob.publish_subscription().await` only
-            // guarantees the *local* insert; the push to relay B is
-            // asynchronous, and under heavy parallel-test load it can
-            // race with alice's insert. Without this wait, msg-1 arrives
-            // at B before B knows bob is subscribed and only reaches bob
-            // when the next anti-entropy tick fires (default 30 s),
-            // making the test's 10 s deadline race that interval — the
-            // root cause of the historical flake.
-            //
-            // We can't observe "alice knows bob's subscription" because
-            // alice never published a subscription herself, so relay A
-            // has no matching filter to push bob's SUBSCRIBE entry to
-            // alice. We query relay B's engine directly via the
-            // test-only `engine()` accessor.
-            let bob_vk = bob.store_verifying_key();
-            let relay_b_knows_bob = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async { relay_b.engine().knows_peer_subscription(&bob_vk).await },
-            )
-            .await;
-            assert!(
-                relay_b_knows_bob,
-                "relay B did not register bob's room subscription (B's push routing to bob not armed)"
-            );
-
             // Alice composes + inserts.
             let body = "hello bob across two relays";
             let sent_at = 1_700_000_000_000u64;
-            let ComposedMessage { entry, block } = compose_message(
-                &alice,
-                &alice_room,
-                0,
-                sent_at,
-                MessageBody::Text(body.to_owned()),
-                &mut OsRng,
-            )
-            .unwrap();
+            let ComposedMessage { entry, block } =
+                compose_message(&alice, &alice_room, 0, sent_at, MessageBody::Text(body.to_owned()), &mut OsRng).unwrap();
             let expected_hash: Hash = block.hash();
             alice_store
                 .insert(entry.clone(), Some(block.clone()))
@@ -346,27 +290,6 @@ async fn failover_when_relay_a_dies() {
                 .await
                 .expect("bob dial relay B");
 
-            // Bob must know relay A and B's broad subscriptions before
-            // publishing — otherwise his push-routing iterates an empty
-            // peer set and the SUBSCRIBE entry never leaves bob's local
-            // store. add_peer returns when Hello completes; the
-            // bootstrap digest exchange that populates bob's registry
-            // happens *after*, asynchronously.
-            let relay_a_vk = VerifyingKey::new(Bytes::copy_from_slice(&relay_a.ed25519_public));
-            let bob_bootstrapped = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async {
-                    bob_engine.knows_peer_subscription(&relay_a_vk).await
-                        && bob_engine.knows_peer_subscription(&relay_b_vk).await
-                },
-            )
-            .await;
-            assert!(
-                bob_bootstrapped,
-                "bob's engine did not bootstrap relay A/B subscriptions"
-            );
-
             bob_engine
                 .publish_subscription(room_messages_filter(&bob_room), Duration::from_secs(60))
                 .await
@@ -383,35 +306,6 @@ async fn failover_when_relay_a_dies() {
             assert!(
                 alice_knows_relay_b,
                 "alice did not learn relay B's subscription before starting"
-            );
-
-            // Wait for BOTH relays to register bob's room subscription.
-            // The chain bob → relay → bob's SUBSCRIBE entry → relay's
-            // local_sub event → registry update happens asynchronously
-            // after `bob.publish_subscription().await` returns; if alice
-            // inserts before this completes, push routing on the
-            // alice-msg-arrives-at-relay hop skips bob and bob has to
-            // wait for the next anti-entropy tick (default 30 s).
-            let bob_vk = bob.store_verifying_key();
-            let relay_a_knows_bob = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async { relay_a.engine().knows_peer_subscription(&bob_vk).await },
-            )
-            .await;
-            let relay_b_knows_bob = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async { relay_b.engine().knows_peer_subscription(&bob_vk).await },
-            )
-            .await;
-            assert!(
-                relay_a_knows_bob,
-                "relay A did not register bob's room subscription"
-            );
-            assert!(
-                relay_b_knows_bob,
-                "relay B did not register bob's room subscription"
             );
 
             // Compose msg-1; expect it to arrive normally (both relays alive).
