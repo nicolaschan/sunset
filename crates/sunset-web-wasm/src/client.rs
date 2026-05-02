@@ -9,6 +9,7 @@ use rand_core::SeedableRng;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+use sunset_core::membership::{Member, TrackerHandles};
 use sunset_core::{Ed25519Verifier, Identity, MessageBody, Room};
 use sunset_noise::{NoiseIdentity, NoiseTransport};
 use sunset_store_memory::MemoryStore;
@@ -46,7 +47,7 @@ pub struct Client {
     on_receipt: Rc<RefCell<Option<js_sys::Function>>>,
     relay_status: Rc<RefCell<String>>,
     presence_started: Rc<RefCell<bool>>,
-    tracker_handles: Rc<crate::membership_tracker::TrackerHandles>,
+    tracker_handles: Rc<TrackerHandles>,
     voice: crate::voice::VoiceCell,
 }
 
@@ -115,9 +116,7 @@ impl Client {
             on_receipt: Rc::new(RefCell::new(None)),
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
             presence_started: Rc::new(RefCell::new(false)),
-            tracker_handles: Rc::new(crate::membership_tracker::TrackerHandles::new(
-                "disconnected",
-            )),
+            tracker_handles: Rc::new(TrackerHandles::new("disconnected")),
             voice: crate::voice::new_voice_cell(),
         })
     }
@@ -238,7 +237,7 @@ impl Client {
             }
         }
 
-        crate::membership_tracker::spawn_tracker(
+        sunset_core::membership::spawn_tracker(
             self.store.clone(),
             engine_events,
             local_peer,
@@ -251,11 +250,21 @@ impl Client {
 
         // Fire an initial relay_status callback in case the seed
         // pushed us into "connected" / "disconnected".
-        crate::membership_tracker::fire_relay_status_now(&self.tracker_handles);
+        sunset_core::membership::fire_relay_status_now(&self.tracker_handles);
     }
 
     pub fn on_members_changed(&self, callback: js_sys::Function) {
-        *self.tracker_handles.on_members.borrow_mut() = Some(callback);
+        // Bridge js_sys::Function to the platform-agnostic
+        // Box<dyn Fn(&[Member])> the tracker invokes. The bridge
+        // builds a JS array of `MemberJs` and calls the JS callback.
+        let bridge = move |members: &[Member]| {
+            let arr = js_sys::Array::new();
+            for m in members {
+                arr.push(&JsValue::from(crate::members::MemberJs::from(m)));
+            }
+            let _ = callback.call1(&JsValue::NULL, &arr);
+        };
+        *self.tracker_handles.on_members.borrow_mut() = Some(Box::new(bridge));
         // Clear the debounce signature so the next `maybe_fire` (within
         // `presence_refresh_ms` via the periodic refresh tick) fires the
         // newly-registered callback with the current member list.
@@ -268,7 +277,10 @@ impl Client {
     }
 
     pub fn on_relay_status_changed(&self, callback: js_sys::Function) {
-        *self.tracker_handles.on_relay_status.borrow_mut() = Some(callback);
+        let bridge = move |status: &str| {
+            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(status));
+        };
+        *self.tracker_handles.on_relay_status.borrow_mut() = Some(Box::new(bridge));
     }
 
     pub async fn publish_room_subscription(&self) -> Result<(), JsError> {

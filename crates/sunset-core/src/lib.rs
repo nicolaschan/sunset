@@ -13,6 +13,7 @@ pub mod error;
 pub mod filters;
 pub mod identity;
 pub mod liveness;
+pub mod membership;
 pub mod message;
 pub mod verifier;
 
