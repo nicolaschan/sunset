@@ -75,6 +75,8 @@ impl Client {
             signaler_dyn,
             local_peer.clone(),
             vec!["stun:stun.l.google.com:19302".into()],
+            std::time::Duration::from_secs(15),
+            256,
         );
         let rtc_noise =
             NoiseTransport::new(rtc_raw, Arc::new(IdentityNoiseAdapter(identity.clone())));

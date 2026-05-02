@@ -57,10 +57,13 @@ pub struct WebRtcRawTransport {
     ice_urls: Vec<String>,
     inner: Rc<RefCell<Inner>>,
     /// Holds completed inbound connections produced by the background
-    /// accept worker. The worker drains `offers_rx` and runs the full
-    /// WebRTC handshake outside the engine's `select!` loop so it
-    /// survives the loop dropping its `accept()` future on every tick.
-    completed_rx: Rc<Mutex<mpsc::UnboundedReceiver<Result<WebRtcRawConnection>>>>,
+    /// accept worker. Lazily filled on first `accept()` call after the
+    /// worker is spawned by `ensure_accept_worker`.
+    completed_rx: Rc<
+        Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<sunset_sync::Result<WebRtcRawConnection>>>,
+        >,
+    >,
 }
 
 struct Inner {
@@ -73,15 +76,21 @@ struct Inner {
     /// Drained by the accept worker. Each entry is (from_peer, offer_sdp).
     offers_tx: mpsc::UnboundedSender<(PeerId, String)>,
     offers_rx: Option<mpsc::UnboundedReceiver<(PeerId, String)>>,
-    completed_tx: Option<mpsc::UnboundedSender<Result<WebRtcRawConnection>>>,
+    accept_handshake_timeout: std::time::Duration,
+    accept_max_inflight: usize,
 }
 
 impl WebRtcRawTransport {
     /// `ice_urls` should typically contain at least one STUN server,
     /// e.g. `["stun:stun.l.google.com:19302".into()]`.
-    pub fn new(signaler: Rc<dyn Signaler>, local_peer: PeerId, ice_urls: Vec<String>) -> Self {
+    pub fn new(
+        signaler: Rc<dyn Signaler>,
+        local_peer: PeerId,
+        ice_urls: Vec<String>,
+        accept_handshake_timeout: std::time::Duration,
+        accept_max_inflight: usize,
+    ) -> Self {
         let (offers_tx, offers_rx) = mpsc::unbounded::<(PeerId, String)>();
-        let (completed_tx, completed_rx) = mpsc::unbounded::<Result<WebRtcRawConnection>>();
         Self {
             signaler,
             local_peer,
@@ -92,9 +101,10 @@ impl WebRtcRawTransport {
                 per_peer: HashMap::new(),
                 offers_tx,
                 offers_rx: Some(offers_rx),
-                completed_tx: Some(completed_tx),
+                accept_handshake_timeout,
+                accept_max_inflight,
             })),
-            completed_rx: Rc::new(Mutex::new(completed_rx)),
+            completed_rx: Rc::new(Mutex::new(None)),
         }
     }
 
@@ -293,14 +303,11 @@ impl RawTransport for WebRtcRawTransport {
     async fn accept(&self) -> Result<Self::Connection> {
         self.ensure_dispatcher();
         self.ensure_accept_worker();
-        // The background accept worker runs the full WebRTC handshake
-        // independently of the engine's `select!` loop (which would
-        // otherwise drop our future on every tick, restarting the
-        // handshake from scratch). Here we just await the next
-        // completed connection.
-        let mut completed_rx = self.completed_rx.lock().await;
-        completed_rx
-            .next()
+        let mut completed = self.completed_rx.lock().await;
+        let rx = completed
+            .as_mut()
+            .ok_or_else(|| Error::Transport("accept worker never initialized".into()))?;
+        rx.recv()
             .await
             .ok_or_else(|| Error::Transport("accept worker terminated".into()))?
     }
@@ -311,42 +318,44 @@ impl WebRtcRawTransport {
     /// drains `offers_rx` and runs the full WebRTC handshake for each
     /// inbound offer, decoupled from the engine's `select!` loop.
     fn ensure_accept_worker(&self) {
-        let (offers_rx_opt, completed_tx_opt) = {
+        let offers_rx = {
             let mut inner = self.inner.borrow_mut();
             if inner.accept_worker_started {
                 return;
             }
             inner.accept_worker_started = true;
-            (inner.offers_rx.take(), inner.completed_tx.take())
+            inner.offers_rx.take()
         };
-        let mut offers_rx = match offers_rx_opt {
-            Some(r) => r,
-            None => return,
-        };
-        let completed_tx = match completed_tx_opt {
-            Some(t) => t,
-            None => return,
-        };
+        let Some(offers_rx) = offers_rx else { return };
+
+        let timeout = self.inner.borrow().accept_handshake_timeout;
+        let cap = self.inner.borrow().accept_max_inflight;
+
         let signaler = self.signaler.clone();
         let local_peer = self.local_peer.clone();
         let ice_urls = self.ice_urls.clone();
         let inner_ref = self.inner.clone();
-        spawn_local(async move {
-            while let Some((from_peer, offer_sdp)) = offers_rx.next().await {
-                let result = run_accept_one(
-                    signaler.clone(),
-                    local_peer.clone(),
-                    ice_urls.clone(),
-                    inner_ref.clone(),
-                    from_peer,
-                    offer_sdp,
-                )
-                .await;
-                if completed_tx.unbounded_send(result).is_err() {
-                    break;
+
+        let completed = sunset_sync::spawn_accept_worker(
+            offers_rx,
+            timeout,
+            cap,
+            move |(from_peer, offer_sdp)| {
+                let signaler = signaler.clone();
+                let local_peer = local_peer.clone();
+                let ice_urls = ice_urls.clone();
+                let inner_ref = inner_ref.clone();
+                async move {
+                    run_accept_one(
+                        signaler, local_peer, ice_urls, inner_ref, from_peer, offer_sdp,
+                    )
+                    .await
                 }
-            }
-        });
+            },
+        );
+
+        // Stash the completed receiver so accept() can drain it.
+        *self.completed_rx.try_lock().expect("first init") = Some(completed);
     }
 }
 
