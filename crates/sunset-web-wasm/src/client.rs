@@ -47,6 +47,7 @@ pub struct Client {
     relay_status: Rc<RefCell<String>>,
     presence_started: Rc<RefCell<bool>>,
     tracker_handles: Rc<crate::membership_tracker::TrackerHandles>,
+    voice: crate::voice::VoiceCell,
 }
 
 #[wasm_bindgen]
@@ -117,6 +118,7 @@ impl Client {
             tracker_handles: Rc::new(crate::membership_tracker::TrackerHandles::new(
                 "disconnected",
             )),
+            voice: crate::voice::new_voice_cell(),
         })
     }
 
@@ -317,6 +319,30 @@ impl Client {
         *self.on_receipt.borrow_mut() = Some(callback);
         // No new subscription needed — spawn_message_subscription handles
         // both Text and Receipt variants.
+    }
+
+    /// Initialise the voice subsystem. Spawns an in-process loopback
+    /// decode loop; `output_handler` is invoked with a Float32Array
+    /// of `FRAME_SAMPLES` samples (mono PCM at `SAMPLE_RATE`) for each
+    /// decoded 20 ms frame. Must be called before `voice_input`.
+    ///
+    /// Implementation: `sunset-voice` `VoiceEncoder` + `VoiceDecoder`
+    /// (currently a passthrough; a real codec slots in there without
+    /// changing this method's signature).
+    pub fn voice_start(&self, output_handler: &js_sys::Function) -> Result<(), JsError> {
+        crate::voice::voice_start(&self.voice, output_handler)
+    }
+
+    /// Stop the voice subsystem and release its resources.
+    pub fn voice_stop(&self) -> Result<(), JsError> {
+        crate::voice::voice_stop(&self.voice)
+    }
+
+    /// Submit one 20 ms frame of mono PCM (Float32Array of length
+    /// `FRAME_SAMPLES` at `SAMPLE_RATE`) for encoding + loopback
+    /// delivery to the output handler.
+    pub fn voice_input(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
+        crate::voice::voice_input(&self.voice, pcm)
     }
 
     fn spawn_message_subscription(&self) {
