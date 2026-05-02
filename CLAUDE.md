@@ -81,6 +81,21 @@ Two non-obvious correctness rules that exist because the wrong shape is easy to 
 
 ## Workflow notes
 
-- Worktrees live under `.worktrees/` (gitignored). Plans are typically executed via the superpowers subagent-driven-development flow with two-stage review (spec compliance → code quality).
+- **Use git worktrees for all implementation work.** Use the `superpowers:using-git-worktrees` skill before starting any feature or plan execution. Worktrees live under `.worktrees/` (gitignored). Plans are executed via the superpowers subagent-driven-development flow with two-stage review (spec compliance → code quality).
 - Cargo.lock is committed (workspace will eventually ship binaries — relay, TUI).
-- Conventional commits aren't enforced; recent history uses imperative, scope-prefixed messages without a `Co-Authored-By` trailer on this branch.
+- Commits must include a `Co-Authored-By` trailer naming the actual model used (e.g. `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>` when running Sonnet 4.6, `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` when running Opus 4.7).
+- Use `gh pr create` (GitHub CLI) to open pull requests — not the API or any other method.
+
+## Debugging discipline
+
+**Tests encode the contract — don't patch around them.**
+
+Before touching a failing test, evaluate it from UX and API-contract perspectives: *should* this work? If yes, the test is correct and the bug is elsewhere. Never change, disable, or increase timeouts on a test to make it pass when the underlying behavior would be unacceptable to a real user. A one-minute connection delay is not an acceptable UX; if an integration test times out in 30 s under those conditions, the timeout is right and the code is broken.
+
+If a unit test requires workarounds for edge cases a caller would never expect to hit, that signals an API design problem — fix the API, not the test.
+
+**Debugging process:**
+
+1. Use the `superpowers:systematic-debugging` skill to understand the bug before proposing any fix.
+2. Step back from the immediate symptom and reason about how the broader architecture *should* solve the problem.
+3. If the fix requires architectural decisions (new abstractions, protocol changes, contract revisions), stop and confirm with the user via the `superpowers:brainstorming` and `superpowers:writing-plans` skills before writing any code.
