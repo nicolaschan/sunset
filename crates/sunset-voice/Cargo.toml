@@ -9,15 +9,31 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hex.workspace = true
 hkdf.workspace = true
 postcard.workspace = true
+rand_chacha.workspace = true
 rand_core.workspace = true
 serde.workspace = true
 sha2.workspace = true
 sunset-core.workspace = true
+sunset-sync.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+web-time.workspace = true
 zeroize.workspace = true
+async-stream.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasmtimer.workspace = true
+wasm-bindgen-futures.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+async-trait.workspace = true
+sunset-store = { path = "../sunset-store" }
