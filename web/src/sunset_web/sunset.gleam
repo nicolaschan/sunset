@@ -214,3 +214,9 @@ pub fn send_reaction(
 
 @external(javascript, "./sunset.ffi.mjs", "clientPublicKeyHex")
 pub fn client_public_key_hex(client: ClientHandle) -> String
+
+/// Lazily registers the `emoji-picker-element` web component. Idempotent;
+/// safe to call on every picker open. Resolves the dynamic import on
+/// first call, caches the promise on subsequent calls.
+@external(javascript, "./sunset.ffi.mjs", "registerEmojiPicker")
+pub fn register_emoji_picker() -> Nil

@@ -314,3 +314,11 @@ export function clientPublicKeyHex(client) {
   const bytes = client.public_key;
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+let emojiPickerLoaded = null;
+export function registerEmojiPicker() {
+  if (!emojiPickerLoaded) {
+    emojiPickerLoaded = import("emoji-picker-element");
+  }
+  return emojiPickerLoaded;
+}
