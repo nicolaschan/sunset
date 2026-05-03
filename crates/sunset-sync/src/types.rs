@@ -55,12 +55,6 @@ pub struct SyncConfig {
     /// `Disconnected { reason: "heartbeat timeout" }`. Default 45 s
     /// (= 3 × `heartbeat_interval`).
     pub heartbeat_timeout: Duration,
-    /// Per-inbound-handshake budget for `transport.accept()`. Bounds the
-    /// time a misbehaving client can wedge the engine's accept loop —
-    /// e.g. a peer that completes the WebSocket upgrade but never
-    /// sends the Noise IK initiator message. On timeout, the connection
-    /// is dropped and the engine continues accepting. Default 15 s.
-    pub accept_handshake_timeout: Duration,
 }
 
 impl Default for SyncConfig {
@@ -73,7 +67,6 @@ impl Default for SyncConfig {
             bootstrap_filter: Filter::Namespace(reserved::SUBSCRIBE_NAME.into()),
             heartbeat_interval: Duration::from_secs(15),
             heartbeat_timeout: Duration::from_secs(45),
-            accept_handshake_timeout: Duration::from_secs(15),
         }
     }
 }

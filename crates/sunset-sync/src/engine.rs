@@ -44,55 +44,21 @@ impl ConnectionId {
     }
 }
 
-/// Wrap `transport.accept()` in a per-handshake deadline. Cross-platform:
-/// uses `tokio::time::timeout` natively and the `wasmtimer` drop-in on
-/// `wasm32`. Returns `None` on timeout; on timeout the future is dropped,
-/// which closes the underlying TCP/Noise resources for the misbehaving
-/// peer.
-async fn accept_with_timeout<T: Transport>(
-    timeout: std::time::Duration,
-    transport: &T,
-) -> Option<Result<T::Connection>> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        tokio::time::timeout(timeout, transport.accept()).await.ok()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        wasmtimer::tokio::timeout(timeout, transport.accept())
-            .await
-            .ok()
-    }
-}
-
 /// Free helper that spins up the outbound channel + spawns the per-peer
 /// task. Extracted from `SyncEngine::spawn_peer` so the AddPeer command
 /// handler can call it from a `'static` spawned task without holding
 /// `&self`.
-#[allow(clippy::too_many_arguments)]
 fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     conn: C,
-    local_peer: PeerId,
-    proto: u32,
+    env: crate::peer::PeerEnv,
     conn_id: ConnectionId,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     hello_done: Option<oneshot::Sender<Result<PeerId>>>,
-    heartbeat_interval: std::time::Duration,
-    heartbeat_timeout: std::time::Duration,
 ) {
     let conn = Rc::new(conn);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
     crate::spawn::spawn_local(run_peer(
-        conn,
-        local_peer,
-        proto,
-        conn_id,
-        out_tx,
-        out_rx,
-        inbound_tx,
-        hello_done,
-        heartbeat_interval,
-        heartbeat_timeout,
+        conn, env, conn_id, out_tx, out_rx, inbound_tx, hello_done,
     ));
 }
 
@@ -222,6 +188,16 @@ where
         let id = *next;
         *next += 1;
         ConnectionId(id)
+    }
+
+    /// Snapshot of the engine-level config that every per-peer task needs.
+    fn peer_env(&self) -> crate::peer::PeerEnv {
+        crate::peer::PeerEnv {
+            local_peer: self.local_peer.clone(),
+            protocol_version: self.config.protocol_version,
+            heartbeat_interval: self.config.heartbeat_interval,
+            heartbeat_timeout: self.config.heartbeat_timeout,
+        }
     }
 
     /// Initiate an outbound connection to `addr`. Returns when the connection
@@ -386,32 +362,17 @@ where
 
         loop {
             tokio::select! {
-                maybe_conn = accept_with_timeout(
-                    self.config.accept_handshake_timeout,
-                    &*self.transport,
-                ) => {
-                    match maybe_conn {
-                        Some(Ok(conn)) => self.spawn_peer(conn, inbound_tx.clone()).await,
-                        Some(Err(e)) => {
-                            // A single accept failure (e.g. a malformed
-                            // WS upgrade from a public-internet probe)
-                            // must not tear down the engine — otherwise
-                            // every subsequent connection on this
-                            // listener hangs forever because nothing
-                            // drains the dispatch channel. Log and
-                            // keep accepting.
-                            eprintln!("sunset-sync: transport accept failed; continuing: {e}");
-                        }
-                        None => {
-                            // Per-handshake timeout. The misbehaving
-                            // peer (e.g. completed WS upgrade but
-                            // never sent Noise IK) had its TCP
-                            // dropped when the future was cancelled;
-                            // the loop continues.
-                            eprintln!(
-                                "sunset-sync: transport accept timed out after {:?}; continuing",
-                                self.config.accept_handshake_timeout
-                            );
+                accept_res = self.transport.accept() => {
+                    match accept_res {
+                        Ok(conn) => self.spawn_peer(conn, inbound_tx.clone()).await,
+                        Err(e) => {
+                            // A single accept failure (e.g. an upstream pump that's
+                            // shutting down) must not tear down the engine — log and
+                            // keep accepting. If the channel underneath has truly
+                            // closed, every subsequent accept will return an error
+                            // too; that's fine — eventually the engine task is
+                            // aborted by the host.
+                            tracing::warn!(error = %e, "transport accept failed; continuing");
                         }
                     }
                 }
@@ -472,10 +433,7 @@ where
                 // progress (e.g. WebRTC, where SDP/ICE flows over the
                 // existing CRDT replication).
                 let transport = self.transport.clone();
-                let local_peer = self.local_peer.clone();
-                let proto = self.config.protocol_version;
-                let hb_int = self.config.heartbeat_interval;
-                let hb_to = self.config.heartbeat_timeout;
+                let env = self.peer_env();
                 let inbound_tx = inbound_tx.clone();
                 let conn_id = self.alloc_conn_id().await;
                 crate::spawn::spawn_local(async move {
@@ -483,16 +441,7 @@ where
                     let r = match connect_res {
                         Ok(conn) => {
                             let (hello_tx, hello_rx) = oneshot::channel::<Result<PeerId>>();
-                            spawn_run_peer(
-                                conn,
-                                local_peer,
-                                proto,
-                                conn_id,
-                                inbound_tx,
-                                Some(hello_tx),
-                                hb_int,
-                                hb_to,
-                            );
+                            spawn_run_peer(conn, env, conn_id, inbound_tx, Some(hello_tx));
                             // Wait for the Hello exchange to complete.
                             match hello_rx.await {
                                 Ok(Ok(peer_id)) => Ok(peer_id),
@@ -534,16 +483,7 @@ where
         inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     ) {
         let conn_id = self.alloc_conn_id().await;
-        spawn_run_peer(
-            conn,
-            self.local_peer.clone(),
-            self.config.protocol_version,
-            conn_id,
-            inbound_tx,
-            None,
-            self.config.heartbeat_interval,
-            self.config.heartbeat_timeout,
-        );
+        spawn_run_peer(conn, self.peer_env(), conn_id, inbound_tx, None);
     }
 
     async fn handle_inbound_event(&self, event: InboundEvent) {
@@ -593,7 +533,12 @@ where
                 conn_id,
                 reason,
             } => {
-                eprintln!("sunset-sync: peer {peer_id:?} disconnected ({conn_id}): {reason}");
+                tracing::info!(
+                    peer_id = ?peer_id,
+                    conn_id = %conn_id,
+                    reason = %reason,
+                    "peer disconnected",
+                );
                 let removed = {
                     let mut state = self.state.lock().await;
                     match state.peer_outbound.get(&peer_id) {
@@ -626,7 +571,7 @@ where
             let entry = match item {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("sunset-sync: replay_existing_subscriptions: {e}");
+                    tracing::warn!(error = %e, "replay_existing_subscriptions: store iteration");
                     continue;
                 }
             };
@@ -634,7 +579,7 @@ where
                 Ok(Some(b)) => b,
                 Ok(None) => continue,
                 Err(e) => {
-                    eprintln!("sunset-sync: replay_existing_subscriptions: {e}");
+                    tracing::warn!(error = %e, "replay_existing_subscriptions: get_content");
                     continue;
                 }
             };
@@ -732,7 +677,7 @@ where
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("sunset-sync: digest scan failed: {e}");
+                tracing::warn!(error = %e, "digest scan failed");
                 return;
             }
         };
@@ -808,9 +753,10 @@ where
                     // Already have a higher-priority version; drop silently.
                 }
                 Err(e) => {
-                    eprintln!(
-                        "sunset-sync: insert failed for entry from {:?}: {}",
-                        entry.verifying_key, e
+                    tracing::warn!(
+                        verifying_key = ?entry.verifying_key,
+                        error = %e,
+                        "insert failed for delivered entry",
                     );
                     continue;
                 }
@@ -983,7 +929,7 @@ where
             .verify_raw(&datagram.verifying_key, &payload, &datagram.signature)
             .is_err()
         {
-            eprintln!("sunset-sync: dropping ephemeral datagram from {from:?} — bad signature");
+            tracing::debug!(from = ?from, "dropping ephemeral datagram — bad signature");
             return;
         }
         self.dispatch_ephemeral_local(&datagram).await;

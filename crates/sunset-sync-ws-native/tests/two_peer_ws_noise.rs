@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::routing::get;
 use bytes::Bytes;
 use rand_core::OsRng;
 use zeroize::Zeroizing;
@@ -20,7 +21,7 @@ use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret}
 use sunset_store::{ContentBlock, Hash, Store as _};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::{PeerAddr, PeerId, SyncConfig, SyncEngine};
-use sunset_sync_ws_native::WebSocketRawTransport;
+use sunset_sync_ws_native::{WebSocketRawTransport, axum_integration};
 
 /// Adapter so sunset-core's `Identity` can be used as a NoiseIdentity
 /// without sunset-core itself depending on sunset-noise.
@@ -51,11 +52,22 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             let alice_store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
             let bob_store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
 
-            // ---- bob listens on a random port ----
-            let bob_raw = WebSocketRawTransport::listening_on("127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap();
-            let bob_bound = bob_raw.local_addr().unwrap();
+            // ---- bob listens on a random port via in-process axum ----
+            let (bob_raw, ws_tx) = WebSocketRawTransport::serving();
+            let app = axum::Router::new().route(
+                "/",
+                get({
+                    let ws_tx = ws_tx.clone();
+                    move |ws: axum::extract::WebSocketUpgrade| {
+                        axum_integration::ws_handler(ws, ws_tx.clone())
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bob_bound = listener.local_addr().unwrap();
+            let _serve_handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
             let bob_noise =
                 NoiseTransport::new(bob_raw, Arc::new(IdentityNoiseAdapter(bob.clone())));
 
@@ -139,8 +151,15 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             // ---- alice composes + inserts ----
             let body = "hello bob via real ws + noise";
             let sent_at = 1_700_000_000_000u64;
-            let ComposedMessage { entry, block } =
-                compose_message(&alice, &alice_room, 0, sent_at, MessageBody::Text(body.to_owned()), &mut OsRng).unwrap();
+            let ComposedMessage { entry, block } = compose_message(
+                &alice,
+                &alice_room,
+                0,
+                sent_at,
+                MessageBody::Text(body.to_owned()),
+                &mut OsRng,
+            )
+            .unwrap();
             let expected_hash: Hash = block.hash();
             alice_store
                 .insert(entry.clone(), Some(block.clone()))

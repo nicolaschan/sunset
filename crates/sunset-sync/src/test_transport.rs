@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::error::{Error, Result};
 use crate::transport::{Transport, TransportConnection};
@@ -47,7 +47,7 @@ impl TestNetwork {
             peer_id,
             addr,
             net: self.clone(),
-            accept_rx: Rc::new(RefCell::new(rx)),
+            accept_rx: Rc::new(Mutex::new(rx)),
         }
     }
 }
@@ -73,7 +73,10 @@ pub struct TestTransport {
     peer_id: PeerId,
     addr: PeerAddr,
     net: TestNetwork,
-    accept_rx: Rc<RefCell<mpsc::UnboundedReceiver<ConnectRequest>>>,
+    /// `tokio::sync::Mutex` (not `RefCell`) so the receiver guard can be
+    /// held across `.await` without tripping `clippy::await_holding_refcell_ref`.
+    /// Single-threaded `?Send` executor — there is no real contention.
+    accept_rx: Rc<Mutex<mpsc::UnboundedReceiver<ConnectRequest>>>,
 }
 
 impl TestTransport {
@@ -142,17 +145,13 @@ impl Transport for TestTransport {
         ))
     }
 
-    // `borrow_mut()` is held across `.await` intentionally: the entire transport
-    // runs on a single-threaded (?Send) executor, so no concurrent borrow can
-    // occur while the future is suspended.
-    #[allow(clippy::await_holding_refcell_ref)]
     async fn accept(&self) -> Result<Self::Connection> {
-        let req = self
-            .accept_rx
-            .borrow_mut()
+        let mut rx = self.accept_rx.lock().await;
+        let req = rx
             .recv()
             .await
             .ok_or_else(|| Error::Transport("transport closed".into()))?;
+        drop(rx);
         // Install our side and signal ready.
         let _ = req.ready.send(());
         Ok(TestConnection::new(
@@ -169,9 +168,12 @@ impl Transport for TestTransport {
 pub struct TestConnection {
     peer_id: PeerId,
     tx: mpsc::UnboundedSender<Bytes>,
-    rx: RefCell<mpsc::UnboundedReceiver<Bytes>>,
+    /// `tokio::sync::Mutex` (not `RefCell`) so the receiver guard can be
+    /// held across `.await` without tripping `clippy::await_holding_refcell_ref`.
+    /// Single-threaded `?Send` executor — there is no real contention.
+    rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
     tx_unrel: mpsc::UnboundedSender<Bytes>,
-    rx_unrel: RefCell<mpsc::UnboundedReceiver<Bytes>>,
+    rx_unrel: Mutex<mpsc::UnboundedReceiver<Bytes>>,
 }
 
 impl TestConnection {
@@ -185,9 +187,9 @@ impl TestConnection {
         Self {
             peer_id,
             tx,
-            rx: RefCell::new(rx),
+            rx: Mutex::new(rx),
             tx_unrel,
-            rx_unrel: RefCell::new(rx_unrel),
+            rx_unrel: Mutex::new(rx_unrel),
         }
     }
 }
@@ -200,12 +202,10 @@ impl TransportConnection for TestConnection {
             .map_err(|_| Error::Transport("connection closed".into()))
     }
 
-    // `borrow_mut()` is held across `.await` intentionally: single-threaded
-    // (?Send) executor means no concurrent borrow can occur while suspended.
-    #[allow(clippy::await_holding_refcell_ref)]
     async fn recv_reliable(&self) -> Result<Bytes> {
         self.rx
-            .borrow_mut()
+            .lock()
+            .await
             .recv()
             .await
             .ok_or_else(|| Error::Transport("connection closed".into()))
@@ -217,12 +217,10 @@ impl TransportConnection for TestConnection {
             .map_err(|_| Error::Transport("connection closed".into()))
     }
 
-    // `borrow_mut()` is held across `.await` intentionally: single-threaded
-    // (?Send) executor means no concurrent borrow can occur while suspended.
-    #[allow(clippy::await_holding_refcell_ref)]
     async fn recv_unreliable(&self) -> Result<Bytes> {
         self.rx_unrel
-            .borrow_mut()
+            .lock()
+            .await
             .recv()
             .await
             .ok_or_else(|| Error::Transport("connection closed".into()))

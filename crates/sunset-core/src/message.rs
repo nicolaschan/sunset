@@ -11,7 +11,7 @@ use sunset_store::{ContentBlock, Hash, SignedKvEntry};
 use crate::canonical::signing_payload;
 use crate::crypto::aead::{aead_decrypt, aead_encrypt, build_msg_aad, derive_msg_key, fresh_nonce};
 use crate::crypto::envelope::{
-    inner_sig_payload_bytes, EncryptedMessage, MessageBody, ReactionAction, SignedMessage,
+    EncryptedMessage, MessageBody, ReactionAction, SignedMessage, inner_sig_payload_bytes,
 };
 use crate::crypto::room::{Room, RoomFingerprint};
 use crate::error::{Error, Result};

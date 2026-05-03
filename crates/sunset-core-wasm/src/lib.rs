@@ -141,9 +141,15 @@ pub fn compose_message(
     let room = Room::open(room_name).map_err(|e| js_err("compose_message room_open", e))?;
     let mut rng = ChaCha20Rng::from_seed(nonce_seed);
 
-    let CoreComposedMessage { entry, block } =
-        core_compose(&identity, &room, epoch_id, sent_at_ms, MessageBody::Text(body.to_owned()), &mut rng)
-            .map_err(|e| js_err("compose_message", e))?;
+    let CoreComposedMessage { entry, block } = core_compose(
+        &identity,
+        &room,
+        epoch_id,
+        sent_at_ms,
+        MessageBody::Text(body.to_owned()),
+        &mut rng,
+    )
+    .map_err(|e| js_err("compose_message", e))?;
 
     Ok(ComposedMessage {
         entry: postcard::to_stdvec(&entry)

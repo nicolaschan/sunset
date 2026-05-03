@@ -244,27 +244,40 @@ impl TrackerHandles {
     }
 }
 
+/// Per-room presence configuration consumed by `spawn_tracker`. Bundling
+/// the namespace key + the three timing knobs keeps the function signature
+/// under clippy's `too_many_arguments` threshold.
+pub struct PresenceConfig {
+    /// Hex-encoded room fingerprint; keys the `<room_fp>/presence/` prefix.
+    pub room_fp_hex: String,
+    /// Heartbeat publish interval, fed to `presence_bucket`.
+    pub interval_ms: u64,
+    /// Presence TTL, fed to `presence_bucket`.
+    pub ttl_ms: u64,
+    /// Inter-tick period of the Online↔Away↔Offline catch-up timer.
+    pub refresh_ms: u64,
+}
+
 /// Spawn the tracker. Runs forever (host-process / page lifetime).
 ///
 /// `store` carries the presence entries (subscribe-namespace + chat +
 /// presence; the tracker filters to `<room_fp>/presence/`).
 /// `engine_events` is the consumer half of
-/// `SyncEngine::subscribe_engine_events()`. `room_fp_hex` keys the
-/// presence-namespace prefix. `interval_ms` / `ttl_ms` thresholds are
-/// passed through to `presence_bucket`; `refresh_ms` is the inter-tick
-/// period of the catch-up timer that handles Online↔Away↔Offline
-/// transitions between heartbeats.
-#[allow(clippy::too_many_arguments)]
+/// `SyncEngine::subscribe_engine_events()`. `cfg` carries the
+/// presence-namespace prefix and timing knobs.
 pub fn spawn_tracker<S: Store + 'static>(
     store: std::sync::Arc<S>,
     mut engine_events: tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
     self_peer: PeerId,
-    room_fp_hex: String,
-    interval_ms: u64,
-    ttl_ms: u64,
-    refresh_ms: u64,
+    cfg: PresenceConfig,
     handles: TrackerHandles,
 ) {
+    let PresenceConfig {
+        room_fp_hex,
+        interval_ms,
+        ttl_ms,
+        refresh_ms,
+    } = cfg;
     // Periodic refresh ticker as a separate task. Pushes a unit into
     // `refresh_rx` every `refresh_ms`. The main select loop only
     // deals with channels — no inline `sleep().fuse()` pinning
@@ -284,7 +297,7 @@ pub fn spawn_tracker<S: Store + 'static>(
         let presence_sub = match store.subscribe(presence_filter, Replay::All).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("MembershipTracker: presence subscribe failed: {e}");
+                tracing::warn!(error = %e, "presence subscribe failed");
                 return;
             }
         };
@@ -302,7 +315,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         Ok(sunset_store::Event::Replaced { new, .. }) => new,
                         Ok(_) => continue,
                         Err(e) => {
-                            eprintln!("MembershipTracker presence event: {e}");
+                            tracing::warn!(error = %e, "presence event error");
                             continue;
                         }
                     };

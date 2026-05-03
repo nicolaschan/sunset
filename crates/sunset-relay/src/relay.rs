@@ -1,30 +1,72 @@
-//! Relay: the wired-up store + identity + transport + engine.
+//! Relay: identity + store + engine + axum HTTP/WS host.
 //!
-//! `Relay::new(config)` does all the setup synchronously (in async fn form).
-//! The returned `RelayHandle` exposes the relay's address + a `run` method
-//! that drives the engine until shutdown.
+//! `Relay::start(config)` does setup synchronously (in async fn form):
+//! identity, store, engine, the SpawningAcceptor that wraps a
+//! WebSocketRawTransport::serving(), the command pump, and a bound
+//! TcpListener. The returned `RelayHandle` exposes the dial URL + a
+//! `run`/`run_for_test` method that drives axum and the engine task
+//! until shutdown.
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use bytes::Bytes;
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use sunset_core::Identity;
-use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret};
+use sunset_noise::{
+    NoiseConnection, NoiseIdentity, NoiseTransport, do_handshake_responder,
+    ed25519_seed_to_x25519_secret,
+};
 use sunset_store::{Filter, VerifyingKey};
 use sunset_store_fs::FsStore;
-use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
+use sunset_sync::{PeerAddr, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine};
 use sunset_sync_ws_native::WebSocketRawTransport;
 
+use crate::app::{AppState, build_app};
+use crate::bridge::RelayCommand;
 use crate::config::{Config, InterestFilter};
 use crate::error::Result;
 use crate::identity;
-use crate::router;
-use crate::status::StatusContext;
+use crate::snapshot::{build_dashboard_snapshot, build_identity_snapshot};
 
-type Engine = SyncEngine<FsStore, NoiseTransport<WebSocketRawTransport>>;
+/// Concrete inbound-side `Transport` the engine sees. Kept private —
+/// callers interact with `RelayHandle`, not this type.
+type InboundTransport = SpawningAcceptor<
+    WebSocketRawTransport,
+    NoiseTransport<WebSocketRawTransport>,
+    InboundPromote,
+    NoiseHandshakeFuture,
+    NoiseConnection<sunset_sync_ws_native::WebSocketRawConnection>,
+>;
+
+/// Type-erased pieces of the `SpawningAcceptor`'s generic parameters.
+/// Defining the closure as a concrete `fn` is impossible (it captures
+/// `Arc<dyn NoiseIdentity>`); we surface it via a boxed trait object
+/// shape on the engine side.
+type InboundPromote =
+    Box<dyn Fn(sunset_sync_ws_native::WebSocketRawConnection) -> NoiseHandshakeFuture + 'static>;
+
+/// The future returned by the promote callback. `Pin<Box<dyn Future>>`
+/// because the closure body captures `Arc<dyn NoiseIdentity>`, so the
+/// concrete future type is unnameable; we erase it here.
+type NoiseHandshakeFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = sunset_sync::Result<
+                    NoiseConnection<sunset_sync_ws_native::WebSocketRawConnection>,
+                >,
+            > + 'static,
+    >,
+>;
+
+type Engine = SyncEngine<FsStore, InboundTransport>;
 
 pub struct Relay {/* sealed; see RelayHandle */}
 
@@ -36,9 +78,30 @@ pub struct RelayHandle {
     engine: Rc<Engine>,
     peers: Vec<String>,
     subscription_filter: Filter,
-    listener: Option<tokio::net::TcpListener>,
-    ws_tx: Option<tokio::sync::mpsc::Sender<tokio::net::TcpStream>>,
-    status_ctx: Option<Rc<StatusContext>>,
+    listener: Option<TcpListener>,
+    /// Senders the axum app uses. Built once in `new`; cloned into
+    /// `AppState` in `run` / `run_for_test`.
+    ws_tx: mpsc::UnboundedSender<axum::extract::ws::WebSocket>,
+    cmd_tx: mpsc::UnboundedSender<RelayCommand>,
+    /// Engine-side context used by the command pump (one shared Rc).
+    /// Held here so the pump's Rc graph stays alive for the relay's
+    /// lifetime. The field is read-only (the pump task already holds
+    /// its own clone), but storing it here documents the ownership.
+    #[allow(dead_code)]
+    cmd_ctx: Rc<CommandContext>,
+}
+
+/// Held by the command pump task on the engine side. Captures the
+/// references it needs to build snapshots without crossing runtimes.
+struct CommandContext {
+    engine: Rc<Engine>,
+    store: Arc<FsStore>,
+    data_dir: PathBuf,
+    ed25519_public: [u8; 32],
+    x25519_public: [u8; 32],
+    listen_addr: SocketAddr,
+    dial_url: String,
+    configured_peers: Vec<String>,
 }
 
 /// Adapter so sunset-core's `Identity` can be used as a `NoiseIdentity`.
@@ -55,9 +118,13 @@ impl NoiseIdentity for IdentityNoiseAdapter {
 
 impl Relay {
     /// Open store, load identity, bind listener, build engine. Returns a
-    /// handle ready for `run()`.
-    #[allow(clippy::new_ret_no_self)]
-    pub async fn new(config: Config) -> Result<RelayHandle> {
+    /// handle ready for `run()` / `run_for_test()`.
+    ///
+    /// **Precondition:** must be called from within a `tokio::task::LocalSet`.
+    /// The constructor spawns `spawn_local` tasks (the command pump and
+    /// `SpawningAcceptor`'s internal handshake pump); calling it without
+    /// an active LocalSet will panic.
+    pub async fn start(config: Config) -> Result<RelayHandle> {
         // 1. Identity (load-or-generate; persists to disk on first start).
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let identity = identity::load_or_generate(&config.identity_secret_path).await?;
@@ -70,62 +137,79 @@ impl Relay {
             MontgomeryPoint::mul_base(&scalar).to_bytes()
         };
 
-        // 2. Store (FsStore with Ed25519Verifier).
+        // 2. Store.
         let store_root = config.data_dir.join("store");
         tokio::fs::create_dir_all(&store_root).await?;
         let store = Arc::new(
             FsStore::with_verifier(&store_root, Arc::new(sunset_core::Ed25519Verifier)).await?,
         );
 
-        // 3. Listener + Noise wrapper.
-        //
-        // The relay owns a single TcpListener. Connections are dispatched per
-        // `crates/sunset-relay/src/router.rs` based on whether they're a WS
-        // upgrade (forwarded to the WebSocketRawTransport) or a GET /dashboard
-        // request (rendered inline).
-        let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+        // 3. Bind the HTTP/WS listener up front so we know the bound port.
+        let listener = TcpListener::bind(config.listen_addr).await?;
         let bound = listener.local_addr().unwrap_or(config.listen_addr);
         let local_address = format!("ws://{}#x25519={}", bound, hex::encode(x25519_public));
 
-        let (ws_tx, ws_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(32);
-        let raw = WebSocketRawTransport::external_streams(ws_rx);
-        let noise = NoiseTransport::new(raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
+        // 4. Inbound side: serving() exposes a Send sender for axum and a
+        //    drainable RawTransport. Outbound side: dial_only.
+        let (raw_inbound, ws_tx) = WebSocketRawTransport::serving();
+        let raw_outbound = WebSocketRawTransport::dial_only();
+        let noise_id: Arc<dyn NoiseIdentity> = Arc::new(IdentityNoiseAdapter(identity.clone()));
+        let connector = NoiseTransport::new(raw_outbound, noise_id.clone());
 
-        // 4. SyncEngine.
+        // 5. SpawningAcceptor — every inbound connection's Noise IK runs
+        //    on its own task, bounded by the configured handshake timeout.
+        let handshake_timeout = Duration::from_secs(config.accept_handshake_timeout_secs);
+        let promote: InboundPromote = {
+            let identity = noise_id.clone();
+            Box::new(move |raw_conn| {
+                let identity = identity.clone();
+                Box::pin(async move {
+                    do_handshake_responder(raw_conn, identity)
+                        .await
+                        .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
+                })
+            })
+        };
+        let transport = SpawningAcceptor::new(raw_inbound, connector, promote, handshake_timeout);
+
+        // 6. Engine.
         let local_peer = PeerId(VerifyingKey::new(Bytes::copy_from_slice(&ed25519_public)));
         let signer: Arc<dyn Signer> = Arc::new(identity.clone());
         let engine = Rc::new(SyncEngine::new(
             store.clone(),
-            noise,
+            transport,
             SyncConfig::default(),
             local_peer,
             signer,
         ));
 
-        // 5. Subscription filter.
+        // 7. Subscription filter for the relay's broad ingestion.
         let subscription_filter = match config.interest_filter {
             InterestFilter::All => Filter::NamePrefix(Bytes::new()),
         };
 
-        // 6. Status context (always built; the dashboard is always available
-        //    at /dashboard on the WS port).
-        let status_ctx = Rc::new(StatusContext {
+        // 8. Bridge channels.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RelayCommand>();
+
+        // 9. Command pump context + task.
+        let cmd_ctx = Rc::new(CommandContext {
             engine: engine.clone(),
             store: store.clone(),
             data_dir: config.data_dir.clone(),
-            dial_url: local_address.clone(),
             ed25519_public,
             x25519_public,
-            configured_peers: config.peers.clone(),
             listen_addr: bound,
+            dial_url: local_address.clone(),
+            configured_peers: config.peers.clone(),
         });
+        spawn_command_pump(cmd_rx, cmd_ctx.clone());
 
-        // 7. Banner.
+        // 10. Banner.
         let mut banner = identity::format_address(&bound, &identity);
-        banner.push_str(&format!("\n  dashboard: http://{}/dashboard", bound));
-        banner.push_str(&format!("\n  identity:  http://{}/", bound));
+        banner.push_str(&format!("\n  dashboard: http://{bound}/dashboard"));
+        banner.push_str(&format!("\n  identity:  http://{bound}/"));
         tracing::info!("\n{}", banner);
-        println!("{}", banner);
+        println!("{banner}");
 
         Ok(RelayHandle {
             local_address,
@@ -135,10 +219,40 @@ impl Relay {
             peers: config.peers,
             subscription_filter,
             listener: Some(listener),
-            ws_tx: Some(ws_tx),
-            status_ctx: Some(status_ctx),
+            ws_tx,
+            cmd_tx,
+            cmd_ctx,
         })
     }
+}
+
+fn spawn_command_pump(mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>, ctx: Rc<CommandContext>) {
+    tokio::task::spawn_local(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                RelayCommand::Snapshot { reply } => {
+                    let meta = crate::snapshot::RelayMeta {
+                        data_dir: &ctx.data_dir,
+                        ed25519_public: ctx.ed25519_public,
+                        x25519_public: ctx.x25519_public,
+                        listen_addr: ctx.listen_addr,
+                        dial_url: &ctx.dial_url,
+                        configured_peers: &ctx.configured_peers,
+                    };
+                    let snap = build_dashboard_snapshot(&ctx.engine, &ctx.store, &meta).await;
+                    let _ = reply.send(snap);
+                }
+                RelayCommand::Identity { reply } => {
+                    let snap = build_identity_snapshot(
+                        ctx.ed25519_public,
+                        ctx.x25519_public,
+                        &ctx.dial_url,
+                    );
+                    let _ = reply.send(snap);
+                }
+            }
+        }
+    });
 }
 
 impl RelayHandle {
@@ -166,18 +280,32 @@ impl RelayHandle {
         }
     }
 
-    /// Drive the engine, dial federated peers, then run until shutdown.
+    fn build_app_state(&self) -> AppState {
+        AppState {
+            ws_tx: self.ws_tx.clone(),
+            cmd_tx: self.cmd_tx.clone(),
+        }
+    }
+
+    /// Drive the engine + axum until shutdown.
     pub async fn run(mut self) -> Result<()> {
+        let listener = self
+            .listener
+            .take()
+            .expect("RelayHandle::run consumed twice");
+        let app: Router = build_app(self.build_app_state());
+
         let engine_clone = self.engine.clone();
         let engine_task = tokio::task::spawn_local(async move { engine_clone.run().await });
 
-        let dispatcher_task = self.spawn_dispatcher();
+        // axum runs as a Send task on the multi-thread runtime workers.
+        let serve_task = tokio::spawn(async move { axum::serve(listener, app).await });
 
+        // Subscription publish + federated dials happen on the engine side.
         self.engine
             .publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))
             .await?;
         tracing::info!("published broad subscription");
-
         self.dial_configured_peers().await;
 
         #[cfg(unix)]
@@ -200,43 +328,31 @@ impl RelayHandle {
         }
 
         engine_task.abort();
-        if let Some(t) = dispatcher_task {
-            t.abort();
-        }
+        serve_task.abort();
         Ok(())
     }
 
-    /// Take the bound listener, WS sender, and status context; spawn the
-    /// dispatcher accept loop. Returns `None` if already consumed (should
-    /// not happen in normal use). After this call, all three are consumed.
-    fn spawn_dispatcher(&mut self) -> Option<tokio::task::JoinHandle<()>> {
-        let listener = self.listener.take()?;
-        let ws_tx = self.ws_tx.take()?;
-        let status_ctx = self.status_ctx.take()?;
-        Some(tokio::task::spawn_local(async move {
-            if let Err(e) = router::dispatch(listener, ws_tx, status_ctx).await {
-                tracing::warn!(error = %e, "router dispatch loop ended");
-            }
-        }))
-    }
-
-    /// For tests: drive the engine without waiting for OS signals. Returns
-    /// the engine task handle so the caller can abort it during teardown.
-    /// Also spawns the dispatcher task (detached; the LocalSet's drop will
-    /// cancel it when the test ends).
+    /// For tests: drive engine + axum without waiting for OS signals.
+    /// Returns the engine task handle so the caller can abort it during teardown.
+    /// The axum task is detached; the test runtime drop will cancel it.
     #[cfg(any(test, feature = "test-helpers"))]
     pub async fn run_for_test(
         &mut self,
     ) -> Result<tokio::task::JoinHandle<sunset_sync::Result<()>>> {
+        let listener = self
+            .listener
+            .take()
+            .expect("RelayHandle::run_for_test consumed twice");
+        let app: Router = build_app(self.build_app_state());
+
         let engine_clone = self.engine.clone();
         let engine_task = tokio::task::spawn_local(async move { engine_clone.run().await });
 
-        let _dispatcher_task = self.spawn_dispatcher();
+        let _serve_task = tokio::spawn(async move { axum::serve(listener, app).await });
 
         self.engine
             .publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))
             .await?;
-
         self.dial_configured_peers().await;
 
         Ok(engine_task)
@@ -247,4 +363,16 @@ impl RelayHandle {
     pub fn engine(&self) -> &Rc<Engine> {
         &self.engine
     }
+}
+
+// `cmd_ctx` is held inside `RelayHandle` so the command pump's `Rc` graph
+// stays alive for the relay's lifetime. When `RelayHandle` drops:
+//   • `cmd_tx` drops → cmd_rx returns None → pump task exits.
+//   • `cmd_ctx` (this clone) drops → refcount drops by 1.
+//   • The pump task's own `cmd_ctx` clone drops when the task ends →
+//     refcount → 0 → CommandContext drops, releasing Rc<Engine> and Arc<FsStore>.
+// The empty Drop body marks this as a deliberate ownership shape, not an
+// oversight. tracing::trace! could go here in the future.
+impl Drop for RelayHandle {
+    fn drop(&mut self) {}
 }
