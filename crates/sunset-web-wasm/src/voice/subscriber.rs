@@ -102,7 +102,7 @@ pub(crate) fn spawn_subscriber(
                         }
                     }
                 }
-                VoicePacket::Heartbeat { sent_at_ms } => {
+                VoicePacket::Heartbeat { sent_at_ms, .. } => {
                     let st = std::time::SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_millis(sent_at_ms);
                     arcs.membership.observe(peer, st).await;

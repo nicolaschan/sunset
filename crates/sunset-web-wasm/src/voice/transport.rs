@@ -55,7 +55,7 @@ pub(crate) fn spawn_heartbeat(state: VoiceCell, identity: Identity, room: Rc<Roo
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
 
-            let packet = sunset_voice::packet::VoicePacket::Heartbeat { sent_at_ms: now_ms };
+            let packet = sunset_voice::packet::VoicePacket::Heartbeat { sent_at_ms: now_ms, is_muted: false };
             match sunset_voice::packet::encrypt(&room, 0, &identity.public(), &packet, &mut rng) {
                 Ok(ev) => match postcard::to_stdvec(&ev) {
                     Ok(payload) => {
