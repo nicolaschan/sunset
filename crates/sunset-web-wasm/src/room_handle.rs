@@ -21,11 +21,7 @@ impl RoomHandle {
 
 #[wasm_bindgen]
 impl RoomHandle {
-    pub async fn send_message(
-        &self,
-        body: String,
-        sent_at_ms: f64,
-    ) -> Result<String, JsError> {
+    pub async fn send_message(&self, body: String, sent_at_ms: f64) -> Result<String, JsError> {
         let value_hash = self
             .inner
             .send_text(body, sent_at_ms as u64)

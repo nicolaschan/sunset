@@ -186,7 +186,6 @@ where
     pub(crate) fn supervisor(&self) -> &Rc<PeerSupervisor<St, T>> {
         &self.supervisor
     }
-
 }
 
 #[cfg(test)]
@@ -285,8 +284,7 @@ mod tests {
         local
             .run_until(async {
                 let peer = helpers::mk_peer(ident(20)).await;
-                let (r1, r2) =
-                    futures::join!(peer.open_room("alpha"), peer.open_room("alpha"));
+                let (r1, r2) = futures::join!(peer.open_room("alpha"), peer.open_room("alpha"));
                 let r1 = r1.expect("open_room r1");
                 let r2 = r2.expect("open_room r2");
                 assert!(
