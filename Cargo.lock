@@ -1934,6 +1934,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "sha2",
+ "sunset-noise",
  "sunset-store",
  "sunset-store-memory",
  "sunset-sync",
