@@ -21,6 +21,7 @@ serde.workspace = true
 sunset-store.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio-stream.workspace = true
 tracing.workspace = true
 web-time.workspace = true
 

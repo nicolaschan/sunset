@@ -9,4 +9,15 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+hkdf.workspace = true
+postcard.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+sha2.workspace = true
+sunset-core.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }

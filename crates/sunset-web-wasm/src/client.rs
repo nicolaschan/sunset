@@ -41,16 +41,20 @@ impl NoiseIdentity for IdentityNoiseAdapter {
 pub struct Client {
     identity: Identity,
     room: Rc<Room>,
+    // Core sync subsystems — long-lived per-Client.
     store: Arc<MemoryStore>,
     engine: Rc<Engine>,
+    bus: crate::voice::BusArc,
     supervisor: Rc<sunset_sync::PeerSupervisor<MemoryStore, MultiTransport<WsT, RtcT>>>,
+    voice: crate::voice::VoiceCell,
+    // JS callbacks + UI-state caches.
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     on_receipt: Rc<RefCell<Option<js_sys::Function>>>,
+    on_peer_connection_state: Rc<RefCell<Option<js_sys::Function>>>,
     relay_status: Rc<RefCell<String>>,
     presence_started: Rc<RefCell<bool>>,
     tracker_handles: Rc<TrackerHandles>,
     reaction_handles: ReactionHandles,
-    voice: crate::voice::VoiceCell,
 }
 
 #[wasm_bindgen]
@@ -108,6 +112,15 @@ impl Client {
             async move { s.run().await }
         });
 
+        let bus: crate::voice::BusArc = std::rc::Rc::new(sunset_core::bus::BusImpl::new(
+            store.clone(),
+            engine.clone(),
+            identity.clone(),
+        ));
+
+        let on_peer_connection_state = Rc::new(RefCell::<Option<js_sys::Function>>::new(None));
+        spawn_peer_connection_state_forwarder(supervisor.clone(), on_peer_connection_state.clone());
+
         let reaction_handles = ReactionHandles::default();
         sunset_core::spawn_reaction_tracker(
             store.clone(),
@@ -121,14 +134,16 @@ impl Client {
             room,
             store,
             engine,
+            bus,
             supervisor,
+            voice: crate::voice::new_voice_cell(),
             on_message: Rc::new(RefCell::new(None)),
             on_receipt: Rc::new(RefCell::new(None)),
+            on_peer_connection_state,
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
             presence_started: Rc::new(RefCell::new(false)),
             tracker_handles: Rc::new(TrackerHandles::new("disconnected")),
             reaction_handles,
-            voice: crate::voice::new_voice_cell(),
         })
     }
 
@@ -429,16 +444,31 @@ impl Client {
         // both Text and Receipt variants.
     }
 
-    /// Initialise the voice subsystem. Spawns an in-process loopback
-    /// decode loop; `output_handler` is invoked with a Float32Array
-    /// of `FRAME_SAMPLES` samples (mono PCM at `SAMPLE_RATE`) for each
-    /// decoded 20 ms frame. Must be called before `voice_input`.
+    /// Start voice in this client's room. Spawns the heartbeat task,
+    /// subscribe loop, and Liveness state combiner. Errors if voice is
+    /// already started.
     ///
-    /// Implementation: `sunset-voice` `VoiceEncoder` + `VoiceDecoder`
-    /// (currently a passthrough; a real codec slots in there without
-    /// changing this method's signature).
-    pub fn voice_start(&self, output_handler: &js_sys::Function) -> Result<(), JsError> {
-        crate::voice::voice_start(&self.voice, output_handler)
+    /// **Side effect:** the subscribe loop's `Bus::subscribe` call
+    /// publishes a per-room subscription entry (1-hour TTL) into the
+    /// store via `engine.publish_subscription`, so peers learn we want
+    /// `voice/<room_fp>/` traffic. The entry is replaced on each call
+    /// (LWW).
+    ///
+    /// `on_frame` called as `on_frame(from_peer_id_bytes: Uint8Array, pcm: Float32Array)`.
+    /// `on_voice_peer_state` called as `(peer_id: Uint8Array, in_call: bool, talking: bool)`.
+    pub fn voice_start(
+        &self,
+        on_frame: &js_sys::Function,
+        on_voice_peer_state: &js_sys::Function,
+    ) -> Result<(), JsError> {
+        crate::voice::voice_start(
+            &self.voice,
+            &self.identity,
+            &self.room,
+            &self.bus,
+            on_frame,
+            on_voice_peer_state,
+        )
     }
 
     /// Stop the voice subsystem and release its resources.
@@ -446,11 +476,32 @@ impl Client {
         crate::voice::voice_stop(&self.voice)
     }
 
-    /// Submit one 20 ms frame of mono PCM (Float32Array of length
-    /// `FRAME_SAMPLES` at `SAMPLE_RATE`) for encoding + loopback
-    /// delivery to the output handler.
     pub fn voice_input(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
         crate::voice::voice_input(&self.voice, pcm)
+    }
+
+    /// Snapshot all current peer connection intents. Returns a JS array
+    /// of objects: `{ addr, state, peer_id?, attempt }`.
+    pub async fn peer_connection_snapshot(&self) -> Result<JsValue, JsError> {
+        let snaps = self.supervisor.snapshot().await;
+        let arr = js_sys::Array::new();
+        for s in snaps {
+            arr.push(&intent_snapshot_to_js(&s)?);
+        }
+        Ok(arr.into())
+    }
+
+    /// Register a callback for live peer connection state changes. The
+    /// handler receives one object per transition with the same shape
+    /// as `peer_connection_snapshot`'s elements.
+    ///
+    /// Replaces any previously-registered callback (matches the shape of
+    /// `on_message` / `on_receipt`). The forwarder task is spawned once
+    /// at `Client::new` and dispatches to whatever callback is currently
+    /// installed; calling this method multiple times does not duplicate
+    /// dispatches.
+    pub fn on_peer_connection_state(&self, handler: js_sys::Function) {
+        *self.on_peer_connection_state.borrow_mut() = Some(handler);
     }
 
     fn spawn_message_subscription(&self) {
@@ -560,6 +611,75 @@ impl Client {
             }
         });
     }
+}
+
+fn intent_state_str(s: sunset_sync::IntentState) -> &'static str {
+    match s {
+        sunset_sync::IntentState::Connecting => "connecting",
+        sunset_sync::IntentState::Connected => "connected",
+        sunset_sync::IntentState::Backoff => "backoff",
+        sunset_sync::IntentState::Cancelled => "cancelled",
+    }
+}
+
+/// Build the JS-shaped `{addr, state, attempt, peer_id?}` object used
+/// by both `peer_connection_snapshot` and `on_peer_connection_state`.
+fn intent_snapshot_to_js(snap: &sunset_sync::IntentSnapshot) -> Result<JsValue, JsError> {
+    let obj = js_sys::Object::new();
+    let addr_str = String::from_utf8_lossy(snap.addr.as_bytes()).into_owned();
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("addr"),
+        &JsValue::from_str(&addr_str),
+    )
+    .map_err(|_| JsError::new("Reflect::set addr failed"))?;
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("state"),
+        &JsValue::from_str(intent_state_str(snap.state)),
+    )
+    .map_err(|_| JsError::new("Reflect::set state failed"))?;
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("attempt"),
+        &JsValue::from_f64(snap.attempt as f64),
+    )
+    .map_err(|_| JsError::new("Reflect::set attempt failed"))?;
+    if let Some(pid) = &snap.peer_id {
+        let pk_arr = js_sys::Uint8Array::from(pid.0.as_bytes());
+        js_sys::Reflect::set(&obj, &JsValue::from_str("peer_id"), &pk_arr)
+            .map_err(|_| JsError::new("Reflect::set peer_id failed"))?;
+    }
+    Ok(obj.into())
+}
+
+/// Spawn the single supervisor-state forwarder. Subscribes to
+/// `PeerSupervisor::subscribe()` once at Client construction; each event
+/// is dispatched to whatever JS handler is currently installed in
+/// `on_peer_connection_state` (None means dropped). This keeps the
+/// JS-facing `on_peer_connection_state(handler)` setter cheap and
+/// idempotent — calling it twice replaces the handler rather than
+/// duplicating dispatches.
+fn spawn_peer_connection_state_forwarder(
+    supervisor: Rc<sunset_sync::PeerSupervisor<MemoryStore, MultiTransport<WsT, RtcT>>>,
+    handler: Rc<RefCell<Option<js_sys::Function>>>,
+) {
+    use futures::StreamExt as _;
+    let mut sub = supervisor.subscribe();
+    wasm_bindgen_futures::spawn_local(async move {
+        while let Some(snap) = sub.next().await {
+            let obj = match intent_snapshot_to_js(&snap) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "intent_snapshot_to_js failed");
+                    continue;
+                }
+            };
+            if let Some(h) = handler.borrow().as_ref() {
+                let _ = h.call1(&JsValue::NULL, &obj);
+            }
+        }
+    });
 }
 
 /// Compose and insert a Receipt for `for_value_hash` into the local

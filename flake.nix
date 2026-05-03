@@ -130,6 +130,8 @@
             # sunset.ffi.mjs can `import` from a relative path.
             cp ${sunsetWebWasmPkg}/sunset_web_wasm.js $out/
             cp ${sunsetWebWasmPkg}/sunset_web_wasm_bg.wasm $out/
+            # Copy the C2b voice e2e test harness so Playwright can fetch it via static-web-server.
+            cp ${./web/voice-e2e-test.html} $out/voice-e2e-test.html
             # Lustre emits an absolute `/sunset_web.js` script src which only
             # works at site root. Rewrite to a relative path so the artefact
             # serves correctly under any GitHub Pages sub-path.
