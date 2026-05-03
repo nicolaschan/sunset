@@ -435,26 +435,23 @@ where
     }
 
     async fn tick_anti_entropy(&self) {
-        let bloom = match build_digest(
-            &*self.store,
-            &self.config.bootstrap_filter,
-            &DigestRange::All,
-            self.config.bloom_size_bits,
-            self.config.bloom_hash_fns,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(_) => return,
+        let peers: Vec<PeerId> = {
+            let state = self.state.lock().await;
+            state.peer_outbound.keys().cloned().collect()
         };
-        let msg = SyncMessage::DigestExchange {
-            filter: self.config.bootstrap_filter.clone(),
-            range: DigestRange::All,
-            bloom: bloom.to_bytes(),
-        };
-        let state = self.state.lock().await;
-        for po in state.peer_outbound.values() {
-            let _ = po.tx.send(msg.clone());
+        if peers.is_empty() {
+            return;
+        }
+        let bootstrap_filter = self.config.bootstrap_filter.clone();
+        let own_filters = self.own_published_filters().await;
+        for peer in &peers {
+            self.send_filter_digest(peer, &bootstrap_filter).await;
+            for filter in &own_filters {
+                if *filter == bootstrap_filter {
+                    continue;
+                }
+                self.send_filter_digest(peer, filter).await;
+            }
         }
     }
 
@@ -2135,6 +2132,75 @@ mod tests {
                 assert!(
                     filters.contains(&chat_filter),
                     "per-filter digest must fire for own published subscription (got {filters:?})"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn anti_entropy_tick_fires_filter_digest_for_own_published_subscriptions() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                // Pre-publish one self-authored subscribe entry. Empty
+                // signature is fine because `make_engine` uses
+                // `MemoryStore::with_accept_all()`; this test exercises
+                // the anti-entropy fan-out, not the publish path.
+                let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
+                let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
+                let block = ContentBlock {
+                    data: Bytes::from(filter_bytes),
+                    references: vec![],
+                };
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine.store.insert(entry, Some(block)).await.unwrap();
+
+                // Pre-register one connected peer with a captured outbound channel.
+                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let peer = PeerId(vk(b"relay"));
+                engine.state.lock().await.peer_outbound.insert(
+                    peer.clone(),
+                    PeerOutbound {
+                        conn_id: ConnectionId::for_test(1),
+                        tx,
+                    },
+                );
+
+                engine.tick_anti_entropy().await;
+
+                // Same drain pattern as the PeerHello test — both digests
+                // are queued by the time `tick_anti_entropy` returns.
+                // Filter doesn't impl Hash, so use Vec + contains.
+                let mut filters: Vec<Filter> = Vec::new();
+                loop {
+                    match rx.try_recv() {
+                        Ok(SyncMessage::DigestExchange { filter, .. }) => {
+                            filters.push(filter);
+                        }
+                        Ok(other) => panic!("expected DigestExchange, got {other:?}"),
+                        Err(_) => break,
+                    }
+                }
+
+                let bootstrap = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
+                assert!(
+                    filters.contains(&bootstrap),
+                    "bootstrap digest must fire (got {filters:?})"
+                );
+                assert!(
+                    filters.contains(&chat_filter),
+                    "per-filter digest must fire on anti-entropy tick (got {filters:?})"
                 );
             })
             .await;
