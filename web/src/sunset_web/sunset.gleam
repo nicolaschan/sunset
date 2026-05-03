@@ -23,13 +23,36 @@ pub fn create_client(
   callback: fn(ClientHandle) -> Nil,
 ) -> Nil
 
-/// Open a connection to a relay. URL must include the `#x25519=<hex>`
-/// fragment. Calls `callback` with `Ok(Nil)` on success or `Error(msg)`.
+/// Register a durable intent to keep connected to `url`. The
+/// callback is fired with `Ok(intent_id)` once the intent is
+/// recorded; `Error(msg)` is reserved for malformed input.
 @external(javascript, "./sunset.ffi.mjs", "addRelay")
 pub fn add_relay(
   client: ClientHandle,
   url: String,
-  callback: fn(Result(Nil, String)) -> Nil,
+  callback: fn(Result(Float, String)) -> Nil,
+) -> Nil
+
+/// Snapshot of one supervisor intent, mirrored from
+/// `IntentSnapshotJs`. `kind` is `"primary"` / `"secondary"` / not
+/// present.
+pub type IntentSnapshot {
+  IntentSnapshot(
+    id: Float,
+    state: String,
+    label: String,
+    peer_pubkey: option.Option(BitArray),
+    kind: option.Option(String),
+    attempt: Int,
+  )
+}
+
+/// Register a callback fired for every intent (once on register,
+/// then once per state transition).
+@external(javascript, "./sunset.ffi.mjs", "onIntentChanged")
+pub fn on_intent_changed(
+  client: ClientHandle,
+  callback: fn(IntentSnapshot) -> Nil,
 ) -> Nil
 
 /// Subscribe the engine to "all messages in this room".
@@ -56,11 +79,6 @@ pub fn on_message(
   client: ClientHandle,
   callback: fn(IncomingMessage) -> Nil,
 ) -> Nil
-
-/// Synchronous accessor for the current relay status. Returns one of
-/// "disconnected", "connecting", "connected", "error".
-@external(javascript, "./sunset.ffi.mjs", "relayStatus")
-pub fn relay_status(client: ClientHandle) -> String
 
 /// Establish a direct WebRTC peer connection. Signaling rides over the
 /// existing relay-mediated CRDT replication (Noise_KK encrypted, full
@@ -121,12 +139,6 @@ pub fn start_presence(
 pub fn on_members_changed(
   client: ClientHandle,
   callback: fn(List(MemberJs)) -> Nil,
-) -> Nil
-
-@external(javascript, "./sunset.ffi.mjs", "onRelayStatusChanged")
-pub fn on_relay_status_changed(
-  client: ClientHandle,
-  callback: fn(String) -> Nil,
 ) -> Nil
 
 @external(javascript, "./sunset.ffi.mjs", "memPubkey")

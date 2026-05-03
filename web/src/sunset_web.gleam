@@ -90,8 +90,14 @@ pub type Model {
     client: Option(ClientHandle),
     /// Real chat messages received from the engine. Empty on first load.
     messages: List(domain.Message),
-    /// Relay connection status: "disconnected", "connecting", "connected", "error".
-    relay_status: String,
+    /// Per-intent state snapshots from the supervisor, keyed by
+    /// IntentId (Float on the JS side via wasm-bindgen). Updated on
+    /// each `IntentChanged` Msg.
+    intents: Dict(Float, sunset.IntentSnapshot),
+    /// One-shot latch: True once we've called
+    /// `publish_room_subscription` after observing the first
+    /// connected intent. Prevents re-publishing on every reconnect.
+    published: Bool,
     /// Live members list from the presence tracker. Empty on first load.
     members: List(domain.Member),
     /// Viewport class — drives the desktop/phone branch in `shell.view`.
@@ -161,14 +167,13 @@ pub type Msg {
   // sunset-web-wasm bridge wiring:
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
-  RelayConnectResult(Result(Nil, String))
+  IntentChanged(snap: sunset.IntentSnapshot)
   SubscribePublishResult(Result(Nil, String))
   IncomingMsg(IncomingMessage)
   IncomingReceipt(message_id: String, from_pubkey: String)
   SubmitDraft
   MessageSent(Result(String, String))
   MembersUpdated(List(domain.Member))
-  RelayStatusUpdated(String)
   ViewportChanged(domain.Viewport)
   OpenDrawer(domain.Drawer)
   CloseDrawer
@@ -238,7 +243,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       voice_settings: seed_voice_settings(),
       client: None,
       messages: [],
-      relay_status: "disconnected",
+      intents: dict.new(),
+      published: False,
       members: [],
       viewport: initial_viewport,
       drawer: None,
@@ -598,13 +604,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             ))
           })
         })
-      // Presence wiring is in ClientReady (not RelayConnectResult) so
-      // it kicks off even when there's no `?relay=` URL — the user
-      // still sees themselves in the member list. Effect order within a
-      // batch is unspecified by Lustre, but that's fine: Client::start_presence
-      // snapshots the engine's current peer set after subscribing, so
-      // already-connected peers are picked up regardless of when
-      // start_presence runs relative to add_relay.
+      // Presence wiring is in ClientReady (not gated on a connected
+      // intent) so it kicks off even when there's no `?relay=` URL —
+      // the user still sees themselves in the member list. Effect
+      // order within a batch is unspecified by Lustre, but that's
+      // fine: Client::start_presence snapshots the engine's current
+      // peer set after subscribing, so already-connected peers are
+      // picked up regardless of when start_presence runs relative to
+      // add_relay.
       let presence_eff =
         effect.from(fn(dispatch) {
           let #(interval, ttl, refresh) = sunset.presence_params_from_url()
@@ -612,8 +619,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           sunset.on_members_changed(client, fn(ms) {
             dispatch(MembersUpdated(map_members(ms)))
           })
-          sunset.on_relay_status_changed(client, fn(s) {
-            dispatch(RelayStatusUpdated(s))
+        })
+      let intent_eff =
+        effect.from(fn(dispatch) {
+          sunset.on_intent_changed(client, fn(snap) {
+            dispatch(IntentChanged(snap))
           })
         })
       // Default relays the client dials when no `?relay=…` query
@@ -625,11 +635,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Error(_) -> default_relays
       }
       let connect_eff =
-        effect.from(fn(dispatch) {
+        effect.from(fn(_dispatch) {
           list.each(relays, fn(url) {
-            sunset.add_relay(client, url, fn(r) {
-              dispatch(RelayConnectResult(r))
-            })
+            // Errors here are JS-side malformed-URL issues; ignore (the
+            // resolver+supervisor handle every transient case).
+            sunset.add_relay(client, url, fn(_r) { Nil })
           })
         })
       let on_reactions_eff =
@@ -645,38 +655,35 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             dispatch(ReactionsChanged(target, inner_dict))
           })
         })
-      let new_status = case relays {
-        [] -> "disconnected"
-        _ -> "connecting"
-      }
       #(
-        Model(..model, client: Some(client), relay_status: new_status),
+        Model(..model, client: Some(client)),
         effect.batch([
           on_receipt_eff,
           on_msg_eff,
           presence_eff,
+          intent_eff,
           on_reactions_eff,
           connect_eff,
         ]),
       )
     }
-    RelayConnectResult(Ok(_)) ->
-      case model.client {
-        Some(client) -> {
+    IntentChanged(snap) -> {
+      let new_intents = dict.insert(model.intents, snap.id, snap)
+      let any_connected =
+        list.any(dict.values(new_intents), fn(s) { s.state == "connected" })
+      case any_connected, model.published, model.client {
+        True, False, Some(client) -> {
           let pub_eff =
             effect.from(fn(dispatch) {
               sunset.publish_room_subscription(client, fn(r) {
                 dispatch(SubscribePublishResult(r))
               })
             })
-          #(Model(..model, relay_status: "connected"), pub_eff)
+          #(Model(..model, intents: new_intents, published: True), pub_eff)
         }
-        None -> #(model, effect.none())
+        _, _, _ -> #(Model(..model, intents: new_intents), effect.none())
       }
-    RelayConnectResult(Error(_)) -> #(
-      Model(..model, relay_status: "error"),
-      effect.none(),
-    )
+    }
     SubscribePublishResult(_) -> #(model, effect.none())
     IncomingMsg(im) -> {
       let new_msg =
@@ -748,7 +755,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         effect.none(),
       )
     }
-    RelayStatusUpdated(s) -> #(Model(..model, relay_status: s), effect.none())
     ToggleMessageSelected(id) -> {
       // Tap/click on a message body. Toggle selection — same id
       // deselects, different id replaces. Closing also dismisses any
@@ -960,10 +966,9 @@ fn view(model: Model) -> Element(Msg) {
 }
 
 fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
-  let displayed_rooms = resolve_rooms(model.joined_rooms, model.relay_status)
+  let displayed_rooms = resolve_rooms(model.joined_rooms, model.intents)
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
-  let active_room =
-    lookup_room(displayed_rooms, current_name, model.relay_status)
+  let active_room = lookup_room(displayed_rooms, current_name, model.intents)
 
   let self_pubkey_hex = option.map(model.client, fn(c) { client_pubkey_hex(c) })
   let raw_messages = model.messages
@@ -1293,47 +1298,68 @@ fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
 /// Resolve a list of joined room names to rich Room records. Names
 /// that match a fixture room reuse its mock data; anything else falls
 /// back to a synthetic Room so the rail still renders something useful.
-fn resolve_rooms(names: List(String), relay_status: String) -> List(Room) {
+fn resolve_rooms(
+  names: List(String),
+  intents: Dict(Float, sunset.IntentSnapshot),
+) -> List(Room) {
   let fixture_rooms = fixture.rooms()
+  let conn = relay_status_pill(intents)
   list.map(names, fn(name) {
     case list.find(fixture_rooms, fn(r) { r.name == name }) {
-      Ok(r) ->
-        Room(..r, status: relay_status_to_conn(relay_status), id: RoomId(name))
-      Error(_) -> synthetic_room(name, relay_status)
+      Ok(r) -> Room(..r, status: conn, id: RoomId(name))
+      Error(_) -> synthetic_room(name, intents)
     }
   })
 }
 
-fn lookup_room(rs: List(Room), name: String, relay_status: String) -> Room {
+fn lookup_room(
+  rs: List(Room),
+  name: String,
+  intents: Dict(Float, sunset.IntentSnapshot),
+) -> Room {
   case list.find(rs, fn(r) { r.name == name }) {
     Ok(r) -> r
-    Error(_) -> synthetic_room(name, relay_status)
+    Error(_) -> synthetic_room(name, intents)
   }
 }
 
 /// Default Room record for a name we have no fixture entry for. Reads
 /// like a freshly-joined room with no observed activity yet.
-fn synthetic_room(name: String, relay_status: String) -> Room {
+fn synthetic_room(
+  name: String,
+  intents: Dict(Float, sunset.IntentSnapshot),
+) -> Room {
   Room(
     id: RoomId(name),
     name: name,
     members: 1,
     online: 1,
     in_call: 0,
-    status: relay_status_to_conn(relay_status),
+    status: relay_status_pill(intents),
     last_active: "now",
     unread: 0,
     bridge: NoBridge,
   )
 }
 
-fn relay_status_to_conn(relay_status: String) -> domain.ConnStatus {
-  case relay_status {
-    "connected" -> domain.Connected
-    "connecting" -> domain.Reconnecting
-    "error" -> domain.Offline
-    "disconnected" -> domain.Offline
-    _ -> domain.Connected
+/// Derive the room-status pill from the supervisor's per-intent
+/// snapshots. Connected wins outright; connecting/backoff falls back
+/// to Reconnecting; everything else (cancelled, empty) is Offline.
+pub fn relay_status_pill(
+  intents: Dict(Float, sunset.IntentSnapshot),
+) -> domain.ConnStatus {
+  let snaps = dict.values(intents)
+  case list.any(snaps, fn(s) { s.state == "connected" }) {
+    True -> domain.Connected
+    False ->
+      case
+        list.any(snaps, fn(s) {
+          s.state == "connecting" || s.state == "backoff"
+        })
+      {
+        True -> domain.Reconnecting
+        False -> domain.Offline
+      }
   }
 }
 
