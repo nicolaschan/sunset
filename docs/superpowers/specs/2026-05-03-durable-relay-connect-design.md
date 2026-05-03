@@ -186,39 +186,40 @@ trait + `WebSysFetch` adapter work unchanged.
 
 ### `sunset-core::membership`
 
-`derive_relay_status` is simplified to:
+The relay-status reporting in the membership tracker is **retired
+entirely** — not just simplified — because `IntentSnapshot` covers it
+in one place. Removed:
 
-```rust
-fn derive_relay_status(peer_kinds: &HashMap<PeerId, TransportKind>) -> String {
-    if peer_kinds.values().any(|k| *k == TransportKind::Primary) {
-        "connected".to_owned()
-    } else {
-        "disconnected".to_owned()
-    }
-}
-```
+- `derive_relay_status`, `maybe_fire_relay_status`, `fire_relay_status_now`.
+- `TrackerHandles::on_relay_status` callback slot and
+  `TrackerHandles::last_relay_status: Rc<RefCell<String>>`.
+- The sticky `"connecting"` / `"error"` strings ferried through
+  `last_relay_status`.
 
-The sticky `"connecting"` / `"error"` branch is removed — those states
-now live entirely in the supervisor's `IntentState`. The membership
-tracker only reflects the binary "any Primary peer connected" view,
-which is what it always actually represented; the sticky-state hack
-existed only to bridge the gap before `add_relay`'s first connect
-landed.
+Justification: every state the membership tracker reported about the
+relay (`connected` / `disconnected` / sticky `connecting` / sticky
+`error`) is observable from the supervisor's intent snapshots
+(`IntentState::Connecting | Connected | Backoff | Cancelled`). The
+membership tracker keeps `peer_kinds` and the per-member callbacks
+because those still cover **inbound** peers and per-member transport
+kind, neither of which the supervisor models.
 
-The frontend's "connecting" / "reconnecting" UI states are now derived
-from intent snapshots, not from the membership tracker.
+`Client::on_relay_status_changed` is removed alongside.
 
 ### Gleam frontend
 
 `web/src/sunset_web.gleam`:
 
-- Drop `RelayConnectResult(url, Result)` Msg variant. `add_relay`
-  returns immediately and doesn't dispatch.
-- Drop the `delay_ms` retry effect added in PR #18 — no longer needed.
+- Drop `RelayConnectResult(url, Result)` Msg variant and its Ok/Error
+  handlers. `add_relay` no longer dispatches a result.
+- Drop the `delay_ms` retry effect added in PR #18.
 - Drop the `delay_ms` FFI from `sunset.ffi.mjs` and `sunset.gleam`.
+- Drop the `RelayStatusUpdated(String)` Msg variant, the
+  `on_relay_status_changed` registration in `ClientReady`, and the
+  `relay_status_to_conn` string-pattern-matching helper.
 - New `IntentChanged(snapshot)` Msg fed from `on_intent_changed`.
 - Model field `intents: Dict(IntentId, IntentSnapshot)` replaces
-  `relay_status: String`.
+  `relay_status: String`. Add `published: Bool` latch.
 - Derive UI status:
   ```gleam
   fn relay_status_pill(intents: Dict(IntentId, IntentSnapshot))
