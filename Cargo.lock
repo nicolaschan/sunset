@@ -2078,7 +2078,16 @@ dependencies = [
 name = "sunset-voice"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "hkdf",
+ "postcard",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2",
+ "sunset-core",
+ "sunset-store",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
