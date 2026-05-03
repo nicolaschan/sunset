@@ -86,6 +86,19 @@ pub(crate) fn split(input: &str) -> Vec<Block> {
             continue;
         }
 
+        if let Some((level, rest)) = match_heading(lines[i]) {
+            if !buf.is_empty() {
+                blocks.push(paragraph_from_lines(&buf));
+                buf.clear();
+            }
+            blocks.push(Block::Heading {
+                level,
+                content: crate::inline::parse_inlines(rest),
+            });
+            i += 1;
+            continue;
+        }
+
         if lines[i].is_empty() {
             if !buf.is_empty() {
                 blocks.push(paragraph_from_lines(&buf));
@@ -119,6 +132,20 @@ fn find_fence_close(lines: &[&str], from: usize) -> Option<usize> {
         if line.trim() == "```" {
             return Some(from + offset);
         }
+    }
+    None
+}
+
+fn match_heading(line: &str) -> Option<(crate::HeadingLevel, &str)> {
+    use crate::HeadingLevel;
+    if let Some(rest) = line.strip_prefix("### ") {
+        return Some((HeadingLevel::H3, rest));
+    }
+    if let Some(rest) = line.strip_prefix("## ") {
+        return Some((HeadingLevel::H2, rest));
+    }
+    if let Some(rest) = line.strip_prefix("# ") {
+        return Some((HeadingLevel::H1, rest));
     }
     None
 }

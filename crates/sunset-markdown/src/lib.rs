@@ -519,6 +519,51 @@ mod tests {
     }
 
     #[test]
+    fn h1_h2_h3() {
+        assert_eq!(
+            parse("# one\n## two\n### three"),
+            Document(vec![
+                Block::Heading {
+                    level: HeadingLevel::H1,
+                    content: vec![Inline::Text("one".to_owned())],
+                },
+                Block::Heading {
+                    level: HeadingLevel::H2,
+                    content: vec![Inline::Text("two".to_owned())],
+                },
+                Block::Heading {
+                    level: HeadingLevel::H3,
+                    content: vec![Inline::Text("three".to_owned())],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn h4_or_more_is_paragraph() {
+        assert_eq!(
+            parse("#### not a heading"),
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "#### not a heading".to_owned()
+            )])])
+        );
+    }
+
+    #[test]
+    fn heading_can_contain_inline_formatting() {
+        assert_eq!(
+            parse("# **bold** title"),
+            Document(vec![Block::Heading {
+                level: HeadingLevel::H1,
+                content: vec![
+                    Inline::Bold(vec![Inline::Text("bold".to_owned())]),
+                    Inline::Text(" title".to_owned()),
+                ],
+            }])
+        );
+    }
+
+    #[test]
     fn unclosed_fenced_code_falls_back_to_paragraph() {
         // Implementation choice: we treat the whole input as paragraphs
         // when the closing fence is missing, rather than swallowing
