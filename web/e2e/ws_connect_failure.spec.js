@@ -101,4 +101,6 @@ test("WS connect failure does not panic the wasm with closure-after-drop", async
     /closure invoked recursively or after being dropped/i.test(m),
   );
   expect(panics, `expected no closure-drop panics, got:\n${panics.join("\n")}`).toEqual([]);
+
+  await ctx.close();
 });
