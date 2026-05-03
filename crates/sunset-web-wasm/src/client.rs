@@ -173,9 +173,19 @@ impl Client {
         };
 
         let addr = sunset_sync::PeerAddr::new(Bytes::from(canonical));
-        match self.supervisor.add(addr).await {
-            Ok(()) => {
-                *self.relay_status.borrow_mut() = "connected".to_owned();
+        match self
+            .supervisor
+            .add(sunset_sync::Connectable::Direct(addr))
+            .await
+        {
+            Ok(_id) => {
+                // The intent has been registered. Status is now driven by
+                // the on_peer_connection_state forwarder once the dial
+                // completes. We optimistically tag "connecting" here so
+                // legacy callers see something other than "disconnected"
+                // before the first state event arrives. (Task 5 retires
+                // this string status entirely.)
+                *self.relay_status.borrow_mut() = "connecting".to_owned();
                 Ok(())
             }
             Err(e) => {
@@ -200,7 +210,7 @@ impl Client {
         let addr_str = format!("webrtc://{}#x25519={}", hex::encode(pk), hex::encode(x_pub));
         let addr = sunset_sync::PeerAddr::new(Bytes::from(addr_str));
         self.supervisor
-            .add(addr)
+            .add(sunset_sync::Connectable::Direct(addr))
             .await
             .map_err(|e| JsError::new(&format!("connect_direct: {e}")))?;
         Ok(())
@@ -624,13 +634,13 @@ fn intent_state_str(s: sunset_sync::IntentState) -> &'static str {
 
 /// Build the JS-shaped `{addr, state, attempt, peer_id?}` object used
 /// by both `peer_connection_snapshot` and `on_peer_connection_state`.
+/// `addr` is the intent's display label (Task 4 enriches this further).
 fn intent_snapshot_to_js(snap: &sunset_sync::IntentSnapshot) -> Result<JsValue, JsError> {
     let obj = js_sys::Object::new();
-    let addr_str = String::from_utf8_lossy(snap.addr.as_bytes()).into_owned();
     js_sys::Reflect::set(
         &obj,
         &JsValue::from_str("addr"),
-        &JsValue::from_str(&addr_str),
+        &JsValue::from_str(&snap.label),
     )
     .map_err(|_| JsError::new("Reflect::set addr failed"))?;
     js_sys::Reflect::set(
@@ -664,10 +674,9 @@ fn spawn_peer_connection_state_forwarder(
     supervisor: Rc<sunset_sync::PeerSupervisor<MemoryStore, MultiTransport<WsT, RtcT>>>,
     handler: Rc<RefCell<Option<js_sys::Function>>>,
 ) {
-    use futures::StreamExt as _;
-    let mut sub = supervisor.subscribe();
     wasm_bindgen_futures::spawn_local(async move {
-        while let Some(snap) = sub.next().await {
+        let mut sub = supervisor.subscribe_intents().await;
+        while let Some(snap) = sub.recv().await {
             let obj = match intent_snapshot_to_js(&snap) {
                 Ok(o) => o,
                 Err(e) => {

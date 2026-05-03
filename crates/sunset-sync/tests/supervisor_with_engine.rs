@@ -16,7 +16,8 @@ use sunset_store::VerifyingKey;
 use sunset_store_memory::MemoryStore;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{
-    BackoffPolicy, IntentState, PeerAddr, PeerId, PeerSupervisor, Signer, SyncConfig, SyncEngine,
+    BackoffPolicy, Connectable, IntentState, PeerAddr, PeerId, PeerSupervisor, Signer, SyncConfig,
+    SyncEngine,
 };
 
 fn vk(b: &[u8]) -> VerifyingKey {
@@ -109,18 +110,27 @@ async fn supervisor_redials_after_disconnect() {
             });
 
             let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
-            sup.add(bob_addr.clone()).await.unwrap();
+            let intent_id = sup
+                .add(Connectable::Direct(bob_addr.clone()))
+                .await
+                .unwrap();
 
-            // After add resolves, the supervisor's intent should be Connected
-            // and the engine should know about bob.
-            let snap = sup.snapshot().await;
-            assert_eq!(snap.len(), 1);
-            assert_eq!(snap[0].state, IntentState::Connected);
-            let connected_peer_id = snap[0]
-                .peer_id
-                .clone()
-                .expect("supervisor must have learned bob's peer id on connect");
-            assert_eq!(connected_peer_id, bob_id);
+            // `add` no longer waits for the first connection — poll until
+            // the intent reports Connected and learns bob's PeerId.
+            let connected_to_bob = wait_for(
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+                || async {
+                    let snap = sup.snapshot().await;
+                    snap.iter().any(|s| {
+                        s.id == intent_id
+                            && s.state == IntentState::Connected
+                            && s.peer_id.as_ref() == Some(&bob_id)
+                    })
+                },
+            )
+            .await;
+            assert!(connected_to_bob, "supervisor failed to connect to bob");
 
             // Tear the connection down at the engine layer. This bypasses
             // the supervisor's command channel — exactly what would happen
@@ -138,7 +148,7 @@ async fn supervisor_redials_after_disconnect() {
                 || async {
                     let snap = sup.snapshot().await;
                     snap.iter().any(|s| {
-                        s.addr == bob_addr
+                        s.id == intent_id
                             && s.state == IntentState::Connected
                             && s.peer_id.as_ref() == Some(&bob_id)
                     })

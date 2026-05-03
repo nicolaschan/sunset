@@ -34,6 +34,6 @@ pub use multi_transport::{MultiConnection, MultiTransport};
 pub use signaler::{SignalMessage, Signaler};
 pub use signer::Signer;
 pub use spawning_acceptor::SpawningAcceptor;
-pub use supervisor::{BackoffPolicy, IntentSnapshot, IntentState, PeerSupervisor};
+pub use supervisor::{BackoffPolicy, IntentId, IntentSnapshot, IntentState, PeerSupervisor};
 pub use transport::{RawConnection, RawTransport, Transport, TransportConnection, TransportKind};
 pub use types::{PeerAddr, PeerId, SyncConfig, TrustSet};

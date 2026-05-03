@@ -37,6 +37,12 @@ pub enum ResolveErr {
     Transient(String),
 }
 
+impl From<crate::error::Error> for ResolveErr {
+    fn from(e: crate::error::Error) -> Self {
+        ResolveErr::Transient(format!("{e}"))
+    }
+}
+
 impl Connectable {
     /// A short string that identifies this intent for UI display
     /// before a `peer_id` is known. For `Direct`, the canonical URL

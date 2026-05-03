@@ -1,22 +1,22 @@
 //! `PeerSupervisor` — durable connection intents above `SyncEngine`.
 //!
-//! The supervisor takes a list of `PeerAddr`s the application wants to keep
+//! The supervisor takes a list of `Connectable`s the application wants to keep
 //! connected, dials them via `engine.add_peer`, watches `EngineEvent::PeerRemoved`,
 //! and redials with exponential backoff when a connection drops.
 //!
-//! See `docs/superpowers/specs/2026-04-29-connection-liveness-and-supervision-design.md`.
+//! See `docs/superpowers/specs/2026-04-29-connection-liveness-and-supervision-design.md`
+//! and `docs/superpowers/specs/2026-05-03-durable-relay-connect-design.md`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use rand_core::{RngCore, SeedableRng};
+use rand_core::SeedableRng;
 use sunset_store::Store;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::engine::{EngineEvent, SyncEngine};
-use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::types::{PeerAddr, PeerId};
 
@@ -64,44 +64,77 @@ pub enum IntentState {
     Cancelled,
 }
 
+/// Opaque, monotonically-allocated identifier for a registered intent.
+/// Stable across reconnect cycles (peer_id may not be known yet on
+/// first attempt; the IntentId always is).
+pub type IntentId = u64;
+
 #[derive(Clone, Debug)]
 pub struct IntentSnapshot {
-    pub addr: PeerAddr,
+    pub id: IntentId,
     pub state: IntentState,
     pub peer_id: Option<PeerId>,
+    pub kind: Option<crate::transport::TransportKind>,
     pub attempt: u32,
+    /// Display label — `Connectable::label()` of the intent that
+    /// created this snapshot. Stable across reconnect cycles.
+    pub label: String,
+}
+
+/// Key used to clean up either dedup map without a second branch on the
+/// connectable. Matches the shape of `direct_dedup` / `resolving_dedup`
+/// so callers stay readable even with three different cleanup paths
+/// (Remove, Parse-in-cmd, Parse-in-dial).
+enum DedupKey {
+    Direct(PeerAddr),
+    Resolving(String),
 }
 
 pub(crate) struct IntentEntry {
+    pub id: IntentId,
     pub state: IntentState,
     pub attempt: u32,
     pub peer_id: Option<PeerId>,
+    pub kind: Option<crate::transport::TransportKind>,
     /// Earliest moment the next dial attempt may run. None when not in Backoff.
     pub next_attempt_at: Option<web_time::SystemTime>,
+    /// What to dial. Used by every retry attempt; for `Resolving`,
+    /// the resolver runs on every attempt so a rotated identity is
+    /// picked up automatically.
+    pub connectable: crate::connectable::Connectable,
+    /// Cached `Connectable::label()` for snapshot construction.
+    pub label: String,
 }
 
 pub(crate) struct SupervisorState {
-    pub intents: HashMap<PeerAddr, IntentEntry>,
-    /// Reverse map: peer_id → addr. Populated when an intent transitions
-    /// to Connected; cleared on disconnect.
-    pub peer_to_addr: HashMap<PeerId, PeerAddr>,
+    pub next_id: IntentId,
+    pub intents: HashMap<IntentId, IntentEntry>,
+    /// Reverse map: connected peer_id → intent that owns the connection.
+    pub peer_to_intent: HashMap<PeerId, IntentId>,
+    /// Dedup: existing `Direct(addr)` intent for this address, if any.
+    pub direct_dedup: HashMap<PeerAddr, IntentId>,
+    /// Dedup: existing `Resolving { input }` intent for this input, if any.
+    pub resolving_dedup: HashMap<String, IntentId>,
     /// Live-state subscribers. Each receives an `IntentSnapshot` every
-    /// time an intent transitions. Senders whose receiver is dropped are
-    /// pruned at broadcast time.
+    /// time an intent transitions, plus an initial replay on subscribe.
+    /// Senders whose receiver is dropped are pruned at broadcast time.
     pub subscribers: Vec<mpsc::UnboundedSender<IntentSnapshot>>,
 }
 
 pub(crate) enum SupervisorCommand {
     Add {
-        addr: PeerAddr,
-        ack: oneshot::Sender<Result<()>>,
+        connectable: crate::connectable::Connectable,
+        ack: oneshot::Sender<Result<IntentId, crate::connectable::ResolveErr>>,
     },
     Remove {
-        addr: PeerAddr,
+        id: IntentId,
         ack: oneshot::Sender<()>,
     },
     Snapshot {
         ack: oneshot::Sender<Vec<IntentSnapshot>>,
+    },
+    Subscribe {
+        ack: oneshot::Sender<mpsc::UnboundedReceiver<IntentSnapshot>>,
     },
 }
 
@@ -126,32 +159,46 @@ where
             cmd_tx,
             cmd_rx: RefCell::new(Some(cmd_rx)),
             state: Rc::new(RefCell::new(SupervisorState {
+                next_id: 0,
                 intents: HashMap::new(),
-                peer_to_addr: HashMap::new(),
+                peer_to_intent: HashMap::new(),
+                direct_dedup: HashMap::new(),
+                resolving_dedup: HashMap::new(),
                 subscribers: Vec::new(),
             })),
             policy,
         })
     }
 
-    /// Register a durable intent. Returns when the FIRST connection
-    /// completes (success → Ok; failure → Err). Subsequent disconnects
-    /// after first success are absorbed silently and trigger redial.
-    /// If `addr` is already registered, returns Ok immediately.
-    pub async fn add(&self, addr: PeerAddr) -> Result<()> {
+    /// Register a durable intent. Returns once the supervisor has
+    /// allocated an `IntentId` and recorded the intent (one cmd-channel
+    /// round-trip; does NOT wait for the first connection). The only
+    /// `Err` is `ResolveErr::Parse` — typed garbage that the resolver
+    /// can never make sense of. Transient failures (resolver fetch,
+    /// dial, Hello) never bubble out: the supervisor retries with the
+    /// existing exponential backoff.
+    ///
+    /// If `connectable` matches an existing intent (same `Direct` addr,
+    /// or same `Resolving { input }`), the existing `IntentId` is
+    /// returned and no new intent is created.
+    pub async fn add(
+        &self,
+        connectable: crate::connectable::Connectable,
+    ) -> Result<IntentId, crate::connectable::ResolveErr> {
         let (ack, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SupervisorCommand::Add { addr, ack })
-            .map_err(|_| Error::Closed)?;
-        rx.await.map_err(|_| Error::Closed)?
+            .send(SupervisorCommand::Add { connectable, ack })
+            .map_err(|_| crate::connectable::ResolveErr::Transient("supervisor closed".into()))?;
+        rx.await
+            .map_err(|_| crate::connectable::ResolveErr::Transient("supervisor closed".into()))?
     }
 
     /// Cancel a durable intent. Tears down the connection if connected.
-    pub async fn remove(&self, addr: PeerAddr) {
+    pub async fn remove(&self, id: IntentId) {
         let (ack, rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(SupervisorCommand::Remove { addr, ack })
+            .send(SupervisorCommand::Remove { id, ack })
             .is_ok()
         {
             let _ = rx.await;
@@ -171,27 +218,39 @@ where
         rx.await.unwrap_or_default()
     }
 
-    /// Subscribe to live intent state changes. The returned stream emits a
-    /// snapshot of an intent every time it transitions (Connecting →
-    /// Connected → Backoff → ...). Stream ends when the supervisor's
-    /// run loop exits.
-    pub fn subscribe(&self) -> futures::stream::LocalBoxStream<'static, IntentSnapshot> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.state.borrow_mut().subscribers.push(tx);
-        Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+    /// Subscribe to intent state changes. The returned receiver is fed
+    /// the current snapshot of every existing intent on subscribe (so
+    /// late subscribers don't miss state), then every change after that.
+    pub async fn subscribe_intents(&self) -> mpsc::UnboundedReceiver<IntentSnapshot> {
+        let (ack, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(SupervisorCommand::Subscribe { ack })
+            .is_err()
+        {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            return rx;
+        }
+        rx.await.unwrap_or_else(|_| {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            rx
+        })
     }
 
-    /// Broadcast the current snapshot of `addr` to all subscribers.
-    /// Drops senders whose receiver has been dropped.
-    fn broadcast(state: &mut SupervisorState, addr: &PeerAddr) {
-        let Some(entry) = state.intents.get(addr) else {
+    /// Broadcast the current snapshot of `id` to all subscribers.
+    /// Drops senders whose receiver has been dropped. Caller must hold
+    /// the inner state lock.
+    fn broadcast(state: &mut SupervisorState, id: IntentId) {
+        let Some(entry) = state.intents.get(&id) else {
             return;
         };
         let snap = IntentSnapshot {
-            addr: addr.clone(),
+            id,
             state: entry.state,
             peer_id: entry.peer_id.clone(),
+            kind: entry.kind,
             attempt: entry.attempt,
+            label: entry.label.clone(),
         };
         state.subscribers.retain(|tx| tx.send(snap.clone()).is_ok());
     }
@@ -238,7 +297,7 @@ where
                     self.clone().handle_engine_event(ev, &mut rng).await;
                 }
                 Some(cmd) = cmd_rx.recv() => {
-                    self.clone().handle_command(cmd, &mut rng).await;
+                    self.clone().handle_command(cmd).await;
                 }
                 _ = sleep_fut => {
                     self.clone().fire_due_backoffs(&mut rng).await;
@@ -268,164 +327,349 @@ where
         _rng: &mut rand_chacha::ChaCha20Rng,
     ) {
         match ev {
-            EngineEvent::PeerAdded { peer_id, .. } => {
-                // The supervisor's dial wrapper already populated peer_id
-                // from add_peer's return value; this event is just a
-                // confirmation latch. No action required beyond
-                // syncing state in case the event arrives first.
+            EngineEvent::PeerAdded { peer_id, kind } => {
                 let mut state = self.state.borrow_mut();
-                if let Some(addr) = state.peer_to_addr.get(&peer_id).cloned() {
-                    if let Some(entry) = state.intents.get_mut(&addr) {
+                if let Some(id) = state.peer_to_intent.get(&peer_id).copied() {
+                    if let Some(entry) = state.intents.get_mut(&id) {
                         entry.state = IntentState::Connected;
+                        entry.kind = Some(kind);
                         entry.attempt = 0;
                         entry.next_attempt_at = None;
+                        Self::broadcast(&mut state, id);
                     }
-                    Self::broadcast(&mut state, &addr);
                 }
             }
             EngineEvent::PeerRemoved { peer_id } => {
                 let mut state = self.state.borrow_mut();
-                if let Some(addr) = state.peer_to_addr.remove(&peer_id) {
-                    let mut transitioned = false;
-                    if let Some(entry) = state.intents.get_mut(&addr) {
+                if let Some(id) = state.peer_to_intent.remove(&peer_id) {
+                    if let Some(entry) = state.intents.get_mut(&id) {
                         if entry.state != IntentState::Cancelled {
                             entry.state = IntentState::Backoff;
                             entry.peer_id = None;
-                            // Schedule first redial immediately (attempt
-                            // counter starts at the *current* attempt; the
-                            // dial-failure handler increments).
-                            let delay = self.policy.delay(entry.attempt, _rng);
+                            entry.kind = None;
+                            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(
+                                id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                    .wrapping_add(entry.attempt as u64),
+                            );
+                            let delay = self.policy.delay(entry.attempt, &mut rng);
                             entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
-                            transitioned = true;
+                            Self::broadcast(&mut state, id);
                         }
-                    }
-                    if transitioned {
-                        Self::broadcast(&mut state, &addr);
                     }
                 }
             }
         }
     }
 
-    async fn handle_command(
-        self: Rc<Self>,
-        cmd: SupervisorCommand,
-        rng: &mut rand_chacha::ChaCha20Rng,
-    ) {
+    async fn handle_command(self: Rc<Self>, cmd: SupervisorCommand) {
         match cmd {
-            SupervisorCommand::Add { addr, ack } => {
-                {
+            SupervisorCommand::Add { connectable, ack } => {
+                // Dedup by Connectable identity.
+                let dedup_id: Option<IntentId> = {
                     let state = self.state.borrow();
-                    if state.intents.contains_key(&addr) {
-                        // Already an intent. Idempotent.
-                        let _ = ack.send(Ok(()));
+                    match &connectable {
+                        crate::connectable::Connectable::Direct(addr) => {
+                            state.direct_dedup.get(addr).copied()
+                        }
+                        crate::connectable::Connectable::Resolving { input, .. } => {
+                            state.resolving_dedup.get(input).copied()
+                        }
+                    }
+                };
+                if let Some(existing) = dedup_id {
+                    let _ = ack.send(Ok(existing));
+                    return;
+                }
+
+                // Eager parse-check for Resolving inputs. The resolver
+                // does this internally on every attempt, but we run it
+                // once here so unparseable inputs never become a zombie
+                // intent that retries forever.
+                if let crate::connectable::Connectable::Resolving { input, .. } = &connectable {
+                    if let Err(sunset_relay_resolver::Error::MalformedInput(e)) =
+                        sunset_relay_resolver::parse_input(input)
+                    {
+                        let _ = ack.send(Err(crate::connectable::ResolveErr::Parse(e)));
                         return;
                     }
                 }
-                {
+
+                let id = {
                     let mut state = self.state.borrow_mut();
+                    let id = state.next_id;
+                    state.next_id += 1;
+
+                    match &connectable {
+                        crate::connectable::Connectable::Direct(addr) => {
+                            state.direct_dedup.insert(addr.clone(), id);
+                        }
+                        crate::connectable::Connectable::Resolving { input, .. } => {
+                            state.resolving_dedup.insert(input.clone(), id);
+                        }
+                    }
+
+                    let label = connectable.label();
                     state.intents.insert(
-                        addr.clone(),
+                        id,
                         IntentEntry {
+                            id,
                             state: IntentState::Connecting,
                             attempt: 0,
                             peer_id: None,
+                            kind: None,
                             next_attempt_at: None,
+                            connectable: connectable.clone(),
+                            label,
                         },
                     );
-                    Self::broadcast(&mut state, &addr);
-                }
-                let engine = self.engine.clone();
-                let state = self.state.clone();
-                let addr_for_dial = addr.clone();
-                crate::spawn::spawn_local(async move {
-                    let r = engine.add_peer(addr_for_dial.clone()).await;
-                    match r {
-                        Ok(peer_id) => {
-                            // Decide whether the intent has been cancelled
-                            // in a short critical section, then drop the
-                            // borrow before any await.
-                            let cancelled = {
-                                let mut s = state.borrow_mut();
-                                let outcome = match s.intents.get_mut(&addr_for_dial) {
-                                    Some(entry) if entry.state == IntentState::Cancelled => true,
-                                    Some(entry) => {
-                                        entry.state = IntentState::Connected;
-                                        entry.peer_id = Some(peer_id.clone());
-                                        entry.attempt = 0;
-                                        entry.next_attempt_at = None;
-                                        s.peer_to_addr
-                                            .insert(peer_id.clone(), addr_for_dial.clone());
-                                        false
-                                    }
-                                    None => false,
-                                };
-                                if !outcome {
-                                    Self::broadcast(&mut s, &addr_for_dial);
-                                }
-                                outcome
-                            };
-                            if cancelled {
-                                // Removed before connection landed; tear down.
-                                let _ = engine.remove_peer(peer_id).await;
-                            }
-                            let _ = ack.send(Ok(()));
-                        }
-                        Err(e) => {
-                            // First-dial failure: remove the intent so the
-                            // caller's Err is observable but no zombie state
-                            // remains.
-                            state.borrow_mut().intents.remove(&addr_for_dial);
-                            let _ = ack.send(Err(e));
-                        }
-                    }
-                });
+                    Self::broadcast(&mut state, id);
+                    id
+                };
+
+                // Reply to the caller now that the intent is registered.
+                // The first dial happens in the background; failures
+                // transition the intent to Backoff (no longer surfaced).
+                let _ = ack.send(Ok(id));
+
+                self.clone().spawn_dial(id);
             }
-            SupervisorCommand::Remove { addr, ack } => {
-                let peer_id_to_remove = {
+
+            SupervisorCommand::Remove { id, ack } => {
+                let (peer_id_to_remove, addr_to_unmap, input_to_unmap) = {
                     let mut state = self.state.borrow_mut();
-                    if let Some(entry) = state.intents.get_mut(&addr) {
+                    let entry = state.intents.get_mut(&id);
+                    let (pid, addr, input) = if let Some(entry) = entry {
                         entry.state = IntentState::Cancelled;
                         let pid = entry.peer_id.clone();
-                        if let Some(p) = &pid {
-                            state.peer_to_addr.remove(p);
-                        }
-                        pid
+                        let addr = match &entry.connectable {
+                            crate::connectable::Connectable::Direct(a) => Some(a.clone()),
+                            _ => None,
+                        };
+                        let input = match &entry.connectable {
+                            crate::connectable::Connectable::Resolving { input, .. } => {
+                                Some(input.clone())
+                            }
+                            _ => None,
+                        };
+                        (pid, addr, input)
                     } else {
-                        None
+                        (None, None, None)
+                    };
+                    if let Some(p) = &pid {
+                        state.peer_to_intent.remove(p);
                     }
+                    Self::broadcast(&mut state, id);
+                    (pid, addr, input)
                 };
                 if let Some(pid) = peer_id_to_remove {
                     let _ = self.engine.remove_peer(pid).await;
                 }
                 {
                     let mut state = self.state.borrow_mut();
-                    state.intents.remove(&addr);
+                    if let Some(addr) = addr_to_unmap {
+                        state.direct_dedup.remove(&addr);
+                    }
+                    if let Some(input) = input_to_unmap {
+                        state.resolving_dedup.remove(&input);
+                    }
+                    state.intents.remove(&id);
                 }
                 let _ = ack.send(());
             }
+
             SupervisorCommand::Snapshot { ack } => {
                 let state = self.state.borrow();
                 let snap: Vec<IntentSnapshot> = state
                     .intents
-                    .iter()
-                    .map(|(addr, e)| IntentSnapshot {
-                        addr: addr.clone(),
+                    .values()
+                    .map(|e| IntentSnapshot {
+                        id: e.id,
                         state: e.state,
                         peer_id: e.peer_id.clone(),
+                        kind: e.kind,
                         attempt: e.attempt,
+                        label: e.label.clone(),
                     })
                     .collect();
                 let _ = ack.send(snap);
             }
+
+            SupervisorCommand::Subscribe { ack } => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                // Replay current state, then register for live updates.
+                // Replay happens BEFORE register so callers can't see a
+                // change for an intent without first having received its
+                // baseline snapshot.
+                {
+                    let mut state = self.state.borrow_mut();
+                    let snaps: Vec<IntentSnapshot> = state
+                        .intents
+                        .values()
+                        .map(|e| IntentSnapshot {
+                            id: e.id,
+                            state: e.state,
+                            peer_id: e.peer_id.clone(),
+                            kind: e.kind,
+                            attempt: e.attempt,
+                            label: e.label.clone(),
+                        })
+                        .collect();
+                    for snap in snaps {
+                        if tx.send(snap).is_err() {
+                            let _ = ack.send(rx);
+                            return;
+                        }
+                    }
+                    state.subscribers.push(tx);
+                }
+                let _ = ack.send(rx);
+            }
         }
-        let _ = rng; // silence unused
     }
 
-    async fn fire_due_backoffs(self: Rc<Self>, rng: &mut rand_chacha::ChaCha20Rng) {
+    /// Spawn a single dial attempt for the given intent. On success,
+    /// transitions the intent to Connected and populates peer_id +
+    /// kind. On failure, transitions to Backoff and schedules the next
+    /// attempt with the existing `BackoffPolicy`.
+    fn spawn_dial(self: Rc<Self>, id: IntentId) {
+        let engine = self.engine.clone();
+        let state = self.state.clone();
+        let policy = self.policy.clone();
+        crate::spawn::spawn_local(async move {
+            // Snapshot the connectable for this attempt.
+            let connectable = {
+                let s = state.borrow();
+                match s.intents.get(&id) {
+                    Some(entry) if entry.state != IntentState::Cancelled => {
+                        entry.connectable.clone()
+                    }
+                    _ => return,
+                }
+            };
+
+            let attempt_result = match connectable.resolve_addr().await {
+                Ok(addr) => engine
+                    .add_peer(addr)
+                    .await
+                    .map_err(crate::connectable::ResolveErr::from),
+                Err(e) => Err(e),
+            };
+
+            // Compute next state. The borrow is split into two scopes so
+            // no `Ref` is held across the post-cancel
+            // `engine.remove_peer().await`: scope 1 inspects state and
+            // returns whether to tear down a late-arriving connection;
+            // scope 2 (entered only on `Proceed`) applies the success /
+            // parse-error / transient-error transition.
+            //
+            // Note: `Remove` deletes the intent entry entirely (not just
+            // setting `state = Cancelled`), so by the time this scope
+            // runs after a `remove(id).await`, `intents.get(&id)` is
+            // `None`. The `None` arm therefore must teardown a
+            // late-arriving connection just like the `Cancelled` arm —
+            // otherwise the engine ends up holding an orphan peer.
+            enum CancelAction {
+                /// Intent is cancelled or already gone; the dial
+                /// succeeded, so we own a connection at the engine that
+                /// needs tearing down before we exit.
+                TearDownLatePeer(PeerId),
+                /// Intent is cancelled or already gone; the dial
+                /// failed, so there's nothing to clean up — just exit.
+                ExitNoOp,
+                /// Intent is not cancelled — proceed with the normal
+                /// state transition in scope 2.
+                Proceed,
+            }
+            let action = {
+                let s = state.borrow();
+                match s.intents.get(&id) {
+                    Some(entry) if entry.state == IntentState::Cancelled => match &attempt_result {
+                        Ok((pid, _)) => CancelAction::TearDownLatePeer(pid.clone()),
+                        Err(_) => CancelAction::ExitNoOp,
+                    },
+                    Some(_) => CancelAction::Proceed,
+                    None => match &attempt_result {
+                        Ok((pid, _)) => CancelAction::TearDownLatePeer(pid.clone()),
+                        Err(_) => CancelAction::ExitNoOp,
+                    },
+                }
+            };
+            match action {
+                CancelAction::ExitNoOp => return,
+                CancelAction::TearDownLatePeer(pid) => {
+                    let _ = engine.remove_peer(pid).await;
+                    return;
+                }
+                CancelAction::Proceed => {}
+            }
+            {
+                let mut s = state.borrow_mut();
+                let Some(entry) = s.intents.get_mut(&id) else {
+                    return;
+                };
+                if entry.state == IntentState::Cancelled {
+                    return;
+                }
+                match attempt_result {
+                    Ok((peer_id, kind)) => {
+                        entry.state = IntentState::Connected;
+                        entry.peer_id = Some(peer_id.clone());
+                        entry.kind = Some(kind);
+                        entry.attempt = 0;
+                        entry.next_attempt_at = None;
+                        s.peer_to_intent.insert(peer_id, id);
+                        Self::broadcast(&mut s, id);
+                    }
+                    Err(crate::connectable::ResolveErr::Parse(_)) => {
+                        // Permanent — cancel the intent and clean up
+                        // dedup so a future `add()` with the same
+                        // `Connectable` can produce a fresh intent
+                        // (and discover the same parse error eagerly
+                        // in the cmd handler) rather than dedup'ing
+                        // to this dead Cancelled one.
+                        entry.state = IntentState::Cancelled;
+                        let dedup_key: DedupKey = match &entry.connectable {
+                            crate::connectable::Connectable::Direct(addr) => {
+                                DedupKey::Direct(addr.clone())
+                            }
+                            crate::connectable::Connectable::Resolving { input, .. } => {
+                                DedupKey::Resolving(input.clone())
+                            }
+                        };
+                        Self::broadcast(&mut s, id);
+                        match dedup_key {
+                            DedupKey::Direct(addr) => {
+                                s.direct_dedup.remove(&addr);
+                            }
+                            DedupKey::Resolving(input) => {
+                                s.resolving_dedup.remove(&input);
+                            }
+                        }
+                        s.intents.remove(&id);
+                    }
+                    Err(_transient) => {
+                        entry.attempt = entry.attempt.saturating_add(1);
+                        entry.state = IntentState::Backoff;
+                        // Use a deterministic-ish RNG seeded from the
+                        // entry id + attempt so retries don't pile up
+                        // at the same wall time across crates that
+                        // share a global RNG.
+                        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(
+                            id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                .wrapping_add(entry.attempt as u64),
+                        );
+                        let delay = policy.delay(entry.attempt, &mut rng);
+                        entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
+                        Self::broadcast(&mut s, id);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn fire_due_backoffs(self: Rc<Self>, _rng: &mut rand_chacha::ChaCha20Rng) {
         let now = web_time::SystemTime::now();
-        // Collect addrs whose backoff has fired.
-        let due: Vec<PeerAddr> = {
+        let due: Vec<IntentId> = {
             let state = self.state.borrow();
             state
                 .intents
@@ -434,83 +678,23 @@ where
                     e.state == IntentState::Backoff
                         && e.next_attempt_at.map(|at| at <= now).unwrap_or(false)
                 })
-                .map(|(a, _)| a.clone())
+                .map(|(id, _)| *id)
                 .collect()
         };
 
-        for addr in due {
-            // Mark as Connecting before dialing so a second backoff tick
-            // doesn't double-fire.
+        for id in due {
             {
                 let mut state = self.state.borrow_mut();
-                let should_broadcast = if let Some(entry) = state.intents.get_mut(&addr) {
+                if let Some(entry) = state.intents.get_mut(&id) {
                     if entry.state != IntentState::Backoff {
-                        false
-                    } else {
-                        entry.state = IntentState::Connecting;
-                        entry.next_attempt_at = None;
-                        true
+                        continue;
                     }
-                } else {
-                    false
-                };
-                if should_broadcast {
-                    Self::broadcast(&mut state, &addr);
-                } else {
-                    continue;
+                    entry.state = IntentState::Connecting;
+                    entry.next_attempt_at = None;
+                    Self::broadcast(&mut state, id);
                 }
             }
-            let engine = self.engine.clone();
-            let state = self.state.clone();
-            let policy = self.policy.clone();
-            let addr_for_dial = addr.clone();
-            // Sample a delay-seed for the next backoff if this fails.
-            let next_seed = rng.next_u64();
-            crate::spawn::spawn_local(async move {
-                let r = engine.add_peer(addr_for_dial.clone()).await;
-                // Compute the new entry state in a short critical section
-                // and capture whether we must tear down a connection that
-                // landed after the intent was cancelled.
-                let cancelled_peer: Option<PeerId> = {
-                    let mut s = state.borrow_mut();
-                    let Some(entry) = s.intents.get_mut(&addr_for_dial) else {
-                        return;
-                    };
-                    let (outcome, transitioned) = if entry.state == IntentState::Cancelled {
-                        (r.ok(), false)
-                    } else {
-                        match r {
-                            Ok(peer_id) => {
-                                entry.state = IntentState::Connected;
-                                entry.peer_id = Some(peer_id.clone());
-                                entry.attempt = 0;
-                                entry.next_attempt_at = None;
-                                s.peer_to_addr.insert(peer_id, addr_for_dial.clone());
-                                (None, true)
-                            }
-                            Err(_) => {
-                                entry.attempt = entry.attempt.saturating_add(1);
-                                entry.state = IntentState::Backoff;
-                                // Use a tiny RNG seeded from `next_seed` so this
-                                // standalone task can compute a delay without sharing
-                                // the parent's RNG.
-                                let mut local_rng =
-                                    rand_chacha::ChaCha20Rng::seed_from_u64(next_seed);
-                                let delay = policy.delay(entry.attempt, &mut local_rng);
-                                entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
-                                (None, true)
-                            }
-                        }
-                    };
-                    if transitioned {
-                        Self::broadcast(&mut s, &addr_for_dial);
-                    }
-                    outcome
-                };
-                if let Some(peer_id) = cancelled_peer {
-                    let _ = engine.remove_peer(peer_id).await;
-                }
-            });
+            self.clone().spawn_dial(id);
         }
     }
 }
@@ -563,76 +747,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn first_dial_success() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let net = TestNetwork::new();
-                let alice = engine_with_addr(&net, b"alice", "alice");
-                let bob = engine_with_addr(&net, b"bob", "bob");
-
-                // Start both engines.
-                crate::spawn::spawn_local({
-                    let a = alice.clone();
-                    async move { a.run().await }
-                });
-                crate::spawn::spawn_local({
-                    let b = bob.clone();
-                    async move { b.run().await }
-                });
-
-                // Supervisor on alice's side.
-                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
-                crate::spawn::spawn_local({
-                    let s = sup.clone();
-                    async move { s.run().await }
-                });
-
-                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
-                sup.add(bob_addr.clone()).await.unwrap();
-
-                let snap = sup.snapshot().await;
-                assert_eq!(snap.len(), 1);
-                assert_eq!(snap[0].state, IntentState::Connected);
-                assert_eq!(snap[0].attempt, 0);
-                assert!(snap[0].peer_id.is_some());
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn first_dial_failure_returns_err_and_clears_intent() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let net = TestNetwork::new();
-                let alice = engine_with_addr(&net, b"alice", "alice");
-
-                crate::spawn::spawn_local({
-                    let a = alice.clone();
-                    async move { a.run().await }
-                });
-
-                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
-                crate::spawn::spawn_local({
-                    let s = sup.clone();
-                    async move { s.run().await }
-                });
-
-                // No engine listening at "ghost".
-                let ghost = PeerAddr::new(Bytes::from_static(b"ghost"));
-                let res = sup.add(ghost.clone()).await;
-                assert!(res.is_err());
-
-                // No zombie intent.
-                let snap = sup.snapshot().await;
-                assert!(snap.iter().find(|s| s.addr == ghost).is_none());
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn idempotent_add() {
+    async fn first_dial_success_returns_id_and_connects() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -656,89 +771,54 @@ mod tests {
                 });
 
                 let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
-                sup.add(bob_addr.clone()).await.unwrap();
-                sup.add(bob_addr.clone()).await.unwrap();
-                sup.add(bob_addr.clone()).await.unwrap();
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
 
-                let snap = sup.snapshot().await;
-                assert_eq!(snap.len(), 1);
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn subscribe_emits_state_transitions() {
-        use futures::StreamExt as _;
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let net = TestNetwork::new();
-                let alice = engine_with_addr(&net, b"alice", "alice");
-                let bob = engine_with_addr(&net, b"bob", "bob");
-
-                crate::spawn::spawn_local({
-                    let a = alice.clone();
-                    async move { a.run().await }
-                });
-                crate::spawn::spawn_local({
-                    let b = bob.clone();
-                    async move { b.run().await }
-                });
-
-                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
-                crate::spawn::spawn_local({
-                    let s = sup.clone();
-                    async move { s.run().await }
-                });
-
-                let mut sub = sup.subscribe();
-
-                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
-                sup.add(bob_addr.clone()).await.unwrap();
-
-                // Drain until we see a Connected event for bob_addr or 1 s passes.
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-                let mut saw_connected = false;
-                while tokio::time::Instant::now() < deadline {
-                    let timeout = deadline - tokio::time::Instant::now();
-                    match tokio::time::timeout(timeout, sub.next()).await {
-                        Ok(Some(snap)) => {
-                            if snap.addr == bob_addr && snap.state == IntentState::Connected {
-                                saw_connected = true;
-                                break;
-                            }
-                        }
-                        _ => break,
+                // Wait until the snapshot reports Connected (with a
+                // bounded retry — the dial happens asynchronously now).
+                let mut connected = false;
+                for _ in 0..50 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
+                        connected = true;
+                        break;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-                assert!(
-                    saw_connected,
-                    "subscribe should have observed bob transition to Connected"
-                );
+                assert!(connected, "intent did not reach Connected");
             })
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn subscribe_observes_connecting_during_redial() {
-        use futures::StreamExt as _;
+    async fn first_dial_failure_enters_backoff_and_retries() {
+        // NOTE: we intentionally do NOT use `start_paused = true` here.
+        // The supervisor's backoff scheduling reads `web_time::SystemTime::now()`
+        // (real wall clock), while the dial-loop wakeup uses `tokio::time::sleep`.
+        // Pausing tokio time desynchronises those two clocks: the
+        // backoff target is ~1 s of real time in the future, but tokio's
+        // sleep only fires when virtual time advances by that much, which
+        // only ever happens if we advance by ≥1 real second. The cleanest
+        // fix is to run on real time with a tight backoff policy so the
+        // test finishes in <1 s of wall clock time.
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let net = TestNetwork::new();
                 let alice = engine_with_addr(&net, b"alice", "alice");
-                let bob = engine_with_addr(&net, b"bob", "bob");
 
                 crate::spawn::spawn_local({
                     let a = alice.clone();
                     async move { a.run().await }
                 });
-                crate::spawn::spawn_local({
-                    let b = bob.clone();
-                    async move { b.run().await }
-                });
 
-                // Tight backoff so the test doesn't take 1 s+ for the redial.
+                // Tight backoff so the redial completes well within the
+                // test's wait window.
                 let policy = BackoffPolicy {
                     initial: std::time::Duration::from_millis(50),
                     max: std::time::Duration::from_millis(50),
@@ -751,45 +831,102 @@ mod tests {
                     async move { s.run().await }
                 });
 
-                let mut sub = sup.subscribe();
-                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
-                sup.add(bob_addr.clone()).await.unwrap();
+                // No engine is listening at "ghost" yet.
+                let ghost = PeerAddr::new(Bytes::from_static(b"ghost"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(ghost.clone()))
+                    .await
+                    .expect("add must return Ok even if first dial will fail");
 
-                // Look up bob's PeerId from the supervisor snapshot, then
-                // force a disconnect through the engine. The engine emits
-                // PeerRemoved, which drives the supervisor's intent to
-                // Backoff; the backoff timer then flips it to Connecting.
-                let bob_peer_id = {
+                // Wait for the intent to enter Backoff (first dial failed).
+                let mut backoff_seen = false;
+                for _ in 0..100 {
                     let snap = sup.snapshot().await;
-                    snap.iter()
-                        .find(|s| s.addr == bob_addr)
-                        .and_then(|s| s.peer_id.clone())
-                        .expect("bob should be Connected with a known PeerId")
-                };
-                alice.remove_peer(bob_peer_id).await.unwrap();
-
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-                let mut saw_backoff = false;
-                let mut saw_connecting_after_backoff = false;
-                while tokio::time::Instant::now() < deadline {
-                    let timeout = deadline - tokio::time::Instant::now();
-                    match tokio::time::timeout(timeout, sub.next()).await {
-                        Ok(Some(snap)) if snap.addr == bob_addr => {
-                            if snap.state == IntentState::Backoff {
-                                saw_backoff = true;
-                            } else if snap.state == IntentState::Connecting && saw_backoff {
-                                saw_connecting_after_backoff = true;
-                                break;
-                            }
-                        }
-                        Ok(Some(_)) => continue,
-                        _ => break,
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Backoff)
+                    {
+                        backoff_seen = true;
+                        break;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 assert!(
-                    saw_connecting_after_backoff,
-                    "subscribe should observe Connecting transition during redial after Backoff"
+                    backoff_seen,
+                    "intent did not enter Backoff after first dial failure"
                 );
+
+                // Bring "ghost" online; intent should reconnect.
+                let _ghost_engine = engine_with_addr(&net, b"ghost", "ghost");
+                crate::spawn::spawn_local({
+                    let g = _ghost_engine.clone();
+                    async move { g.run().await }
+                });
+
+                // The supervisor's backoff timer should fire (50 ms initial,
+                // no jitter) and the next dial should land. Allow generous
+                // slack — 2 s is plenty for a 50 ms backoff.
+                let mut connected = false;
+                for _ in 0..200 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
+                        connected = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(connected, "intent did not reconnect after engine came up");
+
+                // Intent is still in the table (no first-dial cleanup).
+                assert!(sup.snapshot().await.iter().any(|s| s.id == id));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idempotent_add_returns_same_id() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", "bob");
+
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let id1 = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr.clone()))
+                    .await
+                    .unwrap();
+                let id2 = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr.clone()))
+                    .await
+                    .unwrap();
+                let id3 = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
+
+                assert_eq!(id1, id2);
+                assert_eq!(id2, id3);
+                assert_eq!(sup.snapshot().await.len(), 1);
             })
             .await;
     }
@@ -819,13 +956,26 @@ mod tests {
                 });
 
                 let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
-                sup.add(bob_addr.clone()).await.unwrap();
-                sup.remove(bob_addr.clone()).await;
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
 
-                let snap = sup.snapshot().await;
-                assert!(snap.is_empty());
+                // Wait for connect.
+                for _ in 0..50 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
 
-                // Engine no longer has bob in peer_outbound.
+                sup.remove(id).await;
+
+                assert!(sup.snapshot().await.iter().all(|s| s.id != id));
                 let connected = alice.connected_peers().await;
                 assert!(
                     connected
@@ -835,5 +985,193 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// Regression: every `Connected` snapshot must carry `kind: Some(_)`.
+    /// `kind` is the Direct/Relay distinction surfaced to the frontend, so
+    /// "kind populated by a follow-up `PeerAdded` broadcast that races
+    /// against `spawn_dial`'s post-await borrow_mut" is observable as a
+    /// permanent `kind: None` whenever the broadcast runs first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connected_snapshot_carries_kind() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", "bob");
+
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
+
+                // Wait for Connected.
+                for _ in 0..100 {
+                    let snap = sup.snapshot().await;
+                    if let Some(s) = snap.iter().find(|s| s.id == id) {
+                        if s.state == IntentState::Connected {
+                            // Must have kind populated by the time state is Connected.
+                            assert!(
+                                s.kind.is_some(),
+                                "Connected snapshot must carry kind, got {s:?}"
+                            );
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("intent never reached Connected");
+            })
+            .await;
+    }
+
+    /// Regression: the cmd-handler eager parse rejection must not
+    /// poison the dedup state. The eager check runs `parse_input`
+    /// before anything is inserted into `intents` / `direct_dedup` /
+    /// `resolving_dedup`, so a rejected `Resolving` add must leave the
+    /// supervisor's tables exactly as it found them and a subsequent
+    /// valid `add()` must allocate a fresh intent.
+    ///
+    /// Note: this does NOT exercise `spawn_dial`'s `Err(Parse(_))`
+    /// cleanup arm. That arm is currently unreachable in production —
+    /// the eager check filters out anything `parse_input` rejects, and
+    /// `resolver.resolve()` calls the same `parse_input` first. The
+    /// dial-side cleanup is retained as forward-compatible
+    /// defense-in-depth (in case the resolver's mapping ever changes
+    /// to surface Parse errors that the eager check misses), but no
+    /// existing test proves it works.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parse_error_releases_dedup_so_fresh_add_proceeds() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                // First add — eager parse-check rejects, returns Err.
+                // No intent recorded.
+                let bad_fetch: std::rc::Rc<dyn sunset_relay_resolver::HttpFetch> =
+                    std::rc::Rc::new(NoopFetch);
+                let _err = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "".into(),
+                        fetch: bad_fetch.clone(),
+                    })
+                    .await
+                    .expect_err("empty input must Parse-fail");
+
+                // Now register a Direct intent — must succeed with a fresh id,
+                // not dedup to a dead Cancelled one.
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let _bob = engine_with_addr(&net, b"bob", "bob");
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .expect("direct add after parse-fail must succeed");
+
+                // Snapshot should contain exactly one intent (the new one).
+                let snap = sup.snapshot().await;
+                assert_eq!(snap.len(), 1);
+                assert_eq!(snap[0].id, id);
+            })
+            .await;
+    }
+
+    /// Regression: cancelling an intent while its dial is in flight
+    /// must not leave a zombie engine-side connection. Without the
+    /// explicit `engine.remove_peer` call in `spawn_dial`'s
+    /// `Cancelled` branch, a late dial that lands after `remove(id)`
+    /// stays connected at the engine until the remote drops it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_during_in_flight_dial_tears_down_connection() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", "bob");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
+
+                // Cancel BEFORE waiting for Connected. The dial is likely
+                // already in flight; we want to verify the late dial result
+                // doesn't leave a zombie engine-side connection.
+                sup.remove(id).await;
+
+                // Wait long enough for the in-flight dial to complete
+                // (TestNetwork connect + Hello round-trip is sub-millisecond
+                // on localhost) AND for spawn_dial's post-await scope to
+                // run. A polling loop that exits as soon as `bob` is absent
+                // is racy in the supervisor's favor: right after `remove`,
+                // bob isn't connected yet (the dial hasn't completed), and
+                // the loop exits before the leak materializes. Use a fixed
+                // settle instead.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                let connected = alice.connected_peers().await;
+                assert!(
+                    connected.iter().all(|p| p.0.as_bytes() != b"bob"),
+                    "bob still connected to engine after intent removal: {connected:?}"
+                );
+            })
+            .await;
+    }
+
+    struct NoopFetch;
+
+    #[async_trait::async_trait(?Send)]
+    impl sunset_relay_resolver::HttpFetch for NoopFetch {
+        async fn get(&self, _: &str) -> sunset_relay_resolver::Result<String> {
+            unreachable!("parse-check should reject empty input before fetch")
+        }
     }
 }

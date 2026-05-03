@@ -33,7 +33,11 @@ pub(crate) enum InboundEvent {
         /// won't drop the entry on the floor against an empty
         /// `peer_outbound`. Inbound peers (server-side accept) pass
         /// `None`.
-        registered: Option<tokio::sync::oneshot::Sender<crate::error::Result<PeerId>>>,
+        registered: Option<
+            tokio::sync::oneshot::Sender<
+                crate::error::Result<(PeerId, crate::transport::TransportKind)>,
+            >,
+        >,
     },
     /// A SyncMessage arrived (other than Hello).
     Message { from: PeerId, message: SyncMessage },
@@ -87,7 +91,9 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     out_tx: mpsc::UnboundedSender<SyncMessage>,
     mut outbound_rx: mpsc::UnboundedReceiver<SyncMessage>,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
-    hello_done: Option<tokio::sync::oneshot::Sender<Result<PeerId>>>,
+    hello_done: Option<
+        tokio::sync::oneshot::Sender<Result<(PeerId, crate::transport::TransportKind)>>,
+    >,
 ) {
     let PeerEnv {
         local_peer,
