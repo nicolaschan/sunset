@@ -13,6 +13,11 @@
       const incoming = new Map();
       const voiceState = new Map();
       const connState = new Map();
+      // Set of remote peer pubkey hex strings currently visible in the
+      // membership tracker. Real users wait for the peer to appear in the
+      // member rail before clicking "connect direct"; the test mirrors
+      // that wait via `members()` polling.
+      const visibleMembers = new Set();
 
       function hex(uint8) {
         return Array.from(uint8).map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -34,6 +39,12 @@
           await client.publish_room_subscription();
           client.on_peer_connection_state((snap) => {
             connState.set(snap.addr, snap);
+          });
+          client.on_members_changed((members) => {
+            visibleMembers.clear();
+            for (const m of members) {
+              if (!m.is_self) visibleMembers.add(hex(new Uint8Array(m.pubkey)));
+            }
           });
           return { publicKey: window.__voice.publicKeyHex };
         },
@@ -67,7 +78,12 @@
           return window.__voice.client.peer_connection_mode(bytes);
         },
         async startPresence() {
-          await window.__voice.client.start_presence(2000, 6000, 1500);
+          // Tight intervals so the membership tracker converges quickly
+          // in the test (real Gleam UI uses 30s/60s/5s defaults).
+          await window.__voice.client.start_presence(300, 1500, 100);
+        },
+        memberVisible(peerHex) {
+          return visibleMembers.has(peerHex);
         },
         sendFrame(samples) {
           window.__voice.client.voice_input(new Float32Array(samples));

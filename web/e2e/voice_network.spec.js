@@ -136,15 +136,29 @@ test("alice voice_input arrives at bob byte-equal", async ({ browser }) => {
   const alicePk = aliceInfo.publicKey;
   const bobPk = bobInfo.publicKey;
 
-  // Start presence on both first (so connection_mode tracking + member
-  // membership work). Then alice triggers WebRTC P2P to bob.
-  // Voice frames need WebRTC P2P because the WS-to-relay channel can't
-  // carry unreliable EphemeralDelivery messages.
-  // voice_start runs AFTER connect_direct, matching presence.spec.js's
-  // working order.
+  // Start presence on both, then wait for membership exchange to
+  // converge before triggering WebRTC. The chat UI's user implicitly
+  // does this — they see the peer in the member rail before clicking
+  // "connect direct." Without this wait, alice's SDP offer can race
+  // bob's room-subscription propagation through the relay (the relay
+  // only forwards alice's offer to bob once bob's subscription is in
+  // the relay's registry; presence visibility is a strict prerequisite
+  // since presence entries flow through the same registry).
   await alice.evaluate(async () => await window.__voice.startPresence());
   await bob.evaluate(async () => await window.__voice.startPresence());
+  await alice.waitForFunction(
+    (pk) => window.__voice.memberVisible(pk),
+    bobPk,
+    { timeout: 10_000 },
+  );
+  await bob.waitForFunction(
+    (pk) => window.__voice.memberVisible(pk),
+    alicePk,
+    { timeout: 10_000 },
+  );
 
+  // Voice frames need WebRTC P2P because the WS-to-relay channel can't
+  // carry unreliable EphemeralDelivery messages.
   await alice.evaluate(async (pk) => await window.__voice.connectDirect(pk), bobPk);
 
   const directDeadline = Date.now() + 5_000;  // WebRTC P2P on localhost lands in <2 s; 5 s is generous but UX-anchored.
@@ -227,9 +241,21 @@ test("voice peer state transitions in_call -> talking -> silent -> out", async (
   const alicePk = aliceInfo.publicKey;
   const bobPk = bobInfo.publicKey;
 
-  // Same setup as the byte-equal test: presence + connect_direct + voice_start.
+  // Same setup as the byte-equal test: presence + wait for member
+  // exchange + connect_direct + voice_start. See the comment at the
+  // matching block above for why the membership wait is load-bearing.
   await alice.evaluate(async () => await window.__voice.startPresence());
   await bob.evaluate(async () => await window.__voice.startPresence());
+  await alice.waitForFunction(
+    (pk) => window.__voice.memberVisible(pk),
+    bobPk,
+    { timeout: 10_000 },
+  );
+  await bob.waitForFunction(
+    (pk) => window.__voice.memberVisible(pk),
+    alicePk,
+    { timeout: 10_000 },
+  );
   await alice.evaluate(async (pk) => await window.__voice.connectDirect(pk), bobPk);
   const directDeadline = Date.now() + 5_000;  // WebRTC P2P on localhost lands in <2 s; 5 s is generous but UX-anchored.
   let aliceDirect = false;
