@@ -13,12 +13,18 @@
 // Visual snapshot regressions (`toHaveScreenshot`) are intentionally not
 // wired up yet — pixel-stable snapshots come once the design has settled.
 //
-// Five tests below are `test.skip`'d. They asserted on `fixture.messages()`
-// rendered into the DOM (e.g., `.msg-row` containing "routing thru ravi"),
-// but Plan E swapped the message source from fixtures to the live
-// sunset-sync engine, so on a fresh page load the messages list is empty.
-// Refactor each to first send a message via the engine + wait for it to
-// land before exercising the hover/react/details-panel interactions.
+// A handful of round-3 tests below assert on UI behavior tied to
+// `.msg-row` content, which used to come from a static fixture. Plan E
+// switched the message source to the live sunset-sync engine, so on a
+// fresh page load the messages list is empty until the user (or test)
+// sends one. The hover-toolbar test below now sends a real message
+// through the composer and runs its assertions against that. The
+// remaining ones — info-panel + details panel + receipts + pending
+// state — depend on cross-peer crypto chains and receipts that aren't
+// available without a relay + second browser; those scenarios are
+// covered end-to-end by reactions.spec.js, receipts.spec.js, and the
+// two_browser_chat.spec.js suite, so the duplicated single-browser
+// versions stay skipped here with a pointer to their counterpart.
 
 import { expect, test } from "@playwright/test";
 
@@ -316,14 +322,27 @@ test("rooms list does not render timestamps", async ({ page }) => {
   expect(railText).not.toMatch(/(?<!\w)now(?!\w)/);
 });
 
-test.skip("hover on a message reveals the action toolbar", async ({ page }) => {
-  // The actions toolbar exists in the DOM but is invisible (opacity: 0)
-  // until the parent .msg-row is hovered.
-  const row = page.locator(".msg-row", { hasText: "routing thru ravi" });
-  await expect(row).toBeVisible();
+test("hover on a message reveals the action toolbar", async ({ page }, testInfo) => {
+  // The actions toolbar is part of every message row but starts at
+  // opacity 0; CSS makes it visible on `.msg-row:hover`. This is a
+  // pure pointer-on-DOM behavior so a single browser, no relay, is
+  // enough — we just need a real message in the column.
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "hover-reveal toolbar is desktop-only; phone renders actions inline (covered elsewhere)",
+  );
+
+  const input = page.getByPlaceholder(/^Message #/);
+  await expect(input).toBeVisible({ timeout: 15_000 });
+
+  const text = `hover toolbar — ${Date.now()}`;
+  await input.fill(text);
+  await input.press("Enter");
+
+  const row = page.locator(".msg-row", { hasText: text }).first();
+  await expect(row).toBeVisible({ timeout: 15_000 });
 
   const actions = row.locator(".msg-actions");
-
   const initial = await actions.evaluate((el) => getComputedStyle(el).opacity);
   expect(parseFloat(initial)).toBeLessThan(0.5);
 
@@ -338,6 +357,10 @@ test.skip("hover on a message reveals the action toolbar", async ({ page }) => {
     .toBeGreaterThan(0.5);
 });
 
+// Skipped: the live e2e for "open picker + pick + chip lands" is
+// reactions.spec.js (single browser, real relay). Keeping a near-
+// identical fixture-based version here doesn't add coverage and
+// would just need the same send-message setup.
 test.skip("react button opens the emoji picker; clicking an emoji reacts", async ({
   page,
 }) => {

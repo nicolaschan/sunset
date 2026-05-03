@@ -47,7 +47,25 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> SystemTime {
-        SystemTime::now()
+        // std::time::SystemTime::now panics on wasm32-unknown-unknown
+        // (no platform clock); web_time provides a Date.now-backed
+        // implementation there. On native, std works directly.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            SystemTime::now()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // web_time::SystemTime wraps std on native and Date.now()
+            // on wasm. The wasm value still implements duration_since,
+            // and is interchangeable with std::time::SystemTime via
+            // UNIX_EPOCH + duration. Compute the offset from web_time's
+            // UNIX_EPOCH and re-base on std::time::UNIX_EPOCH.
+            let d = web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO);
+            SystemTime::UNIX_EPOCH + d
+        }
     }
 }
 
@@ -180,8 +198,17 @@ impl Liveness {
         let stream = async_stream::stream! {
             use futures::stream::StreamExt;
             let mut rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+            // tokio::time::interval calls Instant::now() which panics on
+            // wasm32-unknown-unknown; use the wasmtimer drop-in there
+            // (matches sunset-sync::engine's anti-entropy timer pattern).
+            #[cfg(not(target_arch = "wasm32"))]
             let mut ticker = tokio::time::interval(sweep_period);
+            #[cfg(target_arch = "wasm32")]
+            let mut ticker = wasmtimer::tokio::interval(sweep_period);
+            #[cfg(not(target_arch = "wasm32"))]
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            #[cfg(target_arch = "wasm32")]
+            ticker.set_missed_tick_behavior(wasmtimer::tokio::MissedTickBehavior::Skip);
             // Skip the immediate first tick so we don't run a redundant
             // sweep before any observation could have fired.
             ticker.tick().await;

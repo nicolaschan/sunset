@@ -35,7 +35,7 @@
           if builtins.pathExists ./web/package-lock.json
           then pkgs.fetchNpmDeps {
             src = webNpmSrc + "/web";
-            hash = "sha256-WkIJ90tJkCnbqafS1gTN2nnTzqSPZVF0TCZbmTFI9iU=";
+            hash = "sha256-ZjoBtc99+jQS3xuYdrcrBN4uVM1ow8HZO9d60rIJ2e8=";
           }
           else null;
 
@@ -100,6 +100,11 @@
           lustre = true;
           buildPhase = ''
             runHook preBuild
+            # Link the Nix-built node_modules so Lustre's esbuild can
+            # resolve bare module specifiers like `emoji-picker-element`
+            # at bundle time. Without this, esbuild fails with
+            # "Could not resolve: <pkg>".
+            ln -sfn ${webNodeModules}/node_modules ./node_modules
             # Trigger Gleam compile to create build/dev/javascript/, then
             # stage the sunset-web-wasm bundle there so Lustre's esbuild can
             # resolve the `import init from "../../sunset_web_wasm.js"` line
@@ -125,6 +130,8 @@
             # sunset.ffi.mjs can `import` from a relative path.
             cp ${sunsetWebWasmPkg}/sunset_web_wasm.js $out/
             cp ${sunsetWebWasmPkg}/sunset_web_wasm_bg.wasm $out/
+            # Copy the C2b voice e2e test harness so Playwright can fetch it via static-web-server.
+            cp ${./web/voice-e2e-test.html} $out/voice-e2e-test.html
             # Lustre emits an absolute `/sunset_web.js` script src which only
             # works at site root. Rewrite to a relative path so the artefact
             # serves correctly under any GitHub Pages sub-path.

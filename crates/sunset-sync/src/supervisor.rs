@@ -85,6 +85,10 @@ pub(crate) struct SupervisorState {
     /// Reverse map: peer_id → addr. Populated when an intent transitions
     /// to Connected; cleared on disconnect.
     pub peer_to_addr: HashMap<PeerId, PeerAddr>,
+    /// Live-state subscribers. Each receives an `IntentSnapshot` every
+    /// time an intent transitions. Senders whose receiver is dropped are
+    /// pruned at broadcast time.
+    pub subscribers: Vec<mpsc::UnboundedSender<IntentSnapshot>>,
 }
 
 pub(crate) enum SupervisorCommand {
@@ -124,6 +128,7 @@ where
             state: Rc::new(RefCell::new(SupervisorState {
                 intents: HashMap::new(),
                 peer_to_addr: HashMap::new(),
+                subscribers: Vec::new(),
             })),
             policy,
         })
@@ -164,6 +169,31 @@ where
             return Vec::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    /// Subscribe to live intent state changes. The returned stream emits a
+    /// snapshot of an intent every time it transitions (Connecting →
+    /// Connected → Backoff → ...). Stream ends when the supervisor's
+    /// run loop exits.
+    pub fn subscribe(&self) -> futures::stream::LocalBoxStream<'static, IntentSnapshot> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.state.borrow_mut().subscribers.push(tx);
+        Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+    }
+
+    /// Broadcast the current snapshot of `addr` to all subscribers.
+    /// Drops senders whose receiver has been dropped.
+    fn broadcast(state: &mut SupervisorState, addr: &PeerAddr) {
+        let Some(entry) = state.intents.get(addr) else {
+            return;
+        };
+        let snap = IntentSnapshot {
+            addr: addr.clone(),
+            state: entry.state,
+            peer_id: entry.peer_id.clone(),
+            attempt: entry.attempt,
+        };
+        state.subscribers.retain(|tx| tx.send(snap.clone()).is_ok());
     }
 
     /// Long-running task. Caller spawns this with `spawn_local`.
@@ -250,11 +280,13 @@ where
                         entry.attempt = 0;
                         entry.next_attempt_at = None;
                     }
+                    Self::broadcast(&mut state, &addr);
                 }
             }
             EngineEvent::PeerRemoved { peer_id } => {
                 let mut state = self.state.borrow_mut();
                 if let Some(addr) = state.peer_to_addr.remove(&peer_id) {
+                    let mut transitioned = false;
                     if let Some(entry) = state.intents.get_mut(&addr) {
                         if entry.state != IntentState::Cancelled {
                             entry.state = IntentState::Backoff;
@@ -264,7 +296,11 @@ where
                             // dial-failure handler increments).
                             let delay = self.policy.delay(entry.attempt, _rng);
                             entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
+                            transitioned = true;
                         }
+                    }
+                    if transitioned {
+                        Self::broadcast(&mut state, &addr);
                     }
                 }
             }
@@ -297,6 +333,7 @@ where
                             next_attempt_at: None,
                         },
                     );
+                    Self::broadcast(&mut state, &addr);
                 }
                 let engine = self.engine.clone();
                 let state = self.state.clone();
@@ -310,7 +347,7 @@ where
                             // borrow before any await.
                             let cancelled = {
                                 let mut s = state.borrow_mut();
-                                match s.intents.get_mut(&addr_for_dial) {
+                                let outcome = match s.intents.get_mut(&addr_for_dial) {
                                     Some(entry) if entry.state == IntentState::Cancelled => true,
                                     Some(entry) => {
                                         entry.state = IntentState::Connected;
@@ -322,7 +359,11 @@ where
                                         false
                                     }
                                     None => false,
+                                };
+                                if !outcome {
+                                    Self::broadcast(&mut s, &addr_for_dial);
                                 }
+                                outcome
                             };
                             if cancelled {
                                 // Removed before connection landed; tear down.
@@ -402,12 +443,21 @@ where
             // doesn't double-fire.
             {
                 let mut state = self.state.borrow_mut();
-                if let Some(entry) = state.intents.get_mut(&addr) {
+                let should_broadcast = if let Some(entry) = state.intents.get_mut(&addr) {
                     if entry.state != IntentState::Backoff {
-                        continue;
+                        false
+                    } else {
+                        entry.state = IntentState::Connecting;
+                        entry.next_attempt_at = None;
+                        true
                     }
-                    entry.state = IntentState::Connecting;
-                    entry.next_attempt_at = None;
+                } else {
+                    false
+                };
+                if should_broadcast {
+                    Self::broadcast(&mut state, &addr);
+                } else {
+                    continue;
                 }
             }
             let engine = self.engine.clone();
@@ -426,8 +476,8 @@ where
                     let Some(entry) = s.intents.get_mut(&addr_for_dial) else {
                         return;
                     };
-                    if entry.state == IntentState::Cancelled {
-                        r.ok()
+                    let (outcome, transitioned) = if entry.state == IntentState::Cancelled {
+                        (r.ok(), false)
                     } else {
                         match r {
                             Ok(peer_id) => {
@@ -435,8 +485,8 @@ where
                                 entry.peer_id = Some(peer_id.clone());
                                 entry.attempt = 0;
                                 entry.next_attempt_at = None;
-                                s.peer_to_addr.insert(peer_id, addr_for_dial);
-                                None
+                                s.peer_to_addr.insert(peer_id, addr_for_dial.clone());
+                                (None, true)
                             }
                             Err(_) => {
                                 entry.attempt = entry.attempt.saturating_add(1);
@@ -448,10 +498,14 @@ where
                                     rand_chacha::ChaCha20Rng::seed_from_u64(next_seed);
                                 let delay = policy.delay(entry.attempt, &mut local_rng);
                                 entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
-                                None
+                                (None, true)
                             }
                         }
+                    };
+                    if transitioned {
+                        Self::broadcast(&mut s, &addr_for_dial);
                     }
+                    outcome
                 };
                 if let Some(peer_id) = cancelled_peer {
                     let _ = engine.remove_peer(peer_id).await;
@@ -608,6 +662,134 @@ mod tests {
 
                 let snap = sup.snapshot().await;
                 assert_eq!(snap.len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_emits_state_transitions() {
+        use futures::StreamExt as _;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob = engine_with_addr(&net, b"bob", "bob");
+
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob.clone();
+                    async move { b.run().await }
+                });
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let mut sub = sup.subscribe();
+
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                sup.add(bob_addr.clone()).await.unwrap();
+
+                // Drain until we see a Connected event for bob_addr or 1 s passes.
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                let mut saw_connected = false;
+                while tokio::time::Instant::now() < deadline {
+                    let timeout = deadline - tokio::time::Instant::now();
+                    match tokio::time::timeout(timeout, sub.next()).await {
+                        Ok(Some(snap)) => {
+                            if snap.addr == bob_addr && snap.state == IntentState::Connected {
+                                saw_connected = true;
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                assert!(
+                    saw_connected,
+                    "subscribe should have observed bob transition to Connected"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_observes_connecting_during_redial() {
+        use futures::StreamExt as _;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob = engine_with_addr(&net, b"bob", "bob");
+
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob.clone();
+                    async move { b.run().await }
+                });
+
+                // Tight backoff so the test doesn't take 1 s+ for the redial.
+                let policy = BackoffPolicy {
+                    initial: std::time::Duration::from_millis(50),
+                    max: std::time::Duration::from_millis(50),
+                    multiplier: 1.0,
+                    jitter: 0.0,
+                };
+                let sup = PeerSupervisor::new(alice.clone(), policy);
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let mut sub = sup.subscribe();
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                sup.add(bob_addr.clone()).await.unwrap();
+
+                // Look up bob's PeerId from the supervisor snapshot, then
+                // force a disconnect through the engine. The engine emits
+                // PeerRemoved, which drives the supervisor's intent to
+                // Backoff; the backoff timer then flips it to Connecting.
+                let bob_peer_id = {
+                    let snap = sup.snapshot().await;
+                    snap.iter()
+                        .find(|s| s.addr == bob_addr)
+                        .and_then(|s| s.peer_id.clone())
+                        .expect("bob should be Connected with a known PeerId")
+                };
+                alice.remove_peer(bob_peer_id).await.unwrap();
+
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                let mut saw_backoff = false;
+                let mut saw_connecting_after_backoff = false;
+                while tokio::time::Instant::now() < deadline {
+                    let timeout = deadline - tokio::time::Instant::now();
+                    match tokio::time::timeout(timeout, sub.next()).await {
+                        Ok(Some(snap)) if snap.addr == bob_addr => {
+                            if snap.state == IntentState::Backoff {
+                                saw_backoff = true;
+                            } else if snap.state == IntentState::Connecting && saw_backoff {
+                                saw_connecting_after_backoff = true;
+                                break;
+                            }
+                        }
+                        Ok(Some(_)) => continue,
+                        _ => break,
+                    }
+                }
+                assert!(
+                    saw_connecting_after_backoff,
+                    "subscribe should observe Connecting transition during redial after Backoff"
+                );
             })
             .await;
     }

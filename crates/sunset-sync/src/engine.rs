@@ -396,26 +396,18 @@ where
     }
 
     async fn tick_anti_entropy(&self) {
-        let bloom = match build_digest(
-            &*self.store,
-            &self.config.bootstrap_filter,
-            &DigestRange::All,
-            self.config.bloom_size_bits,
-            self.config.bloom_hash_fns,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(_) => return,
+        // Snapshot before per-peer fires; send_filter_digest re-acquires
+        // the lock and skips peers that disconnected mid-tick.
+        let peers: Vec<PeerId> = {
+            let state = self.state.lock().await;
+            state.peer_outbound.keys().cloned().collect()
         };
-        let msg = SyncMessage::DigestExchange {
-            filter: self.config.bootstrap_filter.clone(),
-            range: DigestRange::All,
-            bloom: bloom.to_bytes(),
-        };
-        let state = self.state.lock().await;
-        for po in state.peer_outbound.values() {
-            let _ = po.tx.send(msg.clone());
+        if peers.is_empty() {
+            return;
+        }
+        let own_filters = self.own_published_filters().await;
+        for peer in &peers {
+            self.fan_out_digests_to_peer(peer, &own_filters).await;
         }
     }
 
@@ -522,8 +514,8 @@ where
                 if let Some(s) = registered {
                     let _ = s.send(Ok(peer_id.clone()));
                 }
-                // Fire bootstrap digest exchange on the subscribe namespace.
-                self.send_bootstrap_digest(&peer_id).await;
+                let own_filters = self.own_published_filters().await;
+                self.fan_out_digests_to_peer(&peer_id, &own_filters).await;
             }
             InboundEvent::Message { from, message } => {
                 self.handle_peer_message(from, message).await;
@@ -594,9 +586,64 @@ where
         Ok(())
     }
 
-    async fn send_bootstrap_digest(&self, to: &PeerId) {
-        let filter = self.config.bootstrap_filter.clone();
-        self.send_filter_digest(to, &filter).await;
+    /// Walk the local store for `_sunset-sync/subscribe` entries authored
+    /// by `self.local_peer` and return their parsed filters. Used by
+    /// `PeerHello` and `tick_anti_entropy` to fire per-filter digests so
+    /// a (re)connected client catches up on whatever it missed under
+    /// each of its own published interests.
+    ///
+    /// Other peers' subscribe entries are intentionally skipped — they
+    /// own their own catch-up, and this engine has no signing key for
+    /// them. Iteration errors and parse errors are logged-and-skipped,
+    /// matching `replay_existing_subscriptions`.
+    async fn own_published_filters(&self) -> Vec<Filter> {
+        let mut out = Vec::new();
+        let filter = Filter::Specific(
+            self.local_peer.0.clone(),
+            Bytes::from_static(reserved::SUBSCRIBE_NAME),
+        );
+        let mut entries = match self.store.iter(filter).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "own_published_filters: store iteration");
+                return out;
+            }
+        };
+        while let Some(item) = entries.next().await {
+            let entry = match item {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "own_published_filters: store iteration");
+                    continue;
+                }
+            };
+            let block = match self.store.get_content(&entry.value_hash).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "own_published_filters: get_content");
+                    continue;
+                }
+            };
+            if let Ok(parsed) = parse_subscription_entry(&entry, &block) {
+                out.push(parsed);
+            }
+        }
+        out
+    }
+
+    /// Send the bootstrap digest plus a per-own-filter digest to `peer`,
+    /// skipping any own filter that equals `bootstrap_filter` so the
+    /// receiver doesn't see two `DigestExchange`s for the same filter.
+    async fn fan_out_digests_to_peer(&self, peer: &PeerId, own_filters: &[Filter]) {
+        let bootstrap = &self.config.bootstrap_filter;
+        self.send_filter_digest(peer, bootstrap).await;
+        for filter in own_filters {
+            if filter == bootstrap {
+                continue;
+            }
+            self.send_filter_digest(peer, filter).await;
+        }
     }
 
     /// Send a `DigestExchange` over `filter` to `to`. Builds a Bloom
@@ -1091,6 +1138,38 @@ mod tests {
             vk: local_peer.0.clone(),
         });
         SyncEngine::new(store, transport, SyncConfig::default(), local_peer, signer)
+    }
+
+    /// Register a fake connected peer on the engine and return the
+    /// receiver end of its outbound channel.
+    async fn add_test_peer(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        label: &[u8],
+        conn_id: ConnectionId,
+    ) -> (PeerId, mpsc::UnboundedReceiver<SyncMessage>) {
+        let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
+        let peer = PeerId(vk(label));
+        engine
+            .state
+            .lock()
+            .await
+            .peer_outbound
+            .insert(peer.clone(), PeerOutbound { conn_id, tx });
+        (peer, rx)
+    }
+
+    /// Drain `rx` (non-blocking), collecting `DigestExchange.filter`
+    /// values. Panics on any other queued message kind.
+    fn drain_digest_filters(rx: &mut mpsc::UnboundedReceiver<SyncMessage>) -> Vec<Filter> {
+        let mut out = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(SyncMessage::DigestExchange { filter, .. }) => out.push(filter),
+                Ok(other) => panic!("expected DigestExchange, got {other:?}"),
+                Err(_) => break,
+            }
+        }
+        out
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1864,6 +1943,178 @@ mod tests {
                 assert!(
                     saw_filter_digest,
                     "publish_subscription must send a DigestExchange over the new filter to each connected peer so the peer can backfill matching entries we're missing"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn own_published_filters_returns_self_authored_subscribe_entries_only() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                // Self-authored subscribe entry — should be returned.
+                let mine = Filter::NamePrefix(Bytes::from_static(b"room/"));
+                let mine_bytes = postcard::to_stdvec(&mine).unwrap();
+                let mine_block = ContentBlock {
+                    data: Bytes::from(mine_bytes),
+                    references: vec![],
+                };
+                let mine_entry = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: mine_block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine
+                    .store
+                    .insert(mine_entry, Some(mine_block))
+                    .await
+                    .unwrap();
+
+                // Someone else's subscribe entry — must NOT be returned.
+                let theirs = Filter::NamePrefix(Bytes::from_static(b"other/"));
+                let theirs_bytes = postcard::to_stdvec(&theirs).unwrap();
+                let theirs_block = ContentBlock {
+                    data: Bytes::from(theirs_bytes),
+                    references: vec![],
+                };
+                let theirs_entry = SignedKvEntry {
+                    verifying_key: vk(b"bob"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: theirs_block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine
+                    .store
+                    .insert(theirs_entry, Some(theirs_block))
+                    .await
+                    .unwrap();
+
+                // Self-authored entry under a non-subscribe name — must NOT be returned.
+                let chat_block = ContentBlock {
+                    data: Bytes::from_static(b"hi"),
+                    references: vec![],
+                };
+                let chat_entry = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(b"room/msg/1"),
+                    value_hash: chat_block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine
+                    .store
+                    .insert(chat_entry, Some(chat_block))
+                    .await
+                    .unwrap();
+
+                let filters = engine.own_published_filters().await;
+                assert_eq!(filters, vec![mine]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_hello_fires_filter_digest_for_own_published_subscriptions() {
+        use crate::peer::InboundEvent;
+        use crate::transport::TransportKind;
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
+                let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
+                let block = ContentBlock {
+                    data: Bytes::from(filter_bytes),
+                    references: vec![],
+                };
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine.store.insert(entry, Some(block)).await.unwrap();
+
+                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
+                engine
+                    .handle_inbound_event(InboundEvent::PeerHello {
+                        peer_id: PeerId(vk(b"relay")),
+                        conn_id: ConnectionId::for_test(1),
+                        kind: TransportKind::Primary,
+                        out_tx: tx,
+                        registered: None,
+                    })
+                    .await;
+
+                let filters = drain_digest_filters(&mut rx);
+                let bootstrap = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
+                assert!(
+                    filters.contains(&bootstrap),
+                    "bootstrap digest must still fire (got {filters:?})"
+                );
+                assert!(
+                    filters.contains(&chat_filter),
+                    "per-filter digest must fire for own published subscription (got {filters:?})"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn anti_entropy_tick_fires_filter_digest_for_own_published_subscriptions() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
+                let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
+                let block = ContentBlock {
+                    data: Bytes::from(filter_bytes),
+                    references: vec![],
+                };
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine.store.insert(entry, Some(block)).await.unwrap();
+
+                let (_peer, mut rx) =
+                    add_test_peer(&engine, b"relay", ConnectionId::for_test(1)).await;
+
+                engine.tick_anti_entropy().await;
+
+                let filters = drain_digest_filters(&mut rx);
+                let bootstrap = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
+                assert!(
+                    filters.contains(&bootstrap),
+                    "bootstrap digest must fire (got {filters:?})"
+                );
+                assert!(
+                    filters.contains(&chat_filter),
+                    "per-filter digest must fire on anti-entropy tick (got {filters:?})"
                 );
             })
             .await;

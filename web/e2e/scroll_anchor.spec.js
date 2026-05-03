@@ -122,6 +122,19 @@ test("auto-scrolls to bottom when at bottom; preserves position when scrolled up
     )
     .toBe(true);
 
+  // Two-frame helper. The scroll-anchor logic schedules its scroll-to-
+  // bottom via `requestAnimationFrame`, so to know it has had its
+  // chance to run (or to deliberately decline to run) we yield two
+  // animation frames — one for the MutationObserver microtask to land,
+  // one for the rAF callback itself.
+  const settleAnchor = () =>
+    page.evaluate(
+      () =>
+        new Promise((r) =>
+          requestAnimationFrame(() => requestAnimationFrame(r)),
+        ),
+    );
+
   // Now simulate the user scrolling up to read history. The anchor
   // updates its at-bottom flag only on user-intent events (wheel /
   // touchmove / scroll-keys), so dispatch a wheel event alongside the
@@ -132,7 +145,6 @@ test("auto-scrolls to bottom when at bottom; preserves position when scrolled up
       new WheelEvent("wheel", { deltaY: -2000, bubbles: true, cancelable: true }),
     );
   });
-  await page.waitForTimeout(50);
 
   const scrollTopBeforeNew = await scrollArea.evaluate((el) => el.scrollTop);
   expect(scrollTopBeforeNew).toBeLessThan(NEAR_BOTTOM_PX);
@@ -145,9 +157,10 @@ test("auto-scrolls to bottom when at bottom; preserves position when scrolled up
     page.getByText("a new message arriving while user is reading history"),
   ).toBeVisible({ timeout: 15_000 });
 
-  // Allow the requestAnimationFrame in scroll_anchor's mutation
-  // observer to run (it would scroll if it decided to).
-  await page.waitForTimeout(100);
+  // Yield the two rAFs the scroll-anchor's mutation observer would
+  // ride before it could move scrollTop. After this point, if the
+  // anchor was going to scroll us back to the bottom, it has.
+  await settleAnchor();
 
   const scrollTopAfterNew = await scrollArea.evaluate((el) => el.scrollTop);
   // The position should be roughly unchanged — at most a few pixels
@@ -163,7 +176,6 @@ test("auto-scrolls to bottom when at bottom; preserves position when scrolled up
       new WheelEvent("wheel", { deltaY: 2000, bubbles: true, cancelable: true }),
     );
   });
-  await page.waitForTimeout(50);
 
   await input.fill("after returning to bottom");
   await input.press("Enter");
