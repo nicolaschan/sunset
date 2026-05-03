@@ -29,7 +29,7 @@ export function applyTemplate(elementId, before, between, after, caretAtBetween)
       ? start + before.length + middle.length
       : start + before.length;
   el.selectionStart = caret;
-  el.selectionEnd = selected.length > 0 ? caret : caret;
+  el.selectionEnd = caret;
   // Re-fire input so Gleam's on_input handler updates the model.
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.focus();
