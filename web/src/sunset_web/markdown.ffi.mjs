@@ -43,3 +43,14 @@ export function parseMarkdown(body) {
   }
   return [{ Paragraph: [{ Text: body }] }];
 }
+
+export function toPlain(body) {
+  if (wasmModule && wasmModule.to_plain_markdown) {
+    try {
+      return wasmModule.to_plain_markdown(body);
+    } catch (err) {
+      console.error("markdown.toPlain WASM call failed:", err);
+    }
+  }
+  return body;
+}

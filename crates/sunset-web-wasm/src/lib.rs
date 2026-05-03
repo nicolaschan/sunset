@@ -27,7 +27,7 @@ mod voice;
 #[cfg(target_arch = "wasm32")]
 pub use client::Client;
 #[cfg(target_arch = "wasm32")]
-pub use markdown::parse_markdown;
+pub use markdown::{parse_markdown, to_plain_markdown};
 #[cfg(target_arch = "wasm32")]
 pub use members::MemberJs;
 #[cfg(target_arch = "wasm32")]

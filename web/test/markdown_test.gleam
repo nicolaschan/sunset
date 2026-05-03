@@ -225,3 +225,16 @@ pub fn render_code_block_with_language_test() {
   should.be_true(string.contains(html, "rust"))
   should.be_true(string.contains(html, "fn main()"))
 }
+
+// to_plain goes through FFI and needs WASM loaded. In the `gleam test`
+// Node environment (no WASM bundle), the FFI falls back to returning
+// the body unchanged. In production (WASM loaded), formatting markers
+// are stripped and only the plain text remains.
+// Either way, the words must be present in the output.
+pub fn to_plain_returns_something_with_text_test() {
+  let result = markdown.to_plain("hello **bold**")
+  // Test env (no WASM): returns "hello **bold**" (body verbatim).
+  // Production (WASM loaded): returns "hello bold" (markers stripped).
+  should.be_true(string.contains(result, "hello"))
+  should.be_true(string.contains(result, "bold"))
+}

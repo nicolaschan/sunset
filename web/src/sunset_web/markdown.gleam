@@ -85,11 +85,10 @@ pub fn render_blocks(
 }
 
 /// Strip all formatting and return concatenated text. Useful for
-/// notification bodies and `aria-label`s.
-pub fn to_plain(body: String) -> String {
-  // Phase C1: stub. Replaced by Task C6.
-  body
-}
+/// notification bodies and `aria-label`s. Delegates to
+/// `sunset_markdown::to_plain` in the Rust core via WASM FFI.
+@external(javascript, "./markdown.ffi.mjs", "toPlain")
+pub fn to_plain(body: String) -> String
 
 // ----- AST types -----
 // Pub so tests can construct AST values directly without going through FFI.
