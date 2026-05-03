@@ -23,6 +23,7 @@ enum WsSink {
     Client(SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>),
     Server(SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>),
     #[cfg(feature = "axum")]
+    #[allow(dead_code)]
     Axum(SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>),
 }
 
@@ -39,8 +40,8 @@ impl WsSink {
                 let axum_msg = match msg {
                     Message::Binary(b) => axum::extract::ws::Message::Binary(b),
                     Message::Close(_) => axum::extract::ws::Message::Close(None),
-                    _ => return Err(tokio_tungstenite::tungstenite::Error::Protocol(
-                        tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                    _ => return Err(tokio_tungstenite::tungstenite::Error::Io(
+                        std::io::Error::other("ws-native: refusing to send unsupported message kind across axum bridge"),
                     )),
                 };
                 s.send(axum_msg)
@@ -74,6 +75,7 @@ enum WsStream {
     Client(SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
     Server(SplitStream<WebSocketStream<tokio::net::TcpStream>>),
     #[cfg(feature = "axum")]
+    #[allow(dead_code)]
     Axum(SplitStream<axum::extract::ws::WebSocket>),
 }
 
