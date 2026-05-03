@@ -8,6 +8,14 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+## Enables test-only FFI: voice_inject_pcm, voice_install_frame_recorder,
+## voice_recorded_frames, voice_active_peers. Also activates
+## sunset-voice/test-hooks to expose VoiceRuntime::set_frame_sink and
+## snapshot_states.
+test-hooks = ["sunset-voice/test-hooks"]
+
 [lints]
 workspace = true
 
@@ -28,6 +36,7 @@ sunset-relay-resolver.workspace = true
 sunset-sync.workspace = true
 sunset-sync-webrtc-browser.workspace = true
 sunset-sync-ws-browser.workspace = true
+sha2.workspace = true
 sunset-voice = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }

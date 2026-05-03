@@ -48,6 +48,8 @@ pub struct Client {
     /// `voice_start` for the room-handle parameter that selects which
     /// room the call targets.
     voice: crate::voice::VoiceCell,
+    /// Bus shared between voice sessions. Rc so it can be upcast to
+    /// Rc<dyn DynBus> without allocation.
     bus: crate::voice::BusArc,
 }
 
@@ -96,6 +98,7 @@ impl Client {
             async move { s.run().await }
         });
 
+        // Rc so it can be upcast to Rc<dyn DynBus>.
         let bus: crate::voice::BusArc = Rc::new(sunset_core::bus::BusImpl::new(
             store.clone(),
             engine.clone(),
@@ -177,46 +180,108 @@ impl Client {
         Ok(crate::room_handle::RoomHandle::new(open))
     }
 
-    /// Start voice in the room identified by `room_name`. The room
-    /// must have been opened (`open_room`) first; this method takes
-    /// the name (not a RoomHandle) for FFI simplicity. Spawns the
-    /// heartbeat task, subscribe loop, and Liveness state combiner.
-    /// Errors if voice is already started.
+    /// Start voice in the given room. The `room_handle` must have been
+    /// obtained via `open_room`. Constructs `WebDialer`/`WebFrameSink`/
+    /// `WebPeerStateSink`, builds `VoiceRuntime`, and spawns all five
+    /// protocol tasks. Only one active voice session per `Client`.
     ///
-    /// `on_frame` is called as `(from_peer_id_bytes: Uint8Array, pcm: Float32Array)`.
-    /// `on_voice_peer_state` is called as `(peer_id: Uint8Array, in_call: bool, talking: bool)`.
-    ///
-    /// Multi-room note: voice can target only one room at a time per
-    /// `Client` (a user is in at most one voice call). Switching rooms
-    /// requires `voice_stop` then `voice_start` against the new room.
+    /// JS callback signatures:
+    /// - `on_pcm(peer_id: Uint8Array, pcm: Float32Array)` — per-frame delivery
+    /// - `on_drop_peer(peer_id: Uint8Array)` — peer left the call
+    /// - `on_voice_peer_state(peer_id, in_call, talking, is_muted)` — state change
+    /// - `on_set_peer_volume(peer_id: Uint8Array, gain: number)` — set GainNode
     pub fn voice_start(
         &self,
-        room_name: String,
-        on_frame: &js_sys::Function,
-        on_voice_peer_state: &js_sys::Function,
+        room_handle: &crate::room_handle::RoomHandle,
+        on_pcm: js_sys::Function,
+        on_drop_peer: js_sys::Function,
+        on_voice_peer_state: js_sys::Function,
+        on_set_peer_volume: js_sys::Function,
     ) -> Result<(), JsError> {
-        // Re-derive the Room from the name. Duplicates Argon2id work
-        // already done by `open_room`, but voice is started rarely so
-        // the cost is acceptable. A future API could take a RoomHandle
-        // and pull the Room out of `OpenRoom` directly.
-        let room = sunset_core::Room::open(&room_name)
-            .map_err(|e| JsError::new(&format!("voice_start Room::open: {e}")))?;
         crate::voice::voice_start(
             &self.voice,
             &self.identity,
-            &Rc::new(room),
+            room_handle,
             &self.bus,
-            on_frame,
+            on_pcm,
+            on_drop_peer,
             on_voice_peer_state,
+            on_set_peer_volume,
         )
     }
 
-    /// Stop the voice subsystem and release its resources.
+    /// Stop the voice subsystem and release all resources. Dropping
+    /// `VoiceRuntime` cancels all five protocol tasks.
     pub fn voice_stop(&self) -> Result<(), JsError> {
         crate::voice::voice_stop(&self.voice)
     }
 
+    /// Forward PCM from the browser capture worklet to the runtime's
+    /// encode + publish path. Called once per 20 ms audio frame.
     pub fn voice_input(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
         crate::voice::voice_input(&self.voice, pcm)
+    }
+
+    /// Toggle microphone mute. When muted, `send_pcm` drops frames and
+    /// heartbeats carry `is_muted: true`.
+    pub fn voice_set_muted(&self, muted: bool) {
+        crate::voice::voice_set_muted(&self.voice, muted);
+    }
+
+    /// Toggle deafen. When deafened, the jitter pump skips
+    /// `FrameSink::deliver` (so the user hears silence) but liveness
+    /// tracking continues.
+    pub fn voice_set_deafened(&self, deafened: bool) {
+        crate::voice::voice_set_deafened(&self.voice, deafened);
+    }
+
+    /// Set per-peer playback volume. `gain` is a linear multiplier
+    /// (0.0 = mute, 1.0 = unity, >1.0 = boost). Forwarded to JS via
+    /// the `on_set_peer_volume` callback registered at `voice_start`.
+    pub fn voice_set_peer_volume(&self, peer_id: &[u8], gain: f32) {
+        crate::voice::voice_set_peer_volume(&self.voice, peer_id, gain);
+    }
+
+    // ---- Test hooks (compiled in only with feature "test-hooks") ----
+
+    /// Bypass the capture worklet and inject PCM directly into the
+    /// runtime's encode + publish path. Used by Playwright tests to
+    /// generate deterministic synthetic frames.
+    #[cfg(feature = "test-hooks")]
+    pub fn voice_inject_pcm(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
+        crate::voice::voice_input(&self.voice, pcm)
+    }
+
+    /// Wrap the current `FrameSink` in a recording adapter that captures
+    /// per-peer frame metadata into an in-memory ring buffer. Call once
+    /// after `voice_start`; subsequent `voice_recorded_frames` queries
+    /// return data from that point onward.
+    #[cfg(feature = "test-hooks")]
+    pub fn voice_install_frame_recorder(&self) -> Result<(), JsError> {
+        crate::voice::install_recorder(&self.voice)
+    }
+
+    /// Return per-peer recorded frames as `[{seq_in_frame, len, checksum}]`.
+    /// Requires `voice_install_frame_recorder` to have been called first.
+    #[cfg(feature = "test-hooks")]
+    pub fn voice_recorded_frames(&self, peer_id: &[u8]) -> Result<JsValue, JsError> {
+        crate::voice::recorded_frames(&self.voice, peer_id)
+    }
+
+    /// Return the runtime's current per-peer `VoicePeerState` snapshot
+    /// as `[{peer_id, in_call, talking, is_muted}]`.
+    #[cfg(feature = "test-hooks")]
+    pub fn voice_active_peers(&self) -> Result<JsValue, JsError> {
+        crate::voice::active_peers(&self.voice)
+    }
+
+    /// Generate a synthetic PCM frame with an embedded counter in
+    /// `pcm[0]`. Useful from JS test code to create deterministic
+    /// frames whose counter can be verified at the receiver.
+    /// `pcm[0] = counter / 1_000_000.0`.
+    #[cfg(feature = "test-hooks")]
+    pub fn voice_synth_pcm(counter: i32) -> js_sys::Float32Array {
+        let pcm = crate::voice::test_hooks::synth_pcm_with_counter(counter);
+        js_sys::Float32Array::from(pcm.as_slice())
     }
 }

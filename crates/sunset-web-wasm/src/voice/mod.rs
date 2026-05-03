@@ -1,169 +1,279 @@
-//! Voice runtime — orchestrates encoder, network publish, and subscribe.
+//! Voice subsystem — thin browser shell over `VoiceRuntime`.
 //!
-//! `voice_start(on_frame, on_voice_peer_state)` constructs a VoiceState,
-//! spawns the heartbeat timer (transport.rs), the subscribe loop
-//! (subscriber.rs), and the Liveness state combiner (liveness.rs).
-//! `voice_input(pcm)` encodes one frame and publishes the encrypted
-//! bytes via `Bus::publish_ephemeral`.
-//!
-//! Splitting into submodules keeps each file focused on one responsibility.
+//! This module only contains browser-specific glue: JS callback bridging,
+//! per-peer GainNode volume forwarding, and WASM-bindgen marshalling.
+//! All protocol logic lives in `sunset_voice::VoiceRuntime`.
 
-mod liveness;
-mod subscriber;
-mod transport;
+mod dialer;
+mod frame_sink;
+mod peer_state_sink;
+#[cfg(feature = "test-hooks")]
+pub(crate) mod test_hooks;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use bytes::Bytes;
 use js_sys::{Float32Array, Function};
-use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
 use wasm_bindgen::prelude::*;
 
-use sunset_core::bus::Bus;
-use sunset_core::{Identity, Room};
-use sunset_voice::{FRAME_SAMPLES, VoiceEncoder};
+use sunset_core::bus::BusImpl;
+use sunset_store_memory::MemoryStore;
+use sunset_sync::MultiTransport;
+use sunset_voice::runtime::{DynBus, FrameSink, VoiceRuntime};
 
-pub(crate) use transport::{BusArc, spawn_heartbeat};
+use crate::client::{RtcT, WsT};
+use crate::room_handle::RoomHandle;
 
-/// Per-`Client` voice runtime state. `None` until `voice_start` is
-/// called; cleared on `voice_stop` (Drop on inner Rc cancels everything).
-pub(crate) struct VoiceState {
-    encoder: VoiceEncoder,
-    /// Monotonic frame sequence; incremented per voice_input call.
-    seq: u64,
-    /// Identity to sign Bus publishes (cloned from Client).
-    identity: Identity,
-    /// Room used to derive the voice key + AAD.
-    room: Rc<Room>,
-    /// Bus handle (publishes encrypted VoicePackets).
-    bus: BusArc,
-    /// Per-process RNG for nonces. ChaCha20Rng implements CryptoRngCore
-    /// and is wasm-friendly (no OsRng dependency at construction time).
-    rng: ChaCha20Rng,
-    /// Liveness arcs held here so that `voice_stop` (which clears the
-    /// cell) drops the outside strong refs the combiner doesn't own.
-    /// The underscore prefix marks this as held-for-Drop only — the
-    /// combiner reads from its own `Arc<Liveness>` clones and exits on
-    /// the next event after `state.borrow().is_none()` becomes true.
-    _liveness: liveness::VoiceLiveness,
+pub(crate) type BusT = BusImpl<MemoryStore, MultiTransport<WsT, RtcT>>;
+pub(crate) type BusArc = Rc<BusT>;
+
+/// Per-peer gain pending application. Stored so that a volume call for
+/// a peer that hasn't been heard from yet is applied when the worklet
+/// allocates.
+type PendingGains = HashMap<sunset_sync::PeerId, f32>;
+
+pub(crate) struct ActiveVoice {
+    runtime: VoiceRuntime,
+    /// Shared with `WebFrameSink` so `install_recorder` can find the
+    /// original sink to wrap. Also keeps the sink alive alongside the
+    /// runtime (belt-and-suspenders, since the runtime holds an Rc too).
+    frame_sink_rc: Rc<dyn FrameSink>,
+    /// JS callback for per-peer gain forwarding. Accessed directly from
+    /// `voice_set_peer_volume`; not owned by any inner type.
+    on_set_peer_volume: Rc<RefCell<Option<Function>>>,
+    /// Desired per-peer gain. Stored so late-joining peers get their
+    /// configured gain applied on first `voice_set_peer_volume` call.
+    pending_gains: RefCell<PendingGains>,
+    #[cfg(feature = "test-hooks")]
+    recorder: RefCell<Option<Rc<test_hooks::RecordingFrameSink>>>,
 }
 
-pub(crate) type VoiceCell = Rc<RefCell<Option<VoiceState>>>;
+pub(crate) type VoiceCell = Rc<RefCell<Option<ActiveVoice>>>;
 
 pub(crate) fn new_voice_cell() -> VoiceCell {
     Rc::new(RefCell::new(None))
 }
 
-/// Start the voice subsystem. Constructs the encoder, spawns the
-/// heartbeat task, the Bus subscribe loop, and the Liveness state
-/// combiner.
+/// Start the voice subsystem. Constructs `WebDialer`, `WebFrameSink`,
+/// `WebPeerStateSink`, builds `VoiceRuntime`, and spawns all five
+/// runtime tasks via `wasm_bindgen_futures::spawn_local`.
 pub(crate) fn voice_start(
-    state: &VoiceCell,
-    identity: &Identity,
-    room: &Rc<Room>,
+    cell: &VoiceCell,
+    identity: &sunset_core::Identity,
+    room_handle: &RoomHandle,
     bus: &BusArc,
-    on_frame: &Function,
-    on_voice_peer_state: &Function,
+    on_pcm: Function,
+    on_drop_peer: Function,
+    on_voice_peer_state: Function,
+    on_set_peer_volume: Function,
 ) -> Result<(), JsError> {
-    if state.borrow().is_some() {
+    if cell.borrow().is_some() {
         return Err(JsError::new("voice already started"));
     }
 
-    let encoder = VoiceEncoder::new().map_err(|e| JsError::new(&format!("encoder: {e}")))?;
+    let on_pcm_rc = Rc::new(RefCell::new(Some(on_pcm)));
+    let on_drop_rc = Rc::new(RefCell::new(Some(on_drop_peer)));
+    let on_state_rc = Rc::new(RefCell::new(Some(on_voice_peer_state)));
+    let on_volume_rc = Rc::new(RefCell::new(Some(on_set_peer_volume)));
 
-    let now_nanos = web_time::SystemTime::now()
-        .duration_since(web_time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let rng = ChaCha20Rng::seed_from_u64(now_nanos);
-
-    let arcs = liveness::VoiceLiveness::new();
-
-    *state.borrow_mut() = Some(VoiceState {
-        encoder,
-        seq: 0,
-        identity: identity.clone(),
-        room: room.clone(),
-        bus: bus.clone(),
-        rng,
-        _liveness: arcs.clone(),
+    let web_frame_sink: Rc<dyn FrameSink> = Rc::new(frame_sink::WebFrameSink {
+        on_pcm: on_pcm_rc,
+        on_drop: on_drop_rc,
     });
+    let dialer: Rc<dyn sunset_voice::Dialer> = Rc::new(dialer::WebDialer {
+        open_room: room_handle.open_room_rc(),
+    });
+    let peer_state_sink: Rc<dyn sunset_voice::PeerStateSink> =
+        Rc::new(peer_state_sink::WebPeerStateSink {
+            handler: on_state_rc,
+        });
 
-    spawn_heartbeat(state.clone(), identity.clone(), room.clone(), bus.clone());
+    // Upcast the Rc<BusImpl> to Rc<dyn DynBus>. Single-threaded data plane.
+    let dyn_bus: Rc<dyn DynBus> = bus.clone();
 
-    liveness::spawn_combiner(state.clone(), &arcs, on_voice_peer_state.clone());
-    subscriber::spawn_subscriber(
-        state.clone(),
-        room.clone(),
-        bus.clone(),
-        arcs,
-        on_frame.clone(),
-        identity.store_verifying_key(),
+    let (runtime, tasks) = VoiceRuntime::new(
+        dyn_bus,
+        room_handle.room_rc(),
+        identity.clone(),
+        dialer,
+        web_frame_sink.clone(),
+        peer_state_sink,
     );
 
-    Ok(())
-}
+    wasm_bindgen_futures::spawn_local(tasks.heartbeat);
+    wasm_bindgen_futures::spawn_local(tasks.subscribe);
+    wasm_bindgen_futures::spawn_local(tasks.combiner);
+    wasm_bindgen_futures::spawn_local(tasks.auto_connect);
+    wasm_bindgen_futures::spawn_local(tasks.jitter_pump);
 
-pub(crate) fn voice_stop(state: &VoiceCell) -> Result<(), JsError> {
-    *state.borrow_mut() = None;
-    Ok(())
-}
-
-pub(crate) fn voice_input(state: &VoiceCell, pcm: &Float32Array) -> Result<(), JsError> {
-    let mut slot = state.borrow_mut();
-    let voice = slot
-        .as_mut()
-        .ok_or_else(|| JsError::new("voice not started"))?;
-    let len = pcm.length() as usize;
-    if len != FRAME_SAMPLES {
-        return Err(JsError::new(&format!(
-            "voice_input expected {FRAME_SAMPLES} samples, got {len}"
-        )));
-    }
-
-    let mut buf = vec![0.0_f32; FRAME_SAMPLES];
-    pcm.copy_to(&mut buf);
-    let encoded = voice
-        .encoder
-        .encode(&buf)
-        .map_err(|e| JsError::new(&format!("encode: {e}")))?;
-
-    let now_ms = web_time::SystemTime::now()
-        .duration_since(web_time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let packet = sunset_voice::packet::VoicePacket::Frame {
-        codec_id: sunset_voice::CODEC_ID.to_string(),
-        seq: voice.seq,
-        sender_time_ms: now_ms,
-        payload: encoded,
-    };
-    voice.seq = voice.seq.saturating_add(1);
-
-    let ev = sunset_voice::packet::encrypt(
-        &voice.room,
-        0,
-        &voice.identity.public(),
-        &packet,
-        &mut voice.rng,
-    )
-    .map_err(|e| JsError::new(&format!("encrypt: {e}")))?;
-    let payload_bytes =
-        postcard::to_stdvec(&ev).map_err(|e| JsError::new(&format!("postcard encode: {e}")))?;
-
-    let room_fp_hex = voice.room.fingerprint().to_hex();
-    let sender_pk_hex = hex::encode(voice.identity.store_verifying_key().as_bytes());
-    let name = Bytes::from(format!("voice/{room_fp_hex}/{sender_pk_hex}"));
-
-    let bus = voice.bus.clone();
-    let payload = Bytes::from(payload_bytes);
-    wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = bus.publish_ephemeral(name, payload).await {
-            tracing::warn!(error = %e, "voice_input publish_ephemeral failed");
-        }
+    *cell.borrow_mut() = Some(ActiveVoice {
+        runtime,
+        frame_sink_rc: web_frame_sink,
+        on_set_peer_volume: on_volume_rc,
+        pending_gains: RefCell::new(HashMap::new()),
+        #[cfg(feature = "test-hooks")]
+        recorder: RefCell::new(None),
     });
 
     Ok(())
+}
+
+pub(crate) fn voice_stop(cell: &VoiceCell) -> Result<(), JsError> {
+    // Dropping `ActiveVoice` drops `VoiceRuntime`, which cancels all tasks.
+    *cell.borrow_mut() = None;
+    Ok(())
+}
+
+pub(crate) fn voice_input(cell: &VoiceCell, pcm: &Float32Array) -> Result<(), JsError> {
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    if pcm.length() as usize != sunset_voice::FRAME_SAMPLES {
+        return Err(JsError::new(&format!(
+            "voice_input: expected {} samples, got {}",
+            sunset_voice::FRAME_SAMPLES,
+            pcm.length()
+        )));
+    }
+    let mut buf = vec![0.0_f32; sunset_voice::FRAME_SAMPLES];
+    pcm.copy_to(&mut buf);
+    v.runtime.send_pcm(&buf);
+    Ok(())
+}
+
+pub(crate) fn voice_set_muted(cell: &VoiceCell, muted: bool) {
+    if let Some(v) = cell.borrow().as_ref() {
+        v.runtime.set_muted(muted);
+    }
+}
+
+pub(crate) fn voice_set_deafened(cell: &VoiceCell, deafened: bool) {
+    if let Some(v) = cell.borrow().as_ref() {
+        v.runtime.set_deafened(deafened);
+    }
+}
+
+/// Forward a desired per-peer volume to JS via the `on_set_peer_volume`
+/// callback. JS is responsible for setting the GainNode's gain.value.
+pub(crate) fn voice_set_peer_volume(cell: &VoiceCell, peer_bytes: &[u8], gain: f32) {
+    let slot = cell.borrow();
+    let Some(v) = slot.as_ref() else {
+        return;
+    };
+    if peer_bytes.len() != 32 {
+        return;
+    }
+    let pk = sunset_store::VerifyingKey::new(bytes::Bytes::copy_from_slice(peer_bytes));
+    let peer = sunset_sync::PeerId(pk);
+    // Record the desired gain for late-joining peers.
+    v.pending_gains.borrow_mut().insert(peer.clone(), gain);
+    // Forward to JS immediately if the callback is registered.
+    if let Some(f) = v.on_set_peer_volume.borrow().as_ref() {
+        let id = js_sys::Uint8Array::from(peer.0.as_bytes());
+        let _ = f.call2(&JsValue::NULL, &id, &JsValue::from_f64(gain as f64));
+    }
+}
+
+// ---------- Test-hooks helpers (compiled in only with feature "test-hooks") ----------
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn install_recorder(cell: &VoiceCell) -> Result<(), JsError> {
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+
+    let recorder = Rc::new(test_hooks::RecordingFrameSink::new(v.frame_sink_rc.clone()));
+    *v.recorder.borrow_mut() = Some(recorder.clone());
+
+    // Upcast to Rc<dyn FrameSink> so the runtime's RefCell<Rc<dyn FrameSink>>
+    // can accept it.
+    let as_dyn: Rc<dyn sunset_voice::FrameSink> = recorder;
+    if let Err(e) = v.runtime.set_frame_sink(as_dyn) {
+        return Err(JsError::new(&format!("install_recorder: {e}")));
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsValue, JsError> {
+    use js_sys::{Array, Object};
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    let recorder = v.recorder.borrow().as_ref().cloned().ok_or_else(|| {
+        JsError::new("frame recorder not installed; call voice_install_frame_recorder first")
+    })?;
+
+    if peer_bytes.len() != 32 {
+        return Err(JsError::new("peer_id must be 32 bytes"));
+    }
+    let pk = sunset_store::VerifyingKey::new(bytes::Bytes::copy_from_slice(peer_bytes));
+    let peer = sunset_sync::PeerId(pk);
+
+    let frames = recorder.get_frames(&peer);
+    let arr = Array::new();
+    for frame in &frames {
+        let obj = Object::new();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("seq_in_frame"),
+            &JsValue::from_f64(frame.seq_in_frame as f64),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("len"),
+            &JsValue::from_f64(frame.len as f64),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("checksum"),
+            &JsValue::from_str(&frame.checksum),
+        )
+        .unwrap();
+        arr.push(&obj);
+    }
+    Ok(arr.into())
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn active_peers(cell: &VoiceCell) -> Result<JsValue, JsError> {
+    use js_sys::{Array, Object, Uint8Array};
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    let states = v.runtime.snapshot_states();
+    let arr = Array::new();
+    for state in &states {
+        let obj = Object::new();
+        let id = Uint8Array::from(state.peer.0.as_bytes());
+        js_sys::Reflect::set(&obj, &JsValue::from_str("peer_id"), &id).unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("in_call"),
+            &JsValue::from_bool(state.in_call),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("talking"),
+            &JsValue::from_bool(state.talking),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("is_muted"),
+            &JsValue::from_bool(state.is_muted),
+        )
+        .unwrap();
+        arr.push(&obj);
+    }
+    Ok(arr.into())
 }
