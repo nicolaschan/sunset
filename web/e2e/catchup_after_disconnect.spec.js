@@ -210,7 +210,8 @@ test("client catches up on chat sent while it was offline", async ({ browser }) 
   //   - Redial + Hello on localhost: <1s.
   //   - PeerHello → fan_out_digests_to_peer → DigestExchange → reply
   //     → insert → UI render: <1s.
-  // Observed ~18s. 60s is generous; the pre-PR-#13 catch-up case has
-  // no path at all, so it would hang beyond any practical timeout.
-  await expect(pageB.getByText(msgGap)).toBeVisible({ timeout: 60_000 });
+  // Observed ~20s under default parallel workers. 30s is a tight
+  // bound — anything slower than that is a real regression in either
+  // the catch-up path or the recv-side close detection.
+  await expect(pageB.getByText(msgGap)).toBeVisible({ timeout: 30_000 });
 });
