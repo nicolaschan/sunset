@@ -62,7 +62,7 @@ export async function createClient(seed, callback) {
   await ensureLoaded();
   const { Client } = await loadWasmModule();
   const seedBytes = bitsToBytes(seed);
-  const client = new Client(seedBytes);
+  const client = new Client(seedBytes, 0);
   // Test-only hook: expose the client to Playwright when SUNSET_TEST is
   // set on `window` before the bundle loads. No-op in production.
   if (typeof window !== "undefined" && window.SUNSET_TEST) {
