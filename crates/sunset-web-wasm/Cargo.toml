@@ -30,6 +30,7 @@ sunset-sync-ws-browser.workspace = true
 sunset-voice = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 web-time.workspace = true
 zeroize.workspace = true
 

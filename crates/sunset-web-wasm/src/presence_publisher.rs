@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use wasm_bindgen::prelude::*;
 use wasmtimer::tokio::sleep;
 
 use sunset_core::Identity;
@@ -27,7 +26,7 @@ pub fn spawn_publisher(
         let name_str = format!("{room_fp_hex}/presence/{my_hex}");
         loop {
             if let Err(e) = publish_once(&identity, &name_str, &store, ttl_ms).await {
-                web_sys::console::warn_1(&JsValue::from_str(&format!("presence publisher: {e}")));
+                tracing::warn!(error = %e, "presence publisher");
             }
             sleep(Duration::from_millis(interval_ms)).await;
         }

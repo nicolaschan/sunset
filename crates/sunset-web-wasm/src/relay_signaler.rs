@@ -162,9 +162,7 @@ impl RelaySignaler {
         let mut events = match self.store.subscribe(filter, Replay::All).await {
             Ok(s) => s,
             Err(e) => {
-                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
-                    "RelaySignaler subscribe: {e}"
-                )));
+                tracing::error!(error = %e, "RelaySignaler subscribe");
                 return;
             }
         };
@@ -174,16 +172,12 @@ impl RelaySignaler {
                 Ok(sunset_store::Event::Replaced { new, .. }) => new,
                 Ok(_) => continue,
                 Err(e) => {
-                    web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
-                        "RelaySignaler event: {e}"
-                    )));
+                    tracing::error!(error = %e, "RelaySignaler event");
                     continue;
                 }
             };
             if let Err(e) = self.handle_entry(&entry, &inbound_tx).await {
-                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
-                    "RelaySignaler handle_entry: {e}"
-                )));
+                tracing::warn!(error = %e, "RelaySignaler handle_entry");
             }
         }
     }
