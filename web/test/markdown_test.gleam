@@ -66,8 +66,7 @@ pub fn render_strikethrough_test() {
 }
 
 pub fn render_inline_code_test() {
-  let html =
-    render_html([markdown.Paragraph([markdown.InlineCode("b")])])
+  let html = render_html([markdown.Paragraph([markdown.InlineCode("b")])])
   should.be_true(string.contains(html, "<code"))
   should.be_true(string.contains(html, ">b</code>"))
 }
@@ -117,7 +116,11 @@ pub fn render_spoiler_revealed_test() {
 pub fn render_masked_link_test() {
   let html =
     markdown.render_blocks(
-      [markdown.Paragraph([markdown.Link([markdown.Text("click")], "https://example.com", False)])],
+      [
+        markdown.Paragraph([
+          markdown.Link([markdown.Text("click")], "https://example.com", False),
+        ]),
+      ],
       "msg-1",
       fn(_) { False },
       fn(_) { Nil },
@@ -151,7 +154,11 @@ pub fn render_autolink_omits_title_test() {
 pub fn render_disallowed_scheme_renders_as_text_test() {
   let html =
     markdown.render_blocks(
-      [markdown.Paragraph([markdown.Link([markdown.Text("bad")], "javascript:alert(1)", False)])],
+      [
+        markdown.Paragraph([
+          markdown.Link([markdown.Text("bad")], "javascript:alert(1)", False),
+        ]),
+      ],
       "msg-1",
       fn(_) { False },
       fn(_) { Nil },
@@ -194,10 +201,12 @@ pub fn render_quote_test() {
 pub fn render_unordered_list_test() {
   let html =
     markdown.render_blocks(
-      [markdown.UnorderedList([
-        [markdown.Paragraph([markdown.Text("one")])],
-        [markdown.Paragraph([markdown.Text("two")])],
-      ])],
+      [
+        markdown.UnorderedList([
+          [markdown.Paragraph([markdown.Text("one")])],
+          [markdown.Paragraph([markdown.Text("two")])],
+        ]),
+      ],
       "msg-1",
       fn(_) { False },
       fn(_) { Nil },

@@ -25,15 +25,15 @@ import lustre/effect.{type Effect}
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
+import sunset_web/composer
 import sunset_web/domain.{
   type ChannelId, type Message, type Room, ChannelId, NoBridge, Room, RoomId,
 }
 import sunset_web/fixture
+import sunset_web/markdown
 import sunset_web/scroll_anchor
 import sunset_web/storage
 import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
-import sunset_web/composer
-import sunset_web/markdown
 import sunset_web/theme.{type Mode, Dark, Light}
 import sunset_web/ui
 import sunset_web/views/bottom_sheet

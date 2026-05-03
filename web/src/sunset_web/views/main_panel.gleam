@@ -842,21 +842,53 @@ fn composer(
                 // For all other keys let the browser's default action proceed.
                 decode.success(case key, shift, mod {
                   "Enter", False, _ ->
-                    event.handler(on_submit, prevent_default: True, stop_propagation: False)
+                    event.handler(
+                      on_submit,
+                      prevent_default: True,
+                      stop_propagation: False,
+                    )
                   "b", _, True ->
-                    event.handler(on_shortcut("**", "", "**", True), prevent_default: False, stop_propagation: False)
+                    event.handler(
+                      on_shortcut("**", "", "**", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
                   "B", _, True ->
-                    event.handler(on_shortcut("**", "", "**", True), prevent_default: False, stop_propagation: False)
+                    event.handler(
+                      on_shortcut("**", "", "**", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
                   "i", _, True ->
-                    event.handler(on_shortcut("*", "", "*", True), prevent_default: False, stop_propagation: False)
+                    event.handler(
+                      on_shortcut("*", "", "*", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
                   "I", _, True ->
-                    event.handler(on_shortcut("*", "", "*", True), prevent_default: False, stop_propagation: False)
+                    event.handler(
+                      on_shortcut("*", "", "*", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
                   "k", _, True ->
-                    event.handler(on_shortcut("[", "", "](url)", True), prevent_default: False, stop_propagation: False)
+                    event.handler(
+                      on_shortcut("[", "", "](url)", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
                   "K", _, True ->
-                    event.handler(on_shortcut("[", "", "](url)", True), prevent_default: False, stop_propagation: False)
+                    event.handler(
+                      on_shortcut("[", "", "](url)", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
                   _, _, _ ->
-                    event.handler(noop, prevent_default: False, stop_propagation: False)
+                    event.handler(
+                      noop,
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
                 })
               }),
               ui.css([

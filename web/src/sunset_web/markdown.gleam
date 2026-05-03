@@ -62,7 +62,13 @@ pub fn render(
   on_toggle_spoiler: fn(SpoilerKey) -> msg,
   p: Palette,
 ) -> Element(msg) {
-  render_blocks(parse(body), message_id, is_spoiler_revealed, on_toggle_spoiler, p)
+  render_blocks(
+    parse(body),
+    message_id,
+    is_spoiler_revealed,
+    on_toggle_spoiler,
+    p,
+  )
 }
 
 /// Render a pre-parsed AST to a Lustre element. Used by `render` and
@@ -184,9 +190,7 @@ fn quote_decoder() -> decode.Decoder(Block) {
 fn unordered_list_decoder() -> decode.Decoder(Block) {
   use items <- decode.field(
     "UnorderedList",
-    decode.then(decode.dynamic, fn(_) {
-      decode.list(lazy_block_list())
-    }),
+    decode.then(decode.dynamic, fn(_) { decode.list(lazy_block_list()) }),
   )
   decode.success(UnorderedList(items))
 }
@@ -274,8 +278,7 @@ fn link_payload_decoder() -> decode.Decoder(Inline) {
 
 fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
   case b {
-    Paragraph(inlines) ->
-      html.p([], render_inlines(inlines, ctx, path))
+    Paragraph(inlines) -> html.p([], render_inlines(inlines, ctx, path))
 
     Heading(level, content) -> {
       let tag = case level {
@@ -316,7 +319,8 @@ fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
         }),
       )
 
-    CodeBlock(language, source) -> render_code_block(language, source, ctx.palette)
+    CodeBlock(language, source) ->
+      render_code_block(language, source, ctx.palette)
   }
 }
 
@@ -351,7 +355,12 @@ fn render_code_block(
         [attribute.attribute("style", "margin: 0; white-space: pre-wrap;")],
         [
           html.code(
-            [attribute.attribute("style", "font-family: " <> theme.font_mono <> ";")],
+            [
+              attribute.attribute(
+                "style",
+                "font-family: " <> theme.font_mono <> ";",
+              ),
+            ],
             [html.text(source)],
           ),
         ],
@@ -424,10 +433,9 @@ fn render_link(
       // still see what was sent.
       html.span(
         [],
-        list.append(
-          render_inlines(label, ctx, path),
-          [html.text(" (" <> url <> ")")],
-        ),
+        list.append(render_inlines(label, ctx, path), [
+          html.text(" (" <> url <> ")"),
+        ]),
       )
     }
   }
@@ -439,11 +447,7 @@ fn allowed_scheme(url: String) -> Bool {
   || string.starts_with(url, "mailto:")
 }
 
-fn render_spoiler(
-  xs: List(Inline),
-  ctx: Ctx(msg),
-  path: String,
-) -> Element(msg) {
+fn render_spoiler(xs: List(Inline), ctx: Ctx(msg), path: String) -> Element(msg) {
   let key = SpoilerKey(ctx.message_id, path)
   let revealed = ctx.is_revealed(key)
   let style = case revealed {
