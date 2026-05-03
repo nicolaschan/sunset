@@ -8,11 +8,13 @@
 
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
+import gleam/int
 import gleam/list
 import gleam/option.{type Option}
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
+import lustre/event
 
 import sunset_web/theme.{type Palette}
 
@@ -32,15 +34,53 @@ pub fn parse(body: String) -> List(Block) {
   }
 }
 
-pub fn render(body: String, p: Palette) -> Element(msg) {
-  render_blocks(parse(body), p)
+/// A key uniquely identifying a spoiler span within a message.
+/// Used to track revealed state in the top-level Model.
+pub type SpoilerKey {
+  SpoilerKey(message_id: String, offset: Int)
+}
+
+/// Rendering context threaded through all render functions.
+type Ctx(msg) {
+  Ctx(
+    palette: Palette,
+    message_id: String,
+    is_revealed: fn(SpoilerKey) -> Bool,
+    on_toggle: fn(SpoilerKey) -> msg,
+  )
+}
+
+pub fn render(
+  body: String,
+  message_id: String,
+  is_spoiler_revealed: fn(SpoilerKey) -> Bool,
+  on_toggle_spoiler: fn(SpoilerKey) -> msg,
+  p: Palette,
+) -> Element(msg) {
+  render_blocks(parse(body), message_id, is_spoiler_revealed, on_toggle_spoiler, p)
 }
 
 /// Render a pre-parsed AST to a Lustre element. Used by `render` and
 /// directly by tests that build AST values by hand to avoid the FFI
 /// dependency in unit-test environments.
-pub fn render_blocks(blocks: List(Block), p: Palette) -> Element(msg) {
-  html.div([], list.map(blocks, fn(b) { render_block(b, p) }))
+pub fn render_blocks(
+  blocks: List(Block),
+  message_id: String,
+  is_spoiler_revealed: fn(SpoilerKey) -> Bool,
+  on_toggle_spoiler: fn(SpoilerKey) -> msg,
+  p: Palette,
+) -> Element(msg) {
+  let ctx =
+    Ctx(
+      palette: p,
+      message_id: message_id,
+      is_revealed: is_spoiler_revealed,
+      on_toggle: on_toggle_spoiler,
+    )
+  html.div(
+    [],
+    list.index_map(blocks, fn(b, i) { render_block(b, ctx, i * 1_000_000) }),
+  )
 }
 
 /// Strip all formatting and return concatenated text. Useful for
@@ -228,10 +268,10 @@ fn link_payload_decoder() -> decode.Decoder(Inline) {
 
 // ----- Block rendering -----
 
-fn render_block(b: Block, p: Palette) -> Element(msg) {
+fn render_block(b: Block, ctx: Ctx(msg), offset: Int) -> Element(msg) {
   case b {
     Paragraph(inlines) ->
-      html.p([], list.flat_map(inlines, fn(i) { render_inline(i, p) }))
+      html.p([], render_inlines(inlines, ctx, offset))
     _ -> html.text("")
     // Block variants other than Paragraph filled in by Task C5.
   }
@@ -239,18 +279,27 @@ fn render_block(b: Block, p: Palette) -> Element(msg) {
 
 // ----- Inline rendering -----
 
-fn render_inline(i: Inline, p: Palette) -> List(Element(msg)) {
+fn render_inlines(
+  is: List(Inline),
+  ctx: Ctx(msg),
+  offset_base: Int,
+) -> List(Element(msg)) {
+  list.index_map(is, fn(i, idx) { render_inline(i, ctx, offset_base + idx) })
+  |> list.flatten()
+}
+
+fn render_inline(i: Inline, ctx: Ctx(msg), offset: Int) -> List(Element(msg)) {
   case i {
     Text(s) -> [html.text(s)]
     Bold(xs) -> [
-      html.strong([], list.flat_map(xs, fn(x) { render_inline(x, p) })),
+      html.strong([], render_inlines(xs, ctx, offset * 100)),
     ]
-    Italic(xs) -> [html.em([], list.flat_map(xs, fn(x) { render_inline(x, p) }))]
+    Italic(xs) -> [html.em([], render_inlines(xs, ctx, offset * 100))]
     Underline(xs) -> [
-      html.u([], list.flat_map(xs, fn(x) { render_inline(x, p) })),
+      html.u([], render_inlines(xs, ctx, offset * 100)),
     ]
     Strikethrough(xs) -> [
-      html.s([], list.flat_map(xs, fn(x) { render_inline(x, p) })),
+      html.s([], render_inlines(xs, ctx, offset * 100)),
     ]
     InlineCode(s) -> [
       html.code(
@@ -266,9 +315,32 @@ fn render_inline(i: Inline, p: Palette) -> List(Element(msg)) {
       ),
     ]
     LineBreak -> [html.br([])]
-    Spoiler(_xs) -> [html.text("")]
-    // Spoiler rendering in Task C3.
+    Spoiler(xs) -> [render_spoiler(xs, ctx, offset)]
     Link(_, _, _) -> [html.text("")]
     // Link rendering in Task C4.
   }
+}
+
+fn render_spoiler(
+  xs: List(Inline),
+  ctx: Ctx(msg),
+  offset: Int,
+) -> Element(msg) {
+  let key = SpoilerKey(ctx.message_id, offset)
+  let revealed = ctx.is_revealed(key)
+  let style = case revealed {
+    True -> "background: rgba(0,0,0,0.05); border-radius: 3px; padding: 0 2px;"
+    False ->
+      "background: var(--text-muted, #888); color: transparent; border-radius: 3px; padding: 0 2px; cursor: pointer; user-select: none;"
+  }
+  html.span(
+    [
+      attribute.class("spoiler"),
+      attribute.attribute("data-msg-id", ctx.message_id),
+      attribute.attribute("data-offset", int.to_string(offset)),
+      attribute.attribute("style", style),
+      event.on_click(ctx.on_toggle(key)),
+    ],
+    render_inlines(xs, ctx, offset * 100),
+  )
 }

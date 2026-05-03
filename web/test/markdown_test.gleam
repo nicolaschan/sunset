@@ -16,7 +16,7 @@ fn p() {
 }
 
 fn render_html(blocks) {
-  markdown.render_blocks(blocks, p())
+  markdown.render_blocks(blocks, "msg-1", fn(_) { False }, fn(_) { Nil }, p())
   |> element.to_string()
 }
 
@@ -83,4 +83,32 @@ pub fn render_line_break_test() {
   should.be_true(string.contains(html, "<br"))
   should.be_true(string.contains(html, "a"))
   should.be_true(string.contains(html, "b"))
+}
+
+pub fn render_spoiler_hidden_test() {
+  let html =
+    markdown.render_blocks(
+      [markdown.Paragraph([markdown.Spoiler([markdown.Text("secret")])])],
+      "msg-1",
+      fn(_) { False },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  should.be_true(string.contains(html, "color: transparent"))
+  should.be_true(string.contains(html, "secret"))
+}
+
+pub fn render_spoiler_revealed_test() {
+  let html =
+    markdown.render_blocks(
+      [markdown.Paragraph([markdown.Spoiler([markdown.Text("secret")])])],
+      "msg-1",
+      fn(_) { True },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  should.be_false(string.contains(html, "color: transparent"))
+  should.be_true(string.contains(html, "secret"))
 }
