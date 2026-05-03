@@ -1868,6 +1868,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tracing",
  "wasmtimer",
  "web-time",
  "zeroize",
@@ -2010,6 +2011,7 @@ dependencies = [
  "sunset-store-memory",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "wasm-bindgen-futures",
  "wasmtimer",
  "web-time",
@@ -2030,6 +2032,7 @@ dependencies = [
  "sunset-sync",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -2105,9 +2108,11 @@ dependencies = [
  "sunset-voice",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
+ "wasm-tracing",
  "wasmtimer",
  "web-sys",
  "web-time",
@@ -2692,6 +2697,17 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-tracing"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11ab253baf6d3772bbdb37a0966b67d37ab80657ccd1a084b4d7b3de3232375d"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
 ]
 
 [[package]]
