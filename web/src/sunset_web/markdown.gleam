@@ -89,7 +89,12 @@ pub fn render_blocks(
       on_toggle: on_toggle_spoiler,
     )
   html.div(
-    [],
+    [
+      attribute.attribute(
+        "style",
+        "display: flex; flex-direction: column; gap: 4px;",
+      ),
+    ],
     list.index_map(blocks, fn(b, i) { render_block(b, ctx, int.to_string(i)) }),
   )
 }
@@ -278,7 +283,11 @@ fn link_payload_decoder() -> decode.Decoder(Inline) {
 
 fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
   case b {
-    Paragraph(inlines) -> html.p([], render_inlines(inlines, ctx, path))
+    Paragraph(inlines) ->
+      html.p(
+        [attribute.attribute("style", "margin: 0;")],
+        render_inlines(inlines, ctx, path),
+      )
 
     Heading(level, content) -> {
       let tag = case level {
@@ -286,7 +295,10 @@ fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
         2 -> html.h2
         _ -> html.h3
       }
-      tag([], render_inlines(content, ctx, path))
+      tag(
+        [attribute.attribute("style", "margin: 0;")],
+        render_inlines(content, ctx, path),
+      )
     }
 
     Quote(blocks) ->
@@ -304,7 +316,7 @@ fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
 
     UnorderedList(items) ->
       html.ul(
-        [],
+        [attribute.attribute("style", "margin: 0; padding-left: 24px;")],
         list.index_map(items, fn(item, i) {
           html.li(
             [],
@@ -347,7 +359,7 @@ fn render_code_block(
     [
       attribute.attribute(
         "style",
-        "position: relative; background: rgba(0,0,0,0.06); border-radius: 6px; padding: 8px 12px; margin: 4px 0;",
+        "position: relative; background: rgba(0,0,0,0.06); border-radius: 6px; padding: 8px 12px;",
       ),
     ],
     list.append(pill, [
