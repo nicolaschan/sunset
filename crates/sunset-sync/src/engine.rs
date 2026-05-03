@@ -647,6 +647,47 @@ where
         }
     }
 
+    /// Push every entry in our local store matching `filter` to `to` as a
+    /// single `EventDelivery`. Called from `handle_local_store_event` when
+    /// the registry first learns (or changes) `to`'s filter, to deliver
+    /// already-stored entries that pre-date the registry update.
+    ///
+    /// Skipped silently if the peer is not currently connected (no
+    /// outbound channel) — a future PeerHello will fan out digests, and
+    /// anti-entropy ticks bridge the rest.
+    async fn backfill_peer_for_filter(&self, to: &PeerId, filter: &Filter) {
+        let mut iter = match self.store.iter(filter.clone()).await {
+            Ok(it) => it,
+            Err(e) => {
+                tracing::warn!(error = %e, "backfill: store iter failed");
+                return;
+            }
+        };
+        let mut entries = Vec::new();
+        let mut blobs = Vec::new();
+        while let Some(item) = iter.next().await {
+            let entry = match item {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "backfill: store iter yielded error");
+                    continue;
+                }
+            };
+            if let Ok(Some(blob)) = self.store.get_content(&entry.value_hash).await {
+                blobs.push(blob);
+            }
+            entries.push(entry);
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let msg = SyncMessage::EventDelivery { entries, blobs };
+        let state = self.state.lock().await;
+        if let Some(po) = state.peer_outbound.get(to) {
+            let _ = po.tx.send(msg);
+        }
+    }
+
     /// Send a `DigestExchange` over `filter` to `to`. Builds a Bloom
     /// of our entries matching `filter`; the receiver uses its own
     /// store + the bloom to compute "entries we have that the sender
@@ -841,15 +882,30 @@ where
 
         // If this is a subscription announcement, update the registry so
         // future push routing knows about the peer's interests.
+        //
+        // On a new or changed filter, also backfill the peer with already-
+        // stored entries that match the filter. This closes the receiver-side
+        // race where third-party-authored entries arrive in our local store
+        // *before* the recipient's SUBSCRIBE_NAME is parsed; without the
+        // backfill, those entries sit in our store with no forwarding trigger
+        // until anti-entropy fires (well past the latency budget for, e.g.,
+        // WebRTC SDP signaling).
         if entry.name.as_ref() == reserved::SUBSCRIBE_NAME {
             if let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await {
                 if let Ok(filter) = parse_subscription_entry(&entry, &block) {
-                    let _ = self
+                    let peer_vk = entry.verifying_key.clone();
+                    let peer_id = PeerId(peer_vk.clone());
+                    let prev = self
                         .state
                         .lock()
                         .await
                         .registry
-                        .insert(entry.verifying_key.clone(), filter);
+                        .insert(peer_vk.clone(), filter.clone());
+                    let filter_changed = prev.as_ref() != Some(&filter);
+                    let is_self = peer_vk == self.local_peer.0;
+                    if filter_changed && !is_self {
+                        self.backfill_peer_for_filter(&peer_id, &filter).await;
+                    }
                 }
             }
         }
