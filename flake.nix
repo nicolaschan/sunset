@@ -100,6 +100,11 @@
           lustre = true;
           buildPhase = ''
             runHook preBuild
+            # Link the Nix-built node_modules so Lustre's esbuild can
+            # resolve bare module specifiers like `emoji-picker-element`
+            # at bundle time. Without this, esbuild fails with
+            # "Could not resolve: <pkg>".
+            ln -sfn ${webNodeModules}/node_modules ./node_modules
             # Trigger Gleam compile to create build/dev/javascript/, then
             # stage the sunset-web-wasm bundle there so Lustre's esbuild can
             # resolve the `import init from "../../sunset_web_wasm.js"` line

@@ -779,11 +779,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // time we mount it.
       sunset.register_emoji_picker()
       #(
-        Model(
-          ..model,
-          full_picker_for: Some(target),
-          reacting_to: None,
-        ),
+        Model(..model, full_picker_for: Some(target), reacting_to: None),
         effect.none(),
       )
     }
@@ -793,14 +789,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     )
     ReactionsChanged(target, snapshot) -> {
       #(
-        Model(..model, reactions: dict.insert(model.reactions, target, snapshot)),
+        Model(
+          ..model,
+          reactions: dict.insert(model.reactions, target, snapshot),
+        ),
         effect.none(),
       )
     }
     ToggleReactionEmoji(target, emoji) -> {
-      let self_pubkey_hex_opt = option.map(model.client, fn(c) {
-        client_pubkey_hex(c)
-      })
+      let self_pubkey_hex_opt =
+        option.map(model.client, fn(c) { client_pubkey_hex(c) })
       let action = case dict.get(model.reactions, target) {
         Ok(snap) ->
           case dict.get(snap, emoji), self_pubkey_hex_opt {
@@ -813,8 +811,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         Error(_) -> "add"
       }
-      let next_model =
-        Model(..model, reacting_to: None, full_picker_for: None)
+      let next_model = Model(..model, reacting_to: None, full_picker_for: None)
       let send_effect = case model.client {
         Some(c) ->
           effect.from(fn(dispatch) {
@@ -968,9 +965,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
   let active_room =
     lookup_room(displayed_rooms, current_name, model.relay_status)
 
-  let self_pubkey_hex = option.map(model.client, fn(c) {
-    client_pubkey_hex(c)
-  })
+  let self_pubkey_hex = option.map(model.client, fn(c) { client_pubkey_hex(c) })
   let raw_messages = model.messages
   let messages_with_live_reactions =
     list.map(raw_messages, fn(m) {
@@ -1021,9 +1016,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
           ]),
         ],
         [
-          emoji_picker.view(fn(emoji) {
-            ToggleReactionEmoji(target, emoji)
-          }),
+          emoji_picker.view(fn(emoji) { ToggleReactionEmoji(target, emoji) }),
         ],
       )
     None -> element.fragment([])

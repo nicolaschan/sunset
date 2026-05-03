@@ -183,7 +183,9 @@ pub fn rec_from_pubkey(r: IncomingReceipt) -> BitArray
 pub type IncomingReactionsSnapshot
 
 @external(javascript, "./sunset.ffi.mjs", "reactionsSnapshotTargetHex")
-pub fn reactions_snapshot_target_hex(snapshot: IncomingReactionsSnapshot) -> String
+pub fn reactions_snapshot_target_hex(
+  snapshot: IncomingReactionsSnapshot,
+) -> String
 
 /// Returns the snapshot as a `List(#(emoji, List(author_pubkey_hex)))`.
 /// The FFI side flattens the JS Map<emoji, Set<author_hex>> into this
