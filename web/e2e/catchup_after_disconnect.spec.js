@@ -16,17 +16,13 @@
 // SUBSCRIBE_NAME, anti-entropy at the 30s tick fires the same, and the
 // missed message never arrives until the user reloads the page.
 //
-// Timing note: disconnect detection in the browser WS transport is
-// driven by send-side errors. After ws.close() the socket sits in
-// CLOSING for ~2s (the JS WebSocket close handshake) — sends during
-// that window are silently dropped, so the engine doesn't notice. Once
-// the socket reaches CLOSED, the next heartbeat send (at the 15s
-// heartbeat_interval) throws and the engine emits Disconnected. So
-// detection takes up to one full heartbeat after the socket transitions
-// to CLOSED, ~30s from ws.close() in the worst case. (This is a real
-// transport-level bug worth fixing separately; tracked outside this
-// PR.) The 60s budget below accommodates that detection delay plus
-// the supervisor backoff and digest exchange.
+// Timing note: under real TCP failure modes (laptop sleep, network
+// drop, relay shutdown) the browser fires `onclose` quickly and the
+// transport's recv-side close detection makes reconnect <1s. In this
+// test, ws.close() from JS waits for the server's close-frame
+// response, which Chromium times out at ~16s — that's a test-setup
+// artifact, not a production delay. The 60s budget below accommodates
+// it plus supervisor backoff and digest exchange.
 
 import { test, expect } from "@playwright/test";
 import { spawn } from "child_process";
@@ -208,13 +204,13 @@ test("client catches up on chat sent while it was offline", async ({ browser }) 
   await expect(pageB.getByText(msgGap)).toBeHidden({ timeout: 3_000 });
 
   // Wait for B to redial and catch up. Budget covers:
-  //   - ~30s WS-close detection (see file header note).
+  //   - ~16s JS-side WS close handshake (test artifact; see file
+  //     header note).
   //   - Supervisor backoff: 1s + jitter.
   //   - Redial + Hello on localhost: <1s.
   //   - PeerHello → fan_out_digests_to_peer → DigestExchange → reply
   //     → insert → UI render: <1s.
-  // Observed ~33s. 60s leaves margin without hiding regressions: the
-  // pre-PR-#13 case has no catch-up path at all, so it would hang
-  // beyond any practical timeout.
+  // Observed ~18s. 60s is generous; the pre-PR-#13 catch-up case has
+  // no path at all, so it would hang beyond any practical timeout.
   await expect(pageB.getByText(msgGap)).toBeVisible({ timeout: 60_000 });
 });
