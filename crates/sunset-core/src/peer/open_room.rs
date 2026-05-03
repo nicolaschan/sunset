@@ -236,8 +236,6 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             },
             (*self.inner.tracker_handles).clone(),
         );
-
-        crate::membership::fire_relay_status_now(&self.inner.tracker_handles);
     }
 
     pub async fn connect_direct(&self, peer_pubkey: [u8; 32]) -> crate::Result<()> {
@@ -255,7 +253,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         );
         let addr = sunset_sync::PeerAddr::new(bytes::Bytes::from(addr_str));
         peer.supervisor()
-            .add(addr)
+            .add(sunset_sync::Connectable::Direct(addr))
             .await
             .map_err(|e| crate::Error::Other(format!("connect_direct: {e}")))?;
         Ok(())
@@ -282,10 +280,6 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             .last_signature
             .borrow_mut()
             .clear();
-    }
-
-    pub fn on_relay_status_changed<F: Fn(&str) + 'static>(&self, cb: F) {
-        *self.inner.tracker_handles.on_relay_status.borrow_mut() = Some(Box::new(cb));
     }
 
     /// Register a callback that fires whenever the per-target reaction

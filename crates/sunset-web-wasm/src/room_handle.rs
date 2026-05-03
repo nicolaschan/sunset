@@ -61,12 +61,6 @@ impl RoomHandle {
         });
     }
 
-    pub fn on_relay_status_changed(&self, callback: js_sys::Function) {
-        self.inner.on_relay_status_changed(move |status| {
-            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(status));
-        });
-    }
-
     pub async fn start_presence(&self, interval_ms: u32, ttl_ms: u32, refresh_ms: u32) {
         self.inner
             .start_presence(interval_ms as u64, ttl_ms as u64, refresh_ms as u64)

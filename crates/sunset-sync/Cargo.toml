@@ -18,6 +18,7 @@ postcard.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
 serde.workspace = true
+sunset-relay-resolver.workspace = true
 sunset-store.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }

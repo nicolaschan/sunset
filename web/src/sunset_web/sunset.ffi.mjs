@@ -4,15 +4,29 @@
 
 import { BitArray, Ok, Error as GError, toList } from "../../prelude.mjs";
 import { Some, None } from "../../gleam_stdlib/gleam/option.mjs";
-import init, { Client } from "../../sunset_web_wasm.js";
+import { IntentSnapshot } from "./sunset.mjs";
+
+// The wasm-bindgen bundle is loaded lazily via dynamic `import()` so
+// that gleam unit tests (which run on Node and never touch the wasm
+// runtime) don't fail at module-resolution time when the bundle isn't
+// present in the build directory.
+let wasmModulePromise = null;
+function loadWasmModule() {
+  if (!wasmModulePromise) {
+    wasmModulePromise = import("../../sunset_web_wasm.js");
+  }
+  return wasmModulePromise;
+}
 
 let initPromise = null;
 function ensureLoaded() {
   if (!initPromise) {
-    // Explicitly pass the .wasm URL relative to the HTML page; the
-    // default import.meta.url-based lookup breaks once the
-    // wasm-bindgen JS gets bundled into sunset_web.js.
-    initPromise = init("./sunset_web_wasm_bg.wasm");
+    initPromise = loadWasmModule().then((mod) =>
+      // Explicitly pass the .wasm URL relative to the HTML page; the
+      // default import.meta.url-based lookup breaks once the
+      // wasm-bindgen JS gets bundled into sunset_web.js.
+      mod.default("./sunset_web_wasm_bg.wasm"),
+    );
   }
   return initPromise;
 }
@@ -46,6 +60,7 @@ export function loadOrCreateIdentity(callback) {
 
 export async function createClient(seed, callback) {
   await ensureLoaded();
+  const { Client } = await loadWasmModule();
   const seedBytes = bitsToBytes(seed);
   const client = new Client(seedBytes);
   // Test-only hook: expose the client to Playwright when SUNSET_TEST is
@@ -83,11 +98,33 @@ export function clientPeerConnectionMode(room, peerPubkey) {
 
 export async function addRelay(client, url, callback) {
   try {
-    await client.add_relay(url);
-    callback(new Ok(undefined));
+    const id = await client.add_relay(url);
+    callback(new Ok(id));
   } catch (e) {
     callback(new GError(String(e)));
   }
+}
+
+export function onIntentChanged(client, callback) {
+  client.on_intent_changed((snap) => {
+    // Copy the wasm-bindgen object's fields into a real Gleam
+    // IntentSnapshot record so pattern-matching + field access both
+    // work. `peer_pubkey` and `kind` arrive as `undefined` when None
+    // on the Rust side; wrap into Some/None.
+    const peerPubkey = snap.peer_pubkey;
+    const kind = snap.kind;
+    const record = new IntentSnapshot(
+      snap.id,
+      snap.state,
+      snap.label,
+      peerPubkey === undefined || peerPubkey === null
+        ? new None()
+        : new Some(new BitArray(peerPubkey)),
+      kind === undefined || kind === null ? new None() : new Some(kind),
+      snap.attempt,
+    );
+    callback(record);
+  });
 }
 
 export async function sendMessage(room, body, sentAtMs, callback) {
@@ -114,10 +151,6 @@ export function onMessage(room, callback) {
     incoming.free();
     callback(plain);
   });
-}
-
-export function relayStatus(client) {
-  return client.relay_status;
 }
 
 export function relayUrlParam() {
@@ -190,16 +223,6 @@ export function onMembersChanged(room, callback) {
       callback(toList(copied));
     } catch (e) {
       console.warn("onMembersChanged callback threw", e);
-    }
-  });
-}
-
-export function onRelayStatusChanged(room, callback) {
-  room.on_relay_status_changed((s) => {
-    try {
-      callback(String(s));
-    } catch (e) {
-      console.warn("onRelayStatusChanged callback threw", e);
     }
   });
 }
