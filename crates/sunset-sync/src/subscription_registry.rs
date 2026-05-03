@@ -21,11 +21,11 @@ impl SubscriptionRegistry {
         Self::default()
     }
 
-    /// Replace the filter for `vk` with `filter`. (LWW happens at the
-    /// store layer; the registry just reflects whatever currently lives
-    /// at `(vk, _sunset-sync/subscribe)`.)
-    pub fn insert(&mut self, vk: VerifyingKey, filter: Filter) {
-        self.by_peer.insert(vk, filter);
+    /// Replace the filter for `vk` with `filter`. Returns the previous filter
+    /// for that peer, if any. Mirrors `HashMap::insert`'s return semantics so
+    /// callers can distinguish new / changed / unchanged subscriptions.
+    pub fn insert(&mut self, vk: VerifyingKey, filter: Filter) -> Option<Filter> {
+        self.by_peer.insert(vk, filter)
     }
 
     /// Remove `vk`'s registration (e.g., on TTL expiration).
@@ -149,6 +149,30 @@ mod tests {
         };
         let parsed = parse_subscription_entry(&entry, &block).unwrap();
         assert_eq!(parsed, filter);
+    }
+
+    #[test]
+    fn insert_returns_none_for_new_peer() {
+        let mut r = SubscriptionRegistry::new();
+        let prev = r.insert(vk(b"alice"), Filter::Keyspace(vk(b"chat-1")));
+        assert!(prev.is_none(), "expected None when inserting a new peer");
+    }
+
+    #[test]
+    fn insert_returns_previous_filter_for_existing_peer() {
+        let mut r = SubscriptionRegistry::new();
+        r.insert(vk(b"alice"), Filter::Keyspace(vk(b"chat-1")));
+        let prev = r.insert(vk(b"alice"), Filter::Keyspace(vk(b"chat-2")));
+        assert_eq!(prev, Some(Filter::Keyspace(vk(b"chat-1"))));
+    }
+
+    #[test]
+    fn insert_returns_same_filter_when_unchanged() {
+        let mut r = SubscriptionRegistry::new();
+        let f = Filter::Keyspace(vk(b"chat-1"));
+        r.insert(vk(b"alice"), f.clone());
+        let prev = r.insert(vk(b"alice"), f.clone());
+        assert_eq!(prev, Some(f));
     }
 
     #[test]

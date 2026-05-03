@@ -14,6 +14,7 @@ use wasm_bindgen::prelude::*;
 ///   reactions: Map<emoji_string, Set<author_pubkey_hex>>
 /// }
 /// ```
+///
 pub fn snapshot_to_js(target: &Hash, snapshot: &ReactionSnapshot) -> JsValue {
     let map = Map::new();
     for (emoji, authors) in snapshot {

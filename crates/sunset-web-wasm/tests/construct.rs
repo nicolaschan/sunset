@@ -11,7 +11,7 @@ wasm_bindgen_test_configure!(run_in_node_experimental);
 #[wasm_bindgen_test]
 fn client_constructs() {
     let seed = [42u8; 32];
-    let client = Client::new(&seed, "plan-e-test").expect("Client::new");
+    let client = Client::new(&seed).expect("Client::new");
     let pk = client.public_key();
     assert_eq!(pk.len(), 32);
 }

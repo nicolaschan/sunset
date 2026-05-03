@@ -13,11 +13,6 @@
       const incoming = new Map();
       const voiceState = new Map();
       const connState = new Map();
-      // Set of remote peer pubkey hex strings currently visible in the
-      // membership tracker. Real users wait for the peer to appear in the
-      // member rail before clicking "connect direct"; the test mirrors
-      // that wait via `members()` polling.
-      const visibleMembers = new Set();
 
       function hex(uint8) {
         return Array.from(uint8).map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -27,29 +22,25 @@
         async start({ seed, room, relay }) {
           await init();
           const bytes = new Uint8Array(seed.match(/.{2}/g).map((b) => parseInt(b, 16)));
-          const client = new Client(bytes, room);
+          // Multi-room API: Client::new takes only the seed; the room
+          // is opened via client.open_room(name) which publishes the
+          // <fp>/* subscription internally (replaces the old
+          // publish_room_subscription call).
+          const client = new Client(bytes);
           window.__voice.client = client;
+          window.__voice.room = room;
           window.__voice.publicKeyHex = hex(new Uint8Array(client.public_key));
           await client.add_relay(relay);
-          // Subscribe to the room namespace so peers learn we want
-          // <fp>/msg/ AND <fp>/webrtc/ entries from them. Without
-          // this, WebRTC signaling SDP offers never reach the remote
-          // peer and connect_direct hangs forever (the Gleam UI does
-          // this same call right after relay_status: "connected").
-          await client.publish_room_subscription();
-          client.on_peer_connection_state((snap) => {
-            connState.set(snap.addr, snap);
-          });
-          client.on_members_changed((members) => {
-            visibleMembers.clear();
-            for (const m of members) {
-              if (!m.is_self) visibleMembers.add(hex(new Uint8Array(m.pubkey)));
-            }
+          const roomHandle = await client.open_room(room);
+          window.__voice.roomHandle = roomHandle;
+          client.on_intent_changed((snap) => {
+            connState.set(snap.label, snap);
           });
           return { publicKey: window.__voice.publicKeyHex };
         },
         startVoice() {
           window.__voice.client.voice_start(
+            window.__voice.room,
             (fromPeerId, pcm) => {
               const k = hex(new Uint8Array(fromPeerId));
               if (!incoming.has(k)) incoming.set(k, []);
@@ -71,19 +62,19 @@
         },
         async connectDirect(peerHex) {
           const bytes = new Uint8Array(peerHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
-          await window.__voice.client.connect_direct(bytes);
+          // Multi-room API: connect_direct moved from Client to RoomHandle
+          // (signaling rides on the room's <fp>/webrtc/ namespace).
+          await window.__voice.roomHandle.connect_direct(bytes);
         },
         peerMode(peerHex) {
           const bytes = new Uint8Array(peerHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
-          return window.__voice.client.peer_connection_mode(bytes);
+          return window.__voice.roomHandle.peer_connection_mode(bytes);
         },
         async startPresence() {
           // Tight intervals so the membership tracker converges quickly
           // in the test (real Gleam UI uses 30s/60s/5s defaults).
-          await window.__voice.client.start_presence(300, 1500, 100);
-        },
-        memberVisible(peerHex) {
-          return visibleMembers.has(peerHex);
+          // start_presence moved from Client to RoomHandle in multi-room.
+          await window.__voice.roomHandle.start_presence(300, 1500, 100);
         },
         sendFrame(samples) {
           window.__voice.client.voice_input(new Float32Array(samples));

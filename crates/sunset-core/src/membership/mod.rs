@@ -26,6 +26,9 @@
 //! drives both wasm-bindgen `js_sys::Function` shims (in
 //! `sunset-web-wasm`) and native client-surface callbacks (TUI, mod).
 
+pub mod publisher;
+pub use publisher::spawn_publisher;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

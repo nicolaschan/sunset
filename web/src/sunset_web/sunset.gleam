@@ -6,6 +6,8 @@ import gleam/option
 
 pub type ClientHandle
 
+pub type RoomHandle
+
 pub type IncomingMessage
 
 /// Read the persisted 32-byte secret seed from localStorage; if absent,
@@ -17,10 +19,15 @@ pub fn load_or_create_identity(callback: fn(BitArray) -> Nil) -> Nil
 /// Construct a Client. Seed must be 32 bytes. `callback` is called with
 /// the opaque ClientHandle once the wasm bundle is loaded + initialised.
 @external(javascript, "./sunset.ffi.mjs", "createClient")
-pub fn create_client(
-  seed: BitArray,
-  room_name: String,
-  callback: fn(ClientHandle) -> Nil,
+pub fn create_client(seed: BitArray, callback: fn(ClientHandle) -> Nil) -> Nil
+
+/// Open a room by name. Returns a RoomHandle via `callback` once the room
+/// subscription is published and the wasm-side state is initialised.
+@external(javascript, "./sunset.ffi.mjs", "clientOpenRoom")
+pub fn open_room(
+  client: ClientHandle,
+  name: String,
+  callback: fn(RoomHandle) -> Nil,
 ) -> Nil
 
 /// Register a durable intent to keep connected to `url`. The
@@ -55,18 +62,11 @@ pub fn on_intent_changed(
   callback: fn(IntentSnapshot) -> Nil,
 ) -> Nil
 
-/// Subscribe the engine to "all messages in this room".
-@external(javascript, "./sunset.ffi.mjs", "publishRoomSubscription")
-pub fn publish_room_subscription(
-  client: ClientHandle,
-  callback: fn(Result(Nil, String)) -> Nil,
-) -> Nil
-
 /// Compose + insert a message. `callback` receives the value-hash hex on
 /// success.
 @external(javascript, "./sunset.ffi.mjs", "sendMessage")
 pub fn send_message(
-  client: ClientHandle,
+  room: RoomHandle,
   body: String,
   sent_at_ms: Int,
   callback: fn(Result(String, String)) -> Nil,
@@ -75,10 +75,7 @@ pub fn send_message(
 /// Register the per-message callback. Fires once per current + future
 /// message in the room.
 @external(javascript, "./sunset.ffi.mjs", "onMessage")
-pub fn on_message(
-  client: ClientHandle,
-  callback: fn(IncomingMessage) -> Nil,
-) -> Nil
+pub fn on_message(room: RoomHandle, callback: fn(IncomingMessage) -> Nil) -> Nil
 
 /// Establish a direct WebRTC peer connection. Signaling rides over the
 /// existing relay-mediated CRDT replication (Noise_KK encrypted, full
@@ -86,7 +83,7 @@ pub fn on_message(
 /// Noise_IK handshake complete or `Error(msg)` on failure.
 @external(javascript, "./sunset.ffi.mjs", "clientConnectDirect")
 pub fn client_connect_direct(
-  client: ClientHandle,
+  room: RoomHandle,
   peer_pubkey: BitArray,
   callback: fn(Result(Nil, String)) -> Nil,
 ) -> Nil
@@ -95,7 +92,7 @@ pub fn client_connect_direct(
 /// the given remote peer's pubkey.
 @external(javascript, "./sunset.ffi.mjs", "clientPeerConnectionMode")
 pub fn client_peer_connection_mode(
-  client: ClientHandle,
+  room: RoomHandle,
   peer_pubkey: BitArray,
 ) -> String
 
@@ -129,7 +126,7 @@ pub type MemberJs
 /// Start the heartbeat publisher + membership tracker. Idempotent.
 @external(javascript, "./sunset.ffi.mjs", "startPresence")
 pub fn start_presence(
-  client: ClientHandle,
+  room: RoomHandle,
   interval_ms: Int,
   ttl_ms: Int,
   refresh_ms: Int,
@@ -137,7 +134,7 @@ pub fn start_presence(
 
 @external(javascript, "./sunset.ffi.mjs", "onMembersChanged")
 pub fn on_members_changed(
-  client: ClientHandle,
+  room: RoomHandle,
   callback: fn(List(MemberJs)) -> Nil,
 ) -> Nil
 
@@ -166,6 +163,11 @@ pub fn presence_params_from_url() -> #(Int, Int, Int)
 @external(javascript, "./sunset.ffi.mjs", "setIntervalMs")
 pub fn set_interval_ms(ms: Int, callback: fn() -> Nil) -> Nil
 
+/// Schedule a one-shot callback after `ms` milliseconds. Used to stagger
+/// room-open calls at startup so the Argon2id KDF cost doesn't block.
+@external(javascript, "./sunset.ffi.mjs", "setTimeoutMs")
+pub fn set_timeout_ms(ms: Int, callback: fn() -> Nil) -> Nil
+
 /// Wall-clock unix-ms snapshot via JS `Date.now()`.
 @external(javascript, "./sunset.ffi.mjs", "nowMs")
 pub fn now_ms() -> Int
@@ -177,10 +179,7 @@ pub type IncomingReceipt
 /// authored by a peer other than us; self-receipts are dropped at the
 /// bridge layer.
 @external(javascript, "./sunset.ffi.mjs", "onReceipt")
-pub fn on_receipt(
-  client: ClientHandle,
-  callback: fn(IncomingReceipt) -> Nil,
-) -> Nil
+pub fn on_receipt(room: RoomHandle, callback: fn(IncomingReceipt) -> Nil) -> Nil
 
 /// Hex-encoded value_hash of the Text that this Receipt acknowledges.
 @external(javascript, "./sunset.ffi.mjs", "recForValueHashHex")
@@ -211,18 +210,18 @@ pub fn reactions_snapshot_entries(
 /// and again whenever the target's reaction state changes.
 @external(javascript, "./sunset.ffi.mjs", "onReactionsChanged")
 pub fn on_reactions_changed(
-  client: ClientHandle,
+  room: RoomHandle,
   callback: fn(IncomingReactionsSnapshot) -> Nil,
 ) -> Nil
 
-/// Send a reaction event. `action` is "add" or "remove".
+/// Send a reaction event. `action` is "add" or "remove". The wasm
+/// side generates the entry's nonce and sent_at_ms internally.
 @external(javascript, "./sunset.ffi.mjs", "sendReaction")
 pub fn send_reaction(
-  client: ClientHandle,
+  room: RoomHandle,
   target_hex: String,
   emoji: String,
   action: String,
-  sent_at_ms: Int,
   callback: fn(Result(Nil, String)) -> Nil,
 ) -> Nil
 

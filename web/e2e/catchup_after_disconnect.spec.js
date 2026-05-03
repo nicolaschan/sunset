@@ -214,4 +214,7 @@ test("client catches up on chat sent while it was offline", async ({ browser }) 
   // bound — anything slower than that is a real regression in either
   // the catch-up path or the recv-side close detection.
   await expect(pageB.getByText(msgGap)).toBeVisible({ timeout: 30_000 });
+
+  await ctxA.close();
+  await ctxB.close();
 });

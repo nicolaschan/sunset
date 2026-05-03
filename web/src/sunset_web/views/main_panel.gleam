@@ -24,6 +24,7 @@ import sunset_web/domain.{
   type ChannelId, type Message, type Reaction, ChannelId, HasBridge, Minecraft,
   NoBridge,
 }
+import sunset_web/markdown
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
@@ -38,6 +39,7 @@ pub fn view(
   on_draft on_draft: fn(String) -> msg,
   on_submit on_submit: msg,
   noop noop: msg,
+  on_shortcut on_shortcut: fn(String, String, String, Bool) -> msg,
   reacting_to reacting_to: Option(String),
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
@@ -47,6 +49,8 @@ pub fn view(
   receipts receipts: Dict(String, Set(String)),
   selected_msg_id selected_msg_id: Option(String),
   on_toggle_selected on_toggle_selected: fn(String) -> msg,
+  is_spoiler_revealed is_revealed: fn(markdown.SpoilerKey) -> Bool,
+  on_toggle_spoiler on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
   // Slot rendered between the channel header and the message list.
   // Used by the phone shell for the in-call voice mini-bar — voice
   // chat is a per-channel concern, so the banner sits inside the
@@ -90,8 +94,19 @@ pub fn view(
         receipts,
         selected_msg_id,
         on_toggle_selected,
+        is_revealed,
+        on_toggle_spoiler,
       ),
-      composer(p, viewport, channel_name, draft, on_draft, on_submit, noop),
+      composer(
+        p,
+        viewport,
+        channel_name,
+        draft,
+        on_draft,
+        on_submit,
+        noop,
+        on_shortcut,
+      ),
     ],
   )
 }
@@ -139,6 +154,8 @@ fn messages_list(
   receipts: Dict(String, Set(String)),
   selected_msg_id: Option(String),
   on_toggle_selected: fn(String) -> msg,
+  is_revealed: fn(markdown.SpoilerKey) -> Bool,
+  on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
 ) -> Element(msg) {
   let last_seen_index = last_own_seen_index(ms)
   // Pair each message with its index AND its predecessor's author (for grouping).
@@ -181,6 +198,8 @@ fn messages_list(
         on_open_detail,
         on_toggle_selected,
         receipts,
+        is_revealed,
+        on_toggle_spoiler,
       )
     })
 
@@ -218,6 +237,8 @@ fn message_view(
   on_open_detail: fn(String) -> msg,
   on_toggle_selected: fn(String) -> msg,
   receipts: Dict(String, Set(String)),
+  is_revealed: fn(markdown.SpoilerKey) -> Bool,
+  on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
 ) -> Element(msg) {
   let pending =
     m.you
@@ -294,11 +315,11 @@ fn message_view(
                   #("word-break", "break-word"),
                 ]),
               ],
-              [html.text(m.body)],
+              [markdown.render(m.body, m.id, is_revealed, on_toggle_spoiler, p)],
             ),
             case m.reactions {
               [] -> element.fragment([])
-              rs -> reactions_row(p, rs)
+              rs -> reactions_row(p, m.id, rs, on_add_reaction)
             },
           ],
         ),
@@ -662,7 +683,12 @@ fn message_header(p: Palette, m: Message) -> Element(msg) {
   )
 }
 
-fn reactions_row(p: Palette, rs: List(Reaction)) -> Element(msg) {
+fn reactions_row(
+  p: Palette,
+  message_id: String,
+  rs: List(Reaction),
+  on_toggle_reaction: fn(String, String) -> msg,
+) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -673,11 +699,16 @@ fn reactions_row(p: Palette, rs: List(Reaction)) -> Element(msg) {
         #("margin-bottom", "4px"),
       ]),
     ],
-    list.map(rs, fn(r) { reaction_pill(p, r) }),
+    list.map(rs, fn(r) { reaction_pill(p, message_id, r, on_toggle_reaction) }),
   )
 }
 
-fn reaction_pill(p: Palette, r: Reaction) -> Element(msg) {
+fn reaction_pill(
+  p: Palette,
+  message_id: String,
+  r: Reaction,
+  on_toggle_reaction: fn(String, String) -> msg,
+) -> Element(msg) {
   let bg = case r.by_you {
     True -> p.accent_soft
     False -> p.surface_alt
@@ -690,8 +721,24 @@ fn reaction_pill(p: Palette, r: Reaction) -> Element(msg) {
     True -> p.accent
     False -> p.border_soft
   }
-  html.span(
+  let title = case r.by_you {
+    True -> "Remove your " <> r.emoji <> " reaction"
+    False -> "React with " <> r.emoji
+  }
+  // stop_propagation: the message body wrapper above us toggles row
+  // selection on click, which a pill click should not trigger.
+  html.button(
     [
+      attribute.attribute("data-testid", "reaction-pill"),
+      attribute.attribute("data-emoji", r.emoji),
+      attribute.attribute("aria-pressed", case r.by_you {
+        True -> "true"
+        False -> "false"
+      }),
+      attribute.title(title),
+      event.stop_propagation(
+        event.on_click(on_toggle_reaction(message_id, r.emoji)),
+      ),
       ui.css([
         #("display", "inline-flex"),
         #("align-items", "center"),
@@ -702,6 +749,8 @@ fn reaction_pill(p: Palette, r: Reaction) -> Element(msg) {
         #("color", color),
         #("border", "1px solid " <> border),
         #("font-size", "13.75px"),
+        #("font-family", "inherit"),
+        #("cursor", "pointer"),
       ]),
     ],
     [
@@ -766,6 +815,7 @@ fn composer(
   on_draft: fn(String) -> msg,
   on_submit: msg,
   noop: msg,
+  on_shortcut: fn(String, String, String, Bool) -> msg,
 ) -> Element(msg) {
   // Fixed 64px height with a 1px border-top — the rooms-rail you_row
   // and channels-rail self-bar share the same shape so the three
@@ -802,28 +852,89 @@ fn composer(
         ],
         [
           attach_button(p),
-          html.input([
-            attribute.autofocus(True),
-            attribute.value(draft),
-            attribute.placeholder("Message #" <> channel_name),
-            event.on_input(on_draft),
-            event.on("keydown", {
-              use key <- decode.subfield(["key"], decode.string)
-              decode.success(case key {
-                "Enter" -> on_submit
-                _ -> noop
-              })
-            }),
-            ui.css([
-              #("flex", "1"),
-              #("border", "none"),
-              #("background", "transparent"),
-              #("font-family", "inherit"),
-              #("font-size", "16.25px"),
-              #("color", p.text),
-              #("outline", "none"),
-            ]),
-          ]),
+          html.textarea(
+            [
+              attribute.id("composer-textarea"),
+              attribute.autofocus(True),
+              attribute.placeholder("Message #" <> channel_name),
+              attribute.attribute("rows", "1"),
+              event.on_input(on_draft),
+              event.advanced("keydown", {
+                use key <- decode.subfield(["key"], decode.string)
+                use shift <- decode.subfield(["shiftKey"], decode.bool)
+                use meta <- decode.subfield(["metaKey"], decode.bool)
+                use ctrl <- decode.subfield(["ctrlKey"], decode.bool)
+                let mod = meta || ctrl
+                // For Enter (no shift): prevent default so the browser does not
+                // insert a newline into the textarea before Lustre clears it.
+                // For all other keys let the browser's default action proceed.
+                decode.success(case key, shift, mod {
+                  "Enter", False, _ ->
+                    event.handler(
+                      on_submit,
+                      prevent_default: True,
+                      stop_propagation: False,
+                    )
+                  "b", _, True ->
+                    event.handler(
+                      on_shortcut("**", "", "**", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
+                  "B", _, True ->
+                    event.handler(
+                      on_shortcut("**", "", "**", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
+                  "i", _, True ->
+                    event.handler(
+                      on_shortcut("*", "", "*", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
+                  "I", _, True ->
+                    event.handler(
+                      on_shortcut("*", "", "*", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
+                  "k", _, True ->
+                    event.handler(
+                      on_shortcut("[", "", "](url)", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
+                  "K", _, True ->
+                    event.handler(
+                      on_shortcut("[", "", "](url)", True),
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
+                  _, _, _ ->
+                    event.handler(
+                      noop,
+                      prevent_default: False,
+                      stop_propagation: False,
+                    )
+                })
+              }),
+              ui.css([
+                #("flex", "1"),
+                #("border", "none"),
+                #("background", "transparent"),
+                #("font-family", "inherit"),
+                #("font-size", "16.25px"),
+                #("color", p.text),
+                #("outline", "none"),
+                #("resize", "none"),
+                #("overflow", "hidden"),
+                #("padding", "0"),
+                #("line-height", "1.4"),
+              ]),
+            ],
+            draft,
+          ),
           html.span(
             [
               ui.css([

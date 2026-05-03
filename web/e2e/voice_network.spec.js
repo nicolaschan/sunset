@@ -136,26 +136,13 @@ test("alice voice_input arrives at bob byte-equal", async ({ browser }) => {
   const alicePk = aliceInfo.publicKey;
   const bobPk = bobInfo.publicKey;
 
-  // Start presence on both, then wait for membership exchange to
-  // converge before triggering WebRTC. The chat UI's user implicitly
-  // does this — they see the peer in the member rail before clicking
-  // "connect direct." Without this wait, alice's SDP offer can race
-  // bob's room-subscription propagation through the relay (the relay
-  // only forwards alice's offer to bob once bob's subscription is in
-  // the relay's registry; presence visibility is a strict prerequisite
-  // since presence entries flow through the same registry).
+  // Start presence on both. Member-list visibility is no longer a
+  // prerequisite for connect_direct: subscribe-triggered backfill in
+  // sunset-sync ensures alice's SDP offer reaches bob even if it lands
+  // at the relay before bob's room subscription is in the relay's
+  // registry.
   await alice.evaluate(async () => await window.__voice.startPresence());
   await bob.evaluate(async () => await window.__voice.startPresence());
-  await alice.waitForFunction(
-    (pk) => window.__voice.memberVisible(pk),
-    bobPk,
-    { timeout: 10_000 },
-  );
-  await bob.waitForFunction(
-    (pk) => window.__voice.memberVisible(pk),
-    alicePk,
-    { timeout: 10_000 },
-  );
 
   // Voice frames need WebRTC P2P because the WS-to-relay channel can't
   // carry unreliable EphemeralDelivery messages.
@@ -241,21 +228,10 @@ test("voice peer state transitions in_call -> talking -> silent -> out", async (
   const alicePk = aliceInfo.publicKey;
   const bobPk = bobInfo.publicKey;
 
-  // Same setup as the byte-equal test: presence + wait for member
-  // exchange + connect_direct + voice_start. See the comment at the
-  // matching block above for why the membership wait is load-bearing.
+  // Same setup as the byte-equal test — backfill makes the membership
+  // wait unnecessary.
   await alice.evaluate(async () => await window.__voice.startPresence());
   await bob.evaluate(async () => await window.__voice.startPresence());
-  await alice.waitForFunction(
-    (pk) => window.__voice.memberVisible(pk),
-    bobPk,
-    { timeout: 10_000 },
-  );
-  await bob.waitForFunction(
-    (pk) => window.__voice.memberVisible(pk),
-    alicePk,
-    { timeout: 10_000 },
-  );
   await alice.evaluate(async (pk) => await window.__voice.connectDirect(pk), bobPk);
   const directDeadline = Date.now() + 5_000;  // WebRTC P2P on localhost lands in <2 s; 5 s is generous but UX-anchored.
   let aliceDirect = false;

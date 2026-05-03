@@ -121,6 +121,9 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   // wasm bundle initialises asynchronously after the first FFI call.
   await pageA.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
   await pageB.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
+  // Wait for window.sunsetRoom to be exposed (set when the room is opened).
+  await pageA.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
+  await pageB.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
 
   // peer_connection_mode reads from the membership tracker's peer_kinds
   // map, which is only populated once start_presence is called (the
@@ -130,7 +133,7 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   // params (compressed cadence is harmless for this test).
   for (const p of [pageA, pageB]) {
     await p.evaluate(async () => {
-      await window.sunsetClient.start_presence(300, 900, 100);
+      await window.sunsetRoom.start_presence(300, 900, 100);
     });
   }
 
@@ -147,7 +150,7 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   // Both sides build a PC; A initiates, B's background accept worker
   // handles the inbound offer + completes the WebRTC handshake.
   await pageA.evaluate(async (pkArr) => {
-    await window.sunsetClient.connect_direct(new Uint8Array(pkArr));
+    await window.sunsetRoom.connect_direct(new Uint8Array(pkArr));
   }, bPub);
 
   // A reports "direct" once the engine.add_peer completes (set by
@@ -156,19 +159,34 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   // the real acceptance is whether messages flow after the relay dies.
   await pageA.waitForFunction(
     (pkArr) =>
-      window.sunsetClient.peer_connection_mode(new Uint8Array(pkArr)) === "direct",
+      window.sunsetRoom.peer_connection_mode(new Uint8Array(pkArr)) === "direct",
     bPub,
     { timeout: 30_000 },
   );
 
-  // Give the WebRTC datachannel + Noise_IK a moment to fully settle
-  // before tearing down the relay.
-  await new Promise((r) => setTimeout(r, 1500));
-
-  // Kill the relay.
+  // Kill the relay. peer_connection_mode == "direct" already means A's
+  // engine has fired PeerAdded for the WebRTC peer, which only happens
+  // once the datachannel is open and the Hello handshake is complete —
+  // i.e. both sides have an established connection. Tearing the relay
+  // down at this point doesn't disturb the direct path; ICE/DTLS for
+  // the localhost peer-pair is settled by then.
   relayProcess.kill("SIGTERM");
-  // Give it a moment to fully exit so the WS connections die.
-  await new Promise((r) => setTimeout(r, 1000));
+  // Wait for the relay process to fully exit so the WS connections die,
+  // rather than guessing with a fixed sleep.
+  await new Promise((resolve, reject) => {
+    if (relayProcess.exitCode !== null) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(
+      () => reject(new Error("relay didn't exit within 5s of SIGTERM")),
+      5_000,
+    );
+    relayProcess.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 
   // Send a message in each direction; verify arrival via the direct
   // WebRTC datachannel.
@@ -181,4 +199,7 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   await inputB.fill(msg2);
   await inputB.press("Enter");
   await expect(pageA.getByText(msg2)).toBeVisible({ timeout: 30_000 });
+
+  await ctxA.close();
+  await ctxB.close();
 });

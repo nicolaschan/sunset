@@ -20,6 +20,7 @@ postcard.workspace = true
 rand_chacha.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 sunset-core.workspace = true
+sunset-markdown = { workspace = true, features = ["serde"] }
 sunset-noise.workspace = true
 sunset-store.workspace = true
 sunset-store-memory.workspace = true
@@ -40,6 +41,7 @@ zeroize.workspace = true
 # depends on getrandom 0.2, which needs "js" to use the browser RNG.)
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 js-sys.workspace = true
+serde-wasm-bindgen = { workspace = true }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 wasm-tracing.workspace = true
@@ -48,3 +50,5 @@ web-sys = { workspace = true, features = ["WebSocket", "MessageEvent", "BinaryTy
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test.workspace = true
+js-sys.workspace = true
+wasm-bindgen.workspace = true
