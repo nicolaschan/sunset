@@ -53,15 +53,12 @@ pub enum Inline {
     LineBreak,
 }
 
+mod blocks;
+
 /// Parse a message body into a `Document`. Total: malformed input
 /// degrades to literal text rather than erroring.
 pub fn parse(input: &str) -> Document {
-    // Stub. Replaced incrementally by Tasks A2..A15.
-    if input.is_empty() {
-        Document(Vec::new())
-    } else {
-        Document(vec![Block::Paragraph(vec![Inline::Text(input.to_owned())])])
-    }
+    Document(blocks::split(input))
 }
 
 /// Render a `Document` back to a flat string with all formatting markers
@@ -84,6 +81,37 @@ mod tests {
     fn plain_text_is_one_paragraph() {
         assert_eq!(
             parse("hello"),
+            Document(vec![Block::Paragraph(vec![Inline::Text("hello".to_owned())])])
+        );
+    }
+
+    #[test]
+    fn blank_line_splits_paragraphs() {
+        assert_eq!(
+            parse("first\n\nsecond"),
+            Document(vec![
+                Block::Paragraph(vec![Inline::Text("first".to_owned())]),
+                Block::Paragraph(vec![Inline::Text("second".to_owned())]),
+            ])
+        );
+    }
+
+    #[test]
+    fn single_newline_in_paragraph_is_line_break() {
+        assert_eq!(
+            parse("first\nsecond"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("first".to_owned()),
+                Inline::LineBreak,
+                Inline::Text("second".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn trailing_blank_lines_dont_emit_empty_paragraph() {
+        assert_eq!(
+            parse("hello\n\n\n"),
             Document(vec![Block::Paragraph(vec![Inline::Text("hello".to_owned())])])
         );
     }
