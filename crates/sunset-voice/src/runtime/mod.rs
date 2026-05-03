@@ -221,17 +221,7 @@ fn spawn_local<F: std::future::Future<Output = ()> + 'static>(f: F) {
     tokio::task::spawn_local(f);
 }
 
-mod auto_connect {
-    use std::rc::Weak;
-
-    use super::state::RuntimeInner;
-
-    pub(crate) fn spawn(
-        _inner: Weak<RuntimeInner>,
-    ) -> futures::future::LocalBoxFuture<'static, ()> {
-        Box::pin(async {})
-    }
-}
+mod auto_connect;
 mod combiner;
 mod heartbeat;
 mod jitter {
