@@ -255,14 +255,4 @@ mod jitter {
         Box::pin(async {})
     }
 }
-mod subscribe {
-    use std::rc::Weak;
-
-    use super::state::RuntimeInner;
-
-    pub(crate) fn spawn(
-        _inner: Weak<RuntimeInner>,
-    ) -> futures::future::LocalBoxFuture<'static, ()> {
-        Box::pin(async {})
-    }
-}
+mod subscribe;

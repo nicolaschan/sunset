@@ -23,11 +23,38 @@ use sunset_voice::runtime::{
 };
 
 /// Minimal in-memory `DynBus` for tests. Supports `publish_ephemeral`
-/// and one `subscribe_voice_prefix` per test. Loopback is included
+/// and `subscribe_voice_prefix`. Loopback is included
 /// (publishes are visible to subscribers including the publisher).
+///
+/// Uses an mpsc list for fan-out. `inject` delivers a datagram directly
+/// to all registered subscribers (used by tests to simulate inbound traffic).
 struct TestBus {
-    tx: tokio::sync::broadcast::Sender<SignedDatagram>,
     self_pk: sunset_store::VerifyingKey,
+    /// Sinks registered by subscribe_voice_prefix calls. Guarded by a Mutex
+    /// because publish_ephemeral is async and called from the runtime.
+    sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedDatagram>>>,
+    /// Broadcast channel for publish_ephemeral so tests can observe outbound traffic.
+    obs_tx: tokio::sync::broadcast::Sender<SignedDatagram>,
+}
+
+impl TestBus {
+    fn new(self_pk: sunset_store::VerifyingKey) -> (Arc<Self>, tokio::sync::broadcast::Sender<SignedDatagram>) {
+        let (obs_tx, _) = tokio::sync::broadcast::channel(64);
+        let bus = Arc::new(Self {
+            self_pk,
+            sinks: tokio::sync::Mutex::new(vec![]),
+            obs_tx: obs_tx.clone(),
+        });
+        (bus, obs_tx)
+    }
+
+    /// Inject a datagram (from tests) into all subscribe streams.
+    async fn inject(&self, dgram: SignedDatagram) {
+        let sinks = self.sinks.lock().await;
+        for sink in sinks.iter() {
+            let _ = sink.send(dgram.clone());
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -44,7 +71,13 @@ impl DynBus for TestBus {
             payload,
             signature: Bytes::new(),
         };
-        let _ = self.tx.send(dgram);
+        // Fan out to subscribers (loopback).
+        let sinks = self.sinks.lock().await;
+        for sink in sinks.iter() {
+            let _ = sink.send(dgram.clone());
+        }
+        // Also notify test observers.
+        let _ = self.obs_tx.send(dgram);
         Ok(())
     }
 
@@ -52,16 +85,16 @@ impl DynBus for TestBus {
         &self,
         prefix: Bytes,
     ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {
-        let mut rx = self.tx.subscribe();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
+        // Register sink — all subsequent inject() and publish_ephemeral() calls
+        // will fan out to this sender.
+        self.sinks.lock().await.push(tx);
+
         let stream = async_stream::stream! {
-            loop {
-                match rx.recv().await {
-                    Ok(d) => {
-                        if d.name.starts_with(&prefix) {
-                            yield BusEvent::Ephemeral(d);
-                        }
-                    }
-                    Err(_) => return,
+            let mut r = rx;
+            while let Some(d) = r.recv().await {
+                if d.name.starts_with(&prefix) {
+                    yield BusEvent::Ephemeral(d);
                 }
             }
         };
@@ -114,9 +147,8 @@ async fn heartbeat_publishes_periodically_with_is_muted_flag() {
         .run_until(async {
             let (alice, room) = make_identity_and_room(1);
             let pk = alice.store_verifying_key();
-            let (tx, _) = tokio::sync::broadcast::channel(64);
-            let bus: Arc<dyn DynBus> =
-                Arc::new(TestBus { tx: tx.clone(), self_pk: pk.clone() });
+            let (bus_impl, tx) = TestBus::new(pk.clone());
+            let bus: Arc<dyn DynBus> = bus_impl;
 
             let dialer_calls: Rc<RefCell<Vec<PeerId>>> = Rc::new(RefCell::new(vec![]));
             let dialer: Rc<dyn Dialer> =
@@ -202,9 +234,8 @@ async fn send_pcm_publishes_frame_when_unmuted() {
         .run_until(async {
             let (alice, room) = make_identity_and_room(2);
             let pk = alice.store_verifying_key();
-            let (tx, _) = tokio::sync::broadcast::channel(64);
-            let bus: Arc<dyn DynBus> =
-                Arc::new(TestBus { tx: tx.clone(), self_pk: pk.clone() });
+            let (bus_impl, tx) = TestBus::new(pk.clone());
+            let bus: Arc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -262,9 +293,8 @@ async fn send_pcm_drops_frames_when_muted() {
         .run_until(async {
             let (alice, room) = make_identity_and_room(3);
             let pk = alice.store_verifying_key();
-            let (tx, _) = tokio::sync::broadcast::channel(64);
-            let bus: Arc<dyn DynBus> =
-                Arc::new(TestBus { tx: tx.clone(), self_pk: pk.clone() });
+            let (bus_impl, tx) = TestBus::new(pk.clone());
+            let bus: Arc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -321,11 +351,8 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
             let (bob, _) = make_identity_and_room(5);
             let alice_pk = alice.store_verifying_key();
 
-            let (tx, _) = tokio::sync::broadcast::channel(64);
-            let bob_bus: Arc<dyn DynBus> = Arc::new(TestBus {
-                tx: tx.clone(),
-                self_pk: bob.store_verifying_key(),
-            });
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Arc<dyn DynBus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -349,6 +376,9 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
                 peer_state_sink,
             );
             tokio::task::spawn_local(tasks.subscribe);
+
+            // Yield to let the subscribe task start up and register its sink.
+            tokio::task::yield_now().await;
 
             // Alice publishes one Frame as if she were on the network.
             let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
@@ -376,7 +406,7 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
                 payload: Bytes::from(payload),
                 signature: Bytes::new(),
             };
-            let _ = tx.send(dgram);
+            bob_bus_impl.inject(dgram).await;
 
             // Wait for the subscribe loop to push the frame into the jitter buffer.
             let alice_peer = PeerId(alice_pk.clone());
@@ -402,11 +432,8 @@ async fn combiner_emits_state_on_heartbeat() {
         .run_until(async {
             let (alice, room) = make_identity_and_room(6);
             let (bob, _) = make_identity_and_room(7);
-            let (tx, _) = tokio::sync::broadcast::channel(64);
-            let bob_bus: Arc<dyn DynBus> = Arc::new(TestBus {
-                tx: tx.clone(),
-                self_pk: bob.store_verifying_key(),
-            });
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Arc<dyn DynBus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -429,6 +456,9 @@ async fn combiner_emits_state_on_heartbeat() {
             tokio::task::spawn_local(tasks.subscribe);
             tokio::task::spawn_local(tasks.combiner);
 
+            // Yield to let subscribe and combiner tasks start up.
+            tokio::task::yield_now().await;
+
             // Inject one Heartbeat from alice with is_muted=true.
             let pkt = sunset_voice::packet::VoicePacket::Heartbeat {
                 sent_at_ms: 5000,
@@ -448,7 +478,7 @@ async fn combiner_emits_state_on_heartbeat() {
                 payload: Bytes::from(payload),
                 signature: Bytes::new(),
             };
-            let _ = tx.send(dgram);
+            bob_bus_impl.inject(dgram).await;
 
             // Wait for emitted state.
             let result = tokio::time::timeout(Duration::from_secs(1), async {
@@ -476,11 +506,8 @@ async fn auto_connect_dials_first_heartbeat_only_once() {
         .run_until(async {
             let (alice, room) = make_identity_and_room(8);
             let (bob, _) = make_identity_and_room(9);
-            let (tx, _) = tokio::sync::broadcast::channel(64);
-            let bus: Arc<dyn DynBus> = Arc::new(TestBus {
-                tx: tx.clone(),
-                self_pk: bob.store_verifying_key(),
-            });
+            let (bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bus: Arc<dyn DynBus> = bus_impl.clone();
             let calls: Rc<RefCell<Vec<PeerId>>> = Rc::new(RefCell::new(vec![]));
             let dialer: Rc<dyn Dialer> =
                 Rc::new(CountingDialer { calls: calls.clone() });
@@ -503,6 +530,9 @@ async fn auto_connect_dials_first_heartbeat_only_once() {
             tokio::task::spawn_local(tasks.subscribe);
             tokio::task::spawn_local(tasks.auto_connect);
 
+            // Yield to let subscribe and auto_connect tasks start up.
+            tokio::task::yield_now().await;
+
             // Three heartbeats from alice — only the first should trigger ensure_direct.
             for _ in 0..3 {
                 let pkt = sunset_voice::packet::VoicePacket::Heartbeat {
@@ -522,12 +552,12 @@ async fn auto_connect_dials_first_heartbeat_only_once() {
                 let room_fp = room.fingerprint().to_hex();
                 let sender_pk = hex::encode(alice.store_verifying_key().as_bytes());
                 let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
-                let _ = tx.send(SignedDatagram {
+                bus_impl.inject(SignedDatagram {
                     verifying_key: alice.store_verifying_key(),
                     name,
                     payload: Bytes::from(payload),
                     signature: Bytes::new(),
-                });
+                }).await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -545,9 +575,8 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (alice, room) = make_identity_and_room(10);
-            let (tx, _) = tokio::sync::broadcast::channel(64);
-            let bus: Arc<dyn DynBus> =
-                Arc::new(TestBus { tx, self_pk: alice.store_verifying_key() });
+            let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
+            let bus: Arc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -616,9 +645,8 @@ async fn dropping_runtime_terminates_all_tasks() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (alice, room) = make_identity_and_room(11);
-            let (tx, _) = tokio::sync::broadcast::channel(64);
-            let bus: Arc<dyn DynBus> =
-                Arc::new(TestBus { tx, self_pk: alice.store_verifying_key() });
+            let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
+            let bus: Arc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
