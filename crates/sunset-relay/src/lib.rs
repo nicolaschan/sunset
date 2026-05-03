@@ -6,6 +6,7 @@
 //!
 //! See `docs/superpowers/specs/2026-04-27-sunset-relay-design.md`.
 
+pub mod bridge;
 pub mod config;
 pub mod error;
 pub mod identity;
