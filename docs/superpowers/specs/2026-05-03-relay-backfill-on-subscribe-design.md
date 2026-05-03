@@ -32,9 +32,11 @@ In `handle_local_store_event`, after `parse_subscription_entry` succeeds and the
 1. Determine whether the registry insert was a *new* peer or a *changed* filter for an existing peer. If the filter is unchanged (TTL refresh of the same filter), no backfill is triggered.
 2. Skip if `peer_vk == self.local_peer` (a self-published `SUBSCRIBE_NAME`, e.g., the relay's broad subscription at startup).
 3. Skip if the peer is not currently connected (no transport to deliver over; registry insert still happens, and a future `PeerHello` will fire `fan_out_digests_to_peer`).
-4. Otherwise, call `send_filter_digest(peer_vk, new_filter)`.
+4. Otherwise, walk the local store for entries matching `new_filter` and push them to the peer as `EventDelivery` messages.
 
-The peer receives a `DigestExchange` over the new filter, builds its own bloom from local matching entries, and `Fetch`es the missing ones — identical wire-protocol path to PR #13's reconnect catch-up. No new message types, no new code paths, one new call site for an existing primitive.
+The mechanism is a direct push, not a `DigestExchange`. `DigestExchange` as currently defined carries the *sender's* bloom and prompts the *receiver* to push back what the receiver has that the sender doesn't (see `handle_digest_exchange` at engine.rs:715–749). That direction works for `publish_subscription`'s catch-up — the new subscriber sends the digest with an empty bloom and the relay responds with everything matching — but it's the wrong direction for backfill, where the local engine already holds entries the peer is missing. A direct `EventDelivery` walk is the symmetric counterpart of what `handle_local_store_event`'s push branch does on a fresh write, just applied to already-stored entries.
+
+The walk uses the existing `Store::iter(filter)` API — the same primitive `build_digest` and `entries_missing_from_remote` already use. No new message variants, no new wire types — one new private helper on `SyncEngine` (the push loop) and one new call site in `handle_local_store_event`.
 
 ### Registry change-detection
 
