@@ -6,6 +6,8 @@
 #[cfg(target_arch = "wasm32")]
 mod client;
 #[cfg(target_arch = "wasm32")]
+mod markdown;
+#[cfg(target_arch = "wasm32")]
 mod identity;
 #[cfg(target_arch = "wasm32")]
 mod members;
@@ -24,6 +26,8 @@ mod voice;
 
 #[cfg(target_arch = "wasm32")]
 pub use client::Client;
+#[cfg(target_arch = "wasm32")]
+pub use markdown::parse_markdown;
 #[cfg(target_arch = "wasm32")]
 pub use members::MemberJs;
 #[cfg(target_arch = "wasm32")]
