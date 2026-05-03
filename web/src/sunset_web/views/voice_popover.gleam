@@ -19,8 +19,8 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Member, type VoiceSettings, BridgeRelay, Direct, MutedP, NoRelay, OneHop,
-  SelfRelay, Speaking, TwoHop, ViaPeer,
+  type Member, type VoiceSettings, Direct, MutedP, NoRelay, OneHop, SelfRelay,
+  Speaking, TwoHop, ViaPeer,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -285,7 +285,6 @@ fn relay_label(m: Member) -> String {
     OneHop -> "1-hop"
     TwoHop -> "2-hop"
     ViaPeer(name) -> "via " <> name
-    BridgeRelay -> "bridge"
     SelfRelay -> ""
     NoRelay -> ""
   }

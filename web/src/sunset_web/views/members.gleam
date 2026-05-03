@@ -7,9 +7,7 @@ import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
-import sunset_web/domain.{
-  type Member, Away, HasBridge, MutedP, NoBridge, OfflineP, Online, Speaking,
-}
+import sunset_web/domain.{type Member, Away, MutedP, OfflineP, Online, Speaking}
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
@@ -178,10 +176,7 @@ fn member_row(
         ),
         transport_icon(p, m.relay),
       ],
-      case m.bridge {
-        HasBridge(_) -> [bridge_tag(p)]
-        NoBridge -> []
-      },
+      [],
     ]),
   )
 }
@@ -215,20 +210,4 @@ fn transport_icon(p: Palette, r: domain.RelayStatus) -> Element(msg) {
 fn member_id_str(id: domain.MemberId) -> String {
   let domain.MemberId(s) = id
   s
-}
-
-fn bridge_tag(p: Palette) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("padding", "1px 5px"),
-        #("border-radius", "3px"),
-        #("background", p.accent_soft),
-        #("color", p.accent_deep),
-        #("font-size", "12.5px"),
-        #("font-weight", "500"),
-      ]),
-    ],
-    [html.text("⛏")],
-  )
 }

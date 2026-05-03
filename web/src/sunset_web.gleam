@@ -27,8 +27,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
-  Reaction, Room, RoomId,
+  type ChannelId, type Message, type Reaction, type Room, ChannelId, Reaction,
+  Room, RoomId,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -50,6 +50,7 @@ import sunset_web/views/main_panel
 import sunset_web/views/members
 import sunset_web/views/peer_status_popover
 import sunset_web/views/phone_header
+import sunset_web/views/relays as relays_view
 import sunset_web/views/rooms
 import sunset_web/views/settings_popover
 import sunset_web/views/shell
@@ -171,6 +172,9 @@ pub type Model {
     /// (draft, selected message, revealed spoilers) so it resets
     /// naturally when the user navigates to a different room.
     rooms: Dict(String, RoomState),
+    /// IntentId of the relay whose popover is currently open. Client-wide
+    /// (not per-room) because relays are a client-level concept.
+    relays_popover: option.Option(Float),
   )
 }
 
@@ -209,6 +213,8 @@ pub type Msg {
   CloseVoicePopover
   OpenPeerStatusPopover(domain.MemberId)
   ClosePeerStatusPopover
+  OpenRelayPopover(Float)
+  CloseRelayPopover
   Tick(Int)
   SetMemberVolume(String, Int)
   ToggleMemberDenoise(String)
@@ -300,6 +306,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       drawer: None,
       now_ms: 0,
       rooms: dict.new(),
+      relays_popover: None,
     )
 
   let subscribe_hash =
@@ -824,9 +831,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     IdentityReady(seed) -> {
       let create_client_eff =
         effect.from(fn(dispatch) {
-          sunset.create_client(seed, fn(client) {
-            dispatch(ClientReady(client))
-          })
+          sunset.create_client(
+            seed,
+            sunset.heartbeat_interval_ms_from_url(),
+            fn(client) { dispatch(ClientReady(client)) },
+          )
         })
       #(model, create_client_eff)
     }
@@ -979,7 +988,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               you: sunset.inc_is_self(im),
               pending: False,
               reactions: [],
-              bridge: NoBridge,
               details: domain.NoDetails,
             )
           // Append; dedupe by id to handle Replay::All re-emits.
@@ -1204,6 +1212,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       with_active_room(model, fn(state) {
         #(RoomState(..state, peer_status_popover: None), effect.none())
       })
+    OpenRelayPopover(id) -> #(
+      Model(..model, relays_popover: option.Some(id)),
+      effect.none(),
+    )
+    CloseRelayPopover -> #(
+      Model(..model, relays_popover: option.None),
+      effect.none(),
+    )
     Tick(now) -> #(Model(..model, now_ms: now), effect.none())
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
@@ -1585,6 +1601,30 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
+  let relay_sheet_el = case model.viewport, model.relays_popover {
+    domain.Phone, Some(id) -> {
+      let rs = relays_view.relays_for_view(model.intents)
+      case list.find(rs, fn(r) { r.id == id }) {
+        Ok(r) ->
+          bottom_sheet.view(
+            palette: palette,
+            open: True,
+            on_close: CloseRelayPopover,
+            test_id: "relay-sheet",
+            content: relays_view.popover(
+              palette: palette,
+              relay: r,
+              now_ms: model.now_ms,
+              placement: relays_view.InSheet,
+              on_close: CloseRelayPopover,
+            ),
+          )
+        Error(_) -> element.fragment([])
+      }
+    }
+    _, _ -> element.fragment([])
+  }
+
   let user_in_call = list.any(fixture.members(), fn(m) { m.you && m.in_call })
 
   let active_voice_channel_name =
@@ -1654,6 +1694,8 @@ fn room_view_with_state(
       on_open_voice_popover: OpenVoicePopover,
       viewport: model.viewport,
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
+      relays: relays_view.relays_for_view(model.intents),
+      on_open_relay: OpenRelayPopover,
     ),
     main_panel.view(
       palette: palette,
@@ -1705,6 +1747,7 @@ fn room_view_with_state(
     element.fragment([
       voice_popover_overlay(palette, model, state),
       peer_status_popover_overlay(palette, model, state),
+      relay_popover_overlay(palette, model),
       full_picker_overlay_el,
       settings_overlay_el,
     ]),
@@ -1716,7 +1759,7 @@ fn room_view_with_state(
     ),
     details_sheet_el,
     voice_sheet_el,
-    peer_status_sheet_el,
+    element.fragment([peer_status_sheet_el, relay_sheet_el]),
     element.fragment([
       reaction_sheet_el,
       full_picker_sheet_el,
@@ -1777,6 +1820,26 @@ fn peer_status_popover_overlay(
   }
 }
 
+fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
+  case model.viewport, model.relays_popover {
+    domain.Desktop, Some(id) -> {
+      let rs = relays_view.relays_for_view(model.intents)
+      case list.find(rs, fn(r) { r.id == id }) {
+        Ok(r) ->
+          relays_view.popover(
+            palette: palette,
+            relay: r,
+            now_ms: model.now_ms,
+            placement: relays_view.Floating,
+            on_close: CloseRelayPopover,
+          )
+        Error(_) -> element.fragment([])
+      }
+    }
+    _, _ -> element.fragment([])
+  }
+}
+
 fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
   let needle = string.lowercase(string.trim(search))
   case needle {
@@ -1831,7 +1894,6 @@ fn synthetic_room(
     status: relay_status_pill(intents),
     last_active: "now",
     unread: 0,
-    bridge: NoBridge,
   )
 }
 
@@ -1948,7 +2010,6 @@ fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
       relay: connection_mode_to_relay(sunset.mem_connection_mode(m)),
       you: sunset.mem_is_self(m),
       in_call: False,
-      bridge: domain.NoBridge,
       role: domain.NoRole,
       last_heartbeat_ms: sunset.mem_last_heartbeat_ms(m),
     )

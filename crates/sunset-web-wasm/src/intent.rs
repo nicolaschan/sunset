@@ -20,6 +20,8 @@ pub struct IntentSnapshotJs {
     #[wasm_bindgen(getter_with_clone)]
     pub kind: Option<String>,
     pub attempt: u32,
+    pub last_pong_at_unix_ms: Option<f64>,
+    pub last_rtt_ms: Option<f64>,
 }
 
 impl From<&IntentSnapshot> for IntentSnapshotJs {
@@ -41,6 +43,8 @@ impl From<&IntentSnapshot> for IntentSnapshotJs {
                 TransportKind::Unknown => "unknown".to_owned(),
             }),
             attempt: s.attempt,
+            last_pong_at_unix_ms: s.last_pong_at_unix_ms.map(|n| n as f64),
+            last_rtt_ms: s.last_rtt_ms.map(|n| n as f64),
         }
     }
 }

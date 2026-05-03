@@ -95,6 +95,16 @@ pub enum EngineEvent {
     PeerRemoved {
         peer_id: PeerId,
     },
+    /// A liveness `Pong` round-tripped from a connected peer. Carries
+    /// the measured RTT and the wall-clock time the Pong was observed.
+    /// Subscribers (e.g. `PeerSupervisor`) use this to surface live
+    /// per-peer health to applications. Fired once per heartbeat per
+    /// peer (default cadence: every `heartbeat_interval`, 15 s).
+    PongObserved {
+        peer_id: PeerId,
+        rtt_ms: u64,
+        observed_at_unix_ms: u64,
+    },
 }
 
 /// Sender + connection identity for one peer's currently-active connection.
@@ -562,6 +572,18 @@ where
                     self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
                         .await;
                 }
+            }
+            InboundEvent::PongObserved {
+                peer_id,
+                rtt_ms,
+                observed_at_unix_ms,
+            } => {
+                self.emit_engine_event(EngineEvent::PongObserved {
+                    peer_id,
+                    rtt_ms,
+                    observed_at_unix_ms,
+                })
+                .await;
             }
         }
     }
@@ -1145,6 +1167,16 @@ where
             self.send_filter_digest(peer_id, &filter).await;
         }
         Ok(())
+    }
+
+    /// Test-only entry point to emit an engine event from outside the
+    /// engine's own tests module. Mirrors what real engine internals do
+    /// (private `emit_engine_event`); gated to match the supervisor
+    /// tests' cfg so it isn't compiled (and therefore can't be flagged
+    /// dead) in plain `cargo test` without `--features test-helpers`.
+    #[cfg(all(test, feature = "test-helpers"))]
+    pub(crate) async fn emit_engine_event_for_test(&self, ev: EngineEvent) {
+        self.emit_engine_event(ev).await;
     }
 }
 
@@ -2175,6 +2207,46 @@ mod tests {
                     filters.contains(&chat_filter),
                     "per-filter digest must fire on anti-entropy tick (got {filters:?})"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pong_observed_inbound_event_propagates_as_engine_event() {
+        use crate::engine::EngineEvent;
+        use crate::peer::InboundEvent;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let mut sub = engine.subscribe_engine_events().await;
+                let pid = PeerId(vk(b"bob"));
+
+                engine
+                    .handle_inbound_event(InboundEvent::PongObserved {
+                        peer_id: pid.clone(),
+                        rtt_ms: 42,
+                        observed_at_unix_ms: 1_700_000_000_000,
+                    })
+                    .await;
+
+                let ev = tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv())
+                    .await
+                    .expect("no engine event")
+                    .expect("subscriber closed");
+                match ev {
+                    EngineEvent::PongObserved {
+                        peer_id,
+                        rtt_ms,
+                        observed_at_unix_ms,
+                    } => {
+                        assert_eq!(peer_id, pid);
+                        assert_eq!(rtt_ms, 42);
+                        assert_eq!(observed_at_unix_ms, 1_700_000_000_000);
+                    }
+                    other => panic!("unexpected event: {other:?}"),
+                }
             })
             .await;
     }

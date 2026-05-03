@@ -5,11 +5,11 @@
 
 import gleam/option
 import sunset_web/domain.{
-  type Channel, type Member, type Message, type Room, Away, Bridge, BridgeRelay,
-  Channel, ChannelId, Connected, Direct, HasBridge, HasDetails, HasRole, Member,
-  MemberId, Message, MessageDetails, Minecraft, MutedP, NoBridge, NoDetails,
-  NoRelay, NoRole, Offline, OneHop, Online, Reaction, Receipt, Reconnecting,
-  Room, RoomId, SelfRelay, Speaking, TextChannel, TwoHop, ViaPeer, Voice,
+  type Channel, type Member, type Message, type Room, Away, Channel, ChannelId,
+  Connected, Direct, HasDetails, HasRole, Member, MemberId, Message,
+  MessageDetails, MutedP, NoDetails, NoRelay, NoRole, Offline, OneHop, Online,
+  Reaction, Receipt, Reconnecting, Room, RoomId, SelfRelay, Speaking,
+  TextChannel, TwoHop, ViaPeer, Voice,
 }
 
 pub fn rooms() -> List(Room) {
@@ -23,7 +23,6 @@ pub fn rooms() -> List(Room) {
       status: Connected,
       last_active: "now",
       unread: 2,
-      bridge: NoBridge,
     ),
     Room(
       id: RoomId("minecraft-smp"),
@@ -34,7 +33,6 @@ pub fn rooms() -> List(Room) {
       status: Connected,
       last_active: "2m",
       unread: 0,
-      bridge: HasBridge(Minecraft),
     ),
     Room(
       id: RoomId("design-crit"),
@@ -45,7 +43,6 @@ pub fn rooms() -> List(Room) {
       status: Connected,
       last_active: "12m",
       unread: 0,
-      bridge: NoBridge,
     ),
     Room(
       id: RoomId("weekend-radio"),
@@ -56,7 +53,6 @@ pub fn rooms() -> List(Room) {
       status: Connected,
       last_active: "now",
       unread: 7,
-      bridge: NoBridge,
     ),
     Room(
       id: RoomId("ghost-team"),
@@ -67,7 +63,6 @@ pub fn rooms() -> List(Room) {
       status: Offline,
       last_active: "3d",
       unread: 0,
-      bridge: NoBridge,
     ),
     Room(
       id: RoomId("field-notes"),
@@ -78,7 +73,6 @@ pub fn rooms() -> List(Room) {
       status: Reconnecting,
       last_active: "just now",
       unread: 1,
-      bridge: NoBridge,
     ),
   ]
 }
@@ -127,13 +121,6 @@ pub fn channels() -> List(Channel) {
       in_call: 0,
       unread: 0,
     ),
-    Channel(
-      id: ChannelId("minecraft"),
-      name: "minecraft-bridge",
-      kind: Bridge(Minecraft),
-      in_call: 0,
-      unread: 0,
-    ),
   ]
 }
 
@@ -147,7 +134,6 @@ pub fn members() -> List(Member) {
       relay: Direct,
       you: False,
       in_call: True,
-      bridge: NoBridge,
       role: HasRole("host"),
       last_heartbeat_ms: option.None,
     ),
@@ -159,7 +145,6 @@ pub fn members() -> List(Member) {
       relay: Direct,
       you: False,
       in_call: True,
-      bridge: NoBridge,
       role: NoRole,
       last_heartbeat_ms: option.None,
     ),
@@ -171,7 +156,6 @@ pub fn members() -> List(Member) {
       relay: SelfRelay,
       you: True,
       in_call: True,
-      bridge: NoBridge,
       role: NoRole,
       last_heartbeat_ms: option.None,
     ),
@@ -183,7 +167,6 @@ pub fn members() -> List(Member) {
       relay: OneHop,
       you: False,
       in_call: True,
-      bridge: NoBridge,
       role: NoRole,
       last_heartbeat_ms: option.None,
     ),
@@ -192,10 +175,9 @@ pub fn members() -> List(Member) {
       name: "kasper_mc",
       initials: "ka",
       status: Online,
-      relay: BridgeRelay,
+      relay: NoRelay,
       you: False,
       in_call: False,
-      bridge: HasBridge(Minecraft),
       role: NoRole,
       last_heartbeat_ms: option.None,
     ),
@@ -207,7 +189,6 @@ pub fn members() -> List(Member) {
       relay: TwoHop,
       you: False,
       in_call: False,
-      bridge: NoBridge,
       role: NoRole,
       last_heartbeat_ms: option.None,
     ),
@@ -219,7 +200,6 @@ pub fn members() -> List(Member) {
       relay: Direct,
       you: False,
       in_call: False,
-      bridge: NoBridge,
       role: NoRole,
       last_heartbeat_ms: option.None,
     ),
@@ -231,7 +211,6 @@ pub fn members() -> List(Member) {
       relay: NoRelay,
       you: False,
       in_call: False,
-      bridge: NoBridge,
       role: NoRole,
       last_heartbeat_ms: option.None,
     ),
@@ -250,7 +229,6 @@ pub fn messages() -> List(Message) {
       you: False,
       pending: False,
       reactions: [Reaction(emoji: "👍", count: 3, by_you: True)],
-      bridge: NoBridge,
       details: HasDetails(
         MessageDetails(
           sender: "9b1d…74",
@@ -279,7 +257,6 @@ pub fn messages() -> List(Message) {
       you: False,
       pending: False,
       reactions: [],
-      bridge: NoBridge,
       details: HasDetails(
         MessageDetails(
           sender: "3ea4…1c",
@@ -307,7 +284,6 @@ pub fn messages() -> List(Message) {
       you: False,
       pending: False,
       reactions: [],
-      bridge: HasBridge(Minecraft),
       details: HasDetails(
         MessageDetails(
           sender: "kc:7d…0b",
@@ -319,7 +295,7 @@ pub fn messages() -> List(Message) {
           sent_at: "5:49:11 pm",
           delivered_at: "5:49:13 pm",
           receipts: [
-            Receipt(name: "elena", time: "5:49:18 pm", relay: BridgeRelay),
+            Receipt(name: "elena", time: "5:49:18 pm", relay: NoRelay),
           ],
         ),
       ),
@@ -337,7 +313,6 @@ pub fn messages() -> List(Message) {
         Reaction(emoji: "🌅", count: 2, by_you: False),
         Reaction(emoji: "👀", count: 2, by_you: True),
       ],
-      bridge: NoBridge,
       details: HasDetails(
         MessageDetails(
           sender: "8f3c…a2",
@@ -367,7 +342,6 @@ pub fn messages() -> List(Message) {
       you: False,
       pending: False,
       reactions: [],
-      bridge: NoBridge,
       details: HasDetails(
         MessageDetails(
           sender: "c084…fc",
@@ -392,7 +366,6 @@ pub fn messages() -> List(Message) {
       you: False,
       pending: False,
       reactions: [],
-      bridge: NoBridge,
       details: HasDetails(
         MessageDetails(
           sender: "f59e…9e",
@@ -417,7 +390,6 @@ pub fn messages() -> List(Message) {
       you: False,
       pending: True,
       reactions: [],
-      bridge: NoBridge,
       details: NoDetails,
     ),
   ]

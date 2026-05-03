@@ -53,7 +53,7 @@ pub struct Client {
 #[wasm_bindgen]
 impl Client {
     #[wasm_bindgen(constructor)]
-    pub fn new(seed: &[u8]) -> Result<Client, JsError> {
+    pub fn new(seed: &[u8], heartbeat_interval_ms: u32) -> Result<Client, JsError> {
         let identity = identity_from_seed(seed).map_err(|e| JsError::new(&e))?;
         let store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
 
@@ -74,10 +74,19 @@ impl Client {
 
         let multi = MultiTransport::new(ws_noise, rtc_noise);
         let signer: Arc<dyn Signer> = Arc::new(identity.clone());
+
+        let mut config = SyncConfig::default();
+        if heartbeat_interval_ms > 0 {
+            let interval = std::time::Duration::from_millis(heartbeat_interval_ms as u64);
+            config.heartbeat_interval = interval;
+            // Match default 3× ratio between interval and timeout.
+            config.heartbeat_timeout = interval * 3;
+        }
+
         let engine = Rc::new(SyncEngine::new(
             store.clone(),
             multi,
-            SyncConfig::default(),
+            config,
             local_peer,
             signer,
         ));

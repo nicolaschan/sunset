@@ -10,12 +10,13 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Channel, type ChannelId, type ConnStatus, type Member, type Room,
-  type Viewport, Bridge, Connected, Desktop, Minecraft, MutedP, Offline, Phone,
+  type Channel, type ChannelId, type ConnStatus, type Member, type Relay,
+  type Room, type Viewport, Connected, Desktop, MutedP, Offline, Phone,
   Reconnecting, Speaking, TextChannel, Voice,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
+import sunset_web/views/relays as relays_view
 
 pub fn view(
   palette p: Palette,
@@ -28,16 +29,11 @@ pub fn view(
   on_open_voice_popover on_open_voice_popover: fn(String) -> msg,
   viewport viewport: Viewport,
   on_open_rooms on_open_rooms: msg,
+  relays relays: List(Relay),
+  on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
-  let bridge_channels =
-    list.filter(cs, fn(c) {
-      case c.kind {
-        Bridge(_) -> True
-        _ -> False
-      }
-    })
   let in_call = list.filter(ms, fn(m) { m.in_call })
 
   let active_voice =
@@ -91,15 +87,11 @@ pub fn view(
               }),
             ]),
           ),
-          case bridge_channels {
-            [] -> element.fragment([])
-            _ ->
-              section(
-                p,
-                "Bridges",
-                list.map(bridge_channels, fn(c) { bridge_channel_row(p, c) }),
-              )
-          },
+          relays_view.rail_section(
+            palette: p,
+            relays: relays,
+            on_open: on_open_relay,
+          ),
         ],
       ),
       case viewport, active_voice {
@@ -864,31 +856,6 @@ fn phone_hangup_icon() -> Element(msg) {
         ],
         [],
       ),
-    ],
-  )
-}
-
-fn bridge_channel_row(p: Palette, c: Channel) -> Element(msg) {
-  let icon = case c.kind {
-    Bridge(Minecraft) -> "⛏"
-    _ -> "↗"
-  }
-  html.div(
-    [
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("gap", "8px"),
-        #("padding", "6px 12px"),
-        #("font-size", "16.25px"),
-        #("color", p.text_muted),
-      ]),
-    ],
-    [
-      html.span([ui.css([#("color", p.accent), #("opacity", "0.7")])], [
-        html.text(icon),
-      ]),
-      html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
     ],
   )
 }

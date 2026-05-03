@@ -79,6 +79,15 @@ pub struct IntentSnapshot {
     /// Display label — `Connectable::label()` of the intent that
     /// created this snapshot. Stable across reconnect cycles.
     pub label: String,
+    /// Wall-clock ms of the most recent Pong observed from this peer.
+    /// `None` until the first Pong of the *first* connection lands.
+    /// Preserved across Backoff transitions (the popover should show
+    /// "heard from 12s ago" while reconnecting), cleared only when
+    /// the intent itself is removed (`SupervisorCommand::Remove`).
+    pub last_pong_at_unix_ms: Option<u64>,
+    /// Round-trip time of the most recent Pong, in milliseconds.
+    /// `None` under the same conditions as `last_pong_at_unix_ms`.
+    pub last_rtt_ms: Option<u64>,
 }
 
 /// Key used to clean up either dedup map without a second branch on the
@@ -104,6 +113,8 @@ pub(crate) struct IntentEntry {
     pub connectable: crate::connectable::Connectable,
     /// Cached `Connectable::label()` for snapshot construction.
     pub label: String,
+    pub last_pong_at_unix_ms: Option<u64>,
+    pub last_rtt_ms: Option<u64>,
 }
 
 pub(crate) struct SupervisorState {
@@ -251,6 +262,8 @@ where
             kind: entry.kind,
             attempt: entry.attempt,
             label: entry.label.clone(),
+            last_pong_at_unix_ms: entry.last_pong_at_unix_ms,
+            last_rtt_ms: entry.last_rtt_ms,
         };
         state.subscribers.retain(|tx| tx.send(snap.clone()).is_ok());
     }
@@ -358,6 +371,22 @@ where
                     }
                 }
             }
+            EngineEvent::PongObserved {
+                peer_id,
+                rtt_ms,
+                observed_at_unix_ms,
+            } => {
+                let mut state = self.state.borrow_mut();
+                let id = match state.peer_to_intent.get(&peer_id) {
+                    Some(i) => *i,
+                    None => return,
+                };
+                if let Some(entry) = state.intents.get_mut(&id) {
+                    entry.last_pong_at_unix_ms = Some(observed_at_unix_ms);
+                    entry.last_rtt_ms = Some(rtt_ms);
+                }
+                Self::broadcast(&mut state, id);
+            }
         }
     }
 
@@ -420,6 +449,8 @@ where
                             next_attempt_at: None,
                             connectable: connectable.clone(),
                             label,
+                            last_pong_at_unix_ms: None,
+                            last_rtt_ms: None,
                         },
                     );
                     Self::broadcast(&mut state, id);
@@ -489,6 +520,8 @@ where
                         kind: e.kind,
                         attempt: e.attempt,
                         label: e.label.clone(),
+                        last_pong_at_unix_ms: e.last_pong_at_unix_ms,
+                        last_rtt_ms: e.last_rtt_ms,
                     })
                     .collect();
                 let _ = ack.send(snap);
@@ -512,6 +545,8 @@ where
                             kind: e.kind,
                             attempt: e.attempt,
                             label: e.label.clone(),
+                            last_pong_at_unix_ms: e.last_pong_at_unix_ms,
+                            last_rtt_ms: e.last_rtt_ms,
                         })
                         .collect();
                     for snap in snaps {
@@ -1162,6 +1197,189 @@ mod tests {
                     connected.iter().all(|p| p.0.as_bytes() != b"bob"),
                     "bob still connected to engine after intent removal: {connected:?}"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pong_observed_updates_intent_snapshot() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", "bob");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
+                // Wait for Connected so peer_to_intent has bob_pid → id.
+                for _ in 0..200 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                // Inject PongObserved via the engine test shim.
+                let bob_pid = PeerId(vk(b"bob"));
+                alice
+                    .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+                        peer_id: bob_pid,
+                        rtt_ms: 17,
+                        observed_at_unix_ms: 1_700_000_000_500,
+                    })
+                    .await;
+                // Poll snapshot until the supervisor folds the new fields.
+                let mut found = false;
+                for _ in 0..200 {
+                    let snap = sup
+                        .snapshot()
+                        .await
+                        .into_iter()
+                        .find(|s| s.id == id)
+                        .expect("intent");
+                    if snap.last_rtt_ms == Some(17)
+                        && snap.last_pong_at_unix_ms == Some(1_700_000_000_500)
+                    {
+                        found = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(found, "PongObserved did not propagate to IntentSnapshot");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pong_observed_for_unknown_peer_is_dropped() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+                // Subscribe BEFORE injecting; no intents yet, so no replay.
+                let mut sub = sup.subscribe_intents().await;
+                // Inject for a peer the supervisor has never heard of.
+                let stranger = PeerId(vk(b"stranger"));
+                alice
+                    .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+                        peer_id: stranger,
+                        rtt_ms: 1,
+                        observed_at_unix_ms: 1,
+                    })
+                    .await;
+                // Within a short window, no broadcast should arrive.
+                let r =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv()).await;
+                assert!(r.is_err(), "expected no broadcast for unknown peer");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnect_preserves_last_pong_and_rtt() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob = engine_with_addr(&net, b"bob", "bob");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob.clone();
+                    async move { b.run().await }
+                });
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
+                // Wait for Connected.
+                for _ in 0..200 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let bob_pid = PeerId(vk(b"bob"));
+                alice
+                    .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+                        peer_id: bob_pid.clone(),
+                        rtt_ms: 11,
+                        observed_at_unix_ms: 5_000,
+                    })
+                    .await;
+                // Wait for the fold.
+                for _ in 0..200 {
+                    let snap = sup
+                        .snapshot()
+                        .await
+                        .into_iter()
+                        .find(|s| s.id == id)
+                        .expect("intent");
+                    if snap.last_rtt_ms == Some(11) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                // Force disconnect.
+                alice.remove_peer(bob_pid.clone()).await.ok();
+                // Wait for transition to Backoff and assert liveness preserved.
+                for _ in 0..200 {
+                    let snap = sup
+                        .snapshot()
+                        .await
+                        .into_iter()
+                        .find(|s| s.id == id)
+                        .expect("intent");
+                    if snap.state == IntentState::Backoff {
+                        assert_eq!(snap.last_rtt_ms, Some(11));
+                        assert_eq!(snap.last_pong_at_unix_ms, Some(5_000));
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("intent never transitioned to Backoff");
             })
             .await;
     }
