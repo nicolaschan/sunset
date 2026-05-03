@@ -51,7 +51,7 @@ mod tests {
 
     use sunset_core::bus::{BusEvent, BusImpl};
     use sunset_core::identity::Identity;
-    use sunset_store::{AcceptAllVerifier, Filter};
+    use sunset_store::AcceptAllVerifier;
     use sunset_store_memory::MemoryStore;
     use sunset_sync::test_transport::{TestNetwork, TestTransport};
     use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
@@ -91,8 +91,8 @@ mod tests {
                     let _ = engine.run().await;
                 });
 
-                // Upcast to Arc<dyn DynBus> — this is the key test.
-                let dyn_bus: Arc<dyn DynBus> = Arc::new(bus);
+                // Upcast to Rc<dyn DynBus> — this is the key test.
+                let dyn_bus: Rc<dyn DynBus> = Rc::new(bus);
 
                 // subscribe_voice_prefix
                 let prefix = Bytes::from_static(b"voice/test/");
@@ -111,11 +111,10 @@ mod tests {
                     .expect("publish succeeded");
 
                 // Verify the loopback event arrives.
-                let ev =
-                    tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
-                        .await
-                        .expect("event arrived within timeout")
-                        .expect("stream open");
+                let ev = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                    .await
+                    .expect("event arrived within timeout")
+                    .expect("stream open");
 
                 match ev {
                     BusEvent::Ephemeral(d) => {

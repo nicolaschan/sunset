@@ -5,7 +5,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -47,9 +46,9 @@ struct TestBus {
 impl TestBus {
     fn new(
         self_pk: sunset_store::VerifyingKey,
-    ) -> (Arc<Self>, tokio::sync::broadcast::Sender<SignedDatagram>) {
+    ) -> (Rc<Self>, tokio::sync::broadcast::Sender<SignedDatagram>) {
         let (obs_tx, _) = tokio::sync::broadcast::channel(64);
-        let bus = Arc::new(Self {
+        let bus = Rc::new(Self {
             self_pk,
             sinks: tokio::sync::Mutex::new(vec![]),
             obs_tx: obs_tx.clone(),
@@ -159,7 +158,7 @@ async fn heartbeat_publishes_periodically_with_is_muted_flag() {
             let (alice, room) = make_identity_and_room(1);
             let pk = alice.store_verifying_key();
             let (bus_impl, tx) = TestBus::new(pk.clone());
-            let bus: Arc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn DynBus> = bus_impl;
 
             let dialer_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
@@ -244,7 +243,7 @@ async fn send_pcm_publishes_frame_when_unmuted() {
             let (alice, room) = make_identity_and_room(2);
             let pk = alice.store_verifying_key();
             let (bus_impl, tx) = TestBus::new(pk.clone());
-            let bus: Arc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -301,7 +300,7 @@ async fn send_pcm_drops_frames_when_muted() {
             let (alice, room) = make_identity_and_room(3);
             let pk = alice.store_verifying_key();
             let (bus_impl, tx) = TestBus::new(pk.clone());
-            let bus: Arc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -357,7 +356,7 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
             let alice_pk = alice.store_verifying_key();
 
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bob_bus: Arc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -435,7 +434,7 @@ async fn combiner_emits_state_on_heartbeat() {
             let (alice, room) = make_identity_and_room(6);
             let (bob, _) = make_identity_and_room(7);
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bob_bus: Arc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -509,7 +508,7 @@ async fn auto_connect_dials_first_heartbeat_only_once() {
             let (alice, room) = make_identity_and_room(8);
             let (bob, _) = make_identity_and_room(9);
             let (bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bus: Arc<dyn DynBus> = bus_impl.clone();
+            let bus: Rc<dyn DynBus> = bus_impl.clone();
             let calls: DroppedSink = Rc::new(RefCell::new(vec![]));
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: calls.clone(),
@@ -574,7 +573,7 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
         .run_until(async {
             let (alice, room) = make_identity_and_room(10);
             let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
-            let bus: Arc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -701,7 +700,7 @@ async fn dropping_runtime_terminates_all_tasks() {
         .run_until(async {
             let (alice, room) = make_identity_and_room(11);
             let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
-            let bus: Arc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });

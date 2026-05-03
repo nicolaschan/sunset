@@ -1,8 +1,8 @@
 //! `DynBus` — type-erased host-supplied message bus.
 //!
-//! The runtime takes an `Arc<dyn DynBus>` so it does not need to be
+//! The runtime takes an `Rc<dyn DynBus>` so it does not need to be
 //! parameterised over `<S: Store, T: Transport>`. Browsers and native
-//! hosts pass an `Arc<BusImpl<...>>` cast to `dyn DynBus`.
+//! hosts pass an `Rc<BusImpl<...>>` cast to `dyn DynBus`.
 
 use bytes::Bytes;
 use futures::stream::LocalBoxStream;

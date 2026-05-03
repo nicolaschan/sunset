@@ -20,9 +20,11 @@ use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink};
 pub(crate) struct RuntimeInner {
     pub identity: Identity,
     pub room: Rc<Room>,
-    pub bus: Arc<dyn DynBus>,
+    pub bus: Rc<dyn DynBus>,
     pub dialer: Rc<dyn Dialer>,
-    pub frame_sink: Rc<dyn FrameSink>,
+    /// Interior-mutable so `test-hooks` can swap in a recording wrapper
+    /// via `VoiceRuntime::set_frame_sink` without changing the contract.
+    pub frame_sink: RefCell<Rc<dyn FrameSink>>,
     pub peer_state_sink: Rc<dyn PeerStateSink>,
 
     pub encoder: RefCell<VoiceEncoder>,

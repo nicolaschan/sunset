@@ -52,7 +52,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                         state.insert(ev.peer.clone(), AutoConnectState::Unknown);
                         drop(state);
                         // Drop per-peer playback resources.
-                        inner.frame_sink.drop_peer(&ev.peer);
+                        inner.frame_sink.borrow().drop_peer(&ev.peer);
                         // Drop per-peer jitter buffer so re-entry starts fresh.
                         inner.jitter.borrow_mut().remove(&ev.peer);
                         inner.last_delivered.borrow_mut().remove(&ev.peer);

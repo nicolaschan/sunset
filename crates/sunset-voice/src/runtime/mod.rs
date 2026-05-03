@@ -19,7 +19,6 @@ mod traits;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rand_chacha::ChaCha20Rng;
@@ -53,7 +52,7 @@ pub struct VoiceTasks {
 
 impl VoiceRuntime {
     pub fn new(
-        bus: Arc<dyn DynBus>,
+        bus: Rc<dyn DynBus>,
         room: Rc<Room>,
         identity: Identity,
         dialer: Rc<dyn Dialer>,
@@ -75,7 +74,7 @@ impl VoiceRuntime {
             room,
             bus,
             dialer,
-            frame_sink,
+            frame_sink: RefCell::new(frame_sink),
             peer_state_sink,
             encoder: RefCell::new(
                 VoiceEncoder::new().expect("passthrough encoder construction is infallible"),
@@ -217,6 +216,31 @@ impl VoiceRuntime {
             .entry(peer)
             .or_default()
             .push_back(pcm);
+    }
+
+    /// Test-only: swap the `FrameSink` with a new implementation (e.g.
+    /// a recording wrapper). Returns `Err` if voice is not active.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_frame_sink(&self, new_sink: Rc<dyn traits::FrameSink>) -> Result<(), &'static str> {
+        *self.inner.frame_sink.borrow_mut() = new_sink;
+        Ok(())
+    }
+
+    /// Test-only: snapshot the last emitted `VoicePeerState` for every
+    /// peer that has been observed.
+    #[cfg(feature = "test-hooks")]
+    pub fn snapshot_states(&self) -> Vec<traits::VoicePeerState> {
+        self.inner
+            .last_emitted
+            .borrow()
+            .iter()
+            .map(|(peer, s)| traits::VoicePeerState {
+                peer: peer.clone(),
+                in_call: s.in_call,
+                talking: s.talking,
+                is_muted: s.is_muted,
+            })
+            .collect()
     }
 }
 

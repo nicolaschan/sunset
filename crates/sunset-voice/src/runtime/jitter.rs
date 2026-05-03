@@ -52,8 +52,9 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     }
                 }
             }
+            let sink = inner.frame_sink.borrow().clone();
             for (peer, pcm) in to_deliver {
-                inner.frame_sink.deliver(&peer, &pcm);
+                sink.deliver(&peer, &pcm);
             }
         }
     }
