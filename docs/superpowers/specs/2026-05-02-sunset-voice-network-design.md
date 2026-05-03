@@ -88,8 +88,10 @@ pub fn decrypt(
 ```
 
 - `derive_voice_key`: HKDF-SHA256(ikm=epoch_root(epoch_id), info=`VOICE_KEY_DOMAIN || epoch_id.to_le_bytes()`).expand(32). Errors if epoch_id is not present in `Room`.
-- `encrypt`: postcard(packet) → AEAD with 24-byte random nonce, AAD = `VOICE_AAD_DOMAIN || room_fp || sender.as_bytes()`.
-- `decrypt`: reverse; returns `Error::AeadAuthFailed` on tag mismatch. Per the AEAD AAD binding, this fails if the wrong room key is used or if a packet from sender X is replayed claiming to be from sender Y.
+- `encrypt`: postcard(packet) → AEAD with 24-byte random nonce, AAD = `VOICE_AAD_DOMAIN || room_fp || epoch_id_le || sender.as_bytes()`.
+- `decrypt`: reverse; returns `Error::AeadAuthFailed` on tag mismatch. Per the AEAD AAD binding, this fails if the wrong room key is used, if a packet from sender X is replayed claiming to be from sender Y, or if a packet for one epoch is replayed into another.
+
+> **Revision 2026-05-02:** AAD now binds `epoch_id_le` between `room_fp` and `sender.as_bytes()`. This mirrors `sunset-core::crypto::aead::build_msg_aad` which already binds the epoch into the AD; the per-message HKDF already key-separates epochs, so this is belt-and-suspenders against ciphertext substitution across epochs. Frozen vector pinned in `crates/sunset-voice/src/packet.rs::derive_voice_key_frozen_vector`.
 
 `epoch_id = 0` everywhere in v1 (Room rotation isn't in v1). The parameter is plumbed through so future epoch rotation needs only a wire-compatible upgrade, not an API change.
 

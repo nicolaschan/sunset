@@ -43,11 +43,11 @@ pub(crate) struct VoiceState {
     /// and is wasm-friendly (no OsRng dependency at construction time).
     rng: ChaCha20Rng,
     /// Liveness arcs held here so that `voice_stop` (which clears the
-    /// cell) drops the only outside strong refs. The combiner task holds
-    /// its own clones for its stream subscriptions; it exits on the next
-    /// event after `state.borrow().is_none()` becomes true.
-    #[allow(dead_code)]
-    liveness: liveness::VoiceLiveness,
+    /// cell) drops the outside strong refs the combiner doesn't own.
+    /// The underscore prefix marks this as held-for-Drop only — the
+    /// combiner reads from its own `Arc<Liveness>` clones and exits on
+    /// the next event after `state.borrow().is_none()` becomes true.
+    _liveness: liveness::VoiceLiveness,
 }
 
 pub(crate) type VoiceCell = Rc<RefCell<Option<VoiceState>>>;
@@ -88,10 +88,7 @@ pub(crate) fn voice_start(
         room: room.clone(),
         bus: bus.clone(),
         rng,
-        liveness: liveness::VoiceLiveness {
-            frame: arcs.frame.clone(),
-            membership: arcs.membership.clone(),
-        },
+        _liveness: arcs.clone(),
     });
 
     spawn_heartbeat(state.clone(), identity.clone(), room.clone(), bus.clone());
@@ -101,10 +98,7 @@ pub(crate) fn voice_start(
         state.clone(),
         room.clone(),
         bus.clone(),
-        liveness::VoiceLiveness {
-            frame: arcs.frame.clone(),
-            membership: arcs.membership.clone(),
-        },
+        arcs,
         on_frame.clone(),
         identity.store_verifying_key(),
     );

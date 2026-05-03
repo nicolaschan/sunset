@@ -136,7 +136,7 @@ test("alice voice_input arrives at bob byte-equal", async ({ browser }) => {
 
   await alice.evaluate(async (pk) => await window.__voice.connectDirect(pk), bobPk);
 
-  const directDeadline = Date.now() + 15_000;
+  const directDeadline = Date.now() + 5_000;  // WebRTC P2P on localhost lands in <2 s; 5 s is generous but UX-anchored.
   let aliceDirect = false;
   while (Date.now() < directDeadline) {
     const mode = await alice.evaluate((pk) => window.__voice.peerMode(pk), bobPk);
@@ -220,7 +220,7 @@ test("voice peer state transitions in_call -> talking -> silent -> out", async (
   await alice.evaluate(async () => await window.__voice.startPresence());
   await bob.evaluate(async () => await window.__voice.startPresence());
   await alice.evaluate(async (pk) => await window.__voice.connectDirect(pk), bobPk);
-  const directDeadline = Date.now() + 15_000;
+  const directDeadline = Date.now() + 5_000;  // WebRTC P2P on localhost lands in <2 s; 5 s is generous but UX-anchored.
   let aliceDirect = false;
   while (Date.now() < directDeadline) {
     const mode = await alice.evaluate((pk) => window.__voice.peerMode(pk), bobPk);

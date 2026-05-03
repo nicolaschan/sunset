@@ -94,9 +94,12 @@ async fn alice_encrypts_voice_frame_bob_decrypts_and_observes_live() {
             let bob_liveness = Liveness::new(Duration::from_millis(1000));
             let mut bob_live_sub = bob_liveness.subscribe().await;
 
-            // Subscriptions need a moment to propagate via the engine's CRDT path.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
+            // Real voice senders stream frames continuously at ~50 Hz, so the
+            // first frame may be lost while bob's subscribe-entry propagates
+            // to alice via CRDT. Mirror that pattern here: publish in a tight
+            // loop alongside polling for bob's first received event. This
+            // exercises the actual user-visible contract (continuous stream
+            // converges) without sleeping to mask the propagation race.
             let original = VoicePacket::Frame {
                 codec_id: "pcm-f32-le".to_string(),
                 seq: 1,
@@ -107,18 +110,28 @@ async fn alice_encrypts_voice_frame_bob_decrypts_and_observes_live() {
             let payload_bytes = postcard::to_stdvec(&ev).unwrap();
             let alice_pk_hex = hex::encode(alice_id.store_verifying_key().as_bytes());
             let name = Bytes::from(format!("voice/{room_fp_hex}/{alice_pk_hex}"));
-            alice_bus
-                .publish_ephemeral(name.clone(), Bytes::from(payload_bytes))
-                .await
-                .unwrap();
 
-            let ev_bus = tokio::time::timeout(Duration::from_secs(2), bob_stream.next())
-                .await
-                .expect("bus event arrived in time")
-                .expect("stream open");
-            let datagram = match ev_bus {
-                BusEvent::Ephemeral(d) => d,
-                BusEvent::Durable { .. } => panic!("expected ephemeral"),
+            let datagram = {
+                let mut received: Option<sunset_store::SignedDatagram> = None;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while tokio::time::Instant::now() < deadline {
+                    alice_bus
+                        .publish_ephemeral(name.clone(), Bytes::from(payload_bytes.clone()))
+                        .await
+                        .unwrap();
+                    if let Ok(Some(ev_bus)) =
+                        tokio::time::timeout(Duration::from_millis(20), bob_stream.next()).await
+                    {
+                        match ev_bus {
+                            BusEvent::Ephemeral(d) => {
+                                received = Some(d);
+                                break;
+                            }
+                            BusEvent::Durable { .. } => continue,
+                        }
+                    }
+                }
+                received.expect("bob received an ephemeral within 2 s of continuous publishing")
             };
             let sender = IdentityKey::from_store_verifying_key(&datagram.verifying_key).unwrap();
             let received_ev: sunset_voice::packet::EncryptedVoicePacket =

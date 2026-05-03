@@ -17,6 +17,11 @@ use super::VoiceCell;
 pub(crate) const FRAME_STALE_AFTER: Duration = Duration::from_millis(1000);
 pub(crate) const MEMBERSHIP_STALE_AFTER: Duration = Duration::from_secs(5);
 
+/// Pair of `Liveness` arcs (one for actively-talking, one for in-call
+/// membership). Cheap to clone — the underlying `Arc<Liveness>` shares
+/// state across all clones, so observers and the combiner both see the
+/// same observations.
+#[derive(Clone)]
 pub(crate) struct VoiceLiveness {
     pub frame: Arc<Liveness>,
     pub membership: Arc<Liveness>,
@@ -33,19 +38,29 @@ impl VoiceLiveness {
 
 /// Spawn the state combiner. Listens to both Liveness streams and emits
 /// `(peer_id_uint8array, in_call, talking)` whenever the combined state
-/// for any peer changes. Exits when both upstream streams end OR when
-/// `state.borrow().is_none()` (voice_stop has cleared the cell, dropping
-/// the only outside refs to the Liveness arcs).
+/// for any peer changes.
+///
+/// **Exit timing:** the combiner notices `voice_stop` only on the *next*
+/// Liveness event after the cell is cleared. With the 5-second
+/// membership stale window and 2-second heartbeat cadence (transport.rs)
+/// the combiner exits within a few seconds; if the cell is cleared
+/// while no peer is sending or heart-beating, the combiner can linger
+/// up to one membership-stale interval before its next event arrives
+/// and lets it exit. The Liveness arcs are dropped at that point so no
+/// memory leak.
+///
+/// The `else => break` arm only fires if both Liveness mpsc channels
+/// close, which only happens when this task drops its own `Arc<Liveness>`
+/// clones — practically unreachable.
 pub(crate) fn spawn_combiner(
     state: VoiceCell,
     arcs: &VoiceLiveness,
     on_voice_peer_state: Function,
 ) {
-    let frame = arcs.frame.clone();
-    let membership = arcs.membership.clone();
+    let arcs = arcs.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        let mut frame_sub = frame.subscribe().await;
-        let mut membership_sub = membership.subscribe().await;
+        let mut frame_sub = arcs.frame.subscribe().await;
+        let mut membership_sub = arcs.membership.subscribe().await;
         let mut frame_state: HashMap<PeerId, bool> = HashMap::new();
         let mut membership_state: HashMap<PeerId, bool> = HashMap::new();
         let mut last_emitted: HashMap<PeerId, (bool, bool)> = HashMap::new();
