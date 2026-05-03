@@ -7,13 +7,12 @@ mod open_room;
 
 pub use open_room::OpenRoom;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use sunset_store::Store;
-use sunset_sync::{PeerSupervisor, SyncEngine, Transport};
+use sunset_sync::{IntentId, IntentSnapshot, PeerSupervisor, SyncEngine, Transport};
 
 use crate::Identity;
 use crate::crypto::room::RoomFingerprint;
@@ -24,7 +23,6 @@ pub struct Peer<St: Store + 'static, T: Transport + 'static> {
     store: Arc<St>,
     engine: Rc<SyncEngine<St, T>>,
     supervisor: Rc<PeerSupervisor<St, T>>,
-    relay_status: Rc<RefCell<String>>,
     /// Held across `open_room`'s await window so two concurrent
     /// `open_room("alpha")` calls coalesce on a single `RoomState`
     /// rather than racing through the idempotency check, both doing
@@ -52,7 +50,6 @@ where
             store,
             engine,
             supervisor,
-            relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
             open_rooms: tokio::sync::Mutex::new(HashMap::new()),
             rtc_signaler_dispatcher,
         })
@@ -60,10 +57,6 @@ where
 
     pub fn public_key(&self) -> [u8; 32] {
         self.identity.public().as_bytes()
-    }
-
-    pub fn relay_status(&self) -> String {
-        self.relay_status.borrow().clone()
     }
 
     pub async fn open_room(self: &Rc<Self>, room_name: &str) -> crate::Result<OpenRoom<St, T>> {
@@ -158,9 +151,7 @@ where
             room,
             peer_weak: Rc::downgrade(self),
             presence_started: std::cell::Cell::new(false),
-            tracker_handles: Rc::new(crate::membership::TrackerHandles::new(
-                &self.relay_status.borrow(),
-            )),
+            tracker_handles: Rc::new(crate::membership::TrackerHandles::new()),
             reaction_handles,
             cancel_decode: cancel,
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
@@ -170,18 +161,36 @@ where
         Ok(OpenRoom { inner: state })
     }
 
-    pub async fn add_relay(&self, addr: sunset_sync::PeerAddr) -> sunset_sync::Result<()> {
-        *self.relay_status.borrow_mut() = "connecting".to_owned();
-        match self.supervisor.add(addr).await {
-            Ok(()) => {
-                *self.relay_status.borrow_mut() = "connected".to_owned();
-                Ok(())
-            }
-            Err(e) => {
-                *self.relay_status.borrow_mut() = "error".to_owned();
-                Err(e)
-            }
-        }
+    /// Register a durable connection intent. Returns the supervisor's
+    /// `IntentId` once the intent is recorded (one cmd-channel
+    /// round-trip; does NOT wait for the first connection). Transient
+    /// failures (resolver fetch, dial, Hello) never bubble out — the
+    /// supervisor retries with exponential backoff. The only `Err` is
+    /// `ResolveErr::Parse` for typed garbage that the resolver can
+    /// never make sense of.
+    ///
+    /// To observe live state for the returned intent, call
+    /// `on_intent_changed`.
+    pub async fn add_relay(
+        &self,
+        connectable: sunset_sync::Connectable,
+    ) -> Result<IntentId, sunset_sync::ResolveErr> {
+        self.supervisor.add(connectable).await
+    }
+
+    /// Snapshot every registered intent's current state. Used by hosts
+    /// on first paint, before the live `on_intent_changed` stream
+    /// arrives.
+    pub async fn intents(&self) -> Vec<IntentSnapshot> {
+        self.supervisor.snapshot().await
+    }
+
+    /// Subscribe to per-intent state transitions. The returned receiver
+    /// is fed the current snapshot of every existing intent on
+    /// subscribe (so late subscribers don't miss state), then every
+    /// change after that.
+    pub async fn subscribe_intents(&self) -> tokio::sync::mpsc::UnboundedReceiver<IntentSnapshot> {
+        self.supervisor.subscribe_intents().await
     }
 
     // Accessor methods consumed by Phase 5+ (open_room, send_text, etc.).
@@ -213,35 +222,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn peer_new_exposes_public_key_and_default_relay_status() {
+    async fn peer_new_exposes_public_key_and_no_intents() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let peer = helpers::mk_peer(ident(7)).await;
                 assert_eq!(peer.public_key().len(), 32);
-                assert_eq!(peer.relay_status(), "disconnected");
+                // Fresh peer: no intents registered.
+                assert!(peer.intents().await.is_empty());
             })
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn add_relay_with_unreachable_addr_sets_status_error() {
+    async fn add_relay_records_intent_and_returns_id() {
+        // The supervisor is the source of truth for relay connection
+        // state. `add_relay` returns once the intent is recorded (one
+        // cmd-channel round-trip); transient failures (NopTransport's
+        // immediate Transport("nop")) don't bubble out — they leave
+        // the intent in Backoff. We assert the intent is registered
+        // and visible via `intents()`.
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let peer = helpers::mk_peer(ident(8)).await;
-                assert_eq!(peer.relay_status(), "disconnected");
+                assert!(peer.intents().await.is_empty());
 
-                // NopTransport's connect() returns Transport("nop") immediately,
-                // so add_relay short-circuits to error and the status flips to
-                // "error".
-                let result = peer
-                    .add_relay(sunset_sync::PeerAddr::new(bytes::Bytes::from_static(
-                        b"wss://nowhere.invalid",
-                    )))
-                    .await;
-                assert!(result.is_err());
-                assert_eq!(peer.relay_status(), "error");
+                let id = peer
+                    .add_relay(sunset_sync::Connectable::Direct(
+                        sunset_sync::PeerAddr::new(bytes::Bytes::from_static(
+                            b"wss://nowhere.invalid",
+                        )),
+                    ))
+                    .await
+                    .expect("add_relay records intent without bubbling transient errors");
+
+                let snaps = peer.intents().await;
+                assert_eq!(snaps.len(), 1);
+                assert_eq!(snaps[0].id, id);
+                assert_eq!(snaps[0].label, "wss://nowhere.invalid");
             })
             .await;
     }
