@@ -15,7 +15,7 @@ use rand_chacha::rand_core::SeedableRng;
 use sunset_core::Identity;
 use sunset_core::Room;
 use sunset_core::bus::BusEvent;
-use sunset_store::SignedDatagram;
+use sunset_store::{ContentBlock, SignedDatagram, SignedKvEntry};
 use sunset_sync::PeerId;
 use sunset_voice::runtime::{
     Dialer, DynBus, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime,
@@ -28,17 +28,19 @@ type DroppedSink = Rc<RefCell<Vec<PeerId>>>;
 /// Type alias to avoid clippy::type_complexity.
 type EventSink = Rc<RefCell<Vec<VoicePeerState>>>;
 
-/// Minimal in-memory `DynBus` for tests. Supports `publish_ephemeral`
-/// and `subscribe_voice_prefix`. Loopback is included
-/// (publishes are visible to subscribers including the publisher).
+/// Minimal in-memory `DynBus` for tests. Supports ephemeral and durable
+/// publish + subscribe. Loopback is included (publishes are visible to
+/// subscribers including the publisher).
 ///
-/// Uses an mpsc list for fan-out. `inject` delivers a datagram directly
-/// to all registered subscribers (used by tests to simulate inbound traffic).
+/// `inject` and `inject_durable` deliver traffic directly to all registered
+/// subscribers (used by tests to simulate inbound traffic).
 struct TestBus {
     self_pk: sunset_store::VerifyingKey,
     /// Sinks registered by subscribe_voice_prefix calls. Guarded by a Mutex
     /// because publish_ephemeral is async and called from the runtime.
-    sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedDatagram>>>,
+    ephemeral_sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedDatagram>>>,
+    /// Sinks registered by subscribe_prefix calls (for durable entries).
+    durable_sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedKvEntry>>>,
     /// Broadcast channel for publish_ephemeral so tests can observe outbound traffic.
     obs_tx: tokio::sync::broadcast::Sender<SignedDatagram>,
 }
@@ -50,17 +52,26 @@ impl TestBus {
         let (obs_tx, _) = tokio::sync::broadcast::channel(64);
         let bus = Rc::new(Self {
             self_pk,
-            sinks: tokio::sync::Mutex::new(vec![]),
+            ephemeral_sinks: tokio::sync::Mutex::new(vec![]),
+            durable_sinks: tokio::sync::Mutex::new(vec![]),
             obs_tx: obs_tx.clone(),
         });
         (bus, obs_tx)
     }
 
-    /// Inject a datagram (from tests) into all subscribe streams.
+    /// Inject an ephemeral datagram (from tests) into all ephemeral subscribe streams.
     async fn inject(&self, dgram: SignedDatagram) {
-        let sinks = self.sinks.lock().await;
+        let sinks = self.ephemeral_sinks.lock().await;
         for sink in sinks.iter() {
             let _ = sink.send(dgram.clone());
+        }
+    }
+
+    /// Inject a durable KV entry (from tests) into all durable subscribe streams.
+    async fn inject_durable(&self, entry: SignedKvEntry) {
+        let sinks = self.durable_sinks.lock().await;
+        for sink in sinks.iter() {
+            let _ = sink.send(entry.clone());
         }
     }
 }
@@ -79,13 +90,26 @@ impl DynBus for TestBus {
             payload,
             signature: Bytes::new(),
         };
-        // Fan out to subscribers (loopback).
-        let sinks = self.sinks.lock().await;
+        // Fan out to ephemeral subscribers (loopback).
+        let sinks = self.ephemeral_sinks.lock().await;
         for sink in sinks.iter() {
             let _ = sink.send(dgram.clone());
         }
         // Also notify test observers.
         let _ = self.obs_tx.send(dgram);
+        Ok(())
+    }
+
+    async fn publish_durable(
+        &self,
+        entry: SignedKvEntry,
+        _block: Option<ContentBlock>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Fan out to durable subscribers (loopback).
+        let sinks = self.durable_sinks.lock().await;
+        for sink in sinks.iter() {
+            let _ = sink.send(entry.clone());
+        }
         Ok(())
     }
 
@@ -96,13 +120,33 @@ impl DynBus for TestBus {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
         // Register sink — all subsequent inject() and publish_ephemeral() calls
         // will fan out to this sender.
-        self.sinks.lock().await.push(tx);
+        self.ephemeral_sinks.lock().await.push(tx);
 
         let stream = async_stream::stream! {
             let mut r = rx;
             while let Some(d) = r.recv().await {
                 if d.name.starts_with(&prefix) {
                     yield BusEvent::Ephemeral(d);
+                }
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
+    async fn subscribe_prefix(
+        &self,
+        prefix: Bytes,
+    ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SignedKvEntry>();
+        // Register sink — all subsequent inject_durable() and publish_durable() calls
+        // will fan out to this sender.
+        self.durable_sinks.lock().await.push(tx);
+
+        let stream = async_stream::stream! {
+            let mut r = rx;
+            while let Some(entry) = r.recv().await {
+                if entry.name.starts_with(&prefix) {
+                    yield BusEvent::Durable { entry, block: None };
                 }
             }
         };
@@ -149,6 +193,33 @@ fn make_identity_and_room(seed_byte: u8) -> (Identity, Rc<Room>) {
     let identity = Identity::from_secret_bytes(&seed);
     let room = Rc::new(Room::open("test-room").unwrap());
     (identity, room)
+}
+
+/// Build a signed durable voice-presence entry for `sender` in `room`.
+fn make_presence_entry(sender: &Identity, room: &Room) -> SignedKvEntry {
+    use sunset_store::canonical::signing_payload;
+
+    let room_fp = room.fingerprint().to_hex();
+    let sender_pk_hex = hex::encode(sender.store_verifying_key().as_bytes());
+    let name = Bytes::from(format!("voice-presence/{room_fp}/{sender_pk_hex}"));
+    let block = ContentBlock {
+        data: Bytes::new(),
+        references: vec![],
+    };
+    let value_hash = block.hash();
+    let now_ms = 1_000_000u64; // fixed for determinism
+    let mut entry = SignedKvEntry {
+        verifying_key: sender.store_verifying_key(),
+        name,
+        value_hash,
+        priority: now_ms,
+        expires_at: Some(now_ms + 6_000),
+        signature: Bytes::new(),
+    };
+    let payload = signing_payload(&entry);
+    let sig = sender.sign(&payload);
+    entry.signature = Bytes::copy_from_slice(&sig.to_bytes());
+    entry
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -502,7 +573,7 @@ async fn combiner_emits_state_on_heartbeat() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn auto_connect_dials_first_heartbeat_only_once() {
+async fn auto_connect_dials_on_voice_presence_only_once() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (alice, room) = make_identity_and_room(8);
@@ -528,33 +599,16 @@ async fn auto_connect_dials_first_heartbeat_only_once() {
                 frame_sink,
                 peer_state_sink,
             );
-            tokio::task::spawn_local(tasks.subscribe);
             tokio::task::spawn_local(tasks.auto_connect);
 
-            // Yield to let subscribe and auto_connect tasks start up.
+            // Yield to let auto_connect task start up and register its sink.
             tokio::task::yield_now().await;
 
-            // Three heartbeats from alice — only the first should trigger ensure_direct.
+            // Three voice-presence durable entries from alice — only the first
+            // should trigger ensure_direct.
+            let entry = make_presence_entry(&alice, &room);
             for _ in 0..3 {
-                let pkt = sunset_voice::packet::VoicePacket::Heartbeat {
-                    sent_at_ms: 1000,
-                    is_muted: false,
-                };
-                let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xab);
-                let ev = sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng)
-                    .unwrap();
-                let payload = postcard::to_stdvec(&ev).unwrap();
-                let room_fp = room.fingerprint().to_hex();
-                let sender_pk = hex::encode(alice.store_verifying_key().as_bytes());
-                let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
-                bus_impl
-                    .inject(SignedDatagram {
-                        verifying_key: alice.store_verifying_key(),
-                        name,
-                        payload: Bytes::from(payload),
-                        signature: Bytes::new(),
-                    })
-                    .await;
+                bus_impl.inject_durable(entry.clone()).await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -563,6 +617,76 @@ async fn auto_connect_dials_first_heartbeat_only_once() {
                 1,
                 "ensure_direct must be called exactly once"
             );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn voice_presence_publisher_emits_periodically() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(12);
+            let alice_pk = alice.store_verifying_key();
+            let (bus_impl, _obs_tx) = TestBus::new(alice_pk.clone());
+            let bus: Rc<dyn DynBus> = bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let room_fp = room.fingerprint().to_hex();
+            let presence_prefix = Bytes::from(format!("voice-presence/{room_fp}/"));
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bus,
+                room.clone(),
+                alice.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+
+            // Subscribe to durable presence entries before spawning the publisher.
+            let mut stream = bus_impl
+                .subscribe_prefix(presence_prefix)
+                .await
+                .expect("subscribe succeeded");
+
+            tokio::task::spawn_local(tasks.voice_presence_publisher);
+
+            use futures::StreamExt as _;
+
+            // First presence entry must arrive within 1 s.
+            let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("first presence entry within 1s")
+                .expect("stream open");
+
+            match first {
+                BusEvent::Durable { entry, .. } => {
+                    assert_eq!(entry.verifying_key, alice_pk, "entry is from alice");
+                }
+                BusEvent::Ephemeral(_) => panic!("expected Durable"),
+            }
+
+            // Second presence entry must arrive within 3 s (refresh ~2s).
+            let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+                .await
+                .expect("second presence entry within 3s")
+                .expect("stream open");
+
+            match second {
+                BusEvent::Durable { entry, .. } => {
+                    assert_eq!(entry.verifying_key, alice_pk, "second entry is from alice");
+                }
+                BusEvent::Ephemeral(_) => panic!("expected Durable"),
+            }
         })
         .await;
 }
@@ -720,6 +844,7 @@ async fn dropping_runtime_terminates_all_tasks() {
                 tokio::task::spawn_local(tasks.combiner),
                 tokio::task::spawn_local(tasks.auto_connect),
                 tokio::task::spawn_local(tasks.jitter_pump),
+                tokio::task::spawn_local(tasks.voice_presence_publisher),
             ];
 
             drop(runtime);
