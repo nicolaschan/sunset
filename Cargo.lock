@@ -2010,6 +2010,7 @@ dependencies = [
  "sunset-store-memory",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "wasm-bindgen-futures",
  "wasmtimer",
  "web-time",
