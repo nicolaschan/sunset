@@ -43,19 +43,11 @@ pub(crate) struct RuntimeInner {
     pub last_delivered: RefCell<HashMap<PeerId, LastDelivered>>,
     pub auto_connect_state: RefCell<HashMap<PeerId, AutoConnectState>>,
     pub last_emitted: RefCell<HashMap<PeerId, EmittedState>>,
-
-    /// Channel for auto-connect notifications from the subscribe loop.
-    pub auto_connect_chan: AutoConnectChan,
 }
 
 pub(crate) struct LastDelivered {
     pub pcm: Vec<f32>,
     pub underruns: u32,
-}
-
-pub(crate) struct AutoConnectChan {
-    pub tx: tokio::sync::mpsc::UnboundedSender<PeerId>,
-    pub rx: RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<PeerId>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

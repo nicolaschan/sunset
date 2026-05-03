@@ -37,6 +37,16 @@ const FRAME_STALE_AFTER: Duration = Duration::from_millis(1000);
 const MEMBERSHIP_STALE_AFTER: Duration = Duration::from_secs(5);
 const JITTER_MAX_DEPTH: usize = 8;
 const JITTER_PUMP_INTERVAL: Duration = Duration::from_millis(20);
+pub(crate) const VOICE_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const VOICE_PRESENCE_TTL: Duration = Duration::from_secs(6);
+
+pub(crate) fn voice_presence_name(room_fp_hex: &str, sender_pk_hex: &str) -> bytes::Bytes {
+    bytes::Bytes::from(format!("voice-presence/{room_fp_hex}/{sender_pk_hex}"))
+}
+
+pub(crate) fn voice_presence_prefix(room_fp_hex: &str) -> bytes::Bytes {
+    bytes::Bytes::from(format!("voice-presence/{room_fp_hex}/"))
+}
 
 pub struct VoiceRuntime {
     inner: Rc<state::RuntimeInner>,
@@ -48,6 +58,7 @@ pub struct VoiceTasks {
     pub combiner: futures::future::LocalBoxFuture<'static, ()>,
     pub auto_connect: futures::future::LocalBoxFuture<'static, ()>,
     pub jitter_pump: futures::future::LocalBoxFuture<'static, ()>,
+    pub voice_presence_publisher: futures::future::LocalBoxFuture<'static, ()>,
 }
 
 impl VoiceRuntime {
@@ -66,8 +77,6 @@ impl VoiceRuntime {
 
         let frame_liveness = Liveness::new(FRAME_STALE_AFTER);
         let membership_liveness = Liveness::new(MEMBERSHIP_STALE_AFTER);
-
-        let (ac_tx, ac_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let inner = Rc::new(state::RuntimeInner {
             identity,
@@ -89,10 +98,6 @@ impl VoiceRuntime {
             last_delivered: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
             last_emitted: RefCell::new(Default::default()),
-            auto_connect_chan: state::AutoConnectChan {
-                tx: ac_tx,
-                rx: RefCell::new(Some(ac_rx)),
-            },
         });
 
         let tasks = VoiceTasks {
@@ -101,6 +106,7 @@ impl VoiceRuntime {
             combiner: combiner::spawn(Rc::downgrade(&inner)),
             auto_connect: auto_connect::spawn(Rc::downgrade(&inner)),
             jitter_pump: jitter::spawn(Rc::downgrade(&inner)),
+            voice_presence_publisher: voice_presence_publisher::spawn(Rc::downgrade(&inner)),
         };
 
         (VoiceRuntime { inner }, tasks)
@@ -257,3 +263,4 @@ mod combiner;
 mod heartbeat;
 mod jitter;
 mod subscribe;
+mod voice_presence_publisher;

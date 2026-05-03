@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::stream::LocalBoxStream;
 
 use sunset_core::bus::{Bus, BusEvent, BusImpl};
-use sunset_store::{Filter, Store};
+use sunset_store::{ContentBlock, Filter, SignedKvEntry, Store};
 use sunset_sync::Transport;
 
 use super::DynBus;
@@ -31,7 +31,26 @@ where
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
 
+    async fn publish_durable(
+        &self,
+        entry: SignedKvEntry,
+        block: Option<ContentBlock>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Bus::publish_durable(self, entry, block)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    }
+
     async fn subscribe_voice_prefix(
+        &self,
+        prefix: Bytes,
+    ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {
+        Bus::subscribe(self, Filter::NamePrefix(prefix))
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    }
+
+    async fn subscribe_prefix(
         &self,
         prefix: Bytes,
     ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {

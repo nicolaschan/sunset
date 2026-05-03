@@ -101,9 +101,6 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     let st = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sent_at_ms);
                     inner.membership_liveness.observe(peer.clone(), st).await;
 
-                    // Notify auto-connect task.
-                    let _ = inner.auto_connect_chan.tx.send(peer.clone());
-
                     // Emit immediately on mute change.
                     if inner.last_emitted_set_muted_seen(peer.clone(), is_muted) {
                         let entry = *inner.last_emitted.borrow().get(&peer).unwrap();

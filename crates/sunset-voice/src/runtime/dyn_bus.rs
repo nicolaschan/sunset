@@ -6,6 +6,7 @@
 
 use bytes::Bytes;
 use futures::stream::LocalBoxStream;
+use sunset_store::{ContentBlock, SignedKvEntry};
 
 /// Type-erased `Bus`. `?Send` — single-threaded data plane.
 #[async_trait::async_trait(?Send)]
@@ -16,7 +17,18 @@ pub trait DynBus {
         payload: Bytes,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
+    async fn publish_durable(
+        &self,
+        entry: SignedKvEntry,
+        block: Option<ContentBlock>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
     async fn subscribe_voice_prefix(
+        &self,
+        prefix: Bytes,
+    ) -> Result<LocalBoxStream<'static, sunset_core::bus::BusEvent>, Box<dyn std::error::Error>>;
+
+    async fn subscribe_prefix(
         &self,
         prefix: Bytes,
     ) -> Result<LocalBoxStream<'static, sunset_core::bus::BusEvent>, Box<dyn std::error::Error>>;
