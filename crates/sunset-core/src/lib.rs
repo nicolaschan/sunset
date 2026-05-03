@@ -15,6 +15,7 @@ pub mod identity;
 pub mod liveness;
 pub mod membership;
 pub mod message;
+pub mod peer;
 pub mod signaling;
 pub mod verifier;
 
@@ -30,5 +31,6 @@ pub use liveness::{
 pub use message::{
     ComposedMessage, DecodedMessage, compose_message, compose_receipt, compose_text, decode_message,
 };
+pub use peer::{OpenRoom, Peer};
 pub use signaling::{MultiRoomSignaler, RelaySignaler, signaling_filter};
 pub use verifier::Ed25519Verifier;
