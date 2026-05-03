@@ -44,10 +44,10 @@ export function loadOrCreateIdentity(callback) {
   callback(new BitArray(bytes));
 }
 
-export async function createClient(seed, roomName, callback) {
+export async function createClient(seed, callback) {
   await ensureLoaded();
   const seedBytes = bitsToBytes(seed);
-  const client = new Client(seedBytes, roomName);
+  const client = new Client(seedBytes);
   // Test-only hook: expose the client to Playwright when SUNSET_TEST is
   // set on `window` before the bundle loads. No-op in production.
   if (typeof window !== "undefined" && window.SUNSET_TEST) {
@@ -56,19 +56,24 @@ export async function createClient(seed, roomName, callback) {
   callback(client);
 }
 
-export async function clientConnectDirect(client, peerPubkey, callback) {
+export async function clientOpenRoom(client, name, callback) {
+  const handle = await client.open_room(name);
+  callback(handle);
+}
+
+export async function clientConnectDirect(room, peerPubkey, callback) {
   try {
     const bytes = bitsToBytes(peerPubkey);
-    await client.connect_direct(bytes);
+    await room.connect_direct(bytes);
     callback(new Ok(undefined));
   } catch (e) {
     callback(new GError(String(e)));
   }
 }
 
-export function clientPeerConnectionMode(client, peerPubkey) {
+export function clientPeerConnectionMode(room, peerPubkey) {
   const bytes = bitsToBytes(peerPubkey);
-  return client.peer_connection_mode(bytes);
+  return room.peer_connection_mode(bytes);
 }
 
 export async function addRelay(client, url, callback) {
@@ -80,27 +85,18 @@ export async function addRelay(client, url, callback) {
   }
 }
 
-export async function publishRoomSubscription(client, callback) {
-  try {
-    await client.publish_room_subscription();
-    callback(new Ok(undefined));
-  } catch (e) {
-    callback(new GError(String(e)));
-  }
-}
-
-export async function sendMessage(client, body, sentAtMs, callback) {
+export async function sendMessage(room, body, sentAtMs, callback) {
   try {
     const nonce = window.crypto.getRandomValues(new Uint8Array(32));
-    const valueHashHex = await client.send_message(body, sentAtMs, nonce);
+    const valueHashHex = await room.send_message(body, sentAtMs, nonce);
     callback(new Ok(valueHashHex));
   } catch (e) {
     callback(new GError(String(e)));
   }
 }
 
-export function onMessage(client, callback) {
-  client.on_message((incoming) => {
+export function onMessage(room, callback) {
+  room.on_message((incoming) => {
     // Copy fields into a plain JS object so we can free the wasm-bindgen
     // wrapper immediately and avoid GC-delayed memory accumulation.
     const plain = {
@@ -164,16 +160,16 @@ export function incIsSelf(msg) { return msg.is_self; }
 
 // Presence + membership FFI shims.
 
-export async function startPresence(client, intervalMs, ttlMs, refreshMs) {
+export async function startPresence(room, intervalMs, ttlMs, refreshMs) {
   try {
-    await client.start_presence(intervalMs, ttlMs, refreshMs);
+    await room.start_presence(intervalMs, ttlMs, refreshMs);
   } catch (e) {
     console.warn("startPresence failed", e);
   }
 }
 
-export function onMembersChanged(client, callback) {
-  client.on_members_changed((members) => {
+export function onMembersChanged(room, callback) {
+  room.on_members_changed((members) => {
     try {
       // Copy fields into plain JS objects so we don't hold raw
       // wasm-bindgen pointers across the JS/Gleam boundary —
@@ -194,8 +190,8 @@ export function onMembersChanged(client, callback) {
   });
 }
 
-export function onRelayStatusChanged(client, callback) {
-  client.on_relay_status_changed((s) => {
+export function onRelayStatusChanged(room, callback) {
+  room.on_relay_status_changed((s) => {
     try {
       callback(String(s));
     } catch (e) {
@@ -246,8 +242,8 @@ export function presenceParamsFromUrl() {
 
 // Delivery-receipt FFI.
 
-export function onReceipt(client, callback) {
-  client.on_receipt((incoming) => {
+export function onReceipt(room, callback) {
+  room.on_receipt((incoming) => {
     // Copy fields into a plain JS object so we can free the wasm-bindgen
     // wrapper immediately and avoid GC-delayed memory accumulation.
     const plain = {

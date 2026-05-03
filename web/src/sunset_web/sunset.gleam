@@ -6,6 +6,8 @@ import gleam/option
 
 pub type ClientHandle
 
+pub type RoomHandle
+
 pub type IncomingMessage
 
 /// Read the persisted 32-byte secret seed from localStorage; if absent,
@@ -19,8 +21,16 @@ pub fn load_or_create_identity(callback: fn(BitArray) -> Nil) -> Nil
 @external(javascript, "./sunset.ffi.mjs", "createClient")
 pub fn create_client(
   seed: BitArray,
-  room_name: String,
   callback: fn(ClientHandle) -> Nil,
+) -> Nil
+
+/// Open a room by name. Returns a RoomHandle via `callback` once the room
+/// subscription is published and the wasm-side state is initialised.
+@external(javascript, "./sunset.ffi.mjs", "clientOpenRoom")
+pub fn open_room(
+  client: ClientHandle,
+  name: String,
+  callback: fn(RoomHandle) -> Nil,
 ) -> Nil
 
 /// Open a connection to a relay. URL must include the `#x25519=<hex>`
@@ -32,18 +42,11 @@ pub fn add_relay(
   callback: fn(Result(Nil, String)) -> Nil,
 ) -> Nil
 
-/// Subscribe the engine to "all messages in this room".
-@external(javascript, "./sunset.ffi.mjs", "publishRoomSubscription")
-pub fn publish_room_subscription(
-  client: ClientHandle,
-  callback: fn(Result(Nil, String)) -> Nil,
-) -> Nil
-
 /// Compose + insert a message. `callback` receives the value-hash hex on
 /// success.
 @external(javascript, "./sunset.ffi.mjs", "sendMessage")
 pub fn send_message(
-  client: ClientHandle,
+  room: RoomHandle,
   body: String,
   sent_at_ms: Int,
   callback: fn(Result(String, String)) -> Nil,
@@ -53,7 +56,7 @@ pub fn send_message(
 /// message in the room.
 @external(javascript, "./sunset.ffi.mjs", "onMessage")
 pub fn on_message(
-  client: ClientHandle,
+  room: RoomHandle,
   callback: fn(IncomingMessage) -> Nil,
 ) -> Nil
 
@@ -68,7 +71,7 @@ pub fn relay_status(client: ClientHandle) -> String
 /// Noise_IK handshake complete or `Error(msg)` on failure.
 @external(javascript, "./sunset.ffi.mjs", "clientConnectDirect")
 pub fn client_connect_direct(
-  client: ClientHandle,
+  room: RoomHandle,
   peer_pubkey: BitArray,
   callback: fn(Result(Nil, String)) -> Nil,
 ) -> Nil
@@ -77,7 +80,7 @@ pub fn client_connect_direct(
 /// the given remote peer's pubkey.
 @external(javascript, "./sunset.ffi.mjs", "clientPeerConnectionMode")
 pub fn client_peer_connection_mode(
-  client: ClientHandle,
+  room: RoomHandle,
   peer_pubkey: BitArray,
 ) -> String
 
@@ -111,7 +114,7 @@ pub type MemberJs
 /// Start the heartbeat publisher + membership tracker. Idempotent.
 @external(javascript, "./sunset.ffi.mjs", "startPresence")
 pub fn start_presence(
-  client: ClientHandle,
+  room: RoomHandle,
   interval_ms: Int,
   ttl_ms: Int,
   refresh_ms: Int,
@@ -119,13 +122,13 @@ pub fn start_presence(
 
 @external(javascript, "./sunset.ffi.mjs", "onMembersChanged")
 pub fn on_members_changed(
-  client: ClientHandle,
+  room: RoomHandle,
   callback: fn(List(MemberJs)) -> Nil,
 ) -> Nil
 
 @external(javascript, "./sunset.ffi.mjs", "onRelayStatusChanged")
 pub fn on_relay_status_changed(
-  client: ClientHandle,
+  room: RoomHandle,
   callback: fn(String) -> Nil,
 ) -> Nil
 
@@ -166,7 +169,7 @@ pub type IncomingReceipt
 /// bridge layer.
 @external(javascript, "./sunset.ffi.mjs", "onReceipt")
 pub fn on_receipt(
-  client: ClientHandle,
+  room: RoomHandle,
   callback: fn(IncomingReceipt) -> Nil,
 ) -> Nil
 
