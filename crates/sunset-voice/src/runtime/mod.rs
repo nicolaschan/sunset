@@ -13,7 +13,7 @@
 //! for native).
 
 mod dyn_bus;
-pub mod dyn_bus_impl;
+mod dyn_bus_impl;
 mod state;
 mod traits;
 
@@ -219,11 +219,10 @@ impl VoiceRuntime {
     }
 
     /// Test-only: swap the `FrameSink` with a new implementation (e.g.
-    /// a recording wrapper). Returns `Err` if voice is not active.
+    /// a recording wrapper).
     #[cfg(feature = "test-hooks")]
-    pub fn set_frame_sink(&self, new_sink: Rc<dyn traits::FrameSink>) -> Result<(), &'static str> {
+    pub fn set_frame_sink(&self, new_sink: Rc<dyn traits::FrameSink>) {
         *self.inner.frame_sink.borrow_mut() = new_sink;
-        Ok(())
     }
 
     /// Test-only: snapshot the last emitted `VoicePeerState` for every

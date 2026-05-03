@@ -38,6 +38,7 @@ pub(crate) struct ActiveVoice {
     /// Shared with `WebFrameSink` so `install_recorder` can find the
     /// original sink to wrap. Also keeps the sink alive alongside the
     /// runtime (belt-and-suspenders, since the runtime holds an Rc too).
+    #[cfg(feature = "test-hooks")]
     frame_sink_rc: Rc<dyn FrameSink>,
     /// JS callback for per-peer gain forwarding. Accessed directly from
     /// `voice_set_peer_volume`; not owned by any inner type.
@@ -109,6 +110,7 @@ pub(crate) fn voice_start(
 
     *cell.borrow_mut() = Some(ActiveVoice {
         runtime,
+        #[cfg(feature = "test-hooks")]
         frame_sink_rc: web_frame_sink,
         on_set_peer_volume: on_volume_rc,
         pending_gains: RefCell::new(HashMap::new()),
@@ -191,9 +193,7 @@ pub(crate) fn install_recorder(cell: &VoiceCell) -> Result<(), JsError> {
     // Upcast to Rc<dyn FrameSink> so the runtime's RefCell<Rc<dyn FrameSink>>
     // can accept it.
     let as_dyn: Rc<dyn sunset_voice::FrameSink> = recorder;
-    if let Err(e) = v.runtime.set_frame_sink(as_dyn) {
-        return Err(JsError::new(&format!("install_recorder: {e}")));
-    }
+    v.runtime.set_frame_sink(as_dyn);
 
     Ok(())
 }
