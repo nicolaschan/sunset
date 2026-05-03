@@ -92,8 +92,8 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
 /// If `bytes[i..]` starts with `http://` or `https://`, returns the
 /// exclusive end index of the URL (after stripping trailing punctuation).
 fn match_autolink(bytes: &[u8], i: usize) -> Option<usize> {
-    let starts = bytes.get(i..i + 7) == Some(b"http://")
-        || bytes.get(i..i + 8) == Some(b"https://");
+    let starts =
+        bytes.get(i..i + 7) == Some(b"http://") || bytes.get(i..i + 8) == Some(b"https://");
     if !starts {
         return None;
     }
@@ -112,11 +112,17 @@ fn is_url_byte(b: u8) -> bool {
 }
 
 fn is_trailing_punct(b: u8) -> bool {
-    matches!(b, b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'}' | b'\'' | b'"')
+    matches!(
+        b,
+        b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'}' | b'\'' | b'"'
+    )
 }
 
 fn find_byte(bytes: &[u8], target: u8, from: usize) -> Option<usize> {
-    bytes[from..].iter().position(|&b| b == target).map(|p| p + from)
+    bytes[from..]
+        .iter()
+        .position(|&b| b == target)
+        .map(|p| p + from)
 }
 
 /// Returns `(label_end, url_end)` where `bytes[i] = '['`,
@@ -182,7 +188,11 @@ fn is_word_boundary(bytes: &[u8], i: usize) -> bool {
     // next (for closer) character is not an ASCII alphanumeric.
     // We use the same predicate for both because we re-enter
     // match_delimiter at each scan position.
-    let prev = if i == 0 { None } else { bytes.get(i - 1).copied() };
+    let prev = if i == 0 {
+        None
+    } else {
+        bytes.get(i - 1).copied()
+    };
     let next = bytes.get(i + 1).copied();
     !is_word_byte(prev) || !is_word_byte(next)
 }

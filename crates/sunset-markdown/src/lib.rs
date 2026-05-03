@@ -77,7 +77,10 @@ pub fn to_plain(doc: &Document) -> String {
 
 fn write_block(out: &mut String, block: &Block) {
     match block {
-        Block::Paragraph(inlines) | Block::Heading { content: inlines, .. } => {
+        Block::Paragraph(inlines)
+        | Block::Heading {
+            content: inlines, ..
+        } => {
             for il in inlines {
                 write_inline(out, il);
             }
@@ -143,7 +146,9 @@ mod tests {
     fn plain_text_is_one_paragraph() {
         assert_eq!(
             parse("hello"),
-            Document(vec![Block::Paragraph(vec![Inline::Text("hello".to_owned())])])
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "hello".to_owned()
+            )])])
         );
     }
 
@@ -174,7 +179,9 @@ mod tests {
     fn trailing_blank_lines_dont_emit_empty_paragraph() {
         assert_eq!(
             parse("hello\n\n\n"),
-            Document(vec![Block::Paragraph(vec![Inline::Text("hello".to_owned())])])
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "hello".to_owned()
+            )])])
         );
     }
 
@@ -194,7 +201,9 @@ mod tests {
     fn unclosed_bold_degrades_to_literal_text() {
         assert_eq!(
             parse("a **b c"),
-            Document(vec![Block::Paragraph(vec![Inline::Text("a **b c".to_owned())])])
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "a **b c".to_owned()
+            )])])
         );
     }
 
@@ -202,7 +211,9 @@ mod tests {
     fn empty_bold_pair_collapses_to_literal_text() {
         assert_eq!(
             parse("a **** b"),
-            Document(vec![Block::Paragraph(vec![Inline::Text("a **** b".to_owned())])])
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "a **** b".to_owned()
+            )])])
         );
     }
 
@@ -350,7 +361,9 @@ mod tests {
     fn unclosed_backtick_is_literal() {
         assert_eq!(
             parse("a `b c"),
-            Document(vec![Block::Paragraph(vec![Inline::Text("a `b c".to_owned())])])
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "a `b c".to_owned()
+            )])])
         );
     }
 
@@ -512,7 +525,9 @@ mod tests {
         assert_eq!(
             parse("> hello\nworld"),
             Document(vec![
-                Block::Quote(vec![Block::Paragraph(vec![Inline::Text("hello".to_owned())])]),
+                Block::Quote(vec![Block::Paragraph(vec![Inline::Text(
+                    "hello".to_owned()
+                )])]),
                 Block::Paragraph(vec![Inline::Text("world".to_owned())]),
             ])
         );
@@ -558,10 +573,12 @@ mod tests {
     fn list_item_can_contain_inline_formatting() {
         assert_eq!(
             parse("- **bold** item"),
-            Document(vec![Block::UnorderedList(vec![vec![Block::Paragraph(vec![
-                Inline::Bold(vec![Inline::Text("bold".to_owned())]),
-                Inline::Text(" item".to_owned()),
-            ])]])])
+            Document(vec![Block::UnorderedList(vec![vec![Block::Paragraph(
+                vec![
+                    Inline::Bold(vec![Inline::Text("bold".to_owned())]),
+                    Inline::Text(" item".to_owned()),
+                ]
+            )]])])
         );
     }
 
@@ -659,7 +676,10 @@ mod tests {
         // Every character in `to_plain(parse(s))` is also in `s`. We can't
         // assert byte equality, but we can assert the output isn't longer.
         for input in &["hi", "**bold**", "[a](https://x.com)", "# title"] {
-            assert!(to_plain(&parse(input)).len() <= input.len(), "input: {input:?}");
+            assert!(
+                to_plain(&parse(input)).len() <= input.len(),
+                "input: {input:?}"
+            );
         }
     }
 
