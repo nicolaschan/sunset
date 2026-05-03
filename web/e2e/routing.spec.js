@@ -115,15 +115,18 @@ test.describe("landing + routing", () => {
     await page.getByTestId("rooms-search").press("Enter");
     await expect(page).toHaveURL(/#design-crit$/);
 
-    // Delete the active room (design-crit). The rail's per-row delete
-    // button is hidden until hover; force the click since the room-row
-    // wrappers carry the hover-only styling.
+    // Delete the active room (design-crit). On desktop the per-row
+    // delete button is `opacity: 0` until the row is `:hover`'d, so we
+    // hover the row first to reveal the button; that's what a real user
+    // does and it lets Playwright's normal actionability check work.
+    // On touch (mobile-chrome) `@media (hover: none)` keeps the button
+    // visible always, so the explicit hover is a no-op there.
     await openRoomsDrawer(page, testInfo);
-    await page
+    const designCritRow = page
       .getByTestId("rooms-rail")
-      .locator('.room-row', { hasText: "design-crit" })
-      .getByTestId("room-delete")
-      .click({ force: true });
+      .locator(".room-row", { hasText: "design-crit" });
+    await designCritRow.hover();
+    await designCritRow.getByTestId("room-delete").click();
 
     // We should now be looking at dusk-collective (the only remaining room).
     await expect(page).toHaveURL(/#dusk-collective$/);
@@ -142,11 +145,11 @@ test.describe("landing + routing", () => {
     await openRoomsDrawer(page, testInfo);
 
     // Delete the last remaining room → back to landing.
-    await page
+    const duskRow = page
       .getByTestId("rooms-rail")
-      .locator('.room-row', { hasText: "dusk-collective" })
-      .getByTestId("room-delete")
-      .click({ force: true });
+      .locator(".room-row", { hasText: "dusk-collective" });
+    await duskRow.hover();
+    await duskRow.getByTestId("room-delete").click();
 
     await expect(page.getByTestId("landing-view")).toBeVisible();
   });

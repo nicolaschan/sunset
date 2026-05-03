@@ -90,8 +90,8 @@ async function setupPage(browser) {
 test.setTimeout(30_000);
 
 test("two browsers see each other in the member rail", async ({ browser }) => {
-  const { page: a } = await setupPage(browser);
-  const { page: b } = await setupPage(browser);
+  const { ctx: ctxA, page: a } = await setupPage(browser);
+  const { ctx: ctxB, page: b } = await setupPage(browser);
   await a.goto(fastUrl(relayAddress));
   await b.goto(fastUrl(relayAddress));
   await expect(a.getByText("sunset", { exact: true })).toBeVisible({ timeout: 15_000 });
@@ -152,11 +152,14 @@ test("two browsers see each other in the member rail", async ({ browser }) => {
     aPub,
     { timeout: 15_000 },
   );
+
+  await ctxA.close();
+  await ctxB.close();
 });
 
 test("connect_direct flips connection_mode to direct", async ({ browser }) => {
-  const { page: a } = await setupPage(browser);
-  const { page: b } = await setupPage(browser);
+  const { ctx: ctxA, page: a } = await setupPage(browser);
+  const { ctx: ctxB, page: b } = await setupPage(browser);
   await a.goto(fastUrl(relayAddress));
   await b.goto(fastUrl(relayAddress));
   await expect(a.getByText("sunset", { exact: true })).toBeVisible({ timeout: 15_000 });
@@ -197,11 +200,14 @@ test("connect_direct flips connection_mode to direct", async ({ browser }) => {
     bPub,
     { timeout: 10_000 },
   );
+
+  await ctxA.close();
+  await ctxB.close();
 });
 
 test("closing one tab makes the other side see away then drop", async ({ browser }) => {
   const { ctx: ctxA, page: a } = await setupPage(browser);
-  const { page: b } = await setupPage(browser);
+  const { ctx: ctxB, page: b } = await setupPage(browser);
   await a.goto(fastUrl(relayAddress));
   await b.goto(fastUrl(relayAddress));
   await expect(a.getByText("sunset", { exact: true })).toBeVisible({ timeout: 15_000 });
@@ -252,4 +258,7 @@ test("closing one tab makes the other side see away then drop", async ({ browser
     aPub,
     { timeout: 5_000 },
   );
+
+  // ctxA was already closed above (that's the trigger for B's "drop" view).
+  await ctxB.close();
 });
