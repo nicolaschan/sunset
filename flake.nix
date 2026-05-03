@@ -59,7 +59,8 @@
           }
           else null;
 
-        sunsetWebWasmPkg = pkgs.rustPlatform.buildRustPackage {
+        # Helper to build sunset-web-wasm with an optional feature set.
+        mkSunsetWebWasmPkg = { features ? [] }: pkgs.rustPlatform.buildRustPackage {
           pname = "sunset-web-wasm";
           version = "0.1.0";
           src = ./.;
@@ -76,7 +77,8 @@
               --release \
               --target wasm32-unknown-unknown \
               -p sunset-web-wasm \
-              --lib
+              --lib \
+              ${pkgs.lib.optionalString (features != []) ("--features " + builtins.concatStringsSep "," features)}
             runHook postBuild
           '';
           installPhase = ''
@@ -88,6 +90,32 @@
             mkdir -p $out
             cp wasm-out/sunset_web_wasm.js $out/
             cp wasm-out/sunset_web_wasm_bg.wasm $out/
+            runHook postInstall
+          '';
+        };
+
+        sunsetWebWasmPkg = mkSunsetWebWasmPkg {};
+
+        # WASM bundle compiled with the test-hooks feature, enabling
+        # voice_install_frame_recorder / voice_recorded_frames / voice_inject_pcm
+        # / voice_active_peers / voice_synth_pcm for Playwright assertions.
+        sunsetWebWasmTestHooksPkg = mkSunsetWebWasmPkg { features = [ "test-hooks" ]; };
+
+        # Minimal static dist used by the voice protocol e2e tests.
+        # Contains only the harness HTML, test-hooks WASM bundle, and
+        # audio worklets. No full Gleam build needed.
+        webVoiceTestDist = pkgs.stdenv.mkDerivation {
+          name = "sunset-web-voice-test-dist";
+          src = ./web;
+          dontBuild = true;
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/audio
+            cp ${./web/voice-e2e-test.html} $out/voice-e2e-test.html
+            cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm.js $out/sunset_web_wasm.js
+            cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm_bg.wasm $out/sunset_web_wasm_bg.wasm
+            cp audio/voice-capture-worklet.js $out/audio/
+            cp audio/voice-playback-worklet.js $out/audio/
             runHook postInstall
           '';
         };
@@ -144,6 +172,28 @@
             runHook postInstall
           '';
         };
+
+        # Voice protocol e2e test runner. Uses the test-hooks WASM build
+        # so Playwright can exercise voice_inject_pcm / voice_recorded_frames.
+        webTestRunnerVoice = pkgs.writeShellScriptBin "sunset-web-test-voice" ''
+          set -euo pipefail
+
+          export PATH="${pkgs.lib.makeBinPath [
+            pkgs.nodejs
+            pkgs.static-web-server
+            sunsetRelayPkg
+          ]}:$PATH"
+          export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
+          export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
+          export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+          export SUNSET_WEB_DIST="${webVoiceTestDist}"
+
+          cd "$(${pkgs.git}/bin/git rev-parse --show-toplevel)/web"
+          rm -f node_modules
+          ln -sfn "${webNodeModules}/node_modules" node_modules
+
+          exec node_modules/.bin/playwright test "$@"
+        '';
 
         # End-to-end test runner. Builds node_modules + the prod dist, then
         # invokes Playwright with browsers from the Nix store. No network.
@@ -202,12 +252,22 @@
             export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
             export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
             export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+            # Default SUNSET_WEB_DIST to the voice-test dist (test-hooks WASM +
+            # harness HTML + audio worklets). This lets `npx playwright test`
+            # run voice_protocol.spec.js from the dev shell without a separate
+            # `nix run .#web-test-voice` invocation. Override with the full
+            # prod dist when running the entire test suite via `nix run .#web-test`.
+            export SUNSET_WEB_DIST="''${SUNSET_WEB_DIST:-${webVoiceTestDist}}"
+            # Make sunset-relay available in the dev shell for Playwright tests.
+            export PATH="${pkgs.lib.makeBinPath [ sunsetRelayPkg ]}:$PATH"
           '';
         };
 
         packages = {
           sunset-relay = sunsetRelayPkg;
           sunset-web-wasm = sunsetWebWasmPkg;
+          sunset-web-wasm-test-hooks = sunsetWebWasmTestHooksPkg;
+          web-voice-test-dist = webVoiceTestDist;
 
           sunset-relay-docker = pkgs.dockerTools.buildLayeredImage {
             name = "sunset-relay";
@@ -277,6 +337,11 @@
             type = "app";
             program = "${webTestRunner}/bin/sunset-web-test";
             meta.description = "Run the Playwright e2e suite against the prod build";
+          };
+          web-test-voice = {
+            type = "app";
+            program = "${webTestRunnerVoice}/bin/sunset-web-test-voice";
+            meta.description = "Run voice protocol e2e tests (test-hooks WASM build)";
           };
         };
       });
