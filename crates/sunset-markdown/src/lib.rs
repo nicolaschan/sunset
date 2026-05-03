@@ -331,11 +331,64 @@ mod tests {
 
     #[test]
     fn unbalanced_brackets_are_literal() {
+        // The `[docs(` part has no matching `](`, so it stays as literal text.
+        // The bare `https://` URL inside it still autolinks; `)` is trailing
+        // punctuation and gets excluded from the URL.
         assert_eq!(
             parse("see [docs(https://example.com) here"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
-                "see [docs(https://example.com) here".to_owned()
-            )])])
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("see [docs(".to_owned()),
+                Inline::Link {
+                    label: vec![Inline::Text("https://example.com".to_owned())],
+                    url: "https://example.com".to_owned(),
+                    autolink: true,
+                },
+                Inline::Text(") here".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn autolink_https() {
+        assert_eq!(
+            parse("see https://example.com here"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("see ".to_owned()),
+                Inline::Link {
+                    label: vec![Inline::Text("https://example.com".to_owned())],
+                    url: "https://example.com".to_owned(),
+                    autolink: true,
+                },
+                Inline::Text(" here".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn autolink_excludes_trailing_punctuation() {
+        assert_eq!(
+            parse("visit https://example.com."),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("visit ".to_owned()),
+                Inline::Link {
+                    label: vec![Inline::Text("https://example.com".to_owned())],
+                    url: "https://example.com".to_owned(),
+                    autolink: true,
+                },
+                Inline::Text(".".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn autolink_at_start() {
+        assert_eq!(
+            parse("https://example.com"),
+            Document(vec![Block::Paragraph(vec![Inline::Link {
+                label: vec![Inline::Text("https://example.com".to_owned())],
+                url: "https://example.com".to_owned(),
+                autolink: true,
+            }])])
         );
     }
 }

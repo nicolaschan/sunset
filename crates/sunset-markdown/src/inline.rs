@@ -53,6 +53,21 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
             }
         }
 
+        if let Some(url_end) = match_autolink(bytes, i) {
+            if text_start < i {
+                out.push(Inline::Text(input[text_start..i].to_owned()));
+            }
+            let url = &input[i..url_end];
+            out.push(Inline::Link {
+                label: vec![Inline::Text(url.to_owned())],
+                url: url.to_owned(),
+                autolink: true,
+            });
+            i = url_end;
+            text_start = i;
+            continue;
+        }
+
         if let Some((kind, marker_len)) = match_delimiter(bytes, i) {
             if let Some(close) = find_close(bytes, i + marker_len, kind) {
                 // Flush pending plain text.
@@ -72,6 +87,32 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
         out.push(Inline::Text(input[text_start..].to_owned()));
     }
     out
+}
+
+/// If `bytes[i..]` starts with `http://` or `https://`, returns the
+/// exclusive end index of the URL (after stripping trailing punctuation).
+fn match_autolink(bytes: &[u8], i: usize) -> Option<usize> {
+    let starts = bytes.get(i..i + 7) == Some(b"http://")
+        || bytes.get(i..i + 8) == Some(b"https://");
+    if !starts {
+        return None;
+    }
+    let mut j = i;
+    while j < bytes.len() && is_url_byte(bytes[j]) {
+        j += 1;
+    }
+    while j > i && is_trailing_punct(bytes[j - 1]) {
+        j -= 1;
+    }
+    if j == i { None } else { Some(j) }
+}
+
+fn is_url_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace() && !matches!(b, b'<' | b'>' | b'"' | b'`' | b'|')
+}
+
+fn is_trailing_punct(b: u8) -> bool {
+    matches!(b, b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'}' | b'\'' | b'"')
 }
 
 fn find_byte(bytes: &[u8], target: u8, from: usize) -> Option<usize> {
