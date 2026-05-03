@@ -1982,6 +1982,7 @@ name = "sunset-relay"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "clap",
  "curve25519-dalek",

@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
+axum = { workspace = true }
 bytes.workspace = true
 clap.workspace = true
 curve25519-dalek.workspace = true
@@ -31,7 +32,7 @@ sunset-relay-resolver.workspace = true
 sunset-store.workspace = true
 sunset-store-fs.workspace = true
 sunset-sync.workspace = true
-sunset-sync-ws-native.workspace = true
+sunset-sync-ws-native = { workspace = true, features = ["axum"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "signal", "fs", "sync", "net", "time"] }
 toml.workspace = true
