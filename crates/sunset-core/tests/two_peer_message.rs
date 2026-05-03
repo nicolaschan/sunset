@@ -129,15 +129,8 @@ async fn alice_encrypts_bob_decrypts() {
             // ---- alice composes + inserts a real encrypted+signed message ----
             let body = "hello bob, this is encrypted";
             let sent_at = 1_700_000_000_000u64;
-            let ComposedMessage { entry, block } = compose_message(
-                &alice,
-                &alice_room,
-                0,
-                sent_at,
-                MessageBody::Text(body.to_owned()),
-                &mut OsRng,
-            )
-            .unwrap();
+            let ComposedMessage { entry, block } =
+                compose_message(&alice, &alice_room, 0, sent_at, MessageBody::Text(body.to_owned()), &mut OsRng).unwrap();
             let expected_hash: Hash = block.hash();
 
             alice_store

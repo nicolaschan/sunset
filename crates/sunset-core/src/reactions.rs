@@ -45,7 +45,8 @@ pub struct ReactionEvent {
 }
 
 /// In-memory per-tracker state. `target → emoji → author → entry`.
-pub(crate) type ReactionState = HashMap<Hash, HashMap<String, HashMap<IdentityKey, ReactionEntry>>>;
+pub(crate) type ReactionState =
+    HashMap<Hash, HashMap<String, HashMap<IdentityKey, ReactionEntry>>>;
 
 /// Callback fired with `(target, snapshot)` whenever the snapshot for
 /// `target` changes (per `reactions_signature` debounce).
@@ -337,10 +338,7 @@ mod apply_event_tests {
         );
         assert!(!changed, "stale event must not report a change");
         let snap = derive_snapshot(&state, &target);
-        assert!(
-            snap.get("👍").unwrap().contains(&alice),
-            "stale Remove must not evict"
-        );
+        assert!(snap.get("👍").unwrap().contains(&alice), "stale Remove must not evict");
     }
 
     #[test]

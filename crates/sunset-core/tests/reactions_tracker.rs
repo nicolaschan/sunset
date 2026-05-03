@@ -63,11 +63,7 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
                     break;
                 }
             }
-            assert_eq!(
-                observed.borrow().len(),
-                1,
-                "tracker should fire once for Add"
-            );
+            assert_eq!(observed.borrow().len(), 1, "tracker should fire once for Add");
             let (fired_target, fired_snapshot) = observed.borrow()[0].clone();
             assert_eq!(fired_target, target);
             let alice_set = fired_snapshot.get("👍").unwrap();
@@ -96,17 +92,10 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
                     break;
                 }
             }
-            assert_eq!(
-                observed.borrow().len(),
-                2,
-                "tracker should fire again for Remove"
-            );
+            assert_eq!(observed.borrow().len(), 2, "tracker should fire again for Remove");
             let (_, fired_snapshot_2) = observed.borrow()[1].clone();
             assert!(
-                fired_snapshot_2
-                    .get("👍")
-                    .map(|s| s.is_empty())
-                    .unwrap_or(true),
+                fired_snapshot_2.get("👍").map(|s| s.is_empty()).unwrap_or(true),
                 "Remove should yield an empty snapshot for 👍"
             );
 
@@ -170,11 +159,7 @@ async fn tracker_debounces_duplicate_state() {
             for _ in 0..10 {
                 tokio::task::yield_now().await;
             }
-            assert_eq!(
-                observed.borrow().len(),
-                1,
-                "duplicate insert must not double-fire"
-            );
+            assert_eq!(observed.borrow().len(), 1, "duplicate insert must not double-fire");
         })
         .await;
 }

@@ -147,7 +147,9 @@ pub enum MessageBody {
     /// An acknowledgement that the author of this entry decoded the
     /// referenced `Text` message. The author of the receipt is the
     /// receiver of the original message.
-    Receipt { for_value_hash: sunset_store::Hash },
+    Receipt {
+        for_value_hash: sunset_store::Hash,
+    },
     /// An emoji reaction attached to the referenced message. The
     /// author of the entry is the reactor; `for_value_hash` is the
     /// `value_hash` of the message being reacted to. Per
@@ -195,12 +197,7 @@ mod tests {
         let b = inner_sig_payload_bytes(&fp, 1, 100, &MessageBody::Text("hi".to_owned())); // epoch differs
         let c = inner_sig_payload_bytes(&fp, 0, 101, &MessageBody::Text("hi".to_owned())); // sent_at differs
         let d = inner_sig_payload_bytes(&fp, 0, 100, &MessageBody::Text("hello".to_owned())); // body differs
-        let e = inner_sig_payload_bytes(
-            &RoomFingerprint([2u8; 32]),
-            0,
-            100,
-            &MessageBody::Text("hi".to_owned()),
-        ); // room differs
+        let e = inner_sig_payload_bytes(&RoomFingerprint([2u8; 32]), 0, 100, &MessageBody::Text("hi".to_owned())); // room differs
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);
@@ -243,11 +240,7 @@ mod tests {
         let bytes = postcard::to_stdvec(&body).unwrap();
         // 01 = Receipt variant tag; then 32 raw bytes of the hash.
         assert_eq!(bytes[0], 0x01, "MessageBody::Receipt variant tag drifted");
-        assert_eq!(
-            bytes.len(),
-            1 + 32,
-            "Receipt should encode as tag + 32 bytes"
-        );
+        assert_eq!(bytes.len(), 1 + 32, "Receipt should encode as tag + 32 bytes");
         let hash_hex: String = bytes[1..].iter().map(|b| format!("{b:02x}")).collect();
         let expected_hash: String = h.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hash_hex, expected_hash);
@@ -273,11 +266,7 @@ mod tests {
         );
         assert_eq!(bytes[1 + 32], 0x04, "emoji length varint drifted");
         assert_eq!(&bytes[1 + 32 + 1..1 + 32 + 1 + 4], "👍".as_bytes());
-        assert_eq!(
-            bytes[1 + 32 + 1 + 4],
-            0x00,
-            "ReactionAction::Add tag drifted"
-        );
+        assert_eq!(bytes[1 + 32 + 1 + 4], 0x00, "ReactionAction::Add tag drifted");
     }
 
     #[test]
@@ -290,11 +279,7 @@ mod tests {
         };
         let bytes = postcard::to_stdvec(&body).unwrap();
         assert_eq!(bytes[0], 0x02);
-        assert_eq!(
-            *bytes.last().unwrap(),
-            0x01,
-            "ReactionAction::Remove tag drifted"
-        );
+        assert_eq!(*bytes.last().unwrap(), 0x01, "ReactionAction::Remove tag drifted");
     }
 
     #[test]

@@ -30,8 +30,8 @@ mod tests {
     use sunset_store::VerifyingKey;
 
     use crate::crypto::constants::test_fast_params;
-    use crate::crypto::envelope::MessageBody;
     use crate::identity::Identity;
+    use crate::crypto::envelope::MessageBody;
     use crate::message::compose_message;
 
     use super::*;
@@ -44,15 +44,7 @@ mod tests {
     fn matches_a_composed_message_in_the_same_room() {
         let id = Identity::generate(&mut OsRng);
         let room = general();
-        let composed = compose_message(
-            &id,
-            &room,
-            0,
-            1,
-            MessageBody::Text("x".to_owned()),
-            &mut OsRng,
-        )
-        .unwrap();
+        let composed = compose_message(&id, &room, 0, 1, MessageBody::Text("x".to_owned()), &mut OsRng).unwrap();
 
         let filter = room_messages_filter(&room);
         assert!(filter.matches(&composed.entry.verifying_key, &composed.entry.name));
@@ -63,15 +55,7 @@ mod tests {
         let id = Identity::generate(&mut OsRng);
         let alice_room = general();
         let other_room = Room::open_with_params("other", &test_fast_params()).unwrap();
-        let composed = compose_message(
-            &id,
-            &alice_room,
-            0,
-            1,
-            MessageBody::Text("x".to_owned()),
-            &mut OsRng,
-        )
-        .unwrap();
+        let composed = compose_message(&id, &alice_room, 0, 1, MessageBody::Text("x".to_owned()), &mut OsRng).unwrap();
 
         let filter = room_messages_filter(&other_room);
         assert!(!filter.matches(&composed.entry.verifying_key, &composed.entry.name));
