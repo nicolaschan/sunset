@@ -227,6 +227,8 @@ Per peer, the `auto_connect` task observes membership_liveness events and runs t
 
 `Connected` is a logical state — the FSM doesn't actually verify the WebRTC connection is open. `PeerSupervisor` handles that (and its own retry). The FSM only tracks "have I asked for a connection to this peer yet, since the last time I considered them gone." That's enough: `Dialer::ensure_direct` is idempotent, `PeerSupervisor` retries with backoff, and if a peer is unreachable they stay "Dialing" forever (which is fine — their `talking` light just never lights up, which honestly reflects the situation).
 
+**Revision (Phase 1.5):** Auto-connect bootstraps off a separate durable "voice-presence" signal published on `voice-presence/<room_fp>/<sender>` with TTL ~6 s and refresh ~2 s. Voice heartbeats are reserved for post-bootstrap `in_call` / `talking` indicators only; they would otherwise fail to propagate over the WebSocket relay (which drops unreliable traffic). The voice-presence publisher is added to `VoiceTasks`. Drop-on-departure still flows from `membership_liveness` Stale via heartbeats over the established WebRTC connection.
+
 ## Jitter buffer
 
 Per peer, single FIFO of decoded PCM frames (`VecDeque<Vec<f32>>`).
