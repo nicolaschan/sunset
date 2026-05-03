@@ -687,3 +687,16 @@ Spec coverage checklist run after writing the plan:
 - **New regression test** (spec §Tests): covered by Task 2.
 - **Workaround removals** (spec §Tests → Workaround removals): covered by Tasks 4 and 5.
 - **Verification matrix** (spec §Tests → Verification matrix): covered by Task 6.
+
+---
+
+## Refactor: direct push → DigestRequest (post-execution amendment)
+
+After initial execution (Tasks 1–6), a design review of PR #21 identified that the direct-push `backfill_peer_for_filter` approach wastes bandwidth in two cases that matter as the project grows:
+
+1. **Browser persistence (IndexedDB, landing soon):** A reconnecting browser already has matching entries from a prior session; direct push re-sends them all (idempotent via LWW, but wasteful on the wire).
+2. **Federation:** Relays with overlapping subscriptions would re-push entries the peer already received from other federation sources.
+
+The `backfill_peer_for_filter` helper was replaced with a `SyncMessage::DigestRequest` wire variant (added at index 10, end of enum, preserving all existing variant indices and frozen wire-format tests). On registry add/change, the engine sends `DigestRequest { filter, range: All }` to the peer. The peer's new `handle_digest_request` calls the existing `send_filter_digest` back, and the existing `handle_digest_exchange` path computes the diff and pushes only missing entries.
+
+The regression test contract is unchanged — assertion is "bob receives E within bounded time." Only the mechanism narrows: 3-message exchange (DigestRequest → DigestExchange → EventDelivery) instead of 1-message direct push, but bandwidth scales with the diff rather than the full match set. Spec updated to reflect the new mechanism.

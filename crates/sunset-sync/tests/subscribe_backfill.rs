@@ -7,22 +7,23 @@
 //! no `SUBSCRIBE_NAME` in bob's own store at PeerHello time, so the
 //! `fan_out_digests_to_peer` own-filter loop is empty).
 //!
-//! Without subscribe-triggered backfill, alice's `handle_local_store_event`
-//! fires once for E (when E was written, before bob was in the registry),
-//! and once for the `SUBSCRIBE_NAME` (registry updated, but no re-eval
-//! of E). E is stranded in alice's store until anti-entropy — which is
-//! also disabled here because neither side has any `own_published_filters`.
+//! Without the engine fix, alice's `handle_local_store_event` fires
+//! once for E (when E was written, before bob was in the registry),
+//! and once for the `SUBSCRIBE_NAME` (registry updated, but no
+//! re-trigger for E). E is stranded in alice's store until anti-entropy.
 //!
-//! With the engine fix, the registry-update is itself a forwarding
-//! trigger and alice pushes E to bob.
+//! With the engine fix, the registry-update fires a `DigestRequest`
+//! to bob; bob responds with `DigestExchange` (empty bloom over F);
+//! alice's `handle_digest_exchange` computes the diff (just E) and
+//! pushes the entry to bob. Bandwidth-efficient via bloom dedup —
+//! bob's bloom would naturally exclude any matching entries he
+//! already has, so the diff sent on the wire is exactly what bob
+//! is missing.
 //!
 //! Note: the test injects bob's `SUBSCRIBE_NAME` directly into alice's
 //! store via `Store::insert` rather than over the wire. The engine's
 //! response to a `SUBSCRIBE_NAME` landing in its local store is
-//! identical regardless of how it landed (network EventDelivery vs.
-//! direct store insert from a federated source vs. test injection),
-//! so this is a legitimate integration-level driver for the
-//! `handle_local_store_event` path under test.
+//! identical regardless of how it landed.
 
 use std::rc::Rc;
 use std::sync::Arc;

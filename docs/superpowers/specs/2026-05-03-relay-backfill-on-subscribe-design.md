@@ -32,11 +32,16 @@ In `handle_local_store_event`, after `parse_subscription_entry` succeeds and the
 1. Determine whether the registry insert was a *new* peer or a *changed* filter for an existing peer. If the filter is unchanged (TTL refresh of the same filter), no backfill is triggered.
 2. Skip if `peer_vk == self.local_peer` (a self-published `SUBSCRIBE_NAME`, e.g., the relay's broad subscription at startup).
 3. Skip if the peer is not currently connected (no transport to deliver over; registry insert still happens, and a future `PeerHello` will fire `fan_out_digests_to_peer`).
-4. Otherwise, walk the local store for entries matching `new_filter` and push them to the peer as `EventDelivery` messages.
+4. Otherwise, send a `SyncMessage::DigestRequest { filter, range: All }` to the peer.
 
-The mechanism is a direct push, not a `DigestExchange`. `DigestExchange` as currently defined carries the *sender's* bloom and prompts the *receiver* to push back what the receiver has that the sender doesn't (see `handle_digest_exchange` at engine.rs:715–749). That direction works for `publish_subscription`'s catch-up — the new subscriber sends the digest with an empty bloom and the relay responds with everything matching — but it's the wrong direction for backfill, where the local engine already holds entries the peer is missing. A direct `EventDelivery` walk is the symmetric counterpart of what `handle_local_store_event`'s push branch does on a fresh write, just applied to already-stored entries.
+The peer's `handle_peer_message` receives the `DigestRequest` and calls `send_filter_digest` back at the requesting engine, which sends a `DigestExchange` carrying the peer's bloom over `filter`. The requesting engine's existing `handle_digest_exchange` then computes the diff (entries we have that the peer doesn't — as evidenced by the peer's bloom) and pushes only those entries as `EventDelivery`.
 
-The walk uses the existing `Store::iter(filter)` API — the same primitive `build_digest` and `entries_missing_from_remote` already use. No new message variants, no new wire types — one new private helper on `SyncEngine` (the push loop) and one new call site in `handle_local_store_event`.
+Total: 3 messages — `DigestRequest`, `DigestExchange`, `EventDelivery`. Bandwidth is proportional to the diff rather than the full match set, which matters in two cases:
+
+- **Browser persistence (IndexedDB, landing soon):** A reconnecting browser already has matching entries from a prior session. A direct push would re-send all of them (idempotent at the receiver via LWW, but wasteful on the wire). With digest-based dedup, the peer's bloom naturally excludes entries it already holds, and the wire diff is exactly what's missing.
+- **Federation:** Relays with overlapping subscriptions would re-push entries the peer already received from other federation sources. Digest dedup handles this transparently.
+
+A new wire variant `SyncMessage::DigestRequest { filter: Filter, range: DigestRange }` is added at the end of the enum (index 10, after `Pong` at index 9). Adding at the end preserves all existing variant indices — the `Ping`/`Pong` frozen wire-format tests are unaffected. The variant is carried over the reliable channel.
 
 ### Registry change-detection
 
@@ -61,15 +66,15 @@ Registry update and digest dispatch happen on the same task as existing event ha
 
 ### New regression test
 
-Added alongside `crates/sunset-sync/tests/two_peer_sync.rs`. Drives the race deterministically:
+Added at `crates/sunset-sync/tests/subscribe_backfill.rs`. Drives the race deterministically:
 
-1. Two peers `A`, `B` connected to a forwarder (or directly — same code path).
-2. `A` publishes entry `E` *before* `B` publishes `SUBSCRIBE_NAME`.
-3. Block until `E` has been observed at the forwarder's store (deterministic via store cursor — not a sleep).
-4. `B` then publishes `SUBSCRIBE_NAME` for a filter matching `E`.
-5. Assert `B` receives `E` within a short bound — without polling on `knows_peer_subscription` or any other engine-internal state.
+1. Alice connects to Bob. Alice writes entry E authored by a third party (key `chat`, name `k`) before Bob's subscription is in the registry.
+2. Bob's `SUBSCRIBE_NAME` entry is injected directly into Alice's store (simulating any delivery path — network, federation, or test injection; the engine treats all identically).
+3. Assert Bob receives E within a 2-second bound, without any polling on engine-internal state (`knows_peer_subscription` or equivalent).
 
-Litmus check from CLAUDE.md's debugging discipline: a real API user calling `publish_subscription` and expecting subsequent matching entries to arrive is exactly what the contract should guarantee, regardless of write ordering relative to peers' subscriptions.
+The assertion is: **Bob receives E**. The underlying mechanism (as of the refactor to digest-based backfill) is: Alice sends `DigestRequest` to Bob → Bob responds with `DigestExchange` (empty bloom over the filter) → Alice's `handle_digest_exchange` computes diff = {E} → Alice sends `EventDelivery({E})` to Bob. The test validates the user-observable contract; the mechanism is an implementation detail.
+
+Litmus check from CLAUDE.md's debugging discipline: a real API user whose peer's subscription just landed in the store expects outstanding matching entries to arrive — no internal-state polling, no anti-entropy wait.
 
 ### Workaround removals (acceptance criteria)
 

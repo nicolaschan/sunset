@@ -647,49 +647,13 @@ where
         }
     }
 
-    /// Push every entry in our local store matching `filter` to `to` as a
-    /// single `EventDelivery`. Called from `handle_local_store_event` when
-    /// the registry first learns (or changes) `to`'s filter, to deliver
-    /// already-stored entries that pre-date the registry update.
-    ///
-    /// Skipped silently if the peer is not currently connected (no
-    /// outbound channel) — a future PeerHello will fan out digests, and
-    /// anti-entropy ticks bridge the rest.
-    async fn backfill_peer_for_filter(&self, to: &PeerId, filter: &Filter) {
-        let mut iter = match self.store.iter(filter.clone()).await {
-            Ok(it) => it,
-            Err(e) => {
-                tracing::warn!(error = %e, "backfill: store iter failed");
-                return;
-            }
-        };
-        let mut entries = Vec::new();
-        let mut blobs = Vec::new();
-        while let Some(item) = iter.next().await {
-            let entry = match item {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %e, "backfill: store iter yielded error");
-                    continue;
-                }
-            };
-            match self.store.get_content(&entry.value_hash).await {
-                Ok(Some(blob)) => blobs.push(blob),
-                Ok(None) => {} // dangling ref — receiver will issue BlobRequest
-                Err(e) => {
-                    tracing::warn!(error = %e, "backfill: get_content failed");
-                }
-            }
-            entries.push(entry);
-        }
-        if entries.is_empty() {
-            return;
-        }
-        let msg = SyncMessage::EventDelivery { entries, blobs };
-        let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(to) {
-            let _ = po.tx.send(msg);
-        }
+    /// Handle an inbound `DigestRequest`: the peer is asking us to send
+    /// our digest over `filter` so it can compute the diff and push
+    /// any entries we are missing. Responds by firing `send_filter_digest`
+    /// back at the requesting peer, which drives the existing
+    /// `handle_digest_exchange` path on their side.
+    async fn handle_digest_request(&self, from: PeerId, filter: Filter, _range: DigestRange) {
+        self.send_filter_digest(&from, &filter).await;
     }
 
     /// Send a `DigestExchange` over `filter` to `to`. Builds a Bloom
@@ -754,6 +718,9 @@ where
             }
             SyncMessage::Ping { .. } | SyncMessage::Pong { .. } => {
                 // Handled by the per-peer task's liveness loop; engine ignores.
+            }
+            SyncMessage::DigestRequest { filter, range } => {
+                self.handle_digest_request(from, filter, range).await;
             }
         }
     }
@@ -908,7 +875,21 @@ where
                     let filter_changed = prev.as_ref() != Some(&filter);
                     let is_self = peer_vk == self.local_peer.0;
                     if filter_changed && !is_self {
-                        self.backfill_peer_for_filter(&peer_id, &filter).await;
+                        // Send a DigestRequest to the peer so they respond
+                        // with a DigestExchange (their bloom over `filter`).
+                        // The existing handle_digest_exchange path then
+                        // computes the diff and pushes only the entries the
+                        // peer is missing — bandwidth-efficient via bloom
+                        // dedup, safe when the peer already has overlapping
+                        // state (browser persistence, federated relays).
+                        let msg = SyncMessage::DigestRequest {
+                            filter: filter.clone(),
+                            range: DigestRange::All,
+                        };
+                        let state = self.state.lock().await;
+                        if let Some(po) = state.peer_outbound.get(&peer_id) {
+                            let _ = po.tx.send(msg);
+                        }
                     }
                 }
             }
