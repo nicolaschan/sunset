@@ -342,16 +342,12 @@ impl Client {
         // both Text and Receipt variants.
     }
 
-    /// Initialise the voice subsystem. Spawns an in-process loopback
-    /// decode loop; `output_handler` is invoked with a Float32Array
-    /// of `FRAME_SAMPLES` samples (mono PCM at `SAMPLE_RATE`) for each
-    /// decoded 20 ms frame. Must be called before `voice_input`.
-    ///
-    /// Implementation: `sunset-voice` `VoiceEncoder` + `VoiceDecoder`
-    /// (currently a passthrough; a real codec slots in there without
-    /// changing this method's signature).
-    pub fn voice_start(&self, output_handler: &js_sys::Function) -> Result<(), JsError> {
-        crate::voice::voice_start(&self.voice, output_handler)
+    /// Voice FFI is being migrated from loopback to network mode. The
+    /// real signature lands in Task 6 of the C2b plan.
+    pub fn voice_start(&self, _output_handler: &js_sys::Function) -> Result<(), JsError> {
+        Err(JsError::new(
+            "voice FFI being migrated to network mode (C2b)",
+        ))
     }
 
     /// Stop the voice subsystem and release its resources.
@@ -359,11 +355,12 @@ impl Client {
         crate::voice::voice_stop(&self.voice)
     }
 
-    /// Submit one 20 ms frame of mono PCM (Float32Array of length
-    /// `FRAME_SAMPLES` at `SAMPLE_RATE`) for encoding + loopback
-    /// delivery to the output handler.
-    pub fn voice_input(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
-        crate::voice::voice_input(&self.voice, pcm)
+    /// Voice FFI is being migrated from loopback to network mode. The
+    /// real signature lands in Task 6 of the C2b plan.
+    pub fn voice_input(&self, _pcm: &js_sys::Float32Array) -> Result<(), JsError> {
+        Err(JsError::new(
+            "voice FFI being migrated to network mode (C2b)",
+        ))
     }
 
     fn spawn_message_subscription(&self) {
