@@ -303,8 +303,8 @@ impl<S: Store + 'static> Signaler for RelaySignaler<S> {
     }
 }
 
-use std::cell::RefCell;
 use crate::crypto::room::RoomFingerprint;
+use std::cell::RefCell;
 
 /// Routes signaling for a `WebRtcRawTransport` across N open rooms.
 /// Holds a per-room `RelaySignaler` for each open room. `send` picks any
@@ -380,9 +380,8 @@ impl Signaler for MultiRoomSignaler {
         // their recv()s + the register_notify. If a new signaler
         // registers, re-snapshot.
         loop {
-            let signalers: Vec<Rc<dyn Signaler>> = {
-                self.by_room.borrow().values().cloned().collect()
-            };
+            let signalers: Vec<Rc<dyn Signaler>> =
+                { self.by_room.borrow().values().cloned().collect() };
             if signalers.is_empty() {
                 // No signalers — wait for a registration.
                 self.register_notify.notified().await;
@@ -413,8 +412,8 @@ impl Signaler for MultiRoomSignaler {
 #[cfg(test)]
 mod multi_room_tests {
     use super::*;
-    use crate::Identity;
     use crate::Ed25519Verifier;
+    use crate::Identity;
     use crate::Room;
     use crate::crypto::constants::test_fast_params;
     use std::sync::Arc;
@@ -431,73 +430,82 @@ mod multi_room_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn register_inserts_and_unregister_removes() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let dispatcher = MultiRoomSignaler::new();
-            let id = ident(1);
-            let st = store();
-            let room = Room::open_with_params("alpha", &test_fast_params())
-                .expect("Room::open_with_params");
-            let fp = room.fingerprint();
-            let signaler = RelaySignaler::new(id, fp.to_hex(), &st);
+        local
+            .run_until(async {
+                let dispatcher = MultiRoomSignaler::new();
+                let id = ident(1);
+                let st = store();
+                let room = Room::open_with_params("alpha", &test_fast_params())
+                    .expect("Room::open_with_params");
+                let fp = room.fingerprint();
+                let signaler = RelaySignaler::new(id, fp.to_hex(), &st);
 
-            assert_eq!(dispatcher.len(), 0);
-            assert!(!dispatcher.contains(&fp));
+                assert_eq!(dispatcher.len(), 0);
+                assert!(!dispatcher.contains(&fp));
 
-            dispatcher.register(fp, signaler);
-            assert_eq!(dispatcher.len(), 1);
-            assert!(dispatcher.contains(&fp));
+                dispatcher.register(fp, signaler);
+                assert_eq!(dispatcher.len(), 1);
+                assert!(dispatcher.contains(&fp));
 
-            dispatcher.unregister(&fp);
-            assert_eq!(dispatcher.len(), 0);
-            assert!(!dispatcher.contains(&fp));
-        }).await;
+                dispatcher.unregister(&fp);
+                assert_eq!(dispatcher.len(), 0);
+                assert!(!dispatcher.contains(&fp));
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn send_routes_to_registered_signaler_and_reaches_via_recv() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            // Two peers (Alice, Bob) sharing one room. Each builds a
-            // MultiRoomSignaler with one entry. Alice sends to Bob; Bob
-            // recv's the message.
-            let alice_id = ident(1);
-            let bob_id = ident(2);
-            let alice_pk = PeerId(alice_id.store_verifying_key());
-            let bob_pk = PeerId(bob_id.store_verifying_key());
+        local
+            .run_until(async {
+                // Two peers (Alice, Bob) sharing one room. Each builds a
+                // MultiRoomSignaler with one entry. Alice sends to Bob; Bob
+                // recv's the message.
+                let alice_id = ident(1);
+                let bob_id = ident(2);
+                let alice_pk = PeerId(alice_id.store_verifying_key());
+                let bob_pk = PeerId(bob_id.store_verifying_key());
 
-            // Shared store, simulating a fully-replicated relay so both
-            // signalers see the same entries.
-            let st = store();
-            let room = Room::open_with_params("alpha", &test_fast_params()).expect("Room::open");
-            let fp = room.fingerprint();
+                // Shared store, simulating a fully-replicated relay so both
+                // signalers see the same entries.
+                let st = store();
+                let room =
+                    Room::open_with_params("alpha", &test_fast_params()).expect("Room::open");
+                let fp = room.fingerprint();
 
-            let alice_signaler = RelaySignaler::new(alice_id, fp.to_hex(), &st);
-            let bob_signaler = RelaySignaler::new(bob_id, fp.to_hex(), &st);
+                let alice_signaler = RelaySignaler::new(alice_id, fp.to_hex(), &st);
+                let bob_signaler = RelaySignaler::new(bob_id, fp.to_hex(), &st);
 
-            let alice_dispatcher = MultiRoomSignaler::new();
-            alice_dispatcher.register(fp, alice_signaler);
-            let bob_dispatcher = MultiRoomSignaler::new();
-            bob_dispatcher.register(fp, bob_signaler);
+                let alice_dispatcher = MultiRoomSignaler::new();
+                alice_dispatcher.register(fp, alice_signaler);
+                let bob_dispatcher = MultiRoomSignaler::new();
+                bob_dispatcher.register(fp, bob_signaler);
 
-            let payload = bytes::Bytes::from_static(b"hello-bob");
-            alice_dispatcher.send(SignalMessage {
-                from: alice_pk.clone(),
-                to: bob_pk.clone(),
-                seq: 0,
-                payload: payload.clone(),
-            }).await.expect("alice.send");
+                let payload = bytes::Bytes::from_static(b"hello-bob");
+                alice_dispatcher
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: payload.clone(),
+                    })
+                    .await
+                    .expect("alice.send");
 
-            let received = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                bob_dispatcher.recv(),
-            ).await.expect("recv timed out").expect("recv error");
+                let received =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), bob_dispatcher.recv())
+                        .await
+                        .expect("recv timed out")
+                        .expect("recv error");
 
-            // The payload that arrives is decrypted Noise plaintext, which is
-            // our original `payload` bytes (KK first message carries an attached
-            // payload that's plaintext after decryption).
-            assert_eq!(received.from, alice_pk);
-            assert_eq!(received.to, bob_pk);
-            assert_eq!(received.payload.as_ref(), b"hello-bob");
-        }).await;
+                // The payload that arrives is decrypted Noise plaintext, which is
+                // our original `payload` bytes (KK first message carries an attached
+                // payload that's plaintext after decryption).
+                assert_eq!(received.from, alice_pk);
+                assert_eq!(received.to, bob_pk);
+                assert_eq!(received.payload.as_ref(), b"hello-bob");
+            })
+            .await;
     }
 }

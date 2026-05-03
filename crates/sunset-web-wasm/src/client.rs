@@ -76,17 +76,14 @@ impl Client {
             }
         });
 
-        let supervisor = sunset_sync::PeerSupervisor::new(
-            engine.clone(),
-            sunset_sync::BackoffPolicy::default(),
-        );
+        let supervisor =
+            sunset_sync::PeerSupervisor::new(engine.clone(), sunset_sync::BackoffPolicy::default());
         wasm_bindgen_futures::spawn_local({
             let s = supervisor.clone();
             async move { s.run().await }
         });
 
-        let peer =
-            sunset_core::Peer::new(identity, store, engine, supervisor, dispatcher);
+        let peer = sunset_core::Peer::new(identity, store, engine, supervisor, dispatcher);
 
         Ok(Client {
             inner: peer,
@@ -105,8 +102,7 @@ impl Client {
     }
 
     pub async fn add_relay(&self, url_with_fragment: String) -> Result<(), JsError> {
-        let resolver =
-            sunset_relay_resolver::Resolver::new(crate::resolver_adapter::WebSysFetch);
+        let resolver = sunset_relay_resolver::Resolver::new(crate::resolver_adapter::WebSysFetch);
         let canonical = resolver
             .resolve(&url_with_fragment)
             .await
@@ -119,10 +115,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn open_room(
-        &self,
-        name: String,
-    ) -> Result<crate::room_handle::RoomHandle, JsError> {
+    pub async fn open_room(&self, name: String) -> Result<crate::room_handle::RoomHandle, JsError> {
         let open = self
             .inner
             .open_room(&name)

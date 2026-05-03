@@ -15,9 +15,9 @@ use std::sync::Arc;
 use sunset_store::Store;
 use sunset_sync::{PeerSupervisor, SyncEngine, Transport};
 
+use crate::Identity;
 use crate::crypto::room::RoomFingerprint;
 use crate::signaling::MultiRoomSignaler;
-use crate::Identity;
 
 pub struct Peer<St: Store + 'static, T: Transport + 'static> {
     identity: Identity,
@@ -78,11 +78,7 @@ where
         // Build a fresh per-room signaler and register it with the
         // dispatcher.
         let signaler: Rc<crate::signaling::RelaySignaler<St>> =
-            crate::signaling::RelaySignaler::new(
-                self.identity.clone(),
-                fp.to_hex(),
-                &self.store,
-            );
+            crate::signaling::RelaySignaler::new(self.identity.clone(), fp.to_hex(), &self.store);
         self.rtc_signaler_dispatcher.register(fp, signaler.clone());
 
         // Publish the room subscription.
@@ -133,7 +129,9 @@ where
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
         });
 
-        self.open_rooms.borrow_mut().insert(fp, Rc::downgrade(&state));
+        self.open_rooms
+            .borrow_mut()
+            .insert(fp, Rc::downgrade(&state));
         Ok(OpenRoom { inner: state })
     }
 
@@ -208,163 +206,179 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn add_relay_with_unreachable_addr_sets_status_error() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let peer = helpers::mk_peer(ident(8)).await;
-            assert_eq!(peer.relay_status(), "disconnected");
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(8)).await;
+                assert_eq!(peer.relay_status(), "disconnected");
 
-            // NopTransport's connect() returns Transport("nop") immediately,
-            // so add_relay short-circuits to error and the status flips to
-            // "error".
-            let result = peer.add_relay(sunset_sync::PeerAddr::new(
-                bytes::Bytes::from_static(b"wss://nowhere.invalid")
-            )).await;
-            assert!(result.is_err());
-            assert_eq!(peer.relay_status(), "error");
-        }).await;
+                // NopTransport's connect() returns Transport("nop") immediately,
+                // so add_relay short-circuits to error and the status flips to
+                // "error".
+                let result = peer
+                    .add_relay(sunset_sync::PeerAddr::new(bytes::Bytes::from_static(
+                        b"wss://nowhere.invalid",
+                    )))
+                    .await;
+                assert!(result.is_err());
+                assert_eq!(peer.relay_status(), "error");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn send_text_inserts_a_text_entry() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let peer = helpers::mk_peer(ident(10)).await;
-            let room = peer.open_room("alpha").await.expect("open_room");
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(10)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
 
-            let now_ms = 1_700_000_000_000u64;
-            let value_hash = room
-                .send_text("hello world".to_owned(), now_ms)
-                .await
-                .expect("send_text");
+                let now_ms = 1_700_000_000_000u64;
+                let value_hash = room
+                    .send_text("hello world".to_owned(), now_ms)
+                    .await
+                    .expect("send_text");
 
-            // The store should now hold the content block under that hash.
-            use sunset_store::Store as _;
-            let block = peer
-                .store()
-                .get_content(&value_hash)
-                .await
-                .expect("get_content");
-            assert!(block.is_some(), "content block missing");
-        }).await;
+                // The store should now hold the content block under that hash.
+                use sunset_store::Store as _;
+                let block = peer
+                    .store()
+                    .get_content(&value_hash)
+                    .await
+                    .expect("get_content");
+                assert!(block.is_some(), "content block missing");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn open_room_twice_returns_same_state() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let peer = helpers::mk_peer(ident(9)).await;
-            let r1 = peer.open_room("alpha").await.expect("open_room r1");
-            let r2 = peer.open_room("alpha").await.expect("open_room r2");
-            assert_eq!(r1.fingerprint(), r2.fingerprint());
-            // Internal: both handles share the same Rc<RoomState>.
-            assert!(Rc::ptr_eq(&r1.inner, &r2.inner));
-        }).await;
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(9)).await;
+                let r1 = peer.open_room("alpha").await.expect("open_room r1");
+                let r2 = peer.open_room("alpha").await.expect("open_room r2");
+                assert_eq!(r1.fingerprint(), r2.fingerprint());
+                // Internal: both handles share the same Rc<RoomState>.
+                assert!(Rc::ptr_eq(&r1.inner, &r2.inner));
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn on_message_fires_for_self_send() {
         use std::cell::RefCell;
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let peer = helpers::mk_peer(ident(11)).await;
-            let room = peer.open_room("alpha").await.expect("open_room");
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(11)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
 
-            let received: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
-            let received_clone = received.clone();
-            room.on_message(move |decoded, is_self| {
-                if let crate::MessageBody::Text(t) = &decoded.body {
-                    received_clone.borrow_mut().push((t.clone(), is_self));
+                let received: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+                let received_clone = received.clone();
+                room.on_message(move |decoded, is_self| {
+                    if let crate::MessageBody::Text(t) = &decoded.body {
+                        received_clone.borrow_mut().push((t.clone(), is_self));
+                    }
+                });
+
+                let _ = room
+                    .send_text("hello self".to_owned(), 1_700_000_000_000)
+                    .await
+                    .expect("send_text");
+
+                // Yield repeatedly so the decode loop's spawn_local runs.
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
                 }
-            });
 
-            let _ = room
-                .send_text("hello self".to_owned(), 1_700_000_000_000)
-                .await
-                .expect("send_text");
-
-            // Yield repeatedly so the decode loop's spawn_local runs.
-            for _ in 0..50 {
-                tokio::task::yield_now().await;
-            }
-
-            let got = received.borrow().clone();
-            assert_eq!(got, vec![("hello self".to_owned(), true)]);
-        }).await;
+                let got = received.borrow().clone();
+                assert_eq!(got, vec![("hello self".to_owned(), true)]);
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn on_receipt_fires_for_inserted_receipt() {
-        use std::cell::RefCell;
         use rand_core::SeedableRng;
+        use std::cell::RefCell;
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let peer = helpers::mk_peer(ident(12)).await;
-            let room = peer.open_room("alpha").await.expect("open_room");
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(12)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
 
-            let received: Rc<RefCell<Vec<sunset_store::Hash>>> = Rc::new(RefCell::new(Vec::new()));
-            let received_clone = received.clone();
-            // Register a no-op on_message so the decode loop spawns even
-            // though we only care about receipts here. (The loop spawns on
-            // first on_message OR on_receipt registration — either works.)
-            room.on_message(|_, _| {});
-            room.on_receipt(move |for_hash, _from: &crate::IdentityKey| {
-                received_clone.borrow_mut().push(for_hash);
-            });
+                let received: Rc<RefCell<Vec<sunset_store::Hash>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+                let received_clone = received.clone();
+                // Register a no-op on_message so the decode loop spawns even
+                // though we only care about receipts here. (The loop spawns on
+                // first on_message OR on_receipt registration — either works.)
+                room.on_message(|_, _| {});
+                room.on_receipt(move |for_hash, _from: &crate::IdentityKey| {
+                    received_clone.borrow_mut().push(for_hash);
+                });
 
-            // Compose+insert a Receipt referencing some target hash.
-            let target: sunset_store::Hash = blake3::hash(b"target").into();
-            let mut rng = rand_chacha::ChaCha20Rng::from_seed([42; 32]);
-            let composed = crate::compose_receipt(
-                peer.identity(),
-                &room.inner.room,
-                0,
-                1_700_000_000_000,
-                target,
-                &mut rng,
-            ).expect("compose_receipt");
-            use sunset_store::Store as _;
-            peer.store()
-                .insert(composed.entry, Some(composed.block))
-                .await
-                .expect("insert receipt");
+                // Compose+insert a Receipt referencing some target hash.
+                let target: sunset_store::Hash = blake3::hash(b"target").into();
+                let mut rng = rand_chacha::ChaCha20Rng::from_seed([42; 32]);
+                let composed = crate::compose_receipt(
+                    peer.identity(),
+                    &room.inner.room,
+                    0,
+                    1_700_000_000_000,
+                    target,
+                    &mut rng,
+                )
+                .expect("compose_receipt");
+                use sunset_store::Store as _;
+                peer.store()
+                    .insert(composed.entry, Some(composed.block))
+                    .await
+                    .expect("insert receipt");
 
-            for _ in 0..50 {
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(received.borrow().clone(), vec![target]);
-        }).await;
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(received.borrow().clone(), vec![target]);
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn start_presence_publishes_a_heartbeat_entry() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let peer = helpers::mk_peer(ident(13)).await;
-            let room = peer.open_room("alpha").await.expect("open_room");
-            let my_hex = hex::encode(peer.public_key());
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(13)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                let my_hex = hex::encode(peer.public_key());
 
-            room.start_presence(50, 1000, 100).await;
+                room.start_presence(50, 1000, 100).await;
 
-            // Wait for the publisher's first iteration.
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                // Wait for the publisher's first iteration.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-            use futures::StreamExt;
-            use sunset_store::{Filter, Replay, Store as _};
-            let presence_filter = Filter::NamePrefix(bytes::Bytes::from(format!(
-                "{}/presence/{}",
-                room.fingerprint().to_hex(),
-                my_hex,
-            )));
-            let mut sub = peer
-                .store()
-                .subscribe(presence_filter, Replay::All)
-                .await
-                .expect("subscribe");
-            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), sub.next())
-                .await
-                .expect("no presence entry within 500ms")
-                .expect("subscription closed");
-            assert!(matches!(ev, Ok(sunset_store::Event::Inserted(_))));
-        }).await;
+                use futures::StreamExt;
+                use sunset_store::{Filter, Replay, Store as _};
+                let presence_filter = Filter::NamePrefix(bytes::Bytes::from(format!(
+                    "{}/presence/{}",
+                    room.fingerprint().to_hex(),
+                    my_hex,
+                )));
+                let mut sub = peer
+                    .store()
+                    .subscribe(presence_filter, Replay::All)
+                    .await
+                    .expect("subscribe");
+                let ev = tokio::time::timeout(std::time::Duration::from_millis(500), sub.next())
+                    .await
+                    .expect("no presence entry within 500ms")
+                    .expect("subscription closed");
+                assert!(matches!(ev, Ok(sunset_store::Event::Inserted(_))));
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -394,58 +408,79 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn peer_connection_mode_reads_from_tracker() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let peer = helpers::mk_peer(ident(15)).await;
-            let room = peer.open_room("alpha").await.expect("open_room");
-            let bogus_pk = [9u8; 32];
-            // Without start_presence, peer_kinds is empty → "unknown"
-            assert_eq!(room.peer_connection_mode(bogus_pk), "unknown");
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(15)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                let bogus_pk = [9u8; 32];
+                // Without start_presence, peer_kinds is empty → "unknown"
+                assert_eq!(room.peer_connection_mode(bogus_pk), "unknown");
 
-            // Inject a kind manually (test-only, via the tracker handle).
-            use sunset_sync::{PeerId, TransportKind};
-            let pk = PeerId(sunset_store::VerifyingKey::new(bytes::Bytes::copy_from_slice(&bogus_pk)));
-            room.inner.tracker_handles.peer_kinds.borrow_mut().insert(pk, TransportKind::Secondary);
-            assert_eq!(room.peer_connection_mode(bogus_pk), "direct");
-        }).await;
+                // Inject a kind manually (test-only, via the tracker handle).
+                use sunset_sync::{PeerId, TransportKind};
+                let pk = PeerId(sunset_store::VerifyingKey::new(
+                    bytes::Bytes::copy_from_slice(&bogus_pk),
+                ));
+                room.inner
+                    .tracker_handles
+                    .peer_kinds
+                    .borrow_mut()
+                    .insert(pk, TransportKind::Secondary);
+                assert_eq!(room.peer_connection_mode(bogus_pk), "direct");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn on_members_changed_clears_last_signature() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            let peer = helpers::mk_peer(ident(16)).await;
-            let room = peer.open_room("alpha").await.expect("open_room");
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(16)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
 
-            // Seed last_signature with something non-empty so we can verify
-            // the registration clears it. MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode)>
-            room.inner
-                .tracker_handles
-                .last_signature
-                .borrow_mut()
-                .push((
-                    vec![1, 2, 3],
-                    crate::membership::Presence::Online,
-                    crate::membership::ConnectionMode::Direct,
-                ));
-            assert!(!room.inner.tracker_handles.last_signature.borrow().is_empty());
+                // Seed last_signature with something non-empty so we can verify
+                // the registration clears it. MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode)>
+                room.inner
+                    .tracker_handles
+                    .last_signature
+                    .borrow_mut()
+                    .push((
+                        vec![1, 2, 3],
+                        crate::membership::Presence::Online,
+                        crate::membership::ConnectionMode::Direct,
+                    ));
+                assert!(
+                    !room
+                        .inner
+                        .tracker_handles
+                        .last_signature
+                        .borrow()
+                        .is_empty()
+                );
 
-            room.on_members_changed(|_| {});
-            assert!(
-                room.inner.tracker_handles.last_signature.borrow().is_empty(),
-                "last_signature should be cleared after on_members_changed registration"
-            );
-        }).await;
+                room.on_members_changed(|_| {});
+                assert!(
+                    room.inner
+                        .tracker_handles
+                        .last_signature
+                        .borrow()
+                        .is_empty(),
+                    "last_signature should be cleared after on_members_changed registration"
+                );
+            })
+            .await;
     }
 
     pub(super) mod helpers {
         use super::*;
         use async_trait::async_trait;
         use bytes::Bytes;
+        use sunset_sync::types::PeerAddr;
         use sunset_sync::{
             BackoffPolicy, PeerId, SyncConfig, SyncEngine, Transport, TransportConnection,
             TransportKind,
         };
-        use sunset_sync::types::PeerAddr;
 
         /// Stub transport for unit tests that don't exercise the network.
         pub(crate) struct NopTransport;
@@ -498,9 +533,7 @@ mod tests {
             }
         }
 
-        pub(crate) async fn mk_peer(
-            identity: Identity,
-        ) -> Rc<Peer<MemoryStore, NopTransport>> {
+        pub(crate) async fn mk_peer(identity: Identity) -> Rc<Peer<MemoryStore, NopTransport>> {
             let store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
             let signer: Arc<dyn sunset_sync::Signer> = Arc::new(identity.clone());
             let local_peer = PeerId(identity.store_verifying_key());
