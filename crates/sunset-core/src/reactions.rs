@@ -29,6 +29,9 @@ pub type ReactionSnapshot = HashMap<String, BTreeSet<IdentityKey>>;
 /// identity.
 pub type ReactionSig = Vec<(String, Vec<Vec<u8>>)>;
 
+// ReactionEntry / ReactionState / apply_event / derive_snapshot are consumed
+// by spawn_reaction_tracker (B4). Allow dead_code until that task lands.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReactionEntry {
     pub action: ReactionAction,
@@ -49,6 +52,7 @@ pub struct ReactionEvent {
 }
 
 /// In-memory per-tracker state. `target → emoji → author → entry`.
+#[allow(dead_code)]
 pub(crate) type ReactionState =
     HashMap<Hash, HashMap<String, HashMap<IdentityKey, ReactionEntry>>>;
 
@@ -77,6 +81,7 @@ pub struct ReactionHandles {
 /// might have changed; the caller still does a signature comparison
 /// to decide whether to fire the callback (so `true` is safe to
 /// over-report).
+#[allow(dead_code)]
 pub(crate) fn apply_event(state: &mut ReactionState, event: ReactionEvent) -> bool {
     let by_emoji = state.entry(event.target).or_default();
     let by_author = by_emoji.entry(event.emoji.clone()).or_default();
@@ -106,6 +111,7 @@ pub(crate) fn apply_event(state: &mut ReactionState, event: ReactionEvent) -> bo
 /// Render the current snapshot for one target. Authors whose latest
 /// LWW entry is `Remove` are omitted; emoji entries with no remaining
 /// authors are omitted.
+#[allow(dead_code)]
 pub(crate) fn derive_snapshot(state: &ReactionState, target: &Hash) -> ReactionSnapshot {
     let mut out = ReactionSnapshot::new();
     let Some(by_emoji) = state.get(target) else {

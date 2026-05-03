@@ -133,6 +133,7 @@ pub fn compose_receipt<R: CryptoRngCore + ?Sized>(
 /// the message being reacted to; `emoji` is a free-form unicode string
 /// (caller-validated; we only enforce the 64-byte length cap which
 /// covers all unicode emoji including ZWJ family sequences).
+#[allow(clippy::too_many_arguments)]
 pub fn compose_reaction<R: CryptoRngCore + ?Sized>(
     identity: &Identity,
     room: &Room,
