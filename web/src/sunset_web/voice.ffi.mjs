@@ -1,0 +1,150 @@
+// JS-side voice wiring. Owns:
+// - the AudioContext (created lazily on first start)
+// - per-peer { workletNode, gainNode } table
+// - capture worklet stream
+// - GainNode value updates from voice_set_peer_volume
+
+let ctx = null;
+const peers = new Map(); // peerHex -> { worklet, gain }
+let captureNode = null;
+let captureStream = null;
+
+export function ensureCtx() {
+  if (!ctx) ctx = new AudioContext({ sampleRate: 48000 });
+  return ctx;
+}
+
+export async function startCapture(client) {
+  ensureCtx();
+  await ctx.audioWorklet.addModule("/audio/voice-capture-worklet.js");
+  await ctx.audioWorklet.addModule("/audio/voice-playback-worklet.js");
+  captureStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+  });
+  const src = ctx.createMediaStreamSource(captureStream);
+  captureNode = new AudioWorkletNode(ctx, "voice-capture");
+  captureNode.port.onmessage = (e) => {
+    if (e.data instanceof Float32Array && e.data.length === 960) {
+      try {
+        client.voice_input(e.data);
+      } catch (err) {
+        console.warn("voice_input failed", err);
+      }
+    }
+  };
+  src.connect(captureNode);
+}
+
+export function stopCapture() {
+  if (captureStream) {
+    for (const t of captureStream.getTracks()) t.stop();
+    captureStream = null;
+  }
+  captureNode = null;
+  for (const [_peer, slot] of peers) {
+    try {
+      slot.worklet.disconnect();
+      slot.gain.disconnect();
+    } catch (_e) {
+      // ignore disconnect errors
+    }
+  }
+  peers.clear();
+}
+
+export function deliverFrame(peerHex, pcm) {
+  if (!ctx) return;
+  let slot = peers.get(peerHex);
+  if (!slot) {
+    const w = new AudioWorkletNode(ctx, "voice-playback");
+    const g = ctx.createGain();
+    g.gain.value = 1.0;
+    w.connect(g).connect(ctx.destination);
+    slot = { worklet: w, gain: g };
+    peers.set(peerHex, slot);
+  }
+  slot.worklet.port.postMessage(pcm, [pcm.buffer]);
+}
+
+export function dropPeer(peerHex) {
+  const slot = peers.get(peerHex);
+  if (!slot) return;
+  try {
+    slot.worklet.disconnect();
+    slot.gain.disconnect();
+  } catch (_e) {
+    // ignore disconnect errors
+  }
+  peers.delete(peerHex);
+}
+
+export function setPeerVolume(peerHex, gain) {
+  const slot = peers.get(peerHex);
+  if (!slot) return;
+  slot.gain.gain.value = Math.max(0, Math.min(2.0, gain));
+}
+
+export function getPeerGain(peerHex) {
+  const slot = peers.get(peerHex);
+  return slot ? slot.gain.gain.value : null;
+}
+
+// --- Gleam UI helpers (used by voice.gleam FFI bindings) ---
+
+function uint8ToHex(a) {
+  return Array.from(a)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export async function wasmVoiceStart(client, roomHandle) {
+  try {
+    await startCapture(client);
+    client.voice_start(
+      roomHandle,
+      (peerId, pcm) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        deliverFrame(hex, new Float32Array(pcm));
+      },
+      (peerId) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        dropPeer(hex);
+      },
+      (peerId, inCall, talking, isMuted) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        // Forward to a registered Gleam callback; see Task 21.
+        if (window.__voicePeerStateHandler) {
+          window.__voicePeerStateHandler(hex, inCall, talking, isMuted);
+        }
+      },
+      (_peerId, _gain) => {
+        // on_set_peer_volume: JS-side GainNode is managed by deliverFrame/setPeerVolume
+      },
+    );
+    return { Ok: null };
+  } catch (e) {
+    return { Error: String(e?.message || e) };
+  }
+}
+
+export function wasmVoiceStop(client) {
+  try {
+    client.voice_stop();
+  } catch (_e) {
+    // ignore stop errors
+  }
+  stopCapture();
+}
+
+export function wasmVoiceSetMuted(client, m) {
+  client.voice_set_muted(!!m);
+}
+
+export function wasmVoiceSetDeafened(client, d) {
+  client.voice_set_deafened(!!d);
+}
