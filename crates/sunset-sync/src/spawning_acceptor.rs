@@ -329,7 +329,7 @@ mod tests {
     /// Two slow promotes never complete; the third's promote completes
     /// promptly. Acceptor.accept() must return the third without waiting
     /// on the slow ones.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     async fn slow_promotes_do_not_block_a_fast_one() {
         let local = tokio::task::LocalSet::new();
         local
@@ -373,9 +373,17 @@ mod tests {
                 let connector = UnusedConnector;
                 let counter = Rc::new(RefCell::new(0usize));
                 let counter_clone = counter.clone();
+                let started = Rc::new(RefCell::new(0usize));
+                let started_clone = started.clone();
                 let promote = move |_rc: StubRawConn| {
                     let counter_clone = counter_clone.clone();
+                    let started_clone = started_clone.clone();
                     async move {
+                        // Increment `started` on first poll so the test can
+                        // detect that all three tasks are alive and have
+                        // registered their timeout deadlines before the clock
+                        // is advanced.
+                        *started_clone.borrow_mut() += 1;
                         // Stall, then the timeout will cancel us. The Drop
                         // of this future increments the counter.
                         struct Counter(Rc<RefCell<usize>>);
@@ -392,13 +400,22 @@ mod tests {
                 let _acceptor =
                     SpawningAcceptor::new(raw, connector, promote, Duration::from_secs(1));
 
-                // Yield enough times for the pump to drain the 3-item queue
-                // and spawn all three promote tasks (each with a 1 s timeout).
-                // The pump accept()s synchronously from the in-memory queue
-                // so a handful of yields is sufficient.
-                for _ in 0..10 {
+                // Wait for all three promote tasks to be polled at least once.
+                // They each increment `started` on first poll; once started==3,
+                // they're all parked at `pending().await` with their
+                // `tokio::time::timeout` deadlines registered at the current
+                // (paused) clock value. We can then advance past those
+                // deadlines and observe each Drop (which increments `counter`).
+                let real_start = std::time::Instant::now();
+                while *started.borrow() < 3 && real_start.elapsed() < Duration::from_secs(5) {
                     tokio::task::yield_now().await;
                 }
+                assert_eq!(
+                    *started.borrow(),
+                    3,
+                    "expected 3 promotes to be polled at least once before clock advance, saw {}",
+                    started.borrow(),
+                );
 
                 // Now advance the paused clock past the timeout window. All three
                 // promote tasks were registered at t=0 with a 1 s deadline, so
