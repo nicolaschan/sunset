@@ -10,7 +10,8 @@ use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 use sunset_core::membership::{Member, TrackerHandles};
-use sunset_core::{Ed25519Verifier, Identity, MessageBody, Room};
+use sunset_core::reactions::ReactionHandles;
+use sunset_core::{Ed25519Verifier, Identity, MessageBody, ReactionAction, Room};
 use sunset_noise::{NoiseIdentity, NoiseTransport};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::{MultiTransport, PeerId, Signer, SyncConfig, SyncEngine};
@@ -48,6 +49,7 @@ pub struct Client {
     relay_status: Rc<RefCell<String>>,
     presence_started: Rc<RefCell<bool>>,
     tracker_handles: Rc<TrackerHandles>,
+    reaction_handles: ReactionHandles,
     voice: crate::voice::VoiceCell,
 }
 
@@ -106,6 +108,14 @@ impl Client {
             async move { s.run().await }
         });
 
+        let reaction_handles = ReactionHandles::default();
+        sunset_core::spawn_reaction_tracker(
+            store.clone(),
+            (*room).clone(),
+            room.fingerprint().to_hex(),
+            reaction_handles.clone(),
+        );
+
         Ok(Client {
             identity,
             room,
@@ -117,6 +127,7 @@ impl Client {
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
             presence_started: Rc::new(RefCell::new(false)),
             tracker_handles: Rc::new(TrackerHandles::new("disconnected")),
+            reaction_handles,
             voice: crate::voice::new_voice_cell(),
         })
     }
