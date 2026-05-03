@@ -157,42 +157,48 @@ impl Client {
         self.relay_status.borrow().clone()
     }
 
-    pub async fn add_relay(&self, url_with_fragment: String) -> Result<(), JsError> {
-        *self.relay_status.borrow_mut() = "connecting".to_owned();
-
-        // Resolve user input (bare host, host:port, wss://, or fully
-        // canonical wss://host#x25519=hex). Canonical forms short-circuit;
-        // others fetch GET / from the relay to learn its x25519 key.
-        let resolver = sunset_relay_resolver::Resolver::new(crate::resolver_adapter::WebSysFetch);
-        let canonical = match resolver.resolve(&url_with_fragment).await {
-            Ok(s) => s,
-            Err(e) => {
-                *self.relay_status.borrow_mut() = "error".to_owned();
-                return Err(JsError::new(&format!("add_relay resolve: {e}")));
-            }
-        };
-
-        let addr = sunset_sync::PeerAddr::new(Bytes::from(canonical));
-        match self
+    /// Register a durable intent to keep connected to `url`. Returns
+    /// the supervisor-assigned `IntentId` once the intent is recorded
+    /// (one cmd-channel round-trip; does NOT wait for the first
+    /// connection). The only `Err` is for malformed input.
+    pub async fn add_relay(&self, url: String) -> Result<f64, JsError> {
+        let fetch: std::rc::Rc<dyn sunset_relay_resolver::HttpFetch> =
+            std::rc::Rc::new(crate::resolver_adapter::WebSysFetch);
+        let connectable = sunset_sync::Connectable::Resolving { input: url, fetch };
+        let id = self
             .supervisor
-            .add(sunset_sync::Connectable::Direct(addr))
+            .add(connectable)
             .await
-        {
-            Ok(_id) => {
-                // The intent has been registered. Status is now driven by
-                // the on_peer_connection_state forwarder once the dial
-                // completes. We optimistically tag "connecting" here so
-                // legacy callers see something other than "disconnected"
-                // before the first state event arrives. (Task 5 retires
-                // this string status entirely.)
-                *self.relay_status.borrow_mut() = "connecting".to_owned();
-                Ok(())
+            .map_err(|e| JsError::new(&format!("add_relay: {e}")))?;
+        Ok(id as f64)
+    }
+
+    /// Register a JS callback that fires:
+    ///   * once per existing intent, immediately on register, and
+    ///   * once per intent state transition thereafter.
+    /// The callback receives an `IntentSnapshotJs`.
+    pub fn on_intent_changed(&self, callback: js_sys::Function) {
+        let supervisor = self.supervisor.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut rx = supervisor.subscribe_intents().await;
+            while let Some(snap) = rx.recv().await {
+                let js_snap = crate::intent::IntentSnapshotJs::from(&snap);
+                let _ = callback.call1(&JsValue::NULL, &JsValue::from(js_snap));
             }
-            Err(e) => {
-                *self.relay_status.borrow_mut() = "error".to_owned();
-                Err(JsError::new(&format!("add_relay: {e}")))
-            }
-        }
+        });
+    }
+
+    /// Snapshot of every registered intent. Returns a Vec
+    /// (wasm-bindgen serialises this to a JS array). Used by the
+    /// frontend on first paint, before the `on_intent_changed`
+    /// callback's replay arrives.
+    pub async fn intents(&self) -> Vec<crate::intent::IntentSnapshotJs> {
+        self.supervisor
+            .snapshot()
+            .await
+            .iter()
+            .map(crate::intent::IntentSnapshotJs::from)
+            .collect()
     }
 
     /// Establish a direct WebRTC peer connection. Signaling rides on the

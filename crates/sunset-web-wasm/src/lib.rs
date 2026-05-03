@@ -8,6 +8,8 @@ mod client;
 #[cfg(target_arch = "wasm32")]
 mod identity;
 #[cfg(target_arch = "wasm32")]
+mod intent;
+#[cfg(target_arch = "wasm32")]
 mod members;
 #[cfg(target_arch = "wasm32")]
 mod messages;
@@ -24,6 +26,8 @@ mod voice;
 
 #[cfg(target_arch = "wasm32")]
 pub use client::Client;
+#[cfg(target_arch = "wasm32")]
+pub use intent::IntentSnapshotJs;
 #[cfg(target_arch = "wasm32")]
 pub use members::MemberJs;
 #[cfg(target_arch = "wasm32")]
