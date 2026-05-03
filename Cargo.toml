@@ -71,6 +71,7 @@ web-time = "1"
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+wasm-tracing = "2.1"
 tokio-rusqlite = { version = "0.6", features = ["bundled"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
