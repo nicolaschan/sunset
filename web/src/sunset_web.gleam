@@ -1479,7 +1479,11 @@ fn room_view_with_state(
           ]),
         ],
         [
-          emoji_picker.view(fn(emoji) { ToggleReactionEmoji(target, emoji) }),
+          emoji_picker.view(
+            palette: palette,
+            mode: model.mode,
+            on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+          ),
         ],
       )
     None -> element.fragment([])
@@ -1524,9 +1528,11 @@ fn room_view_with_state(
         open: True,
         on_close: CloseFullEmojiPicker,
         test_id: "full-emoji-picker-sheet",
-        content: emoji_picker.view(fn(emoji) {
-          ToggleReactionEmoji(target, emoji)
-        }),
+        content: emoji_picker.view(
+          palette: palette,
+          mode: model.mode,
+          on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+        ),
       )
     None -> element.fragment([])
   }
