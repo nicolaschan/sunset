@@ -14,6 +14,8 @@ mod messages;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod resolver_adapter;
 #[cfg(target_arch = "wasm32")]
+mod room_handle;
+#[cfg(target_arch = "wasm32")]
 mod voice;
 
 #[cfg(target_arch = "wasm32")]
@@ -22,6 +24,8 @@ pub use client::Client;
 pub use members::MemberJs;
 #[cfg(target_arch = "wasm32")]
 pub use messages::IncomingMessage;
+#[cfg(target_arch = "wasm32")]
+pub use room_handle::RoomHandle;
 #[cfg(target_arch = "wasm32")]
 pub use sunset_core::{RelaySignaler, signaling_filter};
 
