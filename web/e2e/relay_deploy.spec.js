@@ -160,6 +160,11 @@ test("client recovers when initial add_relay lands during a deploy outage", asyn
         process.stderr.write(`[${name} console] ${msg.text()}\n`);
       }
     });
+    // Set the test hook BEFORE navigation so the FFI shim exposes
+    // `window.sunsetClient` once the wasm `Client` is constructed.
+    await page.addInitScript(() => {
+      window.SUNSET_TEST = true;
+    });
   }
 
   // Open both pages while the relay is DOWN. The resolver fetch will
@@ -202,7 +207,25 @@ test("client recovers when initial add_relay lands during a deploy outage", asyn
   // store before A's subscription has synced to the relay, and the
   // relay then has no way to attribute the message to a subscriber set
   // and forward it.
-  await new Promise((r) => setTimeout(r, 15_000));
+  //
+  // Poll the supervisor's intent snapshot directly via
+  // `window.sunsetClient.intents()`. With Task 1-3's supervisor driving
+  // the dial as soon as the listener is back, this should resolve in a
+  // second or two — much tighter than the previous fixed 15 s sleep.
+  async function waitForConnected(page) {
+    await page.waitForFunction(
+      () =>
+        window.sunsetClient &&
+        window.sunsetClient.intents &&
+        window.sunsetClient
+          .intents()
+          .then((arr) => arr.some((s) => s.state === "connected")),
+      { timeout: 30_000, polling: 250 },
+    );
+  }
+
+  await waitForConnected(pageA);
+  await waitForConnected(pageB);
 
   const msgPost = `post-deploy from A — ${Date.now()}`;
   await inputA.fill(msgPost);
