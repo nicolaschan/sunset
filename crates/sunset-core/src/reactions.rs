@@ -69,3 +69,272 @@ pub struct ReactionHandles {
     /// state for that target.
     pub last_target_signatures: Rc<RefCell<HashMap<Hash, ReactionSig>>>,
 }
+
+/// Apply one event to in-memory state. The new entry replaces an
+/// existing entry for `(author, target, emoji)` iff `(sent_at_ms,
+/// value_hash)` of the new entry is strictly greater than the existing
+/// entry's pair. Returns `true` if the snapshot for `event.target`
+/// might have changed; the caller still does a signature comparison
+/// to decide whether to fire the callback (so `true` is safe to
+/// over-report).
+pub(crate) fn apply_event(state: &mut ReactionState, event: ReactionEvent) -> bool {
+    let by_emoji = state.entry(event.target).or_default();
+    let by_author = by_emoji.entry(event.emoji.clone()).or_default();
+    let new_entry = ReactionEntry {
+        action: event.action,
+        sent_at_ms: event.sent_at_ms,
+        value_hash: event.value_hash,
+    };
+    match by_author.get(&event.author) {
+        Some(existing) => {
+            let existing_key = (existing.sent_at_ms, *existing.value_hash.as_bytes());
+            let new_key = (new_entry.sent_at_ms, *new_entry.value_hash.as_bytes());
+            if new_key > existing_key {
+                by_author.insert(event.author, new_entry);
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            by_author.insert(event.author, new_entry);
+            true
+        }
+    }
+}
+
+/// Render the current snapshot for one target. Authors whose latest
+/// LWW entry is `Remove` are omitted; emoji entries with no remaining
+/// authors are omitted.
+pub(crate) fn derive_snapshot(state: &ReactionState, target: &Hash) -> ReactionSnapshot {
+    let mut out = ReactionSnapshot::new();
+    let Some(by_emoji) = state.get(target) else {
+        return out;
+    };
+    for (emoji, by_author) in by_emoji {
+        let mut authors = BTreeSet::new();
+        for (author, entry) in by_author {
+            if entry.action == ReactionAction::Add {
+                authors.insert(author.clone());
+            }
+        }
+        if !authors.is_empty() {
+            out.insert(emoji.clone(), authors);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod apply_event_tests {
+    use super::*;
+    use rand_core::OsRng;
+
+    fn alice() -> IdentityKey {
+        crate::identity::Identity::generate(&mut OsRng).public()
+    }
+
+    fn bob() -> IdentityKey {
+        crate::identity::Identity::generate(&mut OsRng).public()
+    }
+
+    fn h(b: u8) -> Hash {
+        let arr = [b; 32];
+        Hash::from(arr)
+    }
+
+    #[test]
+    fn apply_event_inserts_first_event() {
+        let mut state = ReactionState::new();
+        let target = h(1);
+        let alice = alice();
+        let changed = apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Add,
+                sent_at_ms: 100,
+                value_hash: h(10),
+            },
+        );
+        assert!(changed, "first event should mark target as changed");
+        let snap = derive_snapshot(&state, &target);
+        let alice_set = snap.get("👍").unwrap();
+        assert!(alice_set.contains(&alice));
+    }
+
+    #[test]
+    fn apply_event_lww_later_timestamp_wins() {
+        let mut state = ReactionState::new();
+        let target = h(1);
+        let alice = alice();
+        // Add at t=100
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Add,
+                sent_at_ms: 100,
+                value_hash: h(10),
+            },
+        );
+        // Remove at t=200 — later, wins.
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Remove,
+                sent_at_ms: 200,
+                value_hash: h(20),
+            },
+        );
+        let snap = derive_snapshot(&state, &target);
+        assert!(
+            snap.get("👍").map(|s| s.is_empty()).unwrap_or(true),
+            "Remove at later timestamp should evict author"
+        );
+    }
+
+    #[test]
+    fn apply_event_lww_earlier_timestamp_loses() {
+        let mut state = ReactionState::new();
+        let target = h(1);
+        let alice = alice();
+        // Add at t=200
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Add,
+                sent_at_ms: 200,
+                value_hash: h(10),
+            },
+        );
+        // Stale Remove at t=100 — earlier, loses.
+        let changed = apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Remove,
+                sent_at_ms: 100,
+                value_hash: h(20),
+            },
+        );
+        let snap = derive_snapshot(&state, &target);
+        assert!(snap.get("👍").unwrap().contains(&alice), "stale Remove must not evict");
+        let _ = changed;
+    }
+
+    #[test]
+    fn apply_event_value_hash_breaks_timestamp_tie() {
+        let mut state = ReactionState::new();
+        let target = h(1);
+        let alice = alice();
+        let lower = h(0x05);
+        let higher = h(0x50);
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Add,
+                sent_at_ms: 100,
+                value_hash: lower,
+            },
+        );
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Remove,
+                sent_at_ms: 100,
+                value_hash: higher,
+            },
+        );
+        let snap = derive_snapshot(&state, &target);
+        assert!(
+            snap.get("👍").map(|s| s.is_empty()).unwrap_or(true),
+            "higher value_hash at same timestamp should win (Remove evicts)"
+        );
+    }
+
+    #[test]
+    fn apply_event_independent_authors_coexist() {
+        let mut state = ReactionState::new();
+        let target = h(1);
+        let alice = alice();
+        let bob = bob();
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Add,
+                sent_at_ms: 100,
+                value_hash: h(10),
+            },
+        );
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: bob.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Add,
+                sent_at_ms: 100,
+                value_hash: h(11),
+            },
+        );
+        let snap = derive_snapshot(&state, &target);
+        let set = snap.get("👍").unwrap();
+        assert!(set.contains(&alice));
+        assert!(set.contains(&bob));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn apply_event_independent_emoji_coexist() {
+        let mut state = ReactionState::new();
+        let target = h(1);
+        let alice = alice();
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "👍".to_owned(),
+                action: ReactionAction::Add,
+                sent_at_ms: 100,
+                value_hash: h(10),
+            },
+        );
+        apply_event(
+            &mut state,
+            ReactionEvent {
+                author: alice.clone(),
+                target,
+                emoji: "🎉".to_owned(),
+                action: ReactionAction::Add,
+                sent_at_ms: 101,
+                value_hash: h(11),
+            },
+        );
+        let snap = derive_snapshot(&state, &target);
+        assert!(snap.get("👍").unwrap().contains(&alice));
+        assert!(snap.get("🎉").unwrap().contains(&alice));
+    }
+}
