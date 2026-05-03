@@ -43,6 +43,7 @@ pub struct Client {
     store: Arc<MemoryStore>,
     engine: Rc<Engine>,
     supervisor: Rc<sunset_sync::PeerSupervisor<MemoryStore, MultiTransport<WsT, RtcT>>>,
+    rtc_signaler_dispatcher: Rc<sunset_core::MultiRoomSignaler>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     on_receipt: Rc<RefCell<Option<js_sys::Function>>>,
     relay_status: Rc<RefCell<String>>,
@@ -71,10 +72,12 @@ impl Client {
         let room_fp_hex = room.fingerprint().to_hex();
         let signaler: Rc<RelaySignaler<MemoryStore>> =
             RelaySignaler::new(identity.clone(), room_fp_hex.clone(), &store);
+        let dispatcher = sunset_core::MultiRoomSignaler::new();
+        dispatcher.register(room.fingerprint(), signaler);
         let local_peer = PeerId(identity.store_verifying_key());
-        let signaler_dyn: Rc<dyn sunset_sync::Signaler> = signaler;
+        let dispatcher_dyn: Rc<dyn sunset_sync::Signaler> = dispatcher.clone();
         let rtc_raw = WebRtcRawTransport::new(
-            signaler_dyn,
+            dispatcher_dyn,
             local_peer.clone(),
             vec!["stun:stun.l.google.com:19302".into()],
         );
@@ -113,6 +116,7 @@ impl Client {
             store,
             engine,
             supervisor,
+            rtc_signaler_dispatcher: dispatcher,
             on_message: Rc::new(RefCell::new(None)),
             on_receipt: Rc::new(RefCell::new(None)),
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
