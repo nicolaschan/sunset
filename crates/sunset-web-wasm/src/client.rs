@@ -216,7 +216,7 @@ impl Client {
         let room_fp_hex = self.room.fingerprint().to_hex();
         let local_peer = sunset_sync::PeerId(self.identity.store_verifying_key());
 
-        crate::presence_publisher::spawn_publisher(
+        sunset_core::membership::spawn_publisher(
             self.identity.clone(),
             room_fp_hex.clone(),
             self.store.clone(),

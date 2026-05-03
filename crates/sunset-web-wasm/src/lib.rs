@@ -12,8 +12,6 @@ mod members;
 #[cfg(target_arch = "wasm32")]
 mod messages;
 #[cfg(target_arch = "wasm32")]
-mod presence_publisher;
-#[cfg(target_arch = "wasm32")]
 mod relay_signaler;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod resolver_adapter;
