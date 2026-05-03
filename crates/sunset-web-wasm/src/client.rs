@@ -466,6 +466,11 @@ impl Client {
                             let _ = cb.call1(&JsValue::NULL, &JsValue::from(incoming));
                         }
                     }
+                    MessageBody::Reaction { .. } => {
+                        // Reactions are handled by sunset-core's ReactionTracker (spawned
+                        // separately in Client::new — see Phase C of the reactions plan).
+                        // The bridge subscription has nothing to do here.
+                    }
                 }
             }
         });
