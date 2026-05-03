@@ -42,10 +42,11 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delim {
-    Bold,        // **
-    Underline,   // __
-    ItalicStar,  // *
-    ItalicUnder, // _
+    Bold,          // **
+    Underline,     // __
+    Strikethrough, // ~~
+    ItalicStar,    // *
+    ItalicUnder,   // _
 }
 
 fn match_delimiter(bytes: &[u8], i: usize) -> Option<(Delim, usize)> {
@@ -62,6 +63,12 @@ fn match_delimiter(bytes: &[u8], i: usize) -> Option<(Delim, usize)> {
             return None;
         }
         return Some((Delim::Underline, 2));
+    }
+    if bytes.get(i..i + 2) == Some(b"~~") {
+        if bytes.get(i + 2..i + 4) == Some(b"~~") {
+            return None;
+        }
+        return Some((Delim::Strikethrough, 2));
     }
     if bytes.get(i) == Some(&b'*') {
         return Some((Delim::ItalicStar, 1));
@@ -107,6 +114,7 @@ fn wrap(kind: Delim, inner: Vec<Inline>) -> Inline {
     match kind {
         Delim::Bold => Inline::Bold(inner),
         Delim::Underline => Inline::Underline(inner),
+        Delim::Strikethrough => Inline::Strikethrough(inner),
         Delim::ItalicStar | Delim::ItalicUnder => Inline::Italic(inner),
     }
 }

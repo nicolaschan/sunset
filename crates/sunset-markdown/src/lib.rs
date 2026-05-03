@@ -217,4 +217,26 @@ mod tests {
             ])])])
         );
     }
+
+    #[test]
+    fn strikethrough() {
+        assert_eq!(
+            parse("a ~~b~~ c"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::Strikethrough(vec![Inline::Text("b".to_owned())]),
+                Inline::Text(" c".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn single_tilde_is_literal() {
+        assert_eq!(
+            parse("a ~b~ c"),
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "a ~b~ c".to_owned()
+            )])])
+        );
+    }
 }
