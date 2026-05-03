@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>sunset-voice E2E harness</title>
+  </head>
+  <body>
+    <h1>sunset-voice E2E harness</h1>
+    <p>This page is exercised by Playwright; do not load it manually.</p>
+    <script type="module">
+      import init, { Client } from "/sunset_web_wasm.js";
+
+      const incoming = new Map();
+      const voiceState = new Map();
+      const connState = new Map();
+
+      function hex(uint8) {
+        return Array.from(uint8).map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+
+      window.__voice = {
+        async start({ seed, room, relay }) {
+          await init();
+          const bytes = new Uint8Array(seed.match(/.{2}/g).map((b) => parseInt(b, 16)));
+          const client = new Client(bytes, room);
+          window.__voice.client = client;
+          window.__voice.publicKeyHex = hex(new Uint8Array(client.public_key));
+          await client.add_relay(relay);
+          client.on_peer_connection_state((snap) => {
+            connState.set(snap.addr, snap);
+          });
+          client.voice_start(
+            (fromPeerId, pcm) => {
+              const k = hex(new Uint8Array(fromPeerId));
+              if (!incoming.has(k)) incoming.set(k, []);
+              incoming.get(k).push(new Float32Array(pcm));
+            },
+            (peerId, in_call, talking) => {
+              voiceState.set(hex(new Uint8Array(peerId)), { in_call, talking });
+            },
+          );
+          return { publicKey: window.__voice.publicKeyHex };
+        },
+        framesFor(hexPeerId) {
+          return incoming.get(hexPeerId) ?? [];
+        },
+        voiceStateFor(hexPeerId) {
+          return voiceState.get(hexPeerId) ?? null;
+        },
+        connStateForAddr(addr) {
+          return connState.get(addr) ?? null;
+        },
+        sendFrame(samples) {
+          window.__voice.client.voice_input(new Float32Array(samples));
+        },
+        stop() {
+          window.__voice.client.voice_stop();
+        },
+      };
+    </script>
+  </body>
+</html>
