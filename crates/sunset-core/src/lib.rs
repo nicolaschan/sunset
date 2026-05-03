@@ -15,6 +15,7 @@ pub mod identity;
 pub mod liveness;
 pub mod membership;
 pub mod message;
+pub mod signaling;
 pub mod verifier;
 
 pub use bus::{Bus, BusEvent, BusImpl};
@@ -29,4 +30,5 @@ pub use liveness::{
 pub use message::{
     ComposedMessage, DecodedMessage, compose_message, compose_receipt, compose_text, decode_message,
 };
+pub use signaling::{RelaySignaler, signaling_filter};
 pub use verifier::Ed25519Verifier;
