@@ -6,7 +6,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
@@ -21,7 +20,6 @@ pub mod axum_integration;
 
 enum WsSink {
     Client(SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>),
-    Server(SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>),
     #[cfg(feature = "axum")]
     Axum(SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>),
 }
@@ -30,7 +28,6 @@ impl WsSink {
     async fn send(&mut self, msg: Message) -> Result<(), tokio_tungstenite::tungstenite::Error> {
         match self {
             WsSink::Client(s) => s.send(msg).await,
-            WsSink::Server(s) => s.send(msg).await,
             #[cfg(feature = "axum")]
             WsSink::Axum(s) => {
                 // Translate tungstenite::Message → axum::extract::ws::Message.
@@ -61,9 +58,6 @@ impl WsSink {
             WsSink::Client(s) => {
                 s.close().await.ok();
             }
-            WsSink::Server(s) => {
-                s.close().await.ok();
-            }
             #[cfg(feature = "axum")]
             WsSink::Axum(s) => {
                 s.close().await.ok();
@@ -76,7 +70,6 @@ impl WsSink {
 
 enum WsStream {
     Client(SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
-    Server(SplitStream<WebSocketStream<tokio::net::TcpStream>>),
     #[cfg(feature = "axum")]
     Axum(SplitStream<axum::extract::ws::WebSocket>),
 }
@@ -85,7 +78,6 @@ impl WsStream {
     async fn next(&mut self) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
         match self {
             WsStream::Client(s) => s.next().await,
-            WsStream::Server(s) => s.next().await,
             #[cfg(feature = "axum")]
             WsStream::Axum(s) => {
                 let item = s.next().await?;
@@ -108,20 +100,13 @@ impl WsStream {
     }
 }
 
-/// Either a dial-only client or a listening server.
+/// Either a dial-only client or a serving axum-backed transport.
 pub struct WebSocketRawTransport {
     mode: TransportMode,
 }
 
 enum TransportMode {
     DialOnly,
-    Listening {
-        listener: Mutex<TcpListener>,
-    },
-    /// Accept pre-classified TcpStreams from an external dispatcher.
-    ExternalStreams {
-        rx: Mutex<tokio::sync::mpsc::Receiver<TcpStream>>,
-    },
     /// Drains a channel of *already-upgraded* axum WebSocket sockets.
     /// Populated by an upstream HTTP framework (axum) handler that did
     /// the WS upgrade. The transport is crypto-unaware; promotion to an
@@ -136,28 +121,6 @@ impl WebSocketRawTransport {
     pub fn dial_only() -> Self {
         Self {
             mode: TransportMode::DialOnly,
-        }
-    }
-
-    pub async fn listening_on(bind: std::net::SocketAddr) -> SyncResult<Self> {
-        let listener = TcpListener::bind(bind)
-            .await
-            .map_err(|e| SyncError::Transport(format!("bind {bind}: {e}")))?;
-        Ok(Self {
-            mode: TransportMode::Listening {
-                listener: Mutex::new(listener),
-            },
-        })
-    }
-
-    /// Accept already-classified TcpStreams from an external dispatcher.
-    /// The caller has bound the TcpListener and decided which connections
-    /// belong to WS (vs other protocols on the same port). When the
-    /// channel closes, `accept` returns an error and the engine treats it
-    /// as transport failure.
-    pub fn external_streams(rx: tokio::sync::mpsc::Receiver<TcpStream>) -> Self {
-        Self {
-            mode: TransportMode::ExternalStreams { rx: Mutex::new(rx) },
         }
     }
 
@@ -179,16 +142,11 @@ impl WebSocketRawTransport {
         (transport, tx)
     }
 
-    /// Bound address (useful when binding to port 0).
-    ///
-    /// Returns `None` for `ExternalStreams` mode — the relay knows its own
-    /// bound address from the `TcpListener` it holds directly.
+    /// Bound address. Always `None` — the axum listener knows its own
+    /// address from the `TcpListener` it holds directly.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.mode {
-            TransportMode::Listening { listener } => {
-                listener.try_lock().ok().and_then(|l| l.local_addr().ok())
-            }
-            TransportMode::DialOnly | TransportMode::ExternalStreams { .. } => None,
+            TransportMode::DialOnly => None,
             #[cfg(feature = "axum")]
             TransportMode::Serving { .. } => None,
         }
@@ -217,50 +175,21 @@ impl RawTransport for WebSocketRawTransport {
 
     async fn accept(&self) -> SyncResult<Self::Connection> {
         #[cfg(feature = "axum")]
-        {
-            if let TransportMode::Serving { rx } = &self.mode {
-                let mut rx = rx.lock().await;
-                let socket = rx
-                    .recv()
-                    .await
-                    .ok_or_else(|| SyncError::Transport("axum serving channel closed".into()))?;
-                let (sink, stream) = futures_util::StreamExt::split(socket);
-                return Ok(WebSocketRawConnection::new(
-                    WsSink::Axum(sink),
-                    WsStream::Axum(stream),
-                ));
-            }
+        if let TransportMode::Serving { rx } = &self.mode {
+            let mut rx = rx.lock().await;
+            let socket = rx
+                .recv()
+                .await
+                .ok_or_else(|| SyncError::Transport("axum serving channel closed".into()))?;
+            let (sink, stream) = futures_util::StreamExt::split(socket);
+            return Ok(WebSocketRawConnection::new(
+                WsSink::Axum(sink),
+                WsStream::Axum(stream),
+            ));
         }
-        let tcp = match &self.mode {
-            TransportMode::Listening { listener } => {
-                let listener = listener.lock().await;
-                let (tcp, _peer) = listener
-                    .accept()
-                    .await
-                    .map_err(|e| SyncError::Transport(format!("accept: {e}")))?;
-                tcp
-            }
-            TransportMode::ExternalStreams { rx } => {
-                let mut rx = rx.lock().await;
-                rx.recv()
-                    .await
-                    .ok_or_else(|| SyncError::Transport("external stream channel closed".into()))?
-            }
-            TransportMode::DialOnly => {
-                std::future::pending::<()>().await;
-                unreachable!();
-            }
-            #[cfg(feature = "axum")]
-            TransportMode::Serving { .. } => unreachable!("handled above"),
-        };
-        let ws = tokio_tungstenite::accept_async(tcp)
-            .await
-            .map_err(|e| SyncError::Transport(format!("ws upgrade: {e}")))?;
-        let (sink, stream) = ws.split();
-        Ok(WebSocketRawConnection::new(
-            WsSink::Server(sink),
-            WsStream::Server(stream),
-        ))
+        // DialOnly: accept never resolves.
+        std::future::pending::<()>().await;
+        unreachable!()
     }
 }
 

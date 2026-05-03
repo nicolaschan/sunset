@@ -17,9 +17,7 @@ pub mod identity;
 pub mod relay;
 pub mod render;
 pub(crate) mod resolver_adapter;
-pub(crate) mod router;
 pub mod snapshot;
-pub(crate) mod status;
 
 pub use config::Config;
 pub use error::{Error, Result};
