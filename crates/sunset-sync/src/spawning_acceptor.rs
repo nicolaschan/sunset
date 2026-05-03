@@ -201,3 +201,225 @@ where
             .ok_or_else(|| Error::Transport("acceptor channel closed".into()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+    use tokio::sync::{Mutex as AsyncMutex, mpsc};
+
+    use crate::transport::{RawConnection, TransportKind};
+    use crate::types::PeerId;
+
+    // ---- synthetic raw transport / connection ----
+
+    /// A `RawConnection` we never read from — it just exists. Promote
+    /// closures inspect a per-conn id to decide how to behave (fast,
+    /// hang forever, fail).
+    struct StubRawConn {
+        id: usize,
+    }
+
+    #[async_trait(?Send)]
+    impl RawConnection for StubRawConn {
+        async fn send_reliable(&self, _: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn recv_reliable(&self) -> Result<Bytes> {
+            std::future::pending().await
+        }
+        async fn send_unreliable(&self, _: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn recv_unreliable(&self) -> Result<Bytes> {
+            std::future::pending().await
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A `RawTransport` whose `accept()` yields `StubRawConn`s from a
+    /// pre-loaded queue. After the queue is drained, `accept()` blocks
+    /// forever (matching real-world "no more connections coming right
+    /// now" behavior).
+    struct StubRawTransport {
+        queue: AsyncMutex<mpsc::UnboundedReceiver<StubRawConn>>,
+    }
+
+    impl StubRawTransport {
+        fn with_ids(ids: &[usize]) -> Self {
+            let (tx, rx) = mpsc::unbounded_channel();
+            for &id in ids {
+                tx.send(StubRawConn { id }).unwrap();
+            }
+            Self {
+                queue: AsyncMutex::new(rx),
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl RawTransport for StubRawTransport {
+        type Connection = StubRawConn;
+        async fn connect(&self, _: PeerAddr) -> Result<StubRawConn> {
+            Err(Error::Transport("connect not used in these tests".into()))
+        }
+        async fn accept(&self) -> Result<StubRawConn> {
+            let mut q = self.queue.lock().await;
+            q.recv()
+                .await
+                .ok_or_else(|| Error::Transport("queue closed".into()))
+        }
+    }
+
+    // ---- a `Transport` connection that the promote produces ----
+
+    struct StubAuthConn {
+        id: usize,
+    }
+
+    #[async_trait(?Send)]
+    impl TransportConnection for StubAuthConn {
+        async fn send_reliable(&self, _: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn recv_reliable(&self) -> Result<Bytes> {
+            std::future::pending().await
+        }
+        async fn send_unreliable(&self, _: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn recv_unreliable(&self) -> Result<Bytes> {
+            std::future::pending().await
+        }
+        fn peer_id(&self) -> PeerId {
+            PeerId(sunset_store::VerifyingKey::new(Bytes::from(format!(
+                "stub-{}",
+                self.id
+            ))))
+        }
+        fn kind(&self) -> TransportKind {
+            TransportKind::Unknown
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A connector whose `connect()` is unused in these tests.
+    struct UnusedConnector;
+
+    #[async_trait(?Send)]
+    impl Transport for UnusedConnector {
+        type Connection = StubAuthConn;
+        async fn connect(&self, _: PeerAddr) -> Result<StubAuthConn> {
+            Err(Error::Transport("connector unused in these tests".into()))
+        }
+        async fn accept(&self) -> Result<StubAuthConn> {
+            std::future::pending().await
+        }
+    }
+
+    // ---- tests ----
+
+    /// Two slow promotes never complete; the third's promote completes
+    /// promptly. Acceptor.accept() must return the third without waiting
+    /// on the slow ones.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn slow_promotes_do_not_block_a_fast_one() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let raw = StubRawTransport::with_ids(&[1, 2, 3]);
+                let connector = UnusedConnector;
+                let promote = move |rc: StubRawConn| async move {
+                    if rc.id == 3 {
+                        // Fast.
+                        Ok(StubAuthConn { id: rc.id })
+                    } else {
+                        // Stall forever.
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                };
+                let acceptor =
+                    SpawningAcceptor::new(raw, connector, promote, Duration::from_secs(60));
+
+                // The acceptor's pump fires the three accept()s as separate
+                // promote tasks. Tasks 1 and 2 hang; task 3 completes.
+                // accept() should return task 3's connection.
+                let conn = tokio::time::timeout(Duration::from_secs(5), acceptor.accept())
+                    .await
+                    .expect("accept did not return within 5 s — slow promotes blocked the fast one")
+                    .expect("accept errored");
+                assert_eq!(conn.id, 3);
+            })
+            .await;
+    }
+
+    /// Per-task timeout fires independently. With a 1 s timeout and three
+    /// stalled promotes, all three tasks complete (drop+log) within ~1 s
+    /// rather than serializing into 3 s.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn per_task_timeout_fires_independently() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let raw = StubRawTransport::with_ids(&[1, 2, 3]);
+                let connector = UnusedConnector;
+                let counter = Rc::new(RefCell::new(0usize));
+                let counter_clone = counter.clone();
+                let promote = move |_rc: StubRawConn| {
+                    let counter_clone = counter_clone.clone();
+                    async move {
+                        // Stall, then the timeout will cancel us. The Drop
+                        // of this future increments the counter.
+                        struct Counter(Rc<RefCell<usize>>);
+                        impl Drop for Counter {
+                            fn drop(&mut self) {
+                                *self.0.borrow_mut() += 1;
+                            }
+                        }
+                        let _g = Counter(counter_clone);
+                        std::future::pending::<()>().await;
+                        Ok(StubAuthConn { id: 0 })
+                    }
+                };
+                let _acceptor =
+                    SpawningAcceptor::new(raw, connector, promote, Duration::from_secs(1));
+
+                // Yield enough times for the pump to drain the 3-item queue
+                // and spawn all three promote tasks (each with a 1 s timeout).
+                // The pump accept()s synchronously from the in-memory queue
+                // so a handful of yields is sufficient.
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+
+                // Now advance the paused clock past the timeout window. All three
+                // promote tasks were registered at t=0 with a 1 s deadline, so
+                // advancing to 1.5 s fires all three timeouts and drops their guards.
+                tokio::time::advance(Duration::from_millis(1_500)).await;
+                tokio::task::yield_now().await;
+
+                // We expect 3 drops; allow up to 5 s of real-time padding for
+                // the spawn-and-cancel ladder to settle (this is paused-clock
+                // mode, so the real-time bound is just a safety net).
+                let start = tokio::time::Instant::now();
+                while *counter.borrow() < 3 && start.elapsed() < Duration::from_secs(5) {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    *counter.borrow(),
+                    3,
+                    "expected 3 promote-task drops on timeout, saw {}",
+                    counter.borrow(),
+                );
+            })
+            .await;
+    }
+}
