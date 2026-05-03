@@ -1167,8 +1167,10 @@ where
 
     /// Test-only entry point to emit an engine event from outside the
     /// engine's own tests module. Mirrors what real engine internals do
-    /// (private `emit_engine_event`); restricted to `#[cfg(test)]`.
-    #[cfg(test)]
+    /// (private `emit_engine_event`); gated to match the supervisor
+    /// tests' cfg so it isn't compiled (and therefore can't be flagged
+    /// dead) in plain `cargo test` without `--features test-helpers`.
+    #[cfg(all(test, feature = "test-helpers"))]
     pub(crate) async fn emit_engine_event_for_test(&self, ev: EngineEvent) {
         self.emit_engine_event(ev).await;
     }
