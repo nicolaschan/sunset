@@ -569,3 +569,154 @@ test("own message author is rendered in the accent palette color", async ({
   expect(textColor).not.toBe(bodyColor);
   await ctx.close();
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// 6. Follow-ups
+// ─────────────────────────────────────────────────────────────────────
+
+test("on touch devices, tapping a message row pins the highlight backdrop", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "mobile-chrome",
+    "the touch-only `is-selected → highlight` rule is gated on (hover: none)",
+  );
+
+  const { ctx, page, composer } = await openChat(browser, "mobile-tap-bg");
+  await composer.fill(`mobile-tap-${Date.now()}`);
+  await composer.press("Enter");
+  const msgRow = page.locator(".msg-row").last();
+  await expect(msgRow).toBeVisible({ timeout: 15_000 });
+
+  // Idle: row is transparent.
+  const idleBg = await msgRow.evaluate(
+    (el) => getComputedStyle(el).backgroundColor,
+  );
+  expect(idleBg === "rgba(0, 0, 0, 0)" || idleBg === "transparent").toBe(true);
+
+  // Tap the body — `selected_msg_id` flips to this row and the action
+  // toolbar (overflow menu) becomes visible. The highlight should
+  // follow the same selection so the user sees which row the menu
+  // belongs to.
+  await msgRow.click();
+  await expect(msgRow).toHaveClass(/is-selected/);
+
+  const selectedBg = await msgRow.evaluate(
+    (el) => getComputedStyle(el).backgroundColor,
+  );
+  expect(selectedBg).not.toBe("rgba(0, 0, 0, 0)");
+  expect(selectedBg).not.toBe("transparent");
+
+  await ctx.close();
+});
+
+test("the standalone phone theme-toggle row is gone (settings sheet covers it)", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "mobile-chrome",
+    "the deprecated row only ever rendered on phone",
+  );
+
+  const { ctx, page } = await openChat(browser, "no-phone-theme-row");
+
+  // Open the rooms drawer — the only place the row used to live.
+  await page.getByTestId("phone-rooms-toggle").click();
+  await page.getByTestId("channels-room-title").click();
+  await expect(page.getByTestId("rooms-drawer")).toBeVisible();
+
+  expect(await page.getByTestId("phone-theme-toggle").count()).toBe(0);
+
+  await ctx.close();
+});
+
+test("Enter on the rooms-search input does not insert a newline into the composer", async ({
+  browser,
+}, testInfo) => {
+  // Bug repro: keydown's default action on Enter ran on the
+  // newly-mounted+autofocus'd composer textarea (because focus moved
+  // there mid-keystroke), inserting a `\n` into the draft. The fix
+  // calls preventDefault on Enter in the rooms-search input.
+  const { ctx, page, composer } = await openChat(
+    browser,
+    "rooms-search-no-newline",
+  );
+
+  // Open the rooms drawer (mobile) or just use the rooms rail (desktop)
+  // and type a new room name into rooms-search, then press Enter.
+  if (testInfo.project.name === "mobile-chrome") {
+    await page.getByTestId("phone-rooms-toggle").click();
+    await page.getByTestId("channels-room-title").click();
+    await expect(page.getByTestId("rooms-drawer")).toBeVisible();
+  }
+  const search = page
+    .getByTestId("rooms-drawer")
+    .getByTestId("rooms-search")
+    .or(page.getByTestId("rooms-search"))
+    .first();
+  await search.fill("rooms-search-target");
+  await search.press("Enter");
+
+  // Should have navigated to the new room.
+  await expect(page).toHaveURL(/#rooms-search-target$/);
+
+  // Composer textarea must be empty (no leaked newline). We poll
+  // because the value-clear effect runs in a microtask.
+  await expect
+    .poll(async () => composer.evaluate((el) => el.value), { timeout: 5_000 })
+    .toBe("");
+
+  await ctx.close();
+});
+
+test("Enter on the landing input does not insert a newline into the composer", async ({
+  browser,
+}) => {
+  // Same bug as the rooms-search variant, but exercised through the
+  // landing → first-room transition.
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  page.on("pageerror", (err) =>
+    process.stderr.write(`[pageerror] ${err.stack || err}\n`),
+  );
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      process.stderr.write(`[console] ${msg.text()}\n`);
+    }
+  });
+
+  await page.addInitScript(() => {
+    window.SUNSET_TEST = true;
+  });
+  // Start at landing (no hash) with cleared storage so the landing
+  // view actually renders.
+  await page.goto(`/?relay=${encodeURIComponent(relayAddress)}`);
+  await page.evaluate(() => {
+    try {
+      localStorage.clear();
+    } catch {}
+  });
+  await page.goto(`/?relay=${encodeURIComponent(relayAddress)}`);
+
+  await expect(page.getByTestId("landing-input")).toBeVisible({
+    timeout: 15_000,
+  });
+  // Two landing-input matches (desktop card + mobile fallback markup).
+  // Pick the visible one.
+  const landingInput = page
+    .getByTestId("landing-input")
+    .filter({ visible: true })
+    .first();
+  await landingInput.fill("landing-no-newline-target");
+  await landingInput.press("Enter");
+
+  await expect(page).toHaveURL(/#landing-no-newline-target$/);
+
+  const composer = page.getByPlaceholder(/^Message #/);
+  await expect(composer).toBeVisible({ timeout: 15_000 });
+  await expect
+    .poll(async () => composer.evaluate((el) => el.value), { timeout: 5_000 })
+    .toBe("");
+
+  await ctx.close();
+});

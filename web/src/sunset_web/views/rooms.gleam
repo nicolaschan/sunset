@@ -12,7 +12,7 @@ import lustre/event
 import sunset_web/domain.{
   type ConnStatus, type Room, type RoomId, Connected, Offline, Reconnecting,
 }
-import sunset_web/theme.{type Mode, type Palette}
+import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
 pub fn view(
@@ -36,8 +36,6 @@ pub fn view(
   toggle toggle: msg,
   viewport viewport: domain.Viewport,
   members members: List(domain.Member),
-  mode mode: Mode,
-  on_toggle_mode on_toggle_mode: msg,
   on_open_settings on_open_settings: msg,
 ) -> Element(msg) {
   // On phone the rail lives inside a 320px-wide drawer, so it should
@@ -102,10 +100,6 @@ pub fn view(
         on_drag_end,
       ),
       you_row(you, p, col, on_open_settings),
-      case viewport {
-        domain.Phone -> phone_theme_toggle_row(p, mode, on_toggle_mode)
-        domain.Desktop -> element.fragment([])
-      },
     ],
   )
 }
@@ -325,12 +319,21 @@ fn on_enter_with_value(
   noop: msg,
   on_join: fn(String) -> msg,
 ) -> attribute.Attribute(msg) {
-  event.on("keydown", {
+  // Enter calls `preventDefault` on the keydown so the keystroke can't
+  // bleed through into a different focused element after Lustre's
+  // re-render replaces this input. See landing.on_enter_with_value for
+  // the full rationale — same bug, same fix.
+  event.advanced("keydown", {
     use key <- decode.subfield(["key"], decode.string)
     use value <- decode.subfield(["target", "value"], decode.string)
     decode.success(case key {
-      "Enter" -> on_join(value)
-      _ -> noop
+      "Enter" ->
+        event.handler(
+          on_join(value),
+          prevent_default: True,
+          stop_propagation: False,
+        )
+      _ -> event.handler(noop, prevent_default: False, stop_propagation: False)
     })
   })
 }
@@ -890,41 +893,6 @@ fn logo(size: Int) -> Element(msg) {
         [],
       ),
     ],
-  )
-}
-
-fn phone_theme_toggle_row(
-  p: Palette,
-  mode: Mode,
-  on_toggle: msg,
-) -> Element(msg) {
-  let label = case mode {
-    theme.Light -> "Switch to dark mode"
-    theme.Dark -> "Switch to light mode"
-  }
-  html.button(
-    [
-      attribute.attribute("data-testid", "phone-theme-toggle"),
-      attribute.title(label),
-      attribute.attribute("aria-label", label),
-      event.on_click(on_toggle),
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("gap", "8px"),
-        #("padding", "12px 16px"),
-        #("border", "none"),
-        #("border-top", "1px solid " <> p.border_soft),
-        #("background", "transparent"),
-        #("color", p.text),
-        #("font-family", "inherit"),
-        #("font-size", "16.875px"),
-        #("cursor", "pointer"),
-        #("text-align", "left"),
-        #("width", "100%"),
-      ]),
-    ],
-    [html.text(label)],
   )
 }
 
