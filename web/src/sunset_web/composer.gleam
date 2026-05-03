@@ -3,6 +3,9 @@
 @external(javascript, "./composer.ffi.mjs", "autoGrow")
 pub fn auto_grow(element_id: String) -> Nil
 
+@external(javascript, "./composer.ffi.mjs", "resetTextarea")
+pub fn reset_textarea(element_id: String) -> Nil
+
 @external(javascript, "./composer.ffi.mjs", "applyTemplate")
 pub fn apply_template(
   element_id: String,

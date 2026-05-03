@@ -210,3 +210,57 @@ test("pill click toggles only the reaction, not row selection", async ({
 
   await ctx.close();
 });
+
+// Regression: clicking the "+" button in the quick-picker (desktop) or
+// the reaction sheet (mobile) must mount the full emoji picker. A
+// previous refactor left the OpenFullEmojiPicker handler wired but
+// removed the overlay/sheet rendering, so the click was a silent no-op.
+// We assert the appropriate container becomes visible — actually
+// clicking through the emoji-picker-element web component is shadow-DOM
+// territory and out of scope for this regression check.
+test("clicking the + button mounts the full emoji picker", async ({
+  browser,
+}, testInfo) => {
+  const isMobile = testInfo.project.name === "mobile-chrome";
+
+  const { ctx, page, input } = await openChatPage(browser);
+  const msgRow = await sendMessage(
+    page,
+    input,
+    `more-reactions e2e — ${Date.now()}`,
+  );
+
+  // The .msg-actions toolbar (which holds React and Details) is
+  // pointer-events: none until the row is selected on touch devices
+  // (`@media (hover: none)` in shell.gleam). Tap the message body
+  // first to flip is-selected, otherwise the React click on mobile
+  // hits the body wrapper instead of the toolbar.
+  if (isMobile) {
+    await msgRow.click();
+    await expect(msgRow).toHaveClass(/is-selected/);
+  }
+
+  // Open the quick-picker on both viewports — desktop renders the
+  // inline picker next to the row, phone renders a bottom sheet.
+  await msgRow.getByTitle("React").click({ force: true });
+  const quickPicker = page.locator('[data-testid="reaction-picker"]').first();
+  await expect(quickPicker).toBeVisible({ timeout: 5_000 });
+
+  // The "+" button has the same data-testid on desktop and phone.
+  const more = page.locator('[data-testid="reaction-picker-more"]').first();
+  await expect(more).toBeVisible({ timeout: 5_000 });
+  await more.click();
+
+  const fullPicker = isMobile
+    ? page.locator('[data-testid="full-emoji-picker-sheet"]')
+    : page.locator('[data-testid="full-emoji-picker-overlay"]');
+  await expect(fullPicker).toBeVisible({ timeout: 5_000 });
+
+  // The lazy-imported `emoji-picker-element` web component should mount
+  // inside the overlay/sheet. Its container has a stable testid set by
+  // emoji_picker.view.
+  const pickerEl = page.locator('[data-testid="full-emoji-picker"]');
+  await expect(pickerEl).toBeVisible({ timeout: 10_000 });
+
+  await ctx.close();
+});

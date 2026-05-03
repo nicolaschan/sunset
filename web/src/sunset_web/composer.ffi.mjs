@@ -14,6 +14,21 @@ export function autoGrow(elementId) {
   el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
 }
 
+// Called after a submit-clears-draft cycle. We can't just call
+// autoGrow here: Lustre commits the new value="" on its next render
+// pass, and the effect that calls us runs *before* that — so
+// scrollHeight would still report the just-sent multi-line height.
+// Clear the value imperatively (Lustre will idempotently re-apply
+// "" on its render) and drop the inline `style.height` so the
+// textarea's CSS-declared 1-line height takes over.
+export function resetTextarea(elementId) {
+  const el = document.getElementById(elementId);
+  if (!el || el.tagName !== "TEXTAREA") return;
+  el.value = "";
+  el.style.height = "";
+  el.style.overflowY = "hidden";
+}
+
 export function applyTemplate(elementId, before, between, after, caretAtBetween) {
   const el = document.getElementById(elementId);
   if (!el || el.tagName !== "TEXTAREA") return el ? el.value : "";

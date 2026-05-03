@@ -73,9 +73,7 @@ test.afterAll(() => {
   }
 });
 
-test("Enter sends, Shift+Enter inserts newline, Ctrl+B wraps selection", async ({
-  browser,
-}) => {
+async function openComposerPage(browser) {
   const url = `/?relay=${encodeURIComponent(relayAddress)}#sunset-demo`;
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
@@ -90,16 +88,19 @@ test("Enter sends, Shift+Enter inserts newline, Ctrl+B wraps selection", async (
   });
 
   await page.goto(url);
-  // Wait for the app to load and the composer to be ready.
   await expect(page.getByText("sunset", { exact: true })).toBeVisible({
     timeout: 15_000,
   });
 
-  // Locate the composer textarea by its placeholder (matches "Message #general"
-  // etc). The #composer-textarea id is also set but placeholder is more
-  // reliable across Lustre render cycles.
   const composer = page.getByPlaceholder(/^Message #/);
   await expect(composer).toBeVisible({ timeout: 15_000 });
+  return { ctx, page, composer };
+}
+
+test("Enter sends, Shift+Enter inserts newline, Ctrl+B wraps selection", async ({
+  browser,
+}) => {
+  const { ctx, page, composer } = await openComposerPage(browser);
 
   // --- Enter sends a message ---
   await composer.fill("first");
@@ -122,6 +123,54 @@ test("Enter sends, Shift+Enter inserts newline, Ctrl+B wraps selection", async (
   await composer.press("ControlOrMeta+a"); // select all
   await composer.press("ControlOrMeta+b"); // wrap with bold markers
   await expect(composer).toHaveValue("**hello**");
+
+  await ctx.close();
+});
+
+// Regression: the auto-grow FFI sets `style.height` imperatively on
+// every input, but Lustre's value-prop update on submit doesn't clear
+// it. Without an explicit auto-grow re-run on submit the textarea
+// stays sized for the just-sent multi-line draft, hovering over the
+// (now empty) composer.
+test("textarea height collapses to one line after submitting a multi-line message", async ({
+  browser,
+}) => {
+  const { ctx, page, composer } = await openComposerPage(browser);
+
+  // Baseline: empty 1-line height.
+  const oneLineHeight = await composer.evaluate(
+    (el) => el.getBoundingClientRect().height,
+  );
+  expect(oneLineHeight).toBeGreaterThan(0);
+
+  // Compose three lines so the textarea grows past 1-line height.
+  await composer.fill("line one");
+  await composer.press("Shift+Enter");
+  await composer.type("line two");
+  await composer.press("Shift+Enter");
+  await composer.type("line three");
+  await expect(composer).toHaveValue("line one\nline two\nline three");
+
+  const grownHeight = await composer.evaluate(
+    (el) => el.getBoundingClientRect().height,
+  );
+  expect(grownHeight).toBeGreaterThan(oneLineHeight + 8);
+
+  // Submit; verify the textarea cleared AND visually collapsed back.
+  await composer.press("Enter");
+  await expect(composer).toHaveValue("");
+  await expect(
+    page.locator(".msg-row").filter({ hasText: "line three" }).first(),
+  ).toBeVisible({ timeout: 15_000 });
+
+  // Allow the resize effect to flush (Lustre dispatches it on the next
+  // tick). Poll the height — a small tolerance on top of the baseline
+  // covers sub-pixel rounding from the line-height-rounded measurement.
+  await expect
+    .poll(async () => composer.evaluate((el) => el.getBoundingClientRect().height), {
+      timeout: 5_000,
+    })
+    .toBeLessThanOrEqual(oneLineHeight + 2);
 
   await ctx.close();
 });
