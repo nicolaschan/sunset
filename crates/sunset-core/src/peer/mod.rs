@@ -63,6 +63,20 @@ where
         self.relay_status.borrow().clone()
     }
 
+    pub async fn add_relay(&self, addr: sunset_sync::PeerAddr) -> sunset_sync::Result<()> {
+        *self.relay_status.borrow_mut() = "connecting".to_owned();
+        match self.supervisor.add(addr).await {
+            Ok(()) => {
+                *self.relay_status.borrow_mut() = "connected".to_owned();
+                Ok(())
+            }
+            Err(e) => {
+                *self.relay_status.borrow_mut() = "error".to_owned();
+                Err(e)
+            }
+        }
+    }
+
     // Accessor methods consumed by Phase 5+ (open_room, send_text, etc.).
     #[allow(dead_code)]
     pub(crate) fn identity(&self) -> &Identity {
@@ -117,6 +131,24 @@ mod tests {
                 assert_eq!(peer.relay_status(), "disconnected");
             })
             .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_relay_with_unreachable_addr_sets_status_error() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let peer = helpers::mk_peer(ident(8)).await;
+            assert_eq!(peer.relay_status(), "disconnected");
+
+            // NopTransport's connect() returns Transport("nop") immediately,
+            // so add_relay short-circuits to error and the status flips to
+            // "error".
+            let result = peer.add_relay(sunset_sync::PeerAddr::new(
+                bytes::Bytes::from_static(b"wss://nowhere.invalid")
+            )).await;
+            assert!(result.is_err());
+            assert_eq!(peer.relay_status(), "error");
+        }).await;
     }
 
     pub(super) mod helpers {
