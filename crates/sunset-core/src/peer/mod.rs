@@ -122,12 +122,10 @@ where
     }
 
     // Accessor methods consumed by Phase 5+ (open_room, send_text, etc.).
-    #[allow(dead_code)]
     pub(crate) fn identity(&self) -> &Identity {
         &self.identity
     }
 
-    #[allow(dead_code)]
     pub(crate) fn store(&self) -> &Arc<St> {
         &self.store
     }
@@ -192,6 +190,30 @@ mod tests {
             )).await;
             assert!(result.is_err());
             assert_eq!(peer.relay_status(), "error");
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_text_inserts_a_text_entry() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let peer = helpers::mk_peer(ident(10)).await;
+            let room = peer.open_room("alpha").await.expect("open_room");
+
+            let now_ms = 1_700_000_000_000u64;
+            let value_hash = room
+                .send_text("hello world".to_owned(), now_ms)
+                .await
+                .expect("send_text");
+
+            // The store should now hold the content block under that hash.
+            use sunset_store::Store as _;
+            let block = peer
+                .store()
+                .get_content(&value_hash)
+                .await
+                .expect("get_content");
+            assert!(block.is_some(), "content block missing");
         }).await;
     }
 

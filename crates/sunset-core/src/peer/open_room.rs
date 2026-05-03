@@ -33,6 +33,40 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
     pub fn fingerprint(&self) -> crate::crypto::room::RoomFingerprint {
         self.inner.room.fingerprint()
     }
+
+    pub async fn send_text(
+        &self,
+        body: String,
+        sent_at_ms: u64,
+    ) -> crate::Result<sunset_store::Hash> {
+        use crate::MessageBody;
+        use crate::compose_message;
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+
+        let peer = self
+            .inner
+            .peer_weak
+            .upgrade()
+            .ok_or_else(|| crate::Error::Other("peer dropped".into()))?;
+
+        let mut rng = ChaCha20Rng::from_entropy();
+        let composed = compose_message(
+            peer.identity(),
+            &self.inner.room,
+            0u64,
+            sent_at_ms,
+            MessageBody::Text(body),
+            &mut rng,
+        )?;
+
+        let value_hash = composed.entry.value_hash;
+        peer.store()
+            .insert(composed.entry, Some(composed.block))
+            .await
+            .map_err(|e| crate::Error::Other(format!("store insert: {e}")))?;
+        Ok(value_hash)
+    }
 }
 
 impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
