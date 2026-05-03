@@ -122,23 +122,40 @@ pub struct IntentSnapshot {
 
 #### Dial loop (per attempt)
 
-```
-match connectable {
-    Direct(addr)              => engine.add_peer(addr).await
-    Resolving { input, fetch } => {
-        let r = Resolver::new(fetch.clone());
-        let canonical = r.resolve(&input).await?;       // ParseError → permanent;
-                                                        // HTTP error → backoff
-        let addr = PeerAddr::new(Bytes::from(canonical));
-        engine.add_peer(addr).await
-    }
+`Connectable` provides one async method:
+
+```rust
+impl Connectable {
+    /// Produce the canonical `PeerAddr` to dial. For `Direct`, returns
+    /// the stored address immediately. For `Resolving`, runs the
+    /// resolver — every attempt — so an upstream identity rotation is
+    /// handled transparently. `ParseError` is permanent (the intent is
+    /// cancelled); every other error is transient (existing backoff
+    /// applies).
+    async fn resolve_addr(&self) -> Result<PeerAddr, ResolveErr>;
 }
 ```
 
-`ParseError` from `parse_input` is the only thing that aborts the intent
-permanently — typed garbage. Everything else (HTTP 503, connection
-refused, mismatched JSON, dial timeout) is transient and gets the
-existing exponential backoff.
+The supervisor's per-attempt dial code is unchanged from today except
+for the `resolve_addr()` prefix:
+
+```rust
+let addr = connectable.resolve_addr().await?;
+engine.add_peer(addr).await   // <- existing path; unchanged from here
+```
+
+Everything downstream — `engine.add_peer`, the Ok/Err state
+transitions, `peer_to_addr` insertion (still keyed by the canonical
+`PeerAddr`), `BackoffPolicy::delay`, the disconnect-fires-Backoff
+handler, the redial loop — is the existing supervisor code, untouched.
+A `Direct` intent's behavior is identical to today's `add(addr)` flow,
+because for `Direct` the new `resolve_addr` step is a no-op clone.
+
+`ParseError` from `parse_input` is the only thing that aborts the
+intent permanently — typed garbage. Everything else (HTTP 503,
+connection refused, mismatched JSON, dial timeout) is transient and
+gets the same exponential backoff that already exists for connection
+failures.
 
 ### `sunset-web-wasm`
 
