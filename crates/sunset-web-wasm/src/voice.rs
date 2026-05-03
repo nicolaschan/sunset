@@ -69,9 +69,7 @@ pub(crate) fn voice_start(state: &VoiceCell, output_handler: &Function) -> Resul
                     let _ = handler.call1(&JsValue::NULL, &arr);
                 }
                 Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("sunset-voice: decode failed for one frame: {e}").into(),
-                    );
+                    tracing::warn!(error = %e, "decode failed for one frame");
                 }
             }
         }

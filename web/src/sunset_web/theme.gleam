@@ -1,9 +1,13 @@
-//// Quiet (D1) palette + font tokens.
+//// Sunset palette + font tokens.
 ////
-//// Light: warm cream surfaces, deep teal accent.
-//// Dark: warm-tinted ink, brighter teal accent.
+//// Light: warm cream surfaces with a faint pink undertone, terracotta
+//// accent for primary action, dusty amber for "live" / unread, ember
+//// orange for warnings. Greens stay green for `ok` so success still
+//// reads as success universally.
 ////
-//// Source values are taken verbatim from `quiet.jsx` (`QUIET_PALETTES.geist`).
+//// Dark: warm dusk ink (slight plum undertone), peach accent that
+//// brightens on hover, warm gold "live" dot. Same role layout as
+//// light, just shifted up the lightness scale.
 
 pub type Mode {
   Light
@@ -59,49 +63,49 @@ pub fn color_scheme(mode: Mode) -> String {
 
 fn light() -> Palette {
   Palette(
-    bg: "#f7f5f1",
+    bg: "#f8f2ec",
     surface: "#ffffff",
-    surface_alt: "#f4f1ec",
-    surface_sunk: "#eeeae3",
-    border: "#e3ddd2",
-    border_soft: "#ebe6dc",
-    text: "#1c1d20",
-    text_muted: "#5e5b54",
-    text_faint: "#9c9890",
-    accent: "#226d6f",
-    accent_soft: "#dde9e8",
-    accent_deep: "#15514f",
+    surface_alt: "#f4eadf",
+    surface_sunk: "#ecdfcd",
+    border: "#e5d4be",
+    border_soft: "#ede0c9",
+    text: "#1f1c1a",
+    text_muted: "#5e574e",
+    text_faint: "#9d958a",
+    accent: "#bb5a3a",
+    accent_soft: "#f6dccc",
+    accent_deep: "#8a3a22",
     accent_ink: "#ffffff",
     ok: "#3a8a4a",
     ok_soft: "#dceadb",
-    warn: "#b07a1f",
-    warn_soft: "#f4e7cd",
-    live: "#3a8a4a",
-    shadow: "0 1px 2px rgba(40,30,15,0.04)",
-    shadow_lg: "0 16px 50px rgba(40,30,15,0.06)",
+    warn: "#a8641a",
+    warn_soft: "#f5dfbc",
+    live: "#c98a3a",
+    shadow: "0 1px 2px rgba(60,30,15,0.05)",
+    shadow_lg: "0 16px 50px rgba(60,30,15,0.07)",
   )
 }
 
 fn dark() -> Palette {
   Palette(
-    bg: "#0e1314",
-    surface: "#161c1d",
-    surface_alt: "#11171a",
-    surface_sunk: "#0a1011",
-    border: "#222a2c",
-    border_soft: "#1c2426",
-    text: "#e5e3dd",
-    text_muted: "#9aa19c",
-    text_faint: "#5c6663",
-    accent: "#5dbab0",
-    accent_soft: "#1a2e2d",
-    accent_deep: "#7ed4c8",
-    accent_ink: "#0e1314",
+    bg: "#13110f",
+    surface: "#1c1814",
+    surface_alt: "#181410",
+    surface_sunk: "#100c08",
+    border: "#2a221c",
+    border_soft: "#221c17",
+    text: "#ece4d6",
+    text_muted: "#a09489",
+    text_faint: "#5e564d",
+    accent: "#e8997a",
+    accent_soft: "#3a2520",
+    accent_deep: "#f2b095",
+    accent_ink: "#1c1814",
     ok: "#5fbe6e",
     ok_soft: "#1a2c1d",
-    warn: "#d4a455",
-    warn_soft: "#2e2516",
-    live: "#5fbe6e",
+    warn: "#d4884a",
+    warn_soft: "#2e2014",
+    live: "#e6b85a",
     shadow: "0 1px 2px rgba(0,0,0,0.5)",
     shadow_lg: "0 20px 60px rgba(0,0,0,0.6)",
   )
