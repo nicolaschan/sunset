@@ -149,13 +149,19 @@ test("clicking a peer row opens the status popover with live age", async ({ brow
   const initialText = await popover.textContent();
   expect(initialText).toMatch(/heard from (just now|\d+s ago|\d+m ago)/);
 
-  // Wait ~3 seconds; the age readout should change (popover ticker
-  // bumps `now_ms` every 1s and re-renders).
-  await new Promise((r) => setTimeout(r, 3500));
-  const tickedText = await popover.textContent();
-  expect(tickedText).not.toBe(initialText);
+  // Poll until the age readout changes — the popover ticker bumps
+  // `now_ms` every 1 s and re-renders, so any later snapshot must
+  // differ from the initial one. 5 s budget covers the worst-case
+  // case where the initial sample landed 0.99 s into a tick and the
+  // next visible flip happens after 1.01 s of waiting plus jitter.
+  await expect
+    .poll(async () => await popover.textContent(), { timeout: 5_000 })
+    .not.toBe(initialText);
 
   // Close button works.
   await pageA.locator('[data-testid="peer-status-popover-close"]').click();
   await expect(popover).toHaveCount(0);
+
+  await ctxA.close();
+  await ctxB.close();
 });

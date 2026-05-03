@@ -175,31 +175,34 @@ test("chat resumes after relay restart without page reload", async ({ browser })
   relayProcess = restarted.proc;
   expect(restarted.addr).toBe(relayAddress);
 
-  // Wait for the supervisor on each side to detect the disconnect and
-  // reconnect. Design budget:
+  // Send a message immediately — the user-visible contract is that
+  // typing into the composer stores the message in the local CRDT and
+  // the sync engine flushes it once the supervisor redials. Bare sleep
+  // budgets ("wait 25 s for reconnect, then send") were masking that
+  // contract: the test was effectively asserting "send-while-online
+  // works post-redial," not the user's actual experience of "I typed
+  // a message right after the relay hiccup; it eventually arrived."
+  //
+  // Budget covers, end-to-end:
   //   - send-side detection on next heartbeat tick: ≤ heartbeat_interval (15s default)
   //   - supervisor backoff: ~1s initial (with ±20% jitter)
   //   - re-dial connect + Hello handshake: <1s on localhost
-  // Typical total: ~17s. We wait 25s as a tight bound — anything slower
-  // than this is a regression in the supervisor's reconnect path itself.
-  //
-  // (Catch-up of messages sent during the gap is covered by
-  // catchup_after_disconnect.spec.js, which keeps the relay up so a
-  // live producer can actually publish during the gap. Killing the
-  // relay disconnects everyone, so this test asserts only that chat
-  // resumes for new traffic post-redial.)
-  await new Promise((r) => setTimeout(r, 25_000));
-
-  // Send a message — should arrive promptly on the freshly-redialed
-  // connection.
+  //   - digest exchange + delivery to B's UI: <1s
+  // Typical end-to-end ~17 s. 35 s is a tight bound — anything slower
+  // than this is a regression in the reconnect path.
   const msgPost = `post-restart from A — ${Date.now()}`;
   await inputA.fill(msgPost);
   await inputA.press("Enter");
-  await expect(pageB.getByText(msgPost)).toBeVisible({ timeout: 15_000 });
+  await expect(pageB.getByText(msgPost)).toBeVisible({ timeout: 35_000 });
 
-  // Bidirectional sanity: B → A also works after redial.
+  // Bidirectional sanity: by the time msgPost has arrived above, both
+  // sides are reconnected to the relay, so B → A is back to the normal
+  // chat-over-relay path.
   const msgPostB = `post-restart from B — ${Date.now()}`;
   await inputB.fill(msgPostB);
   await inputB.press("Enter");
   await expect(pageA.getByText(msgPostB)).toBeVisible({ timeout: 15_000 });
+
+  await ctxA.close();
+  await ctxB.close();
 });

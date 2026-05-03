@@ -131,6 +131,14 @@ test("two browsers exchange a message via relay", async ({ browser }) => {
   await inputB.fill(msg2);
   await inputB.press("Enter");
   await expect(pageA.getByText(msg2)).toBeVisible({ timeout: 15_000 });
+
+  // Close contexts explicitly. Playwright doesn't auto-close contexts
+  // created via `browser.newContext()` between tests in the same
+  // worker, and a leaked context keeps its wasm + supervisor retry
+  // loops running — that load piles up under workers=1 and causes
+  // later tests' beforeEach hooks to time out.
+  await ctxA.close();
+  await ctxB.close();
 });
 
 test("bare host:port in ?relay= triggers GET / resolution", async ({
@@ -180,4 +188,7 @@ test("bare host:port in ?relay= triggers GET / resolution", async ({
   await inputA.fill(msg);
   await inputA.press("Enter");
   await expect(pageB.getByText(msg)).toBeVisible({ timeout: 15_000 });
+
+  await ctxA.close();
+  await ctxB.close();
 });
