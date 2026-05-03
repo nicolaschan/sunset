@@ -31,6 +31,41 @@ pub(crate) fn split(input: &str) -> Vec<Block> {
             }
         }
 
+        if let Some(rest) = lines[i].strip_prefix(">>> ") {
+            if !buf.is_empty() {
+                blocks.push(paragraph_from_lines(&buf));
+                buf.clear();
+            }
+            // Take this line plus all remaining lines, joined back.
+            let mut quoted = vec![rest];
+            quoted.extend_from_slice(&lines[i + 1..]);
+            let inner = quoted.join("\n");
+            blocks.push(Block::Quote(split(&inner)));
+            return blocks;
+        }
+
+        if let Some(rest) = lines[i].strip_prefix("> ") {
+            if !buf.is_empty() {
+                blocks.push(paragraph_from_lines(&buf));
+                buf.clear();
+            }
+            // Group consecutive `> ` lines into one quote block.
+            let mut quoted = vec![rest.to_owned()];
+            let mut j = i + 1;
+            while j < lines.len() {
+                if let Some(more) = lines[j].strip_prefix("> ") {
+                    quoted.push(more.to_owned());
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let inner = quoted.join("\n");
+            blocks.push(Block::Quote(split(&inner)));
+            i = j;
+            continue;
+        }
+
         if lines[i].is_empty() {
             if !buf.is_empty() {
                 blocks.push(paragraph_from_lines(&buf));

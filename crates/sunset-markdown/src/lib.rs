@@ -437,6 +437,51 @@ mod tests {
     }
 
     #[test]
+    fn single_line_quote() {
+        assert_eq!(
+            parse("> hello"),
+            Document(vec![Block::Quote(vec![Block::Paragraph(vec![
+                Inline::Text("hello".to_owned())
+            ])])])
+        );
+    }
+
+    #[test]
+    fn quote_only_on_consecutive_lines() {
+        assert_eq!(
+            parse("> hello\nworld"),
+            Document(vec![
+                Block::Quote(vec![Block::Paragraph(vec![Inline::Text("hello".to_owned())])]),
+                Block::Paragraph(vec![Inline::Text("world".to_owned())]),
+            ])
+        );
+    }
+
+    #[test]
+    fn block_quote_to_end() {
+        assert_eq!(
+            parse(">>> hello\nworld\nmore"),
+            Document(vec![Block::Quote(vec![Block::Paragraph(vec![
+                Inline::Text("hello".to_owned()),
+                Inline::LineBreak,
+                Inline::Text("world".to_owned()),
+                Inline::LineBreak,
+                Inline::Text("more".to_owned()),
+            ])])])
+        );
+    }
+
+    #[test]
+    fn quote_can_contain_bold() {
+        assert_eq!(
+            parse("> **important**"),
+            Document(vec![Block::Quote(vec![Block::Paragraph(vec![
+                Inline::Bold(vec![Inline::Text("important".to_owned())])
+            ])])])
+        );
+    }
+
+    #[test]
     fn unclosed_fenced_code_falls_back_to_paragraph() {
         // Implementation choice: we treat the whole input as paragraphs
         // when the closing fence is missing, rather than swallowing
