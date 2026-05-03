@@ -655,9 +655,21 @@ where
     }
 
     async fn send_bootstrap_digest(&self, to: &PeerId) {
+        let filter = self.config.bootstrap_filter.clone();
+        self.send_filter_digest(to, &filter).await;
+    }
+
+    /// Send a `DigestExchange` over `filter` to `to`. Builds a Bloom
+    /// of our entries matching `filter`; the receiver uses its own
+    /// store + the bloom to compute "entries we have that the sender
+    /// doesn't" and replies with those as `EventDelivery`. Reused
+    /// for both the per-peer bootstrap exchange (filter =
+    /// SUBSCRIBE_NAME) and the post-`publish_subscription` catch-up
+    /// exchange (filter = the just-published subscription's filter).
+    async fn send_filter_digest(&self, to: &PeerId, filter: &Filter) {
         let bloom = match build_digest(
             &*self.store,
-            &self.config.bootstrap_filter,
+            filter,
             &DigestRange::All,
             self.config.bloom_size_bits,
             self.config.bloom_hash_fns,
@@ -668,7 +680,7 @@ where
             Err(_) => return,
         };
         let msg = SyncMessage::DigestExchange {
-            filter: self.config.bootstrap_filter.clone(),
+            filter: filter.clone(),
             range: DigestRange::All,
             bloom: bloom.to_bytes(),
         };
@@ -984,6 +996,19 @@ where
     }
 
     /// Real implementation of `publish_subscription`'s server side.
+    ///
+    /// Uses millisecond-precision priority (matching `presence_publisher`)
+    /// so two `publish_subscription` calls separated by sub-second wall
+    /// clock — most commonly a process restart sharing a `data_dir` with
+    /// the previous instance, where `Relay::new` + bind + banner takes
+    /// well under one second — produce monotonically-increasing priorities.
+    /// On the unlikely Stale (equal- or greater-priority on-disk entry,
+    /// e.g. clock-stepped backwards by NTP), retry once with
+    /// `existing.priority + 1` so the call always succeeds for our own
+    /// subscribe entry. The contract is "after Ok, the subscription is
+    /// active"; previously, restart within the same UNIX second of the
+    /// prior run silently violated that contract and caused the relay
+    /// process to exit on startup.
     async fn do_publish_subscription(
         &self,
         filter: Filter,
@@ -998,21 +1023,81 @@ where
             data: Bytes::from(value),
             references: vec![],
         };
-        let now_secs = web_time::SystemTime::now()
+        let now_ms = web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let mut entry = SignedKvEntry {
-            verifying_key: self.signer.verifying_key(),
-            name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
-            value_hash: block.hash(),
-            priority: now_secs,
-            expires_at: Some(now_secs.saturating_add(ttl.as_secs())),
-            signature: Bytes::new(),
-        };
-        let payload = signing_payload(&entry);
-        entry.signature = self.signer.sign(&payload);
-        self.store.insert(entry, Some(block)).await?;
+        let ttl_ms = ttl.as_millis() as u64;
+        let vk = self.signer.verifying_key();
+        let name = Bytes::from_static(reserved::SUBSCRIBE_NAME);
+        let value_hash = block.hash();
+
+        let mut priority = now_ms;
+        // At most one retry: the second iteration uses
+        // `existing.priority + 1`, which is strictly greater than any
+        // priority we've ever stored, so the third insert (if reached)
+        // would be impossible by construction.
+        let mut inserted = false;
+        for _ in 0..2 {
+            let mut entry = SignedKvEntry {
+                verifying_key: vk.clone(),
+                name: name.clone(),
+                value_hash,
+                priority,
+                expires_at: Some(priority.saturating_add(ttl_ms)),
+                signature: Bytes::new(),
+            };
+            let payload = signing_payload(&entry);
+            entry.signature = self.signer.sign(&payload);
+            match self.store.insert(entry, Some(block.clone())).await {
+                Ok(()) => {
+                    inserted = true;
+                    break;
+                }
+                Err(sunset_store::Error::Stale) => {
+                    let existing = self
+                        .store
+                        .get_entry(&vk, &name)
+                        .await
+                        .map_err(Error::Store)?;
+                    match existing {
+                        Some(e) => priority = e.priority.saturating_add(1),
+                        // Stale without an existing entry shouldn't happen
+                        // (LWW only rejects against an existing-or-equal
+                        // priority), but propagate cleanly if it does.
+                        None => return Err(Error::Store(sunset_store::Error::Stale)),
+                    }
+                }
+                Err(e) => return Err(Error::Store(e)),
+            }
+        }
+        if !inserted {
+            // The retry loop is bounded by construction — see above.
+            // This branch is unreachable; we return Stale to satisfy
+            // the type system without inventing a new error variant.
+            return Err(Error::Store(sunset_store::Error::Stale));
+        }
+
+        // Fire a digest exchange to every connected peer over the
+        // newly-published filter. The peer responds with any matching
+        // entries it has that aren't in our bloom — closing the
+        // late-subscriber gap where an entry already at the peer
+        // (e.g., a relay holding A's WebRTC offer for us) wouldn't
+        // otherwise reach us until anti-entropy fires for
+        // SUBSCRIBE_NAME, which doesn't carry chat/webrtc data.
+        // Snapshotting peer ids first lets us drop the state lock
+        // before the per-peer bloom build + send work.
+        let peers: Vec<PeerId> = self
+            .state
+            .lock()
+            .await
+            .peer_outbound
+            .keys()
+            .cloned()
+            .collect();
+        for peer_id in &peers {
+            self.send_filter_digest(peer_id, &filter).await;
+        }
         Ok(())
     }
 }
@@ -1692,6 +1777,154 @@ mod tests {
 
                 h.abort();
                 let _ = h.await;
+            })
+            .await;
+    }
+
+    /// Regression test for the Stale-on-restart bug. The relay's
+    /// `Relay::run()` calls `publish_subscription` on startup; if the
+    /// data_dir already contains a subscribe entry written by a prior
+    /// process run with priority equal to (or greater than) the current
+    /// `now_ms`, the LWW store rejects the insert as Stale. Pre-fix,
+    /// the engine surfaced that as an error → `Relay::run` returned
+    /// Err → process exited → clients saw ECONNREFUSED on every
+    /// reconnect attempt, breaking restart-based redial.
+    ///
+    /// `do_publish_subscription` must absorb the Stale and retry with
+    /// `existing.priority + 1`, so the call is always Ok for our own
+    /// subscribe entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_subscription_bumps_priority_past_existing_stale_entry() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = make_engine_with_store("alice", b"alice", store.clone());
+
+                // Pre-populate a subscribe entry under our own
+                // verifying_key with a priority well in the future,
+                // simulating a prior-process-run entry that the new
+                // call's `now_ms` cannot beat.
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"prior-filter"),
+                    references: vec![],
+                };
+                let future_priority: u64 = 9_999_999_999_999; // ~year 2286 in ms
+                let prior = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: block.hash(),
+                    priority: future_priority,
+                    expires_at: Some(future_priority.saturating_add(1)),
+                    signature: Bytes::from_static(&[0u8; 64]),
+                };
+                store
+                    .insert(prior.clone(), Some(block))
+                    .await
+                    .expect("prior insert");
+
+                // The freshly-issued publish_subscription would race a
+                // `now_ms` that is far below `future_priority` and
+                // therefore hit Stale on the first attempt. The retry
+                // bump must raise priority above the prior one and
+                // succeed.
+                let new_filter = Filter::NamePrefix(Bytes::from_static(b"chat/"));
+                engine
+                    .do_publish_subscription(new_filter, std::time::Duration::from_secs(60))
+                    .await
+                    .expect("publish_subscription must succeed even when an existing entry has a higher priority");
+
+                let stored = store
+                    .get_entry(&vk(b"alice"), reserved::SUBSCRIBE_NAME)
+                    .await
+                    .expect("get_entry")
+                    .expect("entry stored");
+                assert!(
+                    stored.priority > prior.priority,
+                    "new priority {} must strictly beat prior priority {}",
+                    stored.priority,
+                    prior.priority
+                );
+                assert_ne!(
+                    stored.value_hash, prior.value_hash,
+                    "new entry must replace the prior one (different filter → different value_hash)"
+                );
+            })
+            .await;
+    }
+
+    /// Regression for the late-subscriber routing race: an entry that
+    /// already lives at our peer when we publish a new subscription
+    /// wouldn't otherwise reach us. The per-event push at the peer
+    /// fired against an empty registry (we hadn't subscribed yet),
+    /// and the periodic anti-entropy / bootstrap-digest exchange
+    /// only carries SUBSCRIBE_NAME entries — chat / webrtc data
+    /// stays stranded. Pre-fix this manifested as `connect_direct`
+    /// hangs in CI: A's WebRTC offer reaches the relay, the relay
+    /// stores it, and B (who joined a moment later) never sees it.
+    ///
+    /// Fix: `do_publish_subscription` follows the local store insert
+    /// with a `DigestExchange` over the new filter, sent to every
+    /// connected peer. The peer responds with whatever matching
+    /// entries we don't already have, reusing the existing
+    /// `handle_digest_exchange` machinery.
+    ///
+    /// This test stands in for the publishing client (B): it sets
+    /// up B with one connected peer (e.g. the relay), calls
+    /// `do_publish_subscription`, and asserts that a digest
+    /// addressed to that peer hits the outbound channel with the
+    /// just-published filter.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_subscription_sends_filter_digest_to_connected_peers() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("bob", b"bob"));
+
+                // Stand up "relay" as a connected peer with an
+                // outbound channel we can drain, mirroring what
+                // `handle_inbound_event(PeerHello)` does on a real
+                // connection.
+                let relay = PeerId(vk(b"relay"));
+                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
+                {
+                    let mut state = engine.state.lock().await;
+                    state.peer_outbound.insert(
+                        relay.clone(),
+                        PeerOutbound {
+                            conn_id: ConnectionId::for_test(0),
+                            tx,
+                        },
+                    );
+                }
+
+                // Publish a subscription whose filter covers a
+                // chat-like namespace. After Ok we expect a
+                // DigestExchange with this exact filter on the
+                // relay's outbound channel.
+                let filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
+                engine
+                    .do_publish_subscription(filter.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("publish_subscription must succeed");
+
+                // Drain everything the engine sent to the relay and
+                // assert: at least one DigestExchange whose filter
+                // matches the freshly-published one.
+                let mut saw_filter_digest = false;
+                while let Ok(msg) = rx.try_recv() {
+                    if let SyncMessage::DigestExchange { filter: f, .. } = msg {
+                        if f == filter {
+                            saw_filter_digest = true;
+                        }
+                    }
+                }
+                assert!(
+                    saw_filter_digest,
+                    "publish_subscription must send a DigestExchange over the new filter to each connected peer so the peer can backfill matching entries we're missing"
+                );
             })
             .await;
     }
