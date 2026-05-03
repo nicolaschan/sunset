@@ -189,7 +189,8 @@ impl VoiceRuntime {
         *self.inner.muted.borrow()
     }
 
-    #[cfg(test)]
+    /// Test-only: report jitter buffer depth for a peer.
+    #[doc(hidden)]
     pub fn test_jitter_len(&self, peer: &sunset_sync::PeerId) -> usize {
         self.inner
             .jitter
@@ -199,7 +200,8 @@ impl VoiceRuntime {
             .unwrap_or(0)
     }
 
-    #[cfg(test)]
+    /// Test-only: push a PCM frame directly into the jitter buffer.
+    #[doc(hidden)]
     pub fn test_push_frame(&self, peer: sunset_sync::PeerId, pcm: Vec<f32>) {
         self.inner
             .jitter
@@ -241,17 +243,7 @@ mod combiner {
         Box::pin(async {})
     }
 }
-mod heartbeat {
-    use std::rc::Weak;
-
-    use super::state::RuntimeInner;
-
-    pub(crate) fn spawn(
-        _inner: Weak<RuntimeInner>,
-    ) -> futures::future::LocalBoxFuture<'static, ()> {
-        Box::pin(async {})
-    }
-}
+mod heartbeat;
 mod jitter {
     use std::rc::Weak;
 
