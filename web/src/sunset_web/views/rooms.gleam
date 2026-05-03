@@ -45,6 +45,16 @@ pub fn view(
     domain.Desktop, True -> "54px"
     domain.Desktop, False -> "260px"
   }
+  // On phone the rail fills the drawer's safe-area-padded content
+  // box, not the raw viewport — the drawer wrapper already accounts
+  // for the iOS status bar / home indicator insets, and a 100dvh rail
+  // would overflow the drawer's clipping box and hide the bottom
+  // you_row behind the home indicator. On desktop the rail still
+  // anchors to the viewport via dvh so it fills the grid row.
+  let height_props = case viewport {
+    domain.Phone -> [#("height", "100%"), #("min-height", "0")]
+    domain.Desktop -> [#("height", "100vh"), #("height", "100dvh")]
+  }
   // The drawer wrapper draws its own border-right; suppress the rail's
   // border-right on phone to avoid a doubled line and the 60px gap that
   // appears when the rail is narrower than its drawer.
@@ -60,23 +70,27 @@ pub fn view(
   html.aside(
     [
       attribute.attribute("data-testid", "rooms-rail"),
-      ui.css([
-        #("width", width),
-        #("min-width", width),
-        #("height", "100vh"),
-        #("height", "100dvh"),
-        #("display", "flex"),
-        #("flex-direction", "column"),
-        #("background", p.surface),
-        #("border-right", border_right),
-        #("transition", "width 220ms ease"),
-        // Children sometimes have absolute-positioned bits (unread badges)
-        // that hang outside their bounding box, plus the inline list rows
-        // are sized for the expanded state — clip everything that doesn't
-        // fit so the collapsed 54px rail never spawns a horizontal scroll.
-        #("overflow", "hidden"),
-        #("min-width", "0"),
-      ]),
+      ui.css(
+        list.append(height_props, [
+          #("width", width),
+          #("min-width", width),
+          #("display", "flex"),
+          #("flex-direction", "column"),
+          #("background", p.surface),
+          #("border-right", border_right),
+          #("transition", "width 220ms ease"),
+          // Children sometimes have absolute-positioned bits (unread badges)
+          // that hang outside their bounding box, plus the inline list rows
+          // are sized for the expanded state — clip everything that doesn't
+          // fit so the collapsed 54px rail never spawns a horizontal scroll.
+          #("overflow", "hidden"),
+          // Allow the rail to shrink below its content's intrinsic width
+          // when the surrounding flex/grid context demands it. Pairs with
+          // the explicit `width` above — `min-width: 0` keeps flexbox
+          // from pinning the rail to its content's natural size.
+          #("min-width", "0"),
+        ]),
+      ),
     ],
     [
       brand_row(p, col, toggle, viewport),

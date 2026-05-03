@@ -54,6 +54,16 @@ pub fn view(
           #("height", "100dvh"),
           #("width", "84vw"),
           #("max-width", "320px"),
+          // Pad the drawer's interior by the iOS safe-area insets so
+          // the status bar / home indicator never sit over interactive
+          // chrome inside the drawer (rooms search, you-row settings
+          // trigger, etc.). The drawer's own background still extends
+          // edge-to-edge under the inset, which gives the cleaner look
+          // the `apple-mobile-web-app-status-bar-style: black-
+          // translucent` meta is designed for. Mirrors the safe-area
+          // handling already used by phone_header for the main shell.
+          #("padding-top", "env(safe-area-inset-top)"),
+          #("padding-bottom", "env(safe-area-inset-bottom)"),
           #("background", p.surface),
           #("color", p.text),
           #("border-right", case side {
