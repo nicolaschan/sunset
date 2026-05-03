@@ -359,10 +359,24 @@ impl MultiRoomSignaler {
 #[async_trait(?Send)]
 impl Signaler for MultiRoomSignaler {
     async fn send(&self, message: SignalMessage) -> SyncResult<()> {
-        // Pick the first registered per-room signaler. The receiver
-        // subscribes to all its open rooms, so any one is sufficient as
-        // a carrier as long as we both have it open. If no rooms are
-        // registered, fail with a clear error.
+        // Pick the first registered per-room signaler (HashMap iteration
+        // order, but it's stable within a process so connect_direct
+        // retries land on the same room). The receiver subscribes to
+        // all its open rooms, so any single room is a sufficient
+        // carrier — provided both peers have that room open.
+        //
+        // KNOWN LIMITATION: if `to` doesn't have the chosen carrier
+        // room open, the signaling entry lands in the relay's store
+        // but `to` never reads it; `connect_direct` then times out at
+        // the WebRTC layer with no helpful error here. Callers who
+        // *can* check shared-room overlap (membership tracker) should
+        // do so before invoking `connect_direct`. Broadcasting through
+        // every room is NOT a valid workaround: per-room signalers
+        // hold independent Noise_KK state, so N copies of msg1 would
+        // each initiate an independent handshake and confuse the
+        // receiver's slot machine.
+        //
+        // If no rooms are registered, fail loudly.
         let signaler = {
             let map = self.by_room.borrow();
             map.values().next().cloned()
@@ -370,7 +384,9 @@ impl Signaler for MultiRoomSignaler {
         match signaler {
             Some(s) => s.send(message).await,
             None => Err(SyncError::Transport(
-                "MultiRoomSignaler::send with no rooms registered".into(),
+                "MultiRoomSignaler::send with no rooms registered \
+                 (call Peer::open_room before connect_direct)"
+                    .into(),
             )),
         }
     }

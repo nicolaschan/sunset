@@ -25,7 +25,12 @@ pub struct Peer<St: Store + 'static, T: Transport + 'static> {
     engine: Rc<SyncEngine<St, T>>,
     supervisor: Rc<PeerSupervisor<St, T>>,
     relay_status: Rc<RefCell<String>>,
-    open_rooms: RefCell<HashMap<RoomFingerprint, Weak<open_room::RoomState<St, T>>>>,
+    /// Held across `open_room`'s await window so two concurrent
+    /// `open_room("alpha")` calls coalesce on a single `RoomState`
+    /// rather than racing through the idempotency check, both doing
+    /// Argon2 work and both registering signalers (the second
+    /// overwriting the first in the dispatcher).
+    open_rooms: tokio::sync::Mutex<HashMap<RoomFingerprint, Weak<open_room::RoomState<St, T>>>>,
     pub(crate) rtc_signaler_dispatcher: Rc<MultiRoomSignaler>,
 }
 
@@ -48,7 +53,7 @@ where
             engine,
             supervisor,
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
-            open_rooms: RefCell::new(HashMap::new()),
+            open_rooms: tokio::sync::Mutex::new(HashMap::new()),
             rtc_signaler_dispatcher,
         })
     }
@@ -63,13 +68,24 @@ where
 
     pub async fn open_room(self: &Rc<Self>, room_name: &str) -> crate::Result<OpenRoom<St, T>> {
         // Open the Room (Argon2id derivation; expensive — ~tens to
-        // hundreds of ms with production params).
+        // hundreds of ms with production params). Done outside the
+        // registry lock so concurrent opens of *different* rooms can
+        // run their KDF in parallel (single-threaded WASM doesn't
+        // actually parallelize, but this keeps native hosts honest).
         let room = Rc::new(crate::Room::open(room_name)?);
         let fp = room.fingerprint();
 
-        // Idempotency check: if this fingerprint is already open and the
-        // weak still upgrades, return another handle to the same RoomState.
-        if let Some(weak) = self.open_rooms.borrow().get(&fp) {
+        // Hold the registry lock across the rest of the open: this is
+        // the idempotency guarantee. Without it two concurrent
+        // open_room("alpha") calls both pass the registry check, both
+        // register signalers (second wins), and the first signaler's
+        // spawn_dispatcher leaks. Cost: serializes opens of *different*
+        // rooms too. Acceptable — opens are rare and the work is
+        // bounded.
+        let mut open_rooms = self.open_rooms.lock().await;
+
+        // Idempotency check under lock.
+        if let Some(weak) = open_rooms.get(&fp) {
             if let Some(strong) = weak.upgrade() {
                 return Ok(OpenRoom { inner: strong });
             }
@@ -129,9 +145,7 @@ where
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
         });
 
-        self.open_rooms
-            .borrow_mut()
-            .insert(fp, Rc::downgrade(&state));
+        open_rooms.insert(fp, Rc::downgrade(&state));
         Ok(OpenRoom { inner: state })
     }
 
@@ -168,17 +182,6 @@ where
         &self.supervisor
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn relay_status_cell(&self) -> Rc<RefCell<String>> {
-        self.relay_status.clone()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn open_rooms_cell(
-        &self,
-    ) -> &RefCell<HashMap<RoomFingerprint, Weak<open_room::RoomState<St, T>>>> {
-        &self.open_rooms
-    }
 }
 
 #[cfg(test)]
@@ -262,6 +265,32 @@ mod tests {
                 assert_eq!(r1.fingerprint(), r2.fingerprint());
                 // Internal: both handles share the same Rc<RoomState>.
                 assert!(Rc::ptr_eq(&r1.inner, &r2.inner));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_open_room_for_same_name_coalesces() {
+        // Race window check: two parallel open_room("alpha") calls must
+        // return handles to the same RoomState. Without serialization
+        // they'd both pass the idempotency check, both do Argon2 work,
+        // both register signalers (second overwrites the first in the
+        // dispatcher), leaking the first signaler's spawn_dispatcher.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(20)).await;
+                let (r1, r2) =
+                    futures::join!(peer.open_room("alpha"), peer.open_room("alpha"));
+                let r1 = r1.expect("open_room r1");
+                let r2 = r2.expect("open_room r2");
+                assert!(
+                    Rc::ptr_eq(&r1.inner, &r2.inner),
+                    "concurrent open_room must coalesce to one RoomState"
+                );
+                // The dispatcher should hold exactly one signaler for this fp,
+                // not two.
+                assert_eq!(peer.rtc_signaler_dispatcher.len(), 1);
             })
             .await;
     }
