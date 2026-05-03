@@ -215,6 +215,12 @@ pub fn decode_message(
     let dalek_sig = DalekSignature::from_bytes(signed.inner_signature.as_bytes());
     author_key.verify(&inner_payload, &dalek_sig)?;
 
+    if let MessageBody::Reaction { ref emoji, .. } = signed.body {
+        if emoji.len() > 64 {
+            return Err(Error::EmojiTooLong { len: emoji.len() });
+        }
+    }
+
     Ok(DecodedMessage {
         author_key,
         room_fingerprint: room.fingerprint(),
@@ -457,6 +463,65 @@ mod tests {
             &mut OsRng,
         );
         assert!(result.is_ok(), "64 bytes should be accepted (limit is inclusive)");
+    }
+
+    #[test]
+    fn decode_rejects_oversized_reaction_emoji() {
+        use crate::crypto::aead::{aead_encrypt, build_msg_aad, derive_msg_key, fresh_nonce};
+        use crate::crypto::envelope::{ReactionAction, Signature};
+
+        let id = alice();
+        let room = general();
+        let room_fp = room.fingerprint();
+
+        // Hand-craft a SignedMessage with an oversized emoji to bypass
+        // compose_reaction's length cap. The signature is computed honestly
+        // over the oversized payload so we exercise the decode-side check
+        // (not signature failure).
+        let target: Hash = blake3::hash(b"target").into();
+        let body = MessageBody::Reaction {
+            for_value_hash: target,
+            emoji: "a".repeat(65),
+            action: ReactionAction::Add,
+        };
+        let inner_payload = inner_sig_payload_bytes(&room_fp, 0, 1, &body);
+        let inner_sig: Signature = id.sign(&inner_payload).to_bytes().into();
+        let signed = SignedMessage {
+            inner_signature: inner_sig,
+            sent_at_ms: 1,
+            body,
+        };
+
+        let pt = postcard::to_stdvec(&signed).unwrap();
+        let nonce = fresh_nonce(&mut OsRng);
+        let pt_hash: Hash = blake3::hash(&pt).into();
+        let k_msg = derive_msg_key(room.epoch_root(0).unwrap(), 0, &pt_hash);
+        let aad = build_msg_aad(room_fp.as_bytes(), 0, &id.public(), 1);
+        let ct = aead_encrypt(&k_msg, &nonce, &aad, &pt);
+
+        let env = EncryptedMessage {
+            epoch_id: 0,
+            nonce,
+            ciphertext: Bytes::from(ct),
+        };
+        let block = ContentBlock {
+            data: Bytes::from(env.to_bytes()),
+            references: vec![pt_hash],
+        };
+        let value_hash = block.hash();
+        let mut entry = sunset_store::SignedKvEntry {
+            verifying_key: id.store_verifying_key(),
+            name: message_name(&room_fp, &value_hash),
+            value_hash,
+            priority: 1,
+            expires_at: None,
+            signature: Bytes::new(),
+        };
+        let outer_sig = id.sign(&crate::canonical::signing_payload(&entry));
+        entry.signature = Bytes::copy_from_slice(&outer_sig.to_bytes());
+
+        let err = decode_message(&room, &entry, &block).unwrap_err();
+        assert!(matches!(err, Error::EmojiTooLong { len: 65 }));
     }
 
     #[test]
