@@ -16,22 +16,28 @@ use sunset_sync::SyncEngine;
 
 use crate::bridge::{DashboardSnapshot, EntryTtl, IdentitySnapshot, StoreStats};
 
+/// Static-for-the-process metadata that the snapshot builder needs.
+/// Bundled to keep `build_dashboard_snapshot` under clippy's
+/// `too_many_arguments` threshold without papering over the lint.
+pub struct RelayMeta<'a> {
+    pub data_dir: &'a Path,
+    pub ed25519_public: [u8; 32],
+    pub x25519_public: [u8; 32],
+    pub listen_addr: std::net::SocketAddr,
+    pub dial_url: &'a str,
+    pub configured_peers: &'a [String],
+}
+
 /// The concrete `SyncEngine` type the relay holds. The `SpawningAcceptor`
 /// wrapping is a private detail of `relay.rs` — for snapshot purposes we
 /// only need the engine APIs (`connected_peers`, `subscriptions_snapshot`)
 /// which are independent of the wrapping transport. We type-erase via
 /// generics in the function signature so the snapshot builder doesn't
 /// need to know the wrapper's full type.
-#[allow(clippy::too_many_arguments)]
 pub async fn build_dashboard_snapshot<T>(
     engine: &Rc<SyncEngine<FsStore, T>>,
     store: &Arc<FsStore>,
-    data_dir: &Path,
-    ed25519_public: [u8; 32],
-    x25519_public: [u8; 32],
-    listen_addr: std::net::SocketAddr,
-    dial_url: &str,
-    configured_peers: &[String],
+    meta: &RelayMeta<'_>,
 ) -> DashboardSnapshot
 where
     T: sunset_sync::Transport + 'static,
@@ -40,17 +46,17 @@ where
     let connected_peers = engine.connected_peers().await;
     let subscriptions = engine.subscriptions_snapshot().await;
     let store_stats = collect_store_stats(&**store).await;
-    let on_disk_size = dir_size(data_dir).unwrap_or(0);
+    let on_disk_size = dir_size(meta.data_dir).unwrap_or(0);
 
     DashboardSnapshot {
-        ed25519_public,
-        x25519_public,
-        listen_addr,
-        dial_url: dial_url.to_owned(),
-        configured_peers: configured_peers.to_vec(),
+        ed25519_public: meta.ed25519_public,
+        x25519_public: meta.x25519_public,
+        listen_addr: meta.listen_addr,
+        dial_url: meta.dial_url.to_owned(),
+        configured_peers: meta.configured_peers.to_vec(),
         connected_peers,
         subscriptions,
-        data_dir: data_dir.to_path_buf(),
+        data_dir: meta.data_dir.to_path_buf(),
         on_disk_size,
         store_stats,
     }

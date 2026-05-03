@@ -30,6 +30,12 @@ jobs:
       - name: cargo fmt --all --check
         run: |
           nix develop --command cargo fmt --all --check
+      - name: no clippy suppressions in source
+        run: |
+          ./scripts/check-no-clippy-allow.sh
+      - name: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        run: |
+          nix develop --command cargo clippy --workspace --all-features --all-targets -- -D warnings
       - name: cargo test --workspace --all-features
         run: |
           nix develop --command cargo test --workspace --all-features

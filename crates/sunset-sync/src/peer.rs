@@ -51,6 +51,17 @@ pub(crate) enum InboundEvent {
     },
 }
 
+/// Engine-level context shared across all per-peer tasks. Bundling these
+/// into a single struct keeps `run_peer` / `spawn_run_peer` under clippy's
+/// `too_many_arguments` threshold without papering over the lint.
+#[derive(Clone)]
+pub(crate) struct PeerEnv {
+    pub local_peer: PeerId,
+    pub protocol_version: u32,
+    pub heartbeat_interval: std::time::Duration,
+    pub heartbeat_timeout: std::time::Duration,
+}
+
 /// Drive a single peer's connection.
 ///
 /// Sends our `Hello`, waits for the peer's `Hello`, then runs concurrent
@@ -62,25 +73,28 @@ pub(crate) enum InboundEvent {
 ///
 /// `inbound_tx` is the shared sender into the engine's main inbound queue.
 ///
-/// `local_protocol_version` is `SyncConfig::protocol_version`.
-/// `local_peer` is the engine's local PeerId.
+/// `env` carries the engine's `local_peer`, protocol version, and heartbeat
+/// timing.
+///
 /// `out_tx` is the outbound sender — passed through `PeerHello` so the engine
 /// can register it under the Hello-declared peer_id (not the transport-level
 /// peer_id, which may differ in schemes that separate routing identity from
 /// application identity, e.g. X25519 routing + Ed25519 application keys).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     conn: Rc<C>,
-    local_peer: PeerId,
-    local_protocol_version: u32,
+    env: PeerEnv,
     conn_id: crate::engine::ConnectionId,
     out_tx: mpsc::UnboundedSender<SyncMessage>,
     mut outbound_rx: mpsc::UnboundedReceiver<SyncMessage>,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     hello_done: Option<tokio::sync::oneshot::Sender<Result<PeerId>>>,
-    heartbeat_interval: std::time::Duration,
-    heartbeat_timeout: std::time::Duration,
 ) {
+    let PeerEnv {
+        local_peer,
+        protocol_version: local_protocol_version,
+        heartbeat_interval,
+        heartbeat_timeout,
+    } = env;
     let local_kind = conn.kind();
     // Clone of the outbound sender used by the recv-side Pong responder
     // and the liveness Ping sender. The original `out_tx` is moved into
@@ -426,6 +440,17 @@ mod tests {
         PeerAddr::new(s)
     }
 
+    /// Build a `PeerEnv` for tests that share a `SyncConfig`'s heartbeat
+    /// timing and the v1 wire protocol.
+    fn peer_env_for(name: &[u8], cfg: &crate::types::SyncConfig) -> PeerEnv {
+        PeerEnv {
+            local_peer: PeerId(vk(name)),
+            protocol_version: 1,
+            heartbeat_interval: cfg.heartbeat_interval,
+            heartbeat_timeout: cfg.heartbeat_timeout,
+        }
+    }
+
     /// Wraps a `TestConnection` but forces every `send_unreliable` call to
     /// return `Err`. Models a transport (e.g. WebSocket) that doesn't support
     /// unreliable datagrams.
@@ -484,27 +509,21 @@ mod tests {
                 // so we can drop them to trigger Goodbye.
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(alice_conn),
-                    PeerId(vk(b"alice")),
-                    1,
+                    peer_env_for(b"alice", &cfg),
                     crate::engine::ConnectionId::for_test(1),
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
-                    PeerId(vk(b"bob")),
-                    1,
+                    peer_env_for(b"bob", &cfg),
                     crate::engine::ConnectionId::for_test(2),
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
 
                 // Each side observes the other's Hello.
@@ -569,27 +588,21 @@ mod tests {
 
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(alice_conn),
-                    PeerId(vk(b"alice")),
-                    1,
+                    peer_env_for(b"alice", &cfg),
                     crate::engine::ConnectionId::for_test(3),
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
-                    PeerId(vk(b"bob")),
-                    1,
+                    peer_env_for(b"bob", &cfg),
                     crate::engine::ConnectionId::for_test(4),
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
 
                 // Drain the Hello on each side so the rest of the test
@@ -689,27 +702,21 @@ mod tests {
 
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(alice_conn),
-                    PeerId(vk(b"alice")),
-                    1,
+                    peer_env_for(b"alice", &cfg),
                     crate::engine::ConnectionId::for_test(1),
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
-                    PeerId(vk(b"bob")),
-                    1,
+                    peer_env_for(b"bob", &cfg),
                     crate::engine::ConnectionId::for_test(2),
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
 
                 // Drain Hellos.
@@ -813,27 +820,21 @@ mod tests {
 
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(alice_conn),
-                    PeerId(vk(b"alice")),
-                    1,
+                    peer_env_for(b"alice", &cfg),
                     crate::engine::ConnectionId::for_test(1),
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
-                    PeerId(vk(b"bob")),
-                    1,
+                    peer_env_for(b"bob", &cfg),
                     crate::engine::ConnectionId::for_test(2),
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
 
                 // Drain Hellos.
@@ -942,27 +943,21 @@ mod tests {
 
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(alice_conn),
-                    PeerId(vk(b"alice")),
-                    1,
+                    peer_env_for(b"alice", &cfg),
                     alice_conn_id,
                     a_out_tx.clone(),
                     a_out_rx,
                     a_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
                 crate::spawn::spawn_local(run_peer(
                     Rc::new(bob_conn),
-                    PeerId(vk(b"bob")),
-                    1,
+                    peer_env_for(b"bob", &cfg),
                     crate::engine::ConnectionId::for_test(43),
                     b_out_tx.clone(),
                     b_out_rx,
                     b_in_tx,
                     None,
-                    cfg.heartbeat_interval,
-                    cfg.heartbeat_timeout,
                 ));
 
                 // Drain Hello.

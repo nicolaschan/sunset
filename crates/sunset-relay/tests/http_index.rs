@@ -42,7 +42,7 @@ async fn get_root_returns_identity_json() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let config = relay_config(dir.path(), "127.0.0.1:0");
-            let mut relay = Relay::new(config).await.expect("relay new");
+            let mut relay = Relay::start(config).await.expect("relay new");
             let dial = relay.dial_address();
             let ed_hex = hex::encode(relay.ed25519_public);
             let x_hex = hex::encode(relay.x25519_public);
@@ -108,7 +108,7 @@ async fn get_unknown_path_is_404() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let config = relay_config(dir.path(), "127.0.0.1:0");
-            let mut relay = Relay::new(config).await.expect("relay new");
+            let mut relay = Relay::start(config).await.expect("relay new");
             let dial = relay.dial_address();
             let _engine_task = relay.run_for_test().await.expect("relay run");
 
