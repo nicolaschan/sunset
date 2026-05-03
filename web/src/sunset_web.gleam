@@ -31,7 +31,7 @@ import sunset_web/domain.{
 import sunset_web/fixture
 import sunset_web/scroll_anchor
 import sunset_web/storage
-import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
+import sunset_web/sunset.{type ClientHandle, type IncomingMessage, type RoomHandle}
 import sunset_web/theme.{type Mode, Dark, Light}
 import sunset_web/ui
 import sunset_web/views/bottom_sheet
@@ -58,6 +58,40 @@ pub type View {
   RoomView(name: String)
 }
 
+/// Per-room UI + engine state. The Model holds a
+/// `Dict(String, RoomState)` keyed by the room name (URL fragment).
+pub type RoomState {
+  RoomState(
+    handle: RoomHandle,
+    messages: List(domain.Message),
+    members: List(domain.Member),
+    receipts: Dict(String, Set(String)),
+    reactions: Dict(String, List(Reaction)),
+    current_channel: ChannelId,
+    draft: String,
+    selected_msg_id: Option(String),
+    reacting_to: Option(String),
+    sheet: Option(domain.Sheet),
+    peer_status_popover: Option(domain.MemberId),
+  )
+}
+
+fn empty_room_state(handle: RoomHandle) -> RoomState {
+  RoomState(
+    handle: handle,
+    messages: [],
+    members: [],
+    receipts: dict.new(),
+    reactions: dict.new(),
+    current_channel: ChannelId(fixture.initial_channel_id),
+    draft: "",
+    selected_msg_id: None,
+    reacting_to: None,
+    sheet: None,
+    peer_status_popover: None,
+  )
+}
+
 pub type Model {
   Model(
     mode: Mode,
@@ -66,10 +100,6 @@ pub type Model {
     rooms_collapsed: Bool,
     landing_input: String,
     sidebar_search: String,
-    current_channel: ChannelId,
-    draft: String,
-    reacting_to: Option(String),
-    reactions: Dict(String, List(Reaction)),
     /// Name of the room currently being dragged in the rooms rail.
     /// `None` between drag operations.
     dragging_room: Option(String),
@@ -81,38 +111,20 @@ pub type Model {
     voice_settings: Dict(String, domain.VoiceSettings),
     /// Engine handle. None until the wasm bundle finishes initialising.
     client: Option(ClientHandle),
-    /// Real chat messages received from the engine. Empty on first load.
-    messages: List(domain.Message),
     /// Relay connection status: "disconnected", "connecting", "connected", "error".
     relay_status: String,
-    /// Live members list from the presence tracker. Empty on first load.
-    members: List(domain.Member),
     /// Viewport class — drives the desktop/phone branch in `shell.view`.
     viewport: domain.Viewport,
     /// Currently open drawer on phone. Ignored on desktop. Channels and
     /// rooms drawers cross-transition (one swaps for the other) rather
     /// than stack.
     drawer: Option(domain.Drawer),
-    /// Currently open bottom sheet on phone. Also drives the desktop
-    /// right-rail (DetailsSheet → details_panel) and floating voice
-    /// popover (VoiceSheet → voice_popover.view).
-    sheet: Option(domain.Sheet),
-    /// Receipts received per outgoing message, keyed by message id
-    /// (value_hash hex). Each entry is the set of peer verifying-key
-    /// short-hex strings that have acknowledged. The bridge filters
-    /// self-receipts at the source so this dict never contains them.
-    receipts: Dict(String, Set(String)),
-    /// Message currently "selected" — its action toolbar (react / info)
-    /// stays visible. On mobile (no hover) this is the only way to
-    /// reveal those buttons; on desktop it pins the row even after the
-    /// pointer leaves. Tap/click anywhere on the message body toggles.
-    selected_msg_id: Option(String),
-    /// Currently-open peer status popover, if any. `Some(member_id)`
-    /// when open, `None` when closed.
-    peer_status_popover: Option(domain.MemberId),
     /// Wall-clock unix-ms snapshot. Updated every second by the
     /// `Tick(now_ms)` message so the popover's age readout stays live.
     now_ms: Int,
+    /// Per-room state, keyed by room name. Populated as each RoomOpened
+    /// message arrives after bootstrap.
+    rooms: Dict(String, RoomState),
   )
 }
 
@@ -151,12 +163,13 @@ pub type Msg {
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
   RelayConnectResult(Result(Nil, String))
-  SubscribePublishResult(Result(Nil, String))
-  IncomingMsg(IncomingMessage)
-  IncomingReceipt(message_id: String, from_pubkey: String)
+  /// A room's wasm-side handle is ready; register callbacks + start presence.
+  RoomOpened(name: String, handle: RoomHandle)
+  IncomingMsg(room: String, im: IncomingMessage)
+  IncomingReceipt(room: String, message_id: String, from_pubkey: String)
   SubmitDraft
   MessageSent(Result(String, String))
-  MembersUpdated(List(domain.Member))
+  MembersUpdated(room: String, members: List(domain.Member))
   RelayStatusUpdated(String)
   ViewportChanged(domain.Viewport)
   OpenDrawer(domain.Drawer)
@@ -217,24 +230,15 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       rooms_collapsed: False,
       landing_input: "",
       sidebar_search: "",
-      current_channel: ChannelId(fixture.initial_channel_id),
-      draft: "",
-      reacting_to: None,
-      reactions: seed_reactions(),
       dragging_room: None,
       drag_over_room: None,
       voice_settings: seed_voice_settings(),
       client: None,
-      messages: [],
       relay_status: "disconnected",
-      members: [],
       viewport: initial_viewport,
       drawer: None,
-      sheet: None,
-      receipts: dict.new(),
-      selected_msg_id: None,
-      peer_status_popover: None,
       now_ms: 0,
+      rooms: dict.new(),
     )
 
   let subscribe_hash =
@@ -338,11 +342,6 @@ fn member_voice_settings(
   }
 }
 
-fn seed_reactions() -> Dict(String, List(Reaction)) {
-  fixture.messages()
-  |> list.fold(dict.new(), fn(d, m) { dict.insert(d, m.id, m.reactions) })
-}
-
 /// Add `name` to `existing` if it isn't already present (prepending
 /// at the head, which is where new rooms appear). If `name` is
 /// already in the list it is returned unchanged — selecting an
@@ -396,6 +395,33 @@ fn short_initials(bits: BitArray) -> String
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "formatTimeMs")
 fn format_time_ms(ms: Int) -> String
 
+/// Look up the active room name from the current view.
+fn active_room_name(model: Model) -> String {
+  case model.view {
+    RoomView(n) -> n
+    LandingView -> ""
+  }
+}
+
+/// Apply `f` to the active room's RoomState (if it exists) and re-insert
+/// the result into `model.rooms`. If there is no active room (landing view)
+/// or the room isn't in the dict yet, returns the model unchanged.
+fn with_active_room(
+  model: Model,
+  f: fn(RoomState) -> #(RoomState, Effect(Msg)),
+) -> #(Model, Effect(Msg)) {
+  let name = active_room_name(model)
+  case name, dict.get(model.rooms, name) {
+    "", _ -> #(model, effect.none())
+    _, Error(_) -> #(model, effect.none())
+    _, Ok(state) -> {
+      let #(new_state, eff) = f(state)
+      let new_rooms = dict.insert(model.rooms, name, new_state)
+      #(Model(..model, rooms: new_rooms), eff)
+    }
+  }
+}
+
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     NoOp -> #(model, effect.none())
@@ -433,7 +459,26 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             Nil
           })
       }
-      #(Model(..model, view: new_view, joined_rooms: new_rooms), persisted)
+      // If navigating to a room not yet opened, trigger open_room.
+      let new_name = case new_view {
+        RoomView(n) -> n
+        LandingView -> ""
+      }
+      let open_eff = case new_name, dict.has_key(model.rooms, new_name), model.client {
+        "", _, _ -> effect.none()
+        _, True, _ -> effect.none()
+        _, False, Some(client) ->
+          effect.from(fn(dispatch) {
+            sunset.open_room(client, new_name, fn(handle) {
+              dispatch(RoomOpened(new_name, handle))
+            })
+          })
+        _, False, None -> effect.none()
+      }
+      #(
+        Model(..model, view: new_view, joined_rooms: new_rooms),
+        effect.batch([persisted, open_eff]),
+      )
     }
     UpdateLandingInput(s) -> #(Model(..model, landing_input: s), effect.none())
     UpdateSidebarSearch(s) -> #(
@@ -446,7 +491,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         "" -> #(model, effect.none())
         _ -> {
           let was_new = !list.contains(model.joined_rooms, name)
-          let new_rooms = ensure_joined(model.joined_rooms, name)
+          let new_room_list = ensure_joined(model.joined_rooms, name)
           // On phone, picking a room from the rooms drawer should land
           // the user in the channels drawer for the new room (so they
           // can pick a channel). Otherwise close to chat as before.
@@ -458,7 +503,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let new_model =
             Model(
               ..model,
-              joined_rooms: new_rooms,
+              joined_rooms: new_room_list,
               view: RoomView(name),
               landing_input: "",
               sidebar_search: "",
@@ -467,10 +512,20 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let persist_eff = case was_new {
             True ->
               effect.from(fn(_) {
-                storage.write_joined_rooms(new_rooms)
+                storage.write_joined_rooms(new_room_list)
                 Nil
               })
             False -> effect.none()
+          }
+          // Open the room via wasm if not already opened.
+          let open_eff = case dict.has_key(model.rooms, name), model.client {
+            False, Some(client) ->
+              effect.from(fn(dispatch) {
+                sunset.open_room(client, name, fn(handle) {
+                  dispatch(RoomOpened(name, handle))
+                })
+              })
+            _, _ -> effect.none()
           }
           #(
             new_model,
@@ -480,32 +535,42 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                 storage.set_hash(name)
                 Nil
               }),
+              open_eff,
             ]),
           )
         }
       }
     }
     DeleteRoom(name) -> {
-      let new_rooms = list.filter(model.joined_rooms, fn(r) { r != name })
+      let new_room_list = list.filter(model.joined_rooms, fn(r) { r != name })
       let active_was_deleted = case model.view {
         RoomView(active) -> active == name
         LandingView -> False
       }
-      let new_view = case active_was_deleted, new_rooms {
+      let new_view = case active_was_deleted, new_room_list {
         True, [next, ..] -> RoomView(next)
         True, [] -> LandingView
         False, _ -> model.view
       }
+      let updated_rooms_dict = dict.delete(model.rooms, name)
       let persist =
         effect.from(fn(_) {
-          storage.write_joined_rooms(new_rooms)
+          storage.write_joined_rooms(new_room_list)
           case new_view {
             RoomView(n) -> storage.set_hash(n)
             LandingView -> storage.set_hash("")
           }
           Nil
         })
-      #(Model(..model, joined_rooms: new_rooms, view: new_view), persist)
+      #(
+        Model(
+          ..model,
+          joined_rooms: new_room_list,
+          view: new_view,
+          rooms: updated_rooms_dict,
+        ),
+        persist,
+      )
     }
     GoToLanding -> {
       let persist =
@@ -537,19 +602,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case model.dragging_room {
         None -> #(Model(..model, drag_over_room: None), effect.none())
         Some(src) -> {
-          let new_rooms = reorder_before(model.joined_rooms, src, target)
-          let persist = case new_rooms == model.joined_rooms {
+          let new_room_list = reorder_before(model.joined_rooms, src, target)
+          let persist = case new_room_list == model.joined_rooms {
             True -> effect.none()
             False ->
               effect.from(fn(_) {
-                storage.write_joined_rooms(new_rooms)
+                storage.write_joined_rooms(new_room_list)
                 Nil
               })
           }
           #(
             Model(
               ..model,
-              joined_rooms: new_rooms,
+              joined_rooms: new_room_list,
               dragging_room: None,
               drag_over_room: None,
             ),
@@ -562,57 +627,29 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, dragging_room: None, drag_over_room: None),
       effect.none(),
     )
-    SelectChannel(id) -> #(Model(..model, current_channel: id), effect.none())
+    SelectChannel(id) ->
+      with_active_room(model, fn(state) {
+        #(RoomState(..state, current_channel: id), effect.none())
+      })
     ToggleRoomsRail -> #(
       Model(..model, rooms_collapsed: !model.rooms_collapsed),
       effect.none(),
     )
-    UpdateDraft(s) -> #(Model(..model, draft: s), effect.none())
+    UpdateDraft(s) ->
+      with_active_room(model, fn(state) {
+        #(RoomState(..state, draft: s), effect.none())
+      })
     IdentityReady(seed) -> {
       let create_client_eff =
         effect.from(fn(dispatch) {
-          sunset.create_client(seed, "sunset-demo", fn(client) {
+          sunset.create_client(seed, fn(client) {
             dispatch(ClientReady(client))
           })
         })
       #(model, create_client_eff)
     }
     ClientReady(client) -> {
-      let on_msg_eff =
-        effect.from(fn(dispatch) {
-          sunset.on_message(client, fn(im) { dispatch(IncomingMsg(im)) })
-        })
-      let on_receipt_eff =
-        effect.from(fn(dispatch) {
-          sunset.on_receipt(client, fn(r) {
-            dispatch(IncomingReceipt(
-              sunset.rec_for_value_hash_hex(r),
-              short_pubkey(sunset.rec_from_pubkey(r)),
-            ))
-          })
-        })
-      // Presence wiring is in ClientReady (not RelayConnectResult) so
-      // it kicks off even when there's no `?relay=` URL — the user
-      // still sees themselves in the member list. Effect order within a
-      // batch is unspecified by Lustre, but that's fine: Client::start_presence
-      // snapshots the engine's current peer set after subscribing, so
-      // already-connected peers are picked up regardless of when
-      // start_presence runs relative to add_relay.
-      let presence_eff =
-        effect.from(fn(dispatch) {
-          let #(interval, ttl, refresh) = sunset.presence_params_from_url()
-          sunset.start_presence(client, interval, ttl, refresh)
-          sunset.on_members_changed(client, fn(ms) {
-            dispatch(MembersUpdated(map_members(ms)))
-          })
-          sunset.on_relay_status_changed(client, fn(s) {
-            dispatch(RelayStatusUpdated(s))
-          })
-        })
-      // Default relays the client dials when no `?relay=…` query
-      // parameter is supplied. The query param, when present, replaces
-      // (does not extend) this list — pasting an explicit relay opts
-      // out of the defaults.
+      // Connect to relays.
       let relays = case sunset.relay_url_param() {
         Ok(url) -> [url]
         Error(_) -> default_relays
@@ -625,199 +662,302 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             })
           })
         })
+
+      // Open rooms: the active room first (immediate), others staggered.
+      let active_name = case model.view {
+        RoomView(name) -> name
+        LandingView ->
+          case model.joined_rooms {
+            [] -> ""
+            [first, ..] -> first
+          }
+      }
+      let other_names =
+        list.filter(model.joined_rooms, fn(n) { n != active_name })
+
+      let open_active_eff = case active_name {
+        "" -> effect.none()
+        name ->
+          effect.from(fn(dispatch) {
+            sunset.open_room(client, name, fn(handle) {
+              dispatch(RoomOpened(name, handle))
+            })
+          })
+      }
+      // Stagger other rooms 50 ms apart to avoid KDF contention.
+      let open_others_eff =
+        effect.from(fn(dispatch) {
+          list.index_map(other_names, fn(name, i) {
+            sunset.set_timeout_ms(i * 50, fn() {
+              sunset.open_room(client, name, fn(handle) {
+                dispatch(RoomOpened(name, handle))
+              })
+            })
+          })
+          Nil
+        })
+
       let new_status = case relays {
         [] -> "disconnected"
         _ -> "connecting"
       }
       #(
         Model(..model, client: Some(client), relay_status: new_status),
-        effect.batch([on_receipt_eff, on_msg_eff, presence_eff, connect_eff]),
+        effect.batch([connect_eff, open_active_eff, open_others_eff]),
       )
     }
-    RelayConnectResult(Ok(_)) ->
-      case model.client {
-        Some(client) -> {
-          let pub_eff =
-            effect.from(fn(dispatch) {
-              sunset.publish_room_subscription(client, fn(r) {
-                dispatch(SubscribePublishResult(r))
-              })
-            })
-          #(Model(..model, relay_status: "connected"), pub_eff)
-        }
-        None -> #(model, effect.none())
-      }
+    RelayConnectResult(Ok(_)) -> #(Model(..model, relay_status: "connected"), effect.none())
     RelayConnectResult(Error(_)) -> #(
       Model(..model, relay_status: "error"),
       effect.none(),
     )
-    SubscribePublishResult(_) -> #(model, effect.none())
-    IncomingMsg(im) -> {
-      let new_msg =
-        domain.Message(
-          id: sunset.inc_value_hash_hex(im),
-          author: short_pubkey(sunset.inc_author_pubkey(im)),
-          initials: short_initials(sunset.inc_author_pubkey(im)),
-          time: format_time_ms(sunset.inc_sent_at_ms(im)),
-          body: sunset.inc_body(im),
-          seen_by: 0,
-          you: sunset.inc_is_self(im),
-          pending: False,
-          reactions: [],
-          bridge: NoBridge,
-          details: domain.NoDetails,
-        )
-      // Append; dedupe by id to handle Replay::All re-emits.
-      let updated = case
-        list.any(model.messages, fn(m) { m.id == new_msg.id })
-      {
-        True -> model.messages
-        False -> list.append(model.messages, [new_msg])
+    RoomOpened(name, handle) -> {
+      let state = empty_room_state(handle)
+      let new_rooms = dict.insert(model.rooms, name, state)
+      let #(interval, ttl, refresh) = sunset.presence_params_from_url()
+      let wire_eff =
+        effect.from(fn(dispatch) {
+          sunset.on_message(handle, fn(im) {
+            dispatch(IncomingMsg(name, im))
+          })
+          sunset.on_receipt(handle, fn(r) {
+            dispatch(IncomingReceipt(
+              name,
+              sunset.rec_for_value_hash_hex(r),
+              short_pubkey(sunset.rec_from_pubkey(r)),
+            ))
+          })
+          sunset.on_members_changed(handle, fn(ms) {
+            dispatch(MembersUpdated(name, map_members(ms)))
+          })
+          sunset.on_relay_status_changed(handle, fn(s) {
+            dispatch(RelayStatusUpdated(s))
+          })
+          sunset.start_presence(handle, interval, ttl, refresh)
+        })
+      #(Model(..model, rooms: new_rooms), wire_eff)
+    }
+    IncomingMsg(name, im) -> {
+      case dict.get(model.rooms, name) {
+        Error(_) -> #(model, effect.none())
+        Ok(state) -> {
+          let new_msg =
+            domain.Message(
+              id: sunset.inc_value_hash_hex(im),
+              author: short_pubkey(sunset.inc_author_pubkey(im)),
+              initials: short_initials(sunset.inc_author_pubkey(im)),
+              time: format_time_ms(sunset.inc_sent_at_ms(im)),
+              body: sunset.inc_body(im),
+              seen_by: 0,
+              you: sunset.inc_is_self(im),
+              pending: False,
+              reactions: [],
+              bridge: NoBridge,
+              details: domain.NoDetails,
+            )
+          // Append; dedupe by id to handle Replay::All re-emits.
+          let updated =
+            case list.any(state.messages, fn(m) { m.id == new_msg.id }) {
+              True -> state.messages
+              False -> list.append(state.messages, [new_msg])
+            }
+          let new_state = RoomState(..state, messages: updated)
+          #(
+            Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
+            effect.none(),
+          )
+        }
       }
-      #(Model(..model, messages: updated), effect.none())
     }
     SubmitDraft -> {
-      let body = sanitize(model.draft)
-      case body, model.client {
+      let active_name = active_room_name(model)
+      case active_name, dict.get(model.rooms, active_name) {
         "", _ -> #(model, effect.none())
-        _, None -> #(model, effect.none())
-        body, Some(client) -> {
-          let send_eff =
-            effect.from(fn(dispatch) {
-              sunset.send_message(client, body, current_time_ms(), fn(r) {
-                dispatch(MessageSent(r))
-              })
-            })
-          #(Model(..model, draft: ""), send_eff)
+        _, Error(_) -> #(model, effect.none())
+        _, Ok(state) -> {
+          let body = sanitize(state.draft)
+          case body {
+            "" -> #(model, effect.none())
+            _ -> {
+              let send_eff =
+                effect.from(fn(dispatch) {
+                  sunset.send_message(
+                    state.handle,
+                    body,
+                    current_time_ms(),
+                    fn(r) { dispatch(MessageSent(r)) },
+                  )
+                })
+              let cleared = RoomState(..state, draft: "")
+              #(
+                Model(
+                  ..model,
+                  rooms: dict.insert(model.rooms, active_name, cleared),
+                ),
+                send_eff,
+              )
+            }
+          }
         }
       }
     }
     MessageSent(_) -> #(model, effect.none())
-    IncomingReceipt(message_id, from_pubkey) -> {
-      let existing = case dict.get(model.receipts, message_id) {
-        Ok(s) -> s
-        Error(_) -> set.new()
-      }
-      let updated = set.insert(existing, from_pubkey)
-      #(
-        Model(
-          ..model,
-          receipts: dict.insert(model.receipts, message_id, updated),
-        ),
-        effect.none(),
-      )
-    }
-    MembersUpdated(ms) -> {
-      // If the open popover's target left, close it.
-      let next_popover = case model.peer_status_popover {
-        None -> None
-        Some(target) ->
-          case list.find(ms, fn(m) { m.id == target }) {
-            Ok(_) -> Some(target)
-            Error(_) -> None
+    IncomingReceipt(name, message_id, from_pubkey) -> {
+      case dict.get(model.rooms, name) {
+        Error(_) -> #(model, effect.none())
+        Ok(state) -> {
+          let existing = case dict.get(state.receipts, message_id) {
+            Ok(s) -> s
+            Error(_) -> set.new()
           }
+          let updated = set.insert(existing, from_pubkey)
+          let new_state =
+            RoomState(
+              ..state,
+              receipts: dict.insert(state.receipts, message_id, updated),
+            )
+          #(
+            Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
+            effect.none(),
+          )
+        }
       }
-      #(
-        Model(..model, members: ms, peer_status_popover: next_popover),
-        effect.none(),
-      )
+    }
+    MembersUpdated(name, ms) -> {
+      case dict.get(model.rooms, name) {
+        Error(_) -> #(model, effect.none())
+        Ok(state) -> {
+          // If the open popover's target left, close it.
+          let next_popover = case state.peer_status_popover {
+            None -> None
+            Some(target) ->
+              case list.find(ms, fn(m) { m.id == target }) {
+                Ok(_) -> Some(target)
+                Error(_) -> None
+              }
+          }
+          let new_state =
+            RoomState(..state, members: ms, peer_status_popover: next_popover)
+          #(
+            Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
+            effect.none(),
+          )
+        }
+      }
     }
     RelayStatusUpdated(s) -> #(Model(..model, relay_status: s), effect.none())
-    ToggleMessageSelected(id) -> {
-      // Tap/click on a message body. Toggle selection — same id
-      // deselects, different id replaces. Closing also dismisses any
-      // open reaction picker for the previously-selected message so
-      // the UI doesn't end up with a phantom picker on a hidden row.
-      let next = case model.selected_msg_id {
-        Some(open) if open == id -> None
-        _ -> Some(id)
-      }
-      let next_picker = case next {
-        None -> None
-        Some(_) -> model.reacting_to
-      }
-      #(
-        Model(..model, selected_msg_id: next, reacting_to: next_picker),
-        effect.none(),
-      )
-    }
-    ToggleReactionPicker(id) -> {
-      let next = case model.reacting_to {
-        Some(open) if open == id -> None
-        _ -> Some(id)
-      }
-      #(Model(..model, reacting_to: next), effect.none())
-    }
-    AddReaction(id, emoji) -> {
-      let current = case dict.get(model.reactions, id) {
-        Ok(rs) -> rs
-        Error(_) -> []
-      }
-      let next = toggle_reaction(current, emoji)
-      let new_model =
-        Model(
-          ..model,
-          reactions: dict.insert(model.reactions, id, next),
-          reacting_to: None,
+    ToggleMessageSelected(id) ->
+      with_active_room(model, fn(state) {
+        // Tap/click on a message body. Toggle selection — same id
+        // deselects, different id replaces. Closing also dismisses any
+        // open reaction picker for the previously-selected message so
+        // the UI doesn't end up with a phantom picker on a hidden row.
+        let next = case state.selected_msg_id {
+          Some(open) if open == id -> None
+          _ -> Some(id)
+        }
+        let next_picker = case next {
+          None -> None
+          Some(_) -> state.reacting_to
+        }
+        #(
+          RoomState(..state, selected_msg_id: next, reacting_to: next_picker),
+          effect.none(),
         )
-      #(new_model, effect.none())
-    }
-    OpenDetail(id) -> #(
-      // Opening the details panel pins selection on the same id so the
-      // row's action toolbar stays visible while the panel is open and
-      // no other row's hover affordance can sneak in alongside it
-      // (the global stylesheet's :has() rule keys off .is-selected).
-      Model(
-        ..model,
-        sheet: Some(domain.DetailsSheet(message_id: id)),
-        reacting_to: None,
-        selected_msg_id: Some(id),
-      ),
-      effect.none(),
-    )
-    CloseDetail -> {
-      // Only close if the active sheet is the details one — guards against
-      // a Voice sheet being opened concurrently and accidentally dismissed.
-      // When closing, drop the matching selection so the toolbar collapses
-      // back to its default state.
-      let #(next_sheet, next_selected) = case model.sheet {
-        Some(domain.DetailsSheet(message_id: id)) -> #(
-          None,
-          case model.selected_msg_id {
-            Some(open) if open == id -> None
+      })
+    ToggleReactionPicker(id) ->
+      with_active_room(model, fn(state) {
+        let next = case state.reacting_to {
+          Some(open) if open == id -> None
+          _ -> Some(id)
+        }
+        #(RoomState(..state, reacting_to: next), effect.none())
+      })
+    AddReaction(id, emoji) ->
+      with_active_room(model, fn(state) {
+        let current = case dict.get(state.reactions, id) {
+          Ok(rs) -> rs
+          Error(_) -> []
+        }
+        let next = toggle_reaction(current, emoji)
+        #(
+          RoomState(
+            ..state,
+            reactions: dict.insert(state.reactions, id, next),
+            reacting_to: None,
+          ),
+          effect.none(),
+        )
+      })
+    OpenDetail(id) ->
+      with_active_room(model, fn(state) {
+        // Opening the details panel pins selection on the same id so the
+        // row's action toolbar stays visible while the panel is open and
+        // no other row's hover affordance can sneak in alongside it
+        // (the global stylesheet's :has() rule keys off .is-selected).
+        #(
+          RoomState(
+            ..state,
+            sheet: Some(domain.DetailsSheet(message_id: id)),
+            reacting_to: None,
+            selected_msg_id: Some(id),
+          ),
+          effect.none(),
+        )
+      })
+    CloseDetail ->
+      with_active_room(model, fn(state) {
+        // Only close if the active sheet is the details one — guards against
+        // a Voice sheet being opened concurrently and accidentally dismissed.
+        // When closing, drop the matching selection so the toolbar collapses
+        // back to its default state.
+        let #(next_sheet, next_selected) = case state.sheet {
+          Some(domain.DetailsSheet(message_id: id)) -> #(
+            None,
+            case state.selected_msg_id {
+              Some(open) if open == id -> None
+              other -> other
+            },
+          )
+          other -> #(other, state.selected_msg_id)
+        }
+        #(
+          RoomState(..state, sheet: next_sheet, selected_msg_id: next_selected),
+          effect.none(),
+        )
+      })
+    OpenVoicePopover(name) ->
+      with_active_room(model, fn(state) {
+        #(
+          RoomState(
+            ..state,
+            sheet: Some(domain.VoiceSheet(member_name: name)),
+            reacting_to: None,
+          ),
+          effect.none(),
+        )
+      })
+    CloseVoicePopover ->
+      with_active_room(model, fn(state) {
+        #(
+          RoomState(..state, sheet: case state.sheet {
+            Some(domain.VoiceSheet(_)) -> None
             other -> other
-          },
+          }),
+          effect.none(),
         )
-        other -> #(other, model.selected_msg_id)
-      }
-      #(
-        Model(..model, sheet: next_sheet, selected_msg_id: next_selected),
-        effect.none(),
-      )
-    }
-    OpenVoicePopover(name) -> #(
-      Model(
-        ..model,
-        sheet: Some(domain.VoiceSheet(member_name: name)),
-        reacting_to: None,
-      ),
-      effect.none(),
-    )
-    CloseVoicePopover -> #(
-      Model(..model, sheet: case model.sheet {
-        Some(domain.VoiceSheet(_)) -> None
-        other -> other
-      }),
-      effect.none(),
-    )
-    OpenPeerStatusPopover(member_id) -> #(
-      Model(..model, peer_status_popover: Some(member_id)),
-      effect.none(),
-    )
-    ClosePeerStatusPopover -> #(
-      Model(..model, peer_status_popover: None),
-      effect.none(),
-    )
+      })
+    OpenPeerStatusPopover(member_id) ->
+      with_active_room(model, fn(state) {
+        #(
+          RoomState(..state, peer_status_popover: Some(member_id)),
+          effect.none(),
+        )
+      })
+    ClosePeerStatusPopover ->
+      with_active_room(model, fn(state) {
+        #(RoomState(..state, peer_status_popover: None), effect.none())
+      })
     Tick(now) -> #(Model(..model, now_ms: now), effect.none())
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
@@ -931,27 +1071,58 @@ fn view(model: Model) -> Element(Msg) {
 }
 
 fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
+  case dict.get(model.rooms, current_name) {
+    Error(_) -> loading_room_view(palette, current_name)
+    Ok(state) -> room_view_with_state(model, palette, current_name, state)
+  }
+}
+
+fn loading_room_view(palette: theme.Palette, name: String) -> Element(Msg) {
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+        #("height", "100vh"),
+        #("height", "100dvh"),
+        #("background", palette.bg),
+        #("color", palette.text_muted),
+        #("font-size", "1rem"),
+        #("font-family", "inherit"),
+      ]),
+    ],
+    [html.text("opening " <> name <> "…")],
+  )
+}
+
+fn room_view_with_state(
+  model: Model,
+  palette,
+  current_name: String,
+  state: RoomState,
+) -> Element(Msg) {
   let displayed_rooms = resolve_rooms(model.joined_rooms, model.relay_status)
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
   let active_room =
     lookup_room(displayed_rooms, current_name, model.relay_status)
 
-  let raw_messages = model.messages
+  let raw_messages = state.messages
   let messages_with_live_reactions =
     list.map(raw_messages, fn(m) {
-      case dict.get(model.reactions, m.id) {
+      case dict.get(state.reactions, m.id) {
         Ok(rs) -> domain.Message(..m, reactions: rs)
         Error(_) -> m
       }
     })
 
-  let detail_msg = case model.sheet {
+  let detail_msg = case state.sheet {
     Some(domain.DetailsSheet(message_id: id)) ->
       find_message(messages_with_live_reactions, id)
     _ -> None
   }
 
-  let reaction_sheet_el = case model.viewport, model.reacting_to {
+  let reaction_sheet_el = case model.viewport, state.reacting_to {
     domain.Phone, Some(id) ->
       bottom_sheet.view(
         palette: palette,
@@ -963,7 +1134,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _, _ -> element.fragment([])
   }
 
-  let details_sheet_el = case model.viewport, model.sheet {
+  let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
       case find_message(messages_with_live_reactions, id) {
         Some(m) ->
@@ -975,8 +1146,8 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
             content: details_panel.view(
               palette: palette,
               message: m,
-              receipts: receipts_for(model.receipts, m.id),
-              members: model.members,
+              receipts: receipts_for(state.receipts, m.id),
+              members: state.members,
               on_close: CloseDetail,
             ),
           )
@@ -985,7 +1156,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _, _ -> element.fragment([])
   }
 
-  let voice_sheet_el = case model.viewport, model.sheet {
+  let voice_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.VoiceSheet(member_name: name)) ->
       case list.find(fixture.members(), fn(m) { m.name == name }) {
         Ok(m) ->
@@ -1011,9 +1182,9 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _, _ -> element.fragment([])
   }
 
-  let peer_status_sheet_el = case model.viewport, model.peer_status_popover {
+  let peer_status_sheet_el = case model.viewport, state.peer_status_popover {
     domain.Phone, Some(member_id) ->
-      case list.find(model.members, fn(m) { m.id == member_id }) {
+      case list.find(state.members, fn(m) { m.id == member_id }) {
         Ok(m) ->
           bottom_sheet.view(
             palette: palette,
@@ -1084,7 +1255,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
       viewport: model.viewport,
-      members: model.members,
+      members: state.members,
       mode: model.mode,
       on_toggle_mode: ToggleMode,
     ),
@@ -1094,8 +1265,8 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       room: active_room,
       channels: fixture.channels(),
       members: fixture.members(),
-      current_channel: model.current_channel,
-      voice_popover_open: case model.sheet {
+      current_channel: state.current_channel,
+      voice_popover_open: case state.sheet {
         Some(domain.VoiceSheet(member_name: name)) -> Some(name)
         _ -> None
       },
@@ -1107,22 +1278,22 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     main_panel.view(
       palette: palette,
       viewport: model.viewport,
-      current_channel: model.current_channel,
+      current_channel: state.current_channel,
       messages: messages_with_live_reactions,
-      draft: model.draft,
+      draft: state.draft,
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
       noop: NoOp,
-      reacting_to: model.reacting_to,
-      detail_msg_id: case model.sheet {
+      reacting_to: state.reacting_to,
+      detail_msg_id: case state.sheet {
         Some(domain.DetailsSheet(message_id: id)) -> Some(id)
         _ -> None
       },
       on_toggle_reaction_picker: ToggleReactionPicker,
       on_add_reaction: AddReaction,
       on_open_detail: OpenDetail,
-      receipts: model.receipts,
-      selected_msg_id: model.selected_msg_id,
+      receipts: state.receipts,
+      selected_msg_id: state.selected_msg_id,
       on_toggle_selected: ToggleMessageSelected,
       voice_minibar: voice_minibar_el,
     ),
@@ -1131,20 +1302,20 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
         details_panel.view(
           palette: palette,
           message: m,
-          receipts: receipts_for(model.receipts, m.id),
-          members: model.members,
+          receipts: receipts_for(state.receipts, m.id),
+          members: state.members,
           on_close: CloseDetail,
         )
       _, _ ->
         members.view(
           palette: palette,
-          members: model.members,
+          members: state.members,
           on_open_status: OpenPeerStatusPopover,
         )
     },
     element.fragment([
-      voice_popover_overlay(palette, model),
-      peer_status_popover_overlay(palette, model),
+      voice_popover_overlay(palette, model, state),
+      peer_status_popover_overlay(palette, model, state),
     ]),
     phone_header.view(
       palette: palette,
@@ -1159,8 +1330,12 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
   )
 }
 
-fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
-  case model.viewport, model.sheet {
+fn voice_popover_overlay(
+  palette,
+  model: Model,
+  state: RoomState,
+) -> Element(Msg) {
+  case model.viewport, state.sheet {
     domain.Desktop, Some(domain.VoiceSheet(member_name: name)) ->
       // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
       case list.find(fixture.members(), fn(m) { m.name == name }) {
@@ -1185,10 +1360,14 @@ fn voice_popover_overlay(palette, model: Model) -> Element(Msg) {
 /// Floating popover for desktop. The phone path renders through
 /// `peer_status_sheet_el` (a `bottom_sheet.view` wrapper), matching the
 /// voice popover convention.
-fn peer_status_popover_overlay(palette, model: Model) -> Element(Msg) {
-  case model.viewport, model.peer_status_popover {
+fn peer_status_popover_overlay(
+  palette,
+  model: Model,
+  state: RoomState,
+) -> Element(Msg) {
+  case model.viewport, state.peer_status_popover {
     domain.Desktop, Some(member_id) ->
-      case list.find(model.members, fn(m) { m.id == member_id }) {
+      case list.find(state.members, fn(m) { m.id == member_id }) {
         Error(_) -> element.fragment([])
         Ok(m) ->
           peer_status_popover.view(

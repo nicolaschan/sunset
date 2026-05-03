@@ -276,3 +276,9 @@ export function setIntervalMs(ms, callback) {
 export function nowMs() {
   return Date.now();
 }
+
+/// One-shot setTimeout wrapper. Used to stagger room-open calls at
+/// startup so the Argon2id KDF cost doesn't block the page.
+export function setTimeoutMs(ms, callback) {
+  setTimeout(callback, ms);
+}

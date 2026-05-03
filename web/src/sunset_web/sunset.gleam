@@ -157,6 +157,11 @@ pub fn presence_params_from_url() -> #(Int, Int, Int)
 @external(javascript, "./sunset.ffi.mjs", "setIntervalMs")
 pub fn set_interval_ms(ms: Int, callback: fn() -> Nil) -> Nil
 
+/// Schedule a one-shot callback after `ms` milliseconds. Used to stagger
+/// room-open calls at startup so the Argon2id KDF cost doesn't block.
+@external(javascript, "./sunset.ffi.mjs", "setTimeoutMs")
+pub fn set_timeout_ms(ms: Int, callback: fn() -> Nil) -> Nil
+
 /// Wall-clock unix-ms snapshot via JS `Date.now()`.
 @external(javascript, "./sunset.ffi.mjs", "nowMs")
 pub fn now_ms() -> Int
