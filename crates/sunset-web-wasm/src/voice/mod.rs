@@ -1,12 +1,15 @@
 //! Voice runtime — orchestrates encoder, network publish, and subscribe.
 //!
 //! `voice_start(on_frame, on_voice_peer_state)` constructs a VoiceState,
-//! spawns the heartbeat timer (transport.rs); subscriber + state combiner
-//! come in Task 5. `voice_input(pcm)` encodes one frame and publishes
-//! the encrypted bytes via `Bus::publish_ephemeral`.
+//! spawns the heartbeat timer (transport.rs), the subscribe loop
+//! (subscriber.rs), and the Liveness state combiner (liveness.rs).
+//! `voice_input(pcm)` encodes one frame and publishes the encrypted
+//! bytes via `Bus::publish_ephemeral`.
 //!
 //! Splitting into submodules keeps each file focused on one responsibility.
 
+mod liveness;
+mod subscriber;
 mod transport;
 
 use std::cell::RefCell;
@@ -49,18 +52,16 @@ pub(crate) fn new_voice_cell() -> VoiceCell {
 }
 
 /// Start the voice subsystem. Constructs the encoder, spawns the
-/// heartbeat task. Subscriber + state combiner come in Task 5.
-///
-/// `_on_frame` and `_on_voice_peer_state` are accepted but currently
-/// unused; Task 5 wires them.
+/// heartbeat task, the Bus subscribe loop, and the Liveness state
+/// combiner.
 #[allow(dead_code)] // Wired up by Client in Task 6.
 pub(crate) fn voice_start(
     state: &VoiceCell,
     identity: &Identity,
     room: &Rc<Room>,
     bus: &BusArc,
-    _on_frame: &Function,
-    _on_voice_peer_state: &Function,
+    on_frame: &Function,
+    on_voice_peer_state: &Function,
 ) -> Result<(), JsError> {
     if state.borrow().is_some() {
         return Err(JsError::new("voice already started"));
@@ -84,6 +85,19 @@ pub(crate) fn voice_start(
     });
 
     spawn_heartbeat(state.clone(), identity.clone(), room.clone(), bus.clone());
+
+    let arcs = liveness::VoiceLiveness::new();
+    liveness::spawn_combiner(&arcs, on_voice_peer_state.clone());
+    subscriber::spawn_subscriber(
+        state.clone(),
+        room.clone(),
+        bus.clone(),
+        liveness::VoiceLiveness {
+            frame: arcs.frame.clone(),
+            membership: arcs.membership.clone(),
+        },
+        on_frame.clone(),
+    );
 
     Ok(())
 }
