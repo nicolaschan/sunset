@@ -654,6 +654,54 @@ where
         Ok(())
     }
 
+    /// Walk the local store for `_sunset-sync/subscribe` entries authored
+    /// by `self.local_peer` and return their parsed filters. Used by
+    /// `PeerHello` and `tick_anti_entropy` to fire per-filter digests so
+    /// a (re)connected client catches up on whatever it missed under
+    /// each of its own published interests.
+    ///
+    /// Other peers' subscribe entries are intentionally skipped — they
+    /// own their own catch-up, and this engine has no signing key for
+    /// them. Iteration errors and parse errors are logged-and-skipped,
+    /// matching `replay_existing_subscriptions`.
+    #[allow(dead_code)] // wired in next commit
+    async fn own_published_filters(&self) -> Vec<Filter> {
+        use futures::StreamExt as _;
+        let mut out = Vec::new();
+        let filter = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
+        let mut entries = match self.store.iter(filter).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "own_published_filters: store iteration");
+                return out;
+            }
+        };
+        while let Some(item) = entries.next().await {
+            let entry = match item {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "own_published_filters: entry");
+                    continue;
+                }
+            };
+            if entry.verifying_key != self.local_peer.0 {
+                continue;
+            }
+            let block = match self.store.get_content(&entry.value_hash).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "own_published_filters: get_content");
+                    continue;
+                }
+            };
+            if let Ok(parsed) = parse_subscription_entry(&entry, &block) {
+                out.push(parsed);
+            }
+        }
+        out
+    }
+
     async fn send_bootstrap_digest(&self, to: &PeerId) {
         let filter = self.config.bootstrap_filter.clone();
         self.send_filter_digest(to, &filter).await;
@@ -1925,6 +1973,82 @@ mod tests {
                     saw_filter_digest,
                     "publish_subscription must send a DigestExchange over the new filter to each connected peer so the peer can backfill matching entries we're missing"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn own_published_filters_returns_self_authored_subscribe_entries_only() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                // Self-authored subscribe entry — should be returned.
+                let mine = Filter::NamePrefix(Bytes::from_static(b"room/"));
+                let mine_bytes = postcard::to_stdvec(&mine).unwrap();
+                let mine_block = ContentBlock {
+                    data: Bytes::from(mine_bytes),
+                    references: vec![],
+                };
+                let mine_entry = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: mine_block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine
+                    .store
+                    .insert(mine_entry, Some(mine_block))
+                    .await
+                    .unwrap();
+
+                // Someone else's subscribe entry — must NOT be returned.
+                let theirs = Filter::NamePrefix(Bytes::from_static(b"other/"));
+                let theirs_bytes = postcard::to_stdvec(&theirs).unwrap();
+                let theirs_block = ContentBlock {
+                    data: Bytes::from(theirs_bytes),
+                    references: vec![],
+                };
+                let theirs_entry = SignedKvEntry {
+                    verifying_key: vk(b"bob"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: theirs_block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine
+                    .store
+                    .insert(theirs_entry, Some(theirs_block))
+                    .await
+                    .unwrap();
+
+                // Self-authored entry under a non-subscribe name — must NOT be returned.
+                let chat_block = ContentBlock {
+                    data: Bytes::from_static(b"hi"),
+                    references: vec![],
+                };
+                let chat_entry = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(b"room/msg/1"),
+                    value_hash: chat_block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine
+                    .store
+                    .insert(chat_entry, Some(chat_block))
+                    .await
+                    .unwrap();
+
+                let filters = engine.own_published_filters().await;
+                assert_eq!(filters, vec![mine]);
             })
             .await;
     }
