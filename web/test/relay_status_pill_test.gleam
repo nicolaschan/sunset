@@ -13,6 +13,8 @@ fn snap(id: Float, state: String) -> IntentSnapshot {
     peer_pubkey: None,
     kind: None,
     attempt: 0,
+    last_pong_at_ms: None,
+    last_rtt_ms: None,
   )
 }
 

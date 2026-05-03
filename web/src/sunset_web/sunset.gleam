@@ -19,7 +19,11 @@ pub fn load_or_create_identity(callback: fn(BitArray) -> Nil) -> Nil
 /// Construct a Client. Seed must be 32 bytes. `callback` is called with
 /// the opaque ClientHandle once the wasm bundle is loaded + initialised.
 @external(javascript, "./sunset.ffi.mjs", "createClient")
-pub fn create_client(seed: BitArray, callback: fn(ClientHandle) -> Nil) -> Nil
+pub fn create_client(
+  seed: BitArray,
+  heartbeat_interval_ms: Int,
+  callback: fn(ClientHandle) -> Nil,
+) -> Nil
 
 /// Open a room by name. Returns a RoomHandle via `callback` once the room
 /// subscription is published and the wasm-side state is initialised.
@@ -51,6 +55,11 @@ pub type IntentSnapshot {
     peer_pubkey: option.Option(BitArray),
     kind: option.Option(String),
     attempt: Int,
+    /// Wall-clock ms of the most recent Pong. None until the first
+    /// Pong of the first connection lands; preserved across Backoff.
+    last_pong_at_ms: option.Option(Int),
+    /// Round-trip time of the most recent Pong, in milliseconds.
+    last_rtt_ms: option.Option(Int),
   )
 }
 
@@ -157,6 +166,11 @@ pub fn mem_last_heartbeat_ms(m: MemberJs) -> option.Option(Int)
 /// Returns `#(interval_ms, ttl_ms, refresh_ms)`. Defaults: 30000/60000/5000.
 @external(javascript, "./sunset.ffi.mjs", "presenceParamsFromUrl")
 pub fn presence_params_from_url() -> #(Int, Int, Int)
+
+/// Read `?heartbeat_interval_ms=NNN` from the URL. Returns 0 when
+/// absent or unparseable. e2e-only knob.
+@external(javascript, "./sunset.ffi.mjs", "heartbeatIntervalMsFromUrl")
+pub fn heartbeat_interval_ms_from_url() -> Int
 
 /// Schedule a recurring callback every `ms` milliseconds. Used by the
 /// popover ticker; runs for the page lifetime, no cancel handle in v1.

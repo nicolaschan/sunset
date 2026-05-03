@@ -58,11 +58,15 @@ export function loadOrCreateIdentity(callback) {
   callback(new BitArray(bytes));
 }
 
-export async function createClient(seed, callback) {
+export async function createClient(seed, heartbeatIntervalMs, callback) {
   await ensureLoaded();
   const { Client } = await loadWasmModule();
   const seedBytes = bitsToBytes(seed);
-  const client = new Client(seedBytes, 0);
+  const hb =
+    Number.isFinite(heartbeatIntervalMs) && heartbeatIntervalMs > 0
+      ? heartbeatIntervalMs
+      : 0;
+  const client = new Client(seedBytes, hb);
   // Test-only hook: expose the client to Playwright when SUNSET_TEST is
   // set on `window` before the bundle loads. No-op in production.
   if (typeof window !== "undefined" && window.SUNSET_TEST) {
@@ -113,6 +117,8 @@ export function onIntentChanged(client, callback) {
     // on the Rust side; wrap into Some/None.
     const peerPubkey = snap.peer_pubkey;
     const kind = snap.kind;
+    const lastPongMs = snap.last_pong_at_unix_ms;
+    const lastRttMs = snap.last_rtt_ms;
     const record = new IntentSnapshot(
       snap.id,
       snap.state,
@@ -122,6 +128,12 @@ export function onIntentChanged(client, callback) {
         : new Some(new BitArray(peerPubkey)),
       kind === undefined || kind === null ? new None() : new Some(kind),
       snap.attempt,
+      lastPongMs === undefined || lastPongMs === null
+        ? new None()
+        : new Some(lastPongMs),
+      lastRttMs === undefined || lastRttMs === null
+        ? new None()
+        : new Some(lastRttMs),
     );
     callback(record);
   });
@@ -349,4 +361,15 @@ export function registerEmojiPicker() {
     emojiPickerLoaded = import("emoji-picker-element");
   }
   return emojiPickerLoaded;
+}
+
+/// Read `?heartbeat_interval_ms=NNN` from the current URL. Returns 0
+/// when absent or unparseable, signalling Client::new to use the
+/// SyncConfig default (15 s). e2e-only knob.
+export function heartbeatIntervalMsFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get("heartbeat_interval_ms");
+  if (raw === null) return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
