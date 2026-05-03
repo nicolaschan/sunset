@@ -1637,8 +1637,6 @@ fn room_view_with_state(
       toggle: ToggleRoomsRail,
       viewport: model.viewport,
       members: state.members,
-      mode: model.mode,
-      on_toggle_mode: ToggleMode,
       on_open_settings: OpenSettings,
     ),
     // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.

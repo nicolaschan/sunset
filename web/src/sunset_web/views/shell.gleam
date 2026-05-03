@@ -267,6 +267,18 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
      .msg-row.is-active {
        background: " <> palette.surface_alt <> ";
      }
+     /* On touch devices the action toolbar ('overflow menu') becomes
+        visible by tapping a message row — `is-selected` pins it. The
+        same selection should also pin the highlight backdrop so the
+        user gets the same hover-affordance feedback that desktop gets
+        on hover. Scoped to (hover: none) so a desktop click on a row
+        doesn't keep it perpetually highlighted (which would conflict
+        with the more transient :hover on pointer devices). */
+     @media (hover: none) {
+       .msg-row.is-selected {
+         background: " <> palette.surface_alt <> ";
+       }
+     }
      /* Action toolbar visibility splits cleanly by input modality:
         pointer devices use :hover (the toolbar follows the cursor —
         always the most recently hovered row, never a stuck previous

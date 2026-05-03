@@ -395,16 +395,29 @@ fn mode_toggle_button(p: Palette, mode: Mode, on_toggle: msg) -> Element(msg) {
 /// `on_join(value)` only on Enter (other keys yield `noop`). Reading
 /// the value out of the event itself avoids any staleness from the
 /// closure being captured against an older render's state.
+///
+/// Enter calls `preventDefault` on the keydown so the keystroke can't
+/// bleed through into a different focused element after Lustre's
+/// re-render replaces this input. Without this, pressing Enter on the
+/// landing input on phone navigates to the room AND inserts a newline
+/// into the (newly-mounted, autofocus'd) composer textarea, because
+/// the browser's default keydown action runs after the DOM mutation
+/// has moved focus.
 fn on_enter_with_value(
   noop: msg,
   on_join: fn(String) -> msg,
 ) -> attribute.Attribute(msg) {
-  event.on("keydown", {
+  event.advanced("keydown", {
     use key <- decode.subfield(["key"], decode.string)
     use value <- decode.subfield(["target", "value"], decode.string)
     decode.success(case key {
-      "Enter" -> on_join(value)
-      _ -> noop
+      "Enter" ->
+        event.handler(
+          on_join(value),
+          prevent_default: True,
+          stop_propagation: False,
+        )
+      _ -> event.handler(noop, prevent_default: False, stop_propagation: False)
     })
   })
 }
