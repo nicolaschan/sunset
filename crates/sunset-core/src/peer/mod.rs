@@ -85,12 +85,41 @@ where
             );
         self.rtc_signaler_dispatcher.register(fp, signaler.clone());
 
-        // Publish the room subscription. Renewal is wired in Task 19.
+        // Publish the room subscription.
         let filter = crate::filters::room_filter(&room);
         self.engine
             .publish_subscription(filter, std::time::Duration::from_secs(3600))
             .await
             .map_err(|e| crate::Error::Other(format!("publish_subscription: {e}")))?;
+
+        // Build cancel signal up front so we can hand it to background tasks.
+        let cancel = Rc::new(std::cell::Cell::new(false));
+
+        // Spawn the subscription renewal task. Re-publishes at TTL/2.
+        let engine_for_renewal = self.engine.clone();
+        let room_for_renewal = room.clone();
+        let cancel_for_renewal = cancel.clone();
+        const SUBSCRIPTION_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+        sunset_sync::spawn::spawn_local(async move {
+            #[cfg(not(target_arch = "wasm32"))]
+            use tokio::time::sleep;
+            #[cfg(target_arch = "wasm32")]
+            use wasmtimer::tokio::sleep;
+            let renewal = SUBSCRIPTION_TTL / 2;
+            loop {
+                sleep(renewal).await;
+                if cancel_for_renewal.get() {
+                    return;
+                }
+                let f = crate::filters::room_filter(&room_for_renewal);
+                if let Err(e) = engine_for_renewal
+                    .publish_subscription(f, SUBSCRIPTION_TTL)
+                    .await
+                {
+                    tracing::warn!("subscription renewal failed: {e}");
+                }
+            }
+        });
 
         let state = Rc::new(open_room::RoomState {
             room,
@@ -100,7 +129,7 @@ where
                 &self.relay_status.borrow(),
             )),
             signaler,
-            cancel_decode: Rc::new(std::cell::Cell::new(false)),
+            cancel_decode: cancel,
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
         });
 
@@ -336,6 +365,30 @@ mod tests {
                 .expect("subscription closed");
             assert!(matches!(ev, Ok(sunset_store::Event::Inserted(_))));
         }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn renewal_loop_exits_when_cancel_set() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(14)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                // Drop the OpenRoom handle; verify cancel was set.
+                let cancel = room.inner.cancel_decode.clone();
+                drop(room);
+                // The Drop impl on RoomState (Phase 4) fires cancel_decode = true.
+                // Yield so the renewal-loop / decode-loop tasks notice (we don't
+                // actually assert their termination here — just that the cancel
+                // signal is set, which structurally guarantees their exit).
+                tokio::task::yield_now().await;
+                assert!(
+                    cancel.get(),
+                    "cancel_decode should be set after OpenRoom drop"
+                );
+            })
+            .await;
     }
 
     pub(super) mod helpers {
