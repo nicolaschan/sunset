@@ -39,6 +39,7 @@ pub fn view(
   on_draft on_draft: fn(String) -> msg,
   on_submit on_submit: msg,
   noop noop: msg,
+  on_shortcut on_shortcut: fn(String, String, String, Bool) -> msg,
   reacting_to reacting_to: Option(String),
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
@@ -96,7 +97,16 @@ pub fn view(
         is_revealed,
         on_toggle_spoiler,
       ),
-      composer(p, viewport, channel_name, draft, on_draft, on_submit, noop),
+      composer(
+        p,
+        viewport,
+        channel_name,
+        draft,
+        on_draft,
+        on_submit,
+        noop,
+        on_shortcut,
+      ),
     ],
   )
 }
@@ -777,6 +787,7 @@ fn composer(
   on_draft: fn(String) -> msg,
   on_submit: msg,
   noop: msg,
+  on_shortcut: fn(String, String, String, Bool) -> msg,
 ) -> Element(msg) {
   // Fixed 64px height with a 1px border-top — the rooms-rail you_row
   // and channels-rail self-bar share the same shape so the three
@@ -823,9 +834,18 @@ fn composer(
               event.on("keydown", {
                 use key <- decode.subfield(["key"], decode.string)
                 use shift <- decode.subfield(["shiftKey"], decode.bool)
-                decode.success(case key, shift {
-                  "Enter", False -> on_submit
-                  _, _ -> noop
+                use meta <- decode.subfield(["metaKey"], decode.bool)
+                use ctrl <- decode.subfield(["ctrlKey"], decode.bool)
+                let mod = meta || ctrl
+                decode.success(case key, shift, mod {
+                  "Enter", False, _ -> on_submit
+                  "b", _, True -> on_shortcut("**", "", "**", True)
+                  "B", _, True -> on_shortcut("**", "", "**", True)
+                  "i", _, True -> on_shortcut("*", "", "*", True)
+                  "I", _, True -> on_shortcut("*", "", "*", True)
+                  "k", _, True -> on_shortcut("[", "", "](url)", True)
+                  "K", _, True -> on_shortcut("[", "", "](url)", True)
+                  _, _, _ -> noop
                 })
               }),
               ui.css([

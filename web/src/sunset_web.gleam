@@ -180,6 +180,12 @@ pub type Msg {
   OpenDrawer(domain.Drawer)
   CloseDrawer
   ToggleSpoiler(message_id: String, offset: Int)
+  ApplyComposerShortcut(
+    before: String,
+    between: String,
+    after: String,
+    caret_at_between: Bool,
+  )
 }
 
 pub fn main() {
@@ -316,6 +322,11 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       sunset.set_interval_ms(1000, fn() { dispatch(Tick(sunset.now_ms())) })
     })
 
+  let attach_shortcuts_eff =
+    effect.from(fn(_dispatch) {
+      composer.attach_shortcut_prevent_default("composer-textarea")
+    })
+
   #(
     model,
     effect.batch([
@@ -326,6 +337,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       subscribe_viewport,
       subscribe_touch_drag,
       ticker_eff,
+      attach_shortcuts_eff,
     ]),
   )
 }
@@ -967,6 +979,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(Model(..model, revealed_spoilers: next), effect.none())
     }
+    ApplyComposerShortcut(b, m, a, caret) -> {
+      let new_value =
+        composer.apply_template("composer-textarea", b, m, a, caret)
+      #(Model(..model, draft: new_value), effect.none())
+    }
   }
 }
 
@@ -1216,6 +1233,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
       noop: NoOp,
+      on_shortcut: fn(b, m, a, caret) { ApplyComposerShortcut(b, m, a, caret) },
       reacting_to: model.reacting_to,
       detail_msg_id: case model.sheet {
         Some(domain.DetailsSheet(message_id: id)) -> Some(id)
