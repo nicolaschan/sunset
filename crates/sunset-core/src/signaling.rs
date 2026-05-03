@@ -1,27 +1,10 @@
-//! `Signaler` impl that sits on top of an existing `MemoryStore` +
+//! `Signaler` impl that sits on top of an existing `Store` +
 //! `SyncEngine`. Each outbound `SignalMessage` becomes a `SignedKvEntry`
 //! named `<room_fp_hex>/webrtc/<from_hex>/<to_hex>/<seq:016x>` whose
 //! content block carries the Noise_KK ciphertext for the payload.
 //!
-//! Two layers of crypto live here:
-//!   - The CRDT entry is **signed** by the sender's Ed25519 identity (via
-//!     the existing `signing_payload` canonical encoding).
-//!   - The payload bytes inside the content block are **encrypted** under
-//!     a per-pair Noise_KK session — full PFS, mutual authentication via
-//!     each peer's static X25519 (derived from the Ed25519 identity).
-//!
-//! Per-peer KK state machine:
-//!   - First send to a new peer → `KkInitiator::write_message_1` produces
-//!     msg1 ciphertext + leaves us awaiting msg2.
-//!   - First inbound from a new peer → `KkResponder::read_message_1` decrypts
-//!     msg1 + leaves us awaiting our `write_message_2` send.
-//!   - Send while awaiting msg2 (initiator side, e.g. early ICE) →
-//!     await on `session_ready` notifier.
-//!   - First send after responder-got-msg1 → `write_message_2` produces
-//!     msg2 ciphertext + transitions to `KkSession`.
-//!   - Receive of msg2 (initiator side) → `read_message_2` transitions
-//!     to `KkSession` + fires `session_ready` notifier.
-//!   - Subsequent send/recv → `KkSession::encrypt`/`decrypt`.
+//! Moved from `sunset-web-wasm::relay_signaler` so non-web hosts can
+//! signal Noise_KK setup via the same CRDT-entry path.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -34,21 +17,17 @@ use futures::channel::{mpsc, oneshot};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-use sunset_core::Identity;
+use crate::Identity;
 use sunset_noise::{KkInitiator, KkResponder, KkSession, ed25519_seed_to_x25519_secret};
 use sunset_store::{
     ContentBlock, Filter, Replay, SignedKvEntry, Store, VerifyingKey, canonical::signing_payload,
 };
-use sunset_store_memory::MemoryStore;
 use sunset_sync::{Error as SyncError, PeerId, Result as SyncResult, SignalMessage, Signaler};
 
-/// Filter used by both the dispatcher (inside this module) and the
-/// engine subscription (`Client::publish_signaling_subscription`).
 pub fn signaling_filter(room_fp_hex: &str) -> Filter {
     Filter::NamePrefix(Bytes::from(format!("{room_fp_hex}/webrtc/")))
 }
 
-/// Build the canonical signaling-entry name. Frozen format.
 fn entry_name(room_fp_hex: &str, from: &PeerId, to: &PeerId, seq: u64) -> Bytes {
     let from_hex = hex::encode(from.verifying_key().as_bytes());
     let to_hex = hex::encode(to.verifying_key().as_bytes());
@@ -57,8 +36,6 @@ fn entry_name(room_fp_hex: &str, from: &PeerId, to: &PeerId, seq: u64) -> Bytes 
     ))
 }
 
-/// Parse `<room_fp_hex>/webrtc/<from_hex>/<to_hex>/<seq:016x>` →
-/// `(from, to, seq)`. Returns `None` on any shape mismatch.
 fn parse_entry_name(name: &[u8], room_fp_hex: &str) -> Option<(PeerId, PeerId, u64)> {
     let s = std::str::from_utf8(name).ok()?;
     let suffix = s.strip_prefix(&format!("{room_fp_hex}/webrtc/"))?;
@@ -78,17 +55,10 @@ fn parse_entry_name(name: &[u8], room_fp_hex: &str) -> Option<(PeerId, PeerId, u
 
 #[derive(Default)]
 struct PeerKkSlot {
-    /// Set when we're the initiator and have sent msg1, awaiting msg2.
     initiator: Option<KkInitiator>,
-    /// Set when we're the responder and have received msg1, awaiting our
-    /// outbound msg2.
     responder: Option<KkResponder>,
-    /// Set after handshake completion, used for transport-mode.
     session: Option<KkSession>,
-    /// Outbound seq counter (per remote peer). Starts at 0.
     next_send_seq: u64,
-    /// Senders to wake up `send()` calls that are blocked waiting for the
-    /// session to become ready.
     on_session_ready: Vec<oneshot::Sender<()>>,
 }
 
@@ -96,27 +66,18 @@ struct Inner {
     peers: HashMap<PeerId, PeerKkSlot>,
 }
 
-pub struct RelaySignaler {
+pub struct RelaySignaler<S: Store + 'static> {
     local_identity: Identity,
     local_x25519_secret: Zeroizing<[u8; 32]>,
-    /// Map from remote peer's Ed25519 pubkey to its X25519 pub for KK setup.
-    /// Cached after first computation.
     x25519_pub_cache: Mutex<HashMap<PeerId, [u8; 32]>>,
-    room_fp_hex: String,
-    store: Arc<MemoryStore>,
+    pub(crate) room_fp_hex: String,
+    store: Arc<S>,
     inner: Mutex<Inner>,
     inbound_rx: Mutex<mpsc::UnboundedReceiver<SignalMessage>>,
 }
 
-impl RelaySignaler {
-    /// Construct a `RelaySignaler` and spawn its inbound dispatcher task.
-    /// The dispatcher subscribes to all `<room_fp>/webrtc/` entries and
-    /// decrypts each one addressed to us.
-    pub fn new(
-        local_identity: Identity,
-        room_fp_hex: String,
-        store: &Arc<MemoryStore>,
-    ) -> Rc<Self> {
+impl<S: Store + 'static> RelaySignaler<S> {
+    pub fn new(local_identity: Identity, room_fp_hex: String, store: &Arc<S>) -> Rc<Self> {
         let local_x25519_secret = ed25519_seed_to_x25519_secret(&local_identity.secret_bytes());
         let (inbound_tx, inbound_rx) = mpsc::unbounded::<SignalMessage>();
         let signaler = Rc::new(Self {
@@ -155,14 +116,12 @@ impl RelaySignaler {
         Ok(x)
     }
 
-    /// Subscribe to all `<room_fp>/webrtc/` entries, decrypt those
-    /// addressed to us, and forward to `inbound_tx`.
     async fn run_dispatcher(&self, inbound_tx: mpsc::UnboundedSender<SignalMessage>) {
         let filter = signaling_filter(&self.room_fp_hex);
         let mut events = match self.store.subscribe(filter, Replay::All).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!(error = %e, "RelaySignaler subscribe");
+                tracing::error!("RelaySignaler subscribe: {e}");
                 return;
             }
         };
@@ -172,12 +131,12 @@ impl RelaySignaler {
                 Ok(sunset_store::Event::Replaced { new, .. }) => new,
                 Ok(_) => continue,
                 Err(e) => {
-                    tracing::error!(error = %e, "RelaySignaler event");
+                    tracing::error!("RelaySignaler event: {e}");
                     continue;
                 }
             };
             if let Err(e) = self.handle_entry(&entry, &inbound_tx).await {
-                tracing::warn!(error = %e, "RelaySignaler handle_entry");
+                tracing::warn!("RelaySignaler handle_entry: {e}");
             }
         }
     }
@@ -190,10 +149,10 @@ impl RelaySignaler {
         let (from, to, seq) = parse_entry_name(&entry.name, &self.room_fp_hex)
             .ok_or_else(|| SyncError::Transport("bad signaling entry name".into()))?;
         if to != self.local_peer() {
-            return Ok(()); // not for us
+            return Ok(());
         }
         if from == self.local_peer() {
-            return Ok(()); // our own outbound, echoed back
+            return Ok(());
         }
 
         let block = self
@@ -215,12 +174,9 @@ impl RelaySignaler {
     }
 
     async fn decrypt_inbound(&self, from: &PeerId, ciphertext: &[u8]) -> SyncResult<Vec<u8>> {
-        // Lock briefly to inspect / mutate slot. Crypto operations happen
-        // inside the lock since we hold the snow state by &mut.
         let mut inner = self.inner.lock().await;
         let slot = inner.peers.entry(from.clone()).or_default();
         if slot.session.is_none() && slot.initiator.is_none() && slot.responder.is_none() {
-            // First message from this peer — they're the initiator.
             let remote_x = self.x25519_pub_for(from).await?;
             let mut resp = KkResponder::new(&self.local_x25519_secret, &remote_x)
                 .map_err(|e| SyncError::Transport(format!("KkResponder::new: {e}")))?;
@@ -231,7 +187,6 @@ impl RelaySignaler {
             return Ok(pt);
         }
         if let Some(init) = slot.initiator.take() {
-            // We sent msg1; this is msg2.
             let (pt, session) = init
                 .read_message_2(ciphertext)
                 .map_err(|e| SyncError::Transport(format!("read_message_2: {e}")))?;
@@ -246,9 +201,6 @@ impl RelaySignaler {
                 .decrypt(ciphertext)
                 .map_err(|e| SyncError::Transport(format!("session.decrypt: {e}")));
         }
-        // Slot is in responder-got-msg1 (we received msg1 but haven't
-        // sent msg2 yet) and we got another inbound. The sender shouldn't
-        // be sending more before our msg2 — drop quietly.
         Err(SyncError::Transport(
             "inbound before responder sent msg2; dropped".into(),
         ))
@@ -279,7 +231,6 @@ impl RelaySignaler {
             name: entry_name(&self.room_fp_hex, &from, to, seq),
             value_hash,
             priority,
-            // Signaling entries are short-lived; expire after 1 hour.
             expires_at: Some(priority + 3_600_000),
             signature: Bytes::new(),
         };
@@ -296,19 +247,16 @@ impl RelaySignaler {
 }
 
 #[async_trait(?Send)]
-impl Signaler for RelaySignaler {
+impl<S: Store + 'static> Signaler for RelaySignaler<S> {
     async fn send(&self, message: SignalMessage) -> SyncResult<()> {
         let to = message.to.clone();
         let plaintext = message.payload;
 
-        // Crypto step 1: figure out which mode we're in. Loop because we
-        // might need to await a session-ready notifier and re-lock.
         loop {
             let ciphertext_opt = {
                 let mut inner = self.inner.lock().await;
                 let slot = inner.peers.entry(to.clone()).or_default();
                 if slot.initiator.is_none() && slot.responder.is_none() && slot.session.is_none() {
-                    // First send to this peer → we're the initiator.
                     let remote_x = self.x25519_pub_for(&to).await?;
                     let mut init = KkInitiator::new(&self.local_x25519_secret, &remote_x)
                         .map_err(|e| SyncError::Transport(format!("KkInitiator::new: {e}")))?;
@@ -332,8 +280,6 @@ impl Signaler for RelaySignaler {
                         .map_err(|e| SyncError::Transport(format!("session.encrypt: {e}")))?;
                     Some(ct)
                 } else {
-                    // initiator.is_some() && session.is_none() — we sent msg1,
-                    // awaiting msg2. Register a waiter.
                     let (tx, rx) = oneshot::channel::<()>();
                     slot.on_session_ready.push(tx);
                     drop(inner);
@@ -346,7 +292,6 @@ impl Signaler for RelaySignaler {
                 self.write_entry(&to, seq, ciphertext).await?;
                 return Ok(());
             }
-            // else: looped back to retry now that session is ready
         }
     }
 
@@ -355,5 +300,228 @@ impl Signaler for RelaySignaler {
         rx.next()
             .await
             .ok_or_else(|| SyncError::Transport("signaler closed".into()))
+    }
+}
+
+use crate::crypto::room::RoomFingerprint;
+use std::cell::RefCell;
+
+/// Routes signaling for a `WebRtcRawTransport` across N open rooms.
+/// Holds a per-room `RelaySignaler` for each open room. `send` picks any
+/// registered signaler (the receiver subscribes to all its open rooms,
+/// so the message reaches them via any one); `recv` fans across all
+/// per-room receivers via select!.
+///
+/// The Signaler trait impl comes in a follow-up task; this task only
+/// implements register/unregister + introspection.
+pub struct MultiRoomSignaler {
+    by_room: RefCell<HashMap<RoomFingerprint, Rc<dyn Signaler>>>,
+    /// Notifier fired when a new signaler is registered, so an in-flight
+    /// `recv` blocked on the current set can re-do its select!.
+    register_notify: tokio::sync::Notify,
+}
+
+impl MultiRoomSignaler {
+    pub fn new() -> Rc<Self> {
+        Rc::new(Self {
+            by_room: RefCell::new(HashMap::new()),
+            register_notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub fn register<S: Store + 'static>(
+        self: &Rc<Self>,
+        fp: RoomFingerprint,
+        signaler: Rc<RelaySignaler<S>>,
+    ) {
+        let dyn_signaler: Rc<dyn Signaler> = signaler;
+        self.by_room.borrow_mut().insert(fp, dyn_signaler);
+        self.register_notify.notify_waiters();
+    }
+
+    pub fn unregister(&self, fp: &RoomFingerprint) {
+        self.by_room.borrow_mut().remove(fp);
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_room.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_room.borrow().is_empty()
+    }
+
+    pub fn contains(&self, fp: &RoomFingerprint) -> bool {
+        self.by_room.borrow().contains_key(fp)
+    }
+}
+
+#[async_trait(?Send)]
+impl Signaler for MultiRoomSignaler {
+    async fn send(&self, message: SignalMessage) -> SyncResult<()> {
+        // Pick the first registered per-room signaler (HashMap iteration
+        // order, but it's stable within a process so connect_direct
+        // retries land on the same room). The receiver subscribes to
+        // all its open rooms, so any single room is a sufficient
+        // carrier — provided both peers have that room open.
+        //
+        // KNOWN LIMITATION: if `to` doesn't have the chosen carrier
+        // room open, the signaling entry lands in the relay's store
+        // but `to` never reads it; `connect_direct` then times out at
+        // the WebRTC layer with no helpful error here. Callers who
+        // *can* check shared-room overlap (membership tracker) should
+        // do so before invoking `connect_direct`. Broadcasting through
+        // every room is NOT a valid workaround: per-room signalers
+        // hold independent Noise_KK state, so N copies of msg1 would
+        // each initiate an independent handshake and confuse the
+        // receiver's slot machine.
+        //
+        // If no rooms are registered, fail loudly.
+        let signaler = {
+            let map = self.by_room.borrow();
+            map.values().next().cloned()
+        };
+        match signaler {
+            Some(s) => s.send(message).await,
+            None => Err(SyncError::Transport(
+                "MultiRoomSignaler::send with no rooms registered \
+                 (call Peer::open_room before connect_direct)"
+                    .into(),
+            )),
+        }
+    }
+
+    async fn recv(&self) -> SyncResult<SignalMessage> {
+        // Loop: snapshot the current set of per-room signalers, race
+        // their recv()s + the register_notify. If a new signaler
+        // registers, re-snapshot.
+        loop {
+            let signalers: Vec<Rc<dyn Signaler>> =
+                { self.by_room.borrow().values().cloned().collect() };
+            if signalers.is_empty() {
+                // No signalers — wait for a registration.
+                self.register_notify.notified().await;
+                continue;
+            }
+            // Build a select! across N recvs + the notify.
+            let mut futures: futures::stream::FuturesUnordered<_> = signalers
+                .iter()
+                .map(|s| {
+                    let s = s.clone();
+                    async move { s.recv().await }
+                })
+                .collect();
+            tokio::select! {
+                biased;
+                _ = self.register_notify.notified() => {
+                    // New room registered; re-snapshot.
+                    continue;
+                }
+                Some(result) = futures::StreamExt::next(&mut futures) => {
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod multi_room_tests {
+    use super::*;
+    use crate::Ed25519Verifier;
+    use crate::Identity;
+    use crate::Room;
+    use crate::crypto::constants::test_fast_params;
+    use std::sync::Arc;
+    use sunset_store_memory::MemoryStore;
+
+    fn ident(seed: u8) -> Identity {
+        Identity::from_secret_bytes(&[seed; 32])
+    }
+
+    fn store() -> Arc<MemoryStore> {
+        Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_inserts_and_unregister_removes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let dispatcher = MultiRoomSignaler::new();
+                let id = ident(1);
+                let st = store();
+                let room = Room::open_with_params("alpha", &test_fast_params())
+                    .expect("Room::open_with_params");
+                let fp = room.fingerprint();
+                let signaler = RelaySignaler::new(id, fp.to_hex(), &st);
+
+                assert_eq!(dispatcher.len(), 0);
+                assert!(!dispatcher.contains(&fp));
+
+                dispatcher.register(fp, signaler);
+                assert_eq!(dispatcher.len(), 1);
+                assert!(dispatcher.contains(&fp));
+
+                dispatcher.unregister(&fp);
+                assert_eq!(dispatcher.len(), 0);
+                assert!(!dispatcher.contains(&fp));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_routes_to_registered_signaler_and_reaches_via_recv() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Two peers (Alice, Bob) sharing one room. Each builds a
+                // MultiRoomSignaler with one entry. Alice sends to Bob; Bob
+                // recv's the message.
+                let alice_id = ident(1);
+                let bob_id = ident(2);
+                let alice_pk = PeerId(alice_id.store_verifying_key());
+                let bob_pk = PeerId(bob_id.store_verifying_key());
+
+                // Shared store, simulating a fully-replicated relay so both
+                // signalers see the same entries.
+                let st = store();
+                let room =
+                    Room::open_with_params("alpha", &test_fast_params()).expect("Room::open");
+                let fp = room.fingerprint();
+
+                let alice_signaler = RelaySignaler::new(alice_id, fp.to_hex(), &st);
+                let bob_signaler = RelaySignaler::new(bob_id, fp.to_hex(), &st);
+
+                let alice_dispatcher = MultiRoomSignaler::new();
+                alice_dispatcher.register(fp, alice_signaler);
+                let bob_dispatcher = MultiRoomSignaler::new();
+                bob_dispatcher.register(fp, bob_signaler);
+
+                let payload = bytes::Bytes::from_static(b"hello-bob");
+                alice_dispatcher
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: payload.clone(),
+                    })
+                    .await
+                    .expect("alice.send");
+
+                let received =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), bob_dispatcher.recv())
+                        .await
+                        .expect("recv timed out")
+                        .expect("recv error");
+
+                // The payload that arrives is decrypted Noise plaintext, which is
+                // our original `payload` bytes (KK first message carries an attached
+                // payload that's plaintext after decryption).
+                assert_eq!(received.from, alice_pk);
+                assert_eq!(received.to, bob_pk);
+                assert_eq!(received.payload.as_ref(), b"hello-bob");
+            })
+            .await;
     }
 }
