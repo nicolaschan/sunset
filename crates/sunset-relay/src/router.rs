@@ -3,6 +3,11 @@
 //! without a WS upgrade → JSON identity descriptor; WS upgrade →
 //! forward the TcpStream to the WebSocketRawTransport via a channel;
 //! anything else → 404.
+//!
+//! Unused at runtime after the axum cut-over (Task 12). Kept in tree to
+//! keep that change reviewable; deleted in Task 14.
+
+#![allow(dead_code)]
 
 use std::rc::Rc;
 use std::time::Duration;

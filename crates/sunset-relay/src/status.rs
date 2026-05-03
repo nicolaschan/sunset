@@ -3,6 +3,11 @@
 //! Rendered at `GET /dashboard` on the relay's single WS port. The accept
 //! loop and routing live in `router.rs`; this module owns only the render
 //! logic and the per-connection response writer.
+//!
+//! Unused at runtime after the axum cut-over (Task 12). Kept in tree to
+//! keep that change reviewable; deleted in Task 14.
+
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

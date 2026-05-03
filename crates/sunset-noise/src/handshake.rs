@@ -128,7 +128,7 @@ async fn do_handshake_initiator<C: RawConnection + 'static>(
     })
 }
 
-async fn do_handshake_responder<C: RawConnection + 'static>(
+pub async fn do_handshake_responder<C: RawConnection + 'static>(
     raw: C,
     local: Arc<dyn NoiseIdentity>,
 ) -> Result<NoiseConnection<C>> {

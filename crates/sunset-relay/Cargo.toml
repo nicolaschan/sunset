@@ -34,7 +34,7 @@ sunset-store-fs.workspace = true
 sunset-sync.workspace = true
 sunset-sync-ws-native = { workspace = true, features = ["axum"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "signal", "fs", "sync", "net", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "signal", "fs", "sync", "net", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
