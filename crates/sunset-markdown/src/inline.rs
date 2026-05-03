@@ -35,6 +35,24 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
             }
         }
 
+        if bytes[i] == b'[' {
+            if let Some((label_end, url_end)) = find_link_parts(bytes, i) {
+                if text_start < i {
+                    out.push(Inline::Text(input[text_start..i].to_owned()));
+                }
+                let label = parse_inlines(&input[i + 1..label_end]);
+                let url = input[label_end + 2..url_end].to_owned();
+                out.push(Inline::Link {
+                    label,
+                    url,
+                    autolink: false,
+                });
+                i = url_end + 1;
+                text_start = i;
+                continue;
+            }
+        }
+
         if let Some((kind, marker_len)) = match_delimiter(bytes, i) {
             if let Some(close) = find_close(bytes, i + marker_len, kind) {
                 // Flush pending plain text.
@@ -58,6 +76,18 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
 
 fn find_byte(bytes: &[u8], target: u8, from: usize) -> Option<usize> {
     bytes[from..].iter().position(|&b| b == target).map(|p| p + from)
+}
+
+/// Returns `(label_end, url_end)` where `bytes[i] = '['`,
+/// `bytes[label_end] = ']'`, `bytes[label_end+1] = '('`, and
+/// `bytes[url_end] = ')'`. Returns None if not a well-formed link.
+fn find_link_parts(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+    let label_end = find_byte(bytes, b']', i + 1)?;
+    if bytes.get(label_end + 1) != Some(&b'(') {
+        return None;
+    }
+    let url_end = find_byte(bytes, b')', label_end + 2)?;
+    Some((label_end, url_end))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

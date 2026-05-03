@@ -300,4 +300,42 @@ mod tests {
             Document(vec![Block::Paragraph(vec![Inline::Text("``".to_owned())])])
         );
     }
+
+    #[test]
+    fn masked_link_basic() {
+        assert_eq!(
+            parse("see [the docs](https://example.com) here"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("see ".to_owned()),
+                Inline::Link {
+                    label: vec![Inline::Text("the docs".to_owned())],
+                    url: "https://example.com".to_owned(),
+                    autolink: false,
+                },
+                Inline::Text(" here".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn masked_link_label_can_contain_bold() {
+        assert_eq!(
+            parse("[**important**](https://x.com)"),
+            Document(vec![Block::Paragraph(vec![Inline::Link {
+                label: vec![Inline::Bold(vec![Inline::Text("important".to_owned())])],
+                url: "https://x.com".to_owned(),
+                autolink: false,
+            }])])
+        );
+    }
+
+    #[test]
+    fn unbalanced_brackets_are_literal() {
+        assert_eq!(
+            parse("see [docs(https://example.com) here"),
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "see [docs(https://example.com) here".to_owned()
+            )])])
+        );
+    }
 }
