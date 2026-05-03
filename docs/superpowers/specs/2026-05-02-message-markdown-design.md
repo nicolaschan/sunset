@@ -136,9 +136,16 @@ the raw URL string. Allowlist enforcement is the renderer's job
 - Property tests (`proptest` or `quickcheck`): `parse` never panics
   on arbitrary UTF-8; `to_plain(parse(s)).len() <= s.len()`.
 
-### `crates/sunset-core-wasm` (modify)
+### `crates/sunset-web-wasm` (modify)
 
-Adds one exported function:
+> **Revision (2026-05-02):** Earlier draft said `sunset-core-wasm`. The
+> web actually loads `sunset-web-wasm` (the fat composite bundle); the
+> standalone `sunset-core-wasm` crate isn't bundled into the web app.
+> The export lives in `sunset-web-wasm` so the existing FFI in
+> `sunset.ffi.mjs` can call it without loading a second WASM module.
+
+Adds one exported function (in a new `markdown.rs` module, gated on
+`#[cfg(target_arch = "wasm32")]` like the other modules):
 
 ```rust
 #[wasm_bindgen]
@@ -148,9 +155,9 @@ pub fn parse_markdown(input: &str) -> JsValue {
 }
 ```
 
-New deps: `sunset-markdown` (with `serde` feature), `serde`,
-`serde-wasm-bindgen`. The crate already targets WASM; no other
-changes.
+New deps on `sunset-web-wasm`: `sunset-markdown` (with `serde`
+feature), `serde`, `serde-wasm-bindgen`. No other changes; the crate
+already targets WASM.
 
 ### `web/src/sunset_web/markdown.gleam` (new)
 
@@ -244,7 +251,7 @@ user types in composer
 receiver renders:
    message stream calls markdown.render(m.body, p)
      → FFI: parse_markdown(body)
-       → sunset-core-wasm exports
+       → sunset-web-wasm exports
          → sunset-markdown::parse
        → returns AST as JSON (via serde-wasm-bindgen)
      → Gleam AST walk → Lustre Element
@@ -274,7 +281,7 @@ the view layer.
 `cargo nextest run -p sunset-markdown`. Property tests gated behind
 the existing dev-deps shape.
 
-**`sunset-core-wasm`:** add a `wasm-bindgen-test` that round-trips a
+**`sunset-web-wasm`:** add a `wasm-bindgen-test` that round-trips a
 handful of inputs through `parse_markdown` and checks the JS-side
 shape (this catches `serde` derive drift).
 
