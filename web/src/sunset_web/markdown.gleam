@@ -7,6 +7,10 @@
 //// `gleam/dynamic/decode` API used elsewhere in the codebase.
 
 import gleam/dynamic.{type Dynamic}
+import gleam/dynamic/decode
+import gleam/list
+import gleam/option.{type Option}
+import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 
@@ -15,13 +19,28 @@ import sunset_web/theme.{type Palette}
 @external(javascript, "./markdown.ffi.mjs", "parseMarkdown")
 fn parse_markdown_ffi(body: String) -> Dynamic
 
-/// Render the body to a single block-container `Element`. Subsequent
-/// tasks fill in the block/inline cases — for now everything renders
-/// as plain text.
-pub fn render(body: String, _p: Palette) -> Element(msg) {
-  let _ast = parse_markdown_ffi(body)
-  // Phase C1: stub. Replaced by Tasks C2..C5.
-  html.div([], [html.text(body)])
+/// Parse a body string to its block-level AST. Calls the Rust parser
+/// over FFI; on any decode failure returns a single Paragraph wrapping
+/// the body as literal text.
+///
+/// Exposed so tests can assert against parsed AST without re-rendering.
+pub fn parse(body: String) -> List(Block) {
+  let ast = parse_markdown_ffi(body)
+  case decode.run(ast, decode.list(block_decoder())) {
+    Ok(bs) -> bs
+    Error(_) -> [Paragraph([Text(body)])]
+  }
+}
+
+pub fn render(body: String, p: Palette) -> Element(msg) {
+  render_blocks(parse(body), p)
+}
+
+/// Render a pre-parsed AST to a Lustre element. Used by `render` and
+/// directly by tests that build AST values by hand to avoid the FFI
+/// dependency in unit-test environments.
+pub fn render_blocks(blocks: List(Block), p: Palette) -> Element(msg) {
+  html.div([], list.map(blocks, fn(b) { render_block(b, p) }))
 }
 
 /// Strip all formatting and return concatenated text. Useful for
@@ -29,4 +48,227 @@ pub fn render(body: String, _p: Palette) -> Element(msg) {
 pub fn to_plain(body: String) -> String {
   // Phase C1: stub. Replaced by Task C6.
   body
+}
+
+// ----- AST types -----
+// Pub so tests can construct AST values directly without going through FFI.
+
+pub type Block {
+  Paragraph(content: List(Inline))
+  Heading(level: Int, content: List(Inline))
+  Quote(content: List(Block))
+  UnorderedList(items: List(List(Block)))
+  CodeBlock(language: Option(String), source: String)
+}
+
+pub type Inline {
+  Text(value: String)
+  Bold(children: List(Inline))
+  Italic(children: List(Inline))
+  Underline(children: List(Inline))
+  Strikethrough(children: List(Inline))
+  Spoiler(children: List(Inline))
+  InlineCode(value: String)
+  Link(label: List(Inline), url: String, autolink: Bool)
+  LineBreak
+}
+
+// ----- Lazy decoder helpers -----
+//
+// The Block and Inline types are mutually recursive (Block → Inline → Block
+// for Quote/UnorderedList). Gleam's `decode.list(inline_decoder())` would
+// call `inline_decoder()` eagerly at construction time, causing infinite
+// recursion before any data is decoded.
+//
+// We break the cycle by deferring decoder construction to decode-time via
+// `decode.then`. `decode.dynamic` always succeeds and hands the raw value
+// to the continuation. `decode.then(decode.dynamic, fn(_) { my_decoder() })`
+// builds `my_decoder()` only when the outer decoder is actually run.
+
+fn lazy_inline_list() -> decode.Decoder(List(Inline)) {
+  decode.then(decode.dynamic, fn(_) { decode.list(inline_decoder()) })
+}
+
+fn lazy_block_list() -> decode.Decoder(List(Block)) {
+  decode.then(decode.dynamic, fn(_) { decode.list(block_decoder()) })
+}
+
+// ----- Decoders -----
+//
+// Externally-tagged enums from serde-wasm-bindgen come through as
+// either:
+//   - {"VariantName": payload}    (variants with data)
+//   - "VariantName"               (unit variants like LineBreak)
+//
+// `decode.one_of` tries each branch in order.
+
+fn block_decoder() -> decode.Decoder(Block) {
+  decode.one_of(paragraph_decoder(), [
+    heading_decoder(),
+    quote_decoder(),
+    unordered_list_decoder(),
+    code_block_decoder(),
+  ])
+}
+
+fn paragraph_decoder() -> decode.Decoder(Block) {
+  use inlines <- decode.field("Paragraph", lazy_inline_list())
+  decode.success(Paragraph(inlines))
+}
+
+fn heading_decoder() -> decode.Decoder(Block) {
+  use payload <- decode.field("Heading", heading_payload_decoder())
+  decode.success(payload)
+}
+
+fn heading_payload_decoder() -> decode.Decoder(Block) {
+  use level <- decode.field("level", decode.string)
+  use content <- decode.field("content", lazy_inline_list())
+  let n = case level {
+    "H1" -> 1
+    "H2" -> 2
+    _ -> 3
+  }
+  decode.success(Heading(n, content))
+}
+
+fn quote_decoder() -> decode.Decoder(Block) {
+  use blocks <- decode.field("Quote", lazy_block_list())
+  decode.success(Quote(blocks))
+}
+
+fn unordered_list_decoder() -> decode.Decoder(Block) {
+  use items <- decode.field(
+    "UnorderedList",
+    decode.then(decode.dynamic, fn(_) {
+      decode.list(lazy_block_list())
+    }),
+  )
+  decode.success(UnorderedList(items))
+}
+
+fn code_block_decoder() -> decode.Decoder(Block) {
+  use payload <- decode.field("CodeBlock", code_block_payload_decoder())
+  decode.success(payload)
+}
+
+fn code_block_payload_decoder() -> decode.Decoder(Block) {
+  use language <- decode.field("language", decode.optional(decode.string))
+  use source <- decode.field("source", decode.string)
+  decode.success(CodeBlock(language, source))
+}
+
+fn inline_decoder() -> decode.Decoder(Inline) {
+  decode.one_of(line_break_decoder(), [
+    text_decoder(),
+    bold_decoder(),
+    italic_decoder(),
+    underline_decoder(),
+    strikethrough_decoder(),
+    spoiler_decoder(),
+    inline_code_decoder(),
+    link_decoder(),
+  ])
+}
+
+fn line_break_decoder() -> decode.Decoder(Inline) {
+  use s <- decode.then(decode.string)
+  case s {
+    "LineBreak" -> decode.success(LineBreak)
+    _ -> decode.failure(LineBreak, "not LineBreak")
+  }
+}
+
+fn text_decoder() -> decode.Decoder(Inline) {
+  use s <- decode.field("Text", decode.string)
+  decode.success(Text(s))
+}
+
+fn inline_code_decoder() -> decode.Decoder(Inline) {
+  use s <- decode.field("InlineCode", decode.string)
+  decode.success(InlineCode(s))
+}
+
+fn bold_decoder() -> decode.Decoder(Inline) {
+  use xs <- decode.field("Bold", lazy_inline_list())
+  decode.success(Bold(xs))
+}
+
+fn italic_decoder() -> decode.Decoder(Inline) {
+  use xs <- decode.field("Italic", lazy_inline_list())
+  decode.success(Italic(xs))
+}
+
+fn underline_decoder() -> decode.Decoder(Inline) {
+  use xs <- decode.field("Underline", lazy_inline_list())
+  decode.success(Underline(xs))
+}
+
+fn strikethrough_decoder() -> decode.Decoder(Inline) {
+  use xs <- decode.field("Strikethrough", lazy_inline_list())
+  decode.success(Strikethrough(xs))
+}
+
+fn spoiler_decoder() -> decode.Decoder(Inline) {
+  use xs <- decode.field("Spoiler", lazy_inline_list())
+  decode.success(Spoiler(xs))
+}
+
+fn link_decoder() -> decode.Decoder(Inline) {
+  use payload <- decode.field("Link", link_payload_decoder())
+  decode.success(payload)
+}
+
+fn link_payload_decoder() -> decode.Decoder(Inline) {
+  use label <- decode.field("label", lazy_inline_list())
+  use url <- decode.field("url", decode.string)
+  use autolink <- decode.field("autolink", decode.bool)
+  decode.success(Link(label, url, autolink))
+}
+
+// ----- Block rendering -----
+
+fn render_block(b: Block, p: Palette) -> Element(msg) {
+  case b {
+    Paragraph(inlines) ->
+      html.p([], list.flat_map(inlines, fn(i) { render_inline(i, p) }))
+    _ -> html.text("")
+    // Block variants other than Paragraph filled in by Task C5.
+  }
+}
+
+// ----- Inline rendering -----
+
+fn render_inline(i: Inline, p: Palette) -> List(Element(msg)) {
+  case i {
+    Text(s) -> [html.text(s)]
+    Bold(xs) -> [
+      html.strong([], list.flat_map(xs, fn(x) { render_inline(x, p) })),
+    ]
+    Italic(xs) -> [html.em([], list.flat_map(xs, fn(x) { render_inline(x, p) }))]
+    Underline(xs) -> [
+      html.u([], list.flat_map(xs, fn(x) { render_inline(x, p) })),
+    ]
+    Strikethrough(xs) -> [
+      html.s([], list.flat_map(xs, fn(x) { render_inline(x, p) })),
+    ]
+    InlineCode(s) -> [
+      html.code(
+        [
+          attribute.attribute(
+            "style",
+            "font-family: "
+              <> theme.font_mono
+              <> "; background: rgba(0,0,0,0.1); padding: 0 4px; border-radius: 3px;",
+          ),
+        ],
+        [html.text(s)],
+      ),
+    ]
+    LineBreak -> [html.br([])]
+    Spoiler(_xs) -> [html.text("")]
+    // Spoiler rendering in Task C3.
+    Link(_, _, _) -> [html.text("")]
+    // Link rendering in Task C4.
+  }
 }

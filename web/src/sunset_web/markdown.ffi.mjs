@@ -19,16 +19,27 @@
 //   | { Link: { label: [inline, ...], url: "...", autolink: true|false } }
 //   | "LineBreak"   // unit variant — serialized as a bare string
 //
-// On any error (e.g. WASM not yet loaded), returns the body as a single
-// Paragraph(Text(body)) so rendering still produces something useful.
+// Dynamic import: in `gleam test` (Node, no WASM bundle built) the WASM
+// module isn't present. Dynamic import lets the module load anyway and
+// fall back to literal-text rendering. Unit tests for the renderer don't
+// go through this path (they call `render_blocks` with hand-built AST);
+// the full pipeline is covered by Playwright e2e.
 
-import { parse_markdown } from "../../sunset_web_wasm.js";
+let wasmModule = null;
+try {
+  wasmModule = await import("../../sunset_web_wasm.js");
+} catch (_err) {
+  // WASM bundle not built (test env or pre-build). parseMarkdown will
+  // return the literal-text fallback below.
+}
 
 export function parseMarkdown(body) {
-  try {
-    return parse_markdown(body);
-  } catch (err) {
-    console.error("markdown.parseMarkdown failed:", err);
-    return [{ Paragraph: [{ Text: body }] }];
+  if (wasmModule && wasmModule.parse_markdown) {
+    try {
+      return wasmModule.parse_markdown(body);
+    } catch (err) {
+      console.error("markdown.parseMarkdown WASM call failed:", err);
+    }
   }
+  return [{ Paragraph: [{ Text: body }] }];
 }
