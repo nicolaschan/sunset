@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 serde = { workspace = true, optional = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [features]
 default = []
 serde = ["dep:serde", "serde/derive"]
