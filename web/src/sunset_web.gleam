@@ -120,6 +120,11 @@ pub type Model {
     /// Wall-clock unix-ms snapshot. Updated every second by the
     /// `Tick(now_ms)` message so the popover's age readout stays live.
     now_ms: Int,
+    /// Set of spoiler keys whose content is currently visible.
+    /// Each key is `#(message_id, offset)` where offset is the
+    /// character position of the `||` in the original message text.
+    /// Reset to empty whenever the user navigates to a different room.
+    revealed_spoilers: set.Set(#(String, Int)),
   )
 }
 
@@ -172,6 +177,7 @@ pub type Msg {
   ViewportChanged(domain.Viewport)
   OpenDrawer(domain.Drawer)
   CloseDrawer
+  ToggleSpoiler(message_id: String, offset: Int)
 }
 
 pub fn main() {
@@ -247,6 +253,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       selected_msg_id: None,
       peer_status_popover: None,
       now_ms: 0,
+      revealed_spoilers: set.new(),
     )
 
   let subscribe_hash =
@@ -440,7 +447,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             Nil
           })
       }
-      #(Model(..model, view: new_view, joined_rooms: new_rooms), persisted)
+      #(
+        Model(
+          ..model,
+          view: new_view,
+          joined_rooms: new_rooms,
+          revealed_spoilers: set.new(),
+        ),
+        persisted,
+      )
     }
     UpdateLandingInput(s) -> #(Model(..model, landing_input: s), effect.none())
     UpdateSidebarSearch(s) -> #(
@@ -470,6 +485,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               landing_input: "",
               sidebar_search: "",
               drawer: new_drawer,
+              revealed_spoilers: set.new(),
             )
           let persist_eff = case was_new {
             True ->
@@ -938,6 +954,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     OpenDrawer(d) -> #(Model(..model, drawer: Some(d)), effect.none())
     CloseDrawer -> #(Model(..model, drawer: None), effect.none())
+    ToggleSpoiler(mid, off) -> {
+      let key = #(mid, off)
+      let next = case set.contains(model.revealed_spoilers, key) {
+        True -> set.delete(model.revealed_spoilers, key)
+        False -> set.insert(model.revealed_spoilers, key)
+      }
+      #(Model(..model, revealed_spoilers: next), effect.none())
+    }
   }
 }
 
