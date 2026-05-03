@@ -25,9 +25,6 @@ pub type ReactionSnapshot = HashMap<String, BTreeSet<IdentityKey>>;
 /// identity.
 pub type ReactionSig = Vec<(String, Vec<Vec<u8>>)>;
 
-// ReactionEntry / ReactionState / apply_event / derive_snapshot are consumed
-// by spawn_reaction_tracker (B4). Allow dead_code until that task lands.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReactionEntry {
     pub action: ReactionAction,
@@ -48,7 +45,6 @@ pub struct ReactionEvent {
 }
 
 /// In-memory per-tracker state. `target → emoji → author → entry`.
-#[allow(dead_code)]
 pub(crate) type ReactionState =
     HashMap<Hash, HashMap<String, HashMap<IdentityKey, ReactionEntry>>>;
 
@@ -77,7 +73,6 @@ pub struct ReactionHandles {
 /// might have changed; the caller still does a signature comparison
 /// to decide whether to fire the callback (so `true` is safe to
 /// over-report).
-#[allow(dead_code)]
 pub(crate) fn apply_event(state: &mut ReactionState, event: ReactionEvent) -> bool {
     let by_emoji = state.entry(event.target).or_default();
     let by_author = by_emoji.entry(event.emoji.clone()).or_default();
@@ -107,7 +102,6 @@ pub(crate) fn apply_event(state: &mut ReactionState, event: ReactionEvent) -> bo
 /// Render the current snapshot for one target. Authors whose latest
 /// LWW entry is `Remove` are omitted; emoji entries with no remaining
 /// authors are omitted.
-#[allow(dead_code)]
 pub(crate) fn derive_snapshot(state: &ReactionState, target: &Hash) -> ReactionSnapshot {
     let mut out = ReactionSnapshot::new();
     let Some(by_emoji) = state.get(target) else {
@@ -125,6 +119,97 @@ pub(crate) fn derive_snapshot(state: &ReactionState, target: &Hash) -> ReactionS
         }
     }
     out
+}
+
+/// Spawn the reaction tracker. Subscribes to the room's
+/// `<room_fp>/msg/` namespace, decodes each entry, filters down to
+/// `MessageBody::Reaction` events, applies them, and fires
+/// `on_reactions_changed` per debounced per-target snapshot change.
+///
+/// Runs forever (host-process / page lifetime). The store subscription
+/// is `Replay::All` so historical reactions are re-folded on startup.
+pub fn spawn_reaction_tracker<S: sunset_store::Store + 'static>(
+    store: std::sync::Arc<S>,
+    room: crate::crypto::room::Room,
+    room_fp_hex: String,
+    handles: ReactionHandles,
+) {
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use sunset_store::{Filter, Replay};
+
+    use crate::crypto::envelope::MessageBody;
+    use crate::message::decode_message;
+
+    sunset_sync::spawn::spawn_local(async move {
+        let prefix = format!("{room_fp_hex}/msg/");
+        let filter = Filter::NamePrefix(Bytes::from(prefix));
+        let mut sub = match store.subscribe(filter, Replay::All).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ReactionTracker: subscribe failed: {e}");
+                return;
+            }
+        };
+
+        let mut state = ReactionState::new();
+
+        while let Some(ev) = sub.next().await {
+            let entry = match ev {
+                Ok(sunset_store::Event::Inserted(e)) => e,
+                Ok(sunset_store::Event::Replaced { new, .. }) => new,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("ReactionTracker: store event error: {e}");
+                    continue;
+                }
+            };
+            let block = match store.get_content(&entry.value_hash).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("ReactionTracker: get_content failed: {e}");
+                    continue;
+                }
+            };
+            let decoded = match decode_message(&room, &entry, &block) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let MessageBody::Reaction {
+                for_value_hash,
+                emoji,
+                action,
+            } = decoded.body
+            else {
+                continue;
+            };
+            let event = ReactionEvent {
+                author: decoded.author_key,
+                target: for_value_hash,
+                emoji,
+                action,
+                sent_at_ms: decoded.sent_at_ms,
+                value_hash: decoded.value_hash,
+            };
+            let target = event.target;
+            if !apply_event(&mut state, event) {
+                continue;
+            }
+            let snapshot = derive_snapshot(&state, &target);
+            let new_sig = reactions_signature(&snapshot);
+            let mut sigs = handles.last_target_signatures.borrow_mut();
+            let prev = sigs.get(&target);
+            if prev == Some(&new_sig) {
+                continue;
+            }
+            sigs.insert(target, new_sig);
+            drop(sigs);
+            if let Some(cb) = handles.on_reactions_changed.borrow().as_ref() {
+                cb(&target, &snapshot);
+            }
+        }
+    });
 }
 
 /// Stable signature of a snapshot used for debounce. Sorted lex on
