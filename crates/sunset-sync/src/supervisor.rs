@@ -443,12 +443,21 @@ where
             // doesn't double-fire.
             {
                 let mut state = self.state.borrow_mut();
-                if let Some(entry) = state.intents.get_mut(&addr) {
+                let should_broadcast = if let Some(entry) = state.intents.get_mut(&addr) {
                     if entry.state != IntentState::Backoff {
-                        continue;
+                        false
+                    } else {
+                        entry.state = IntentState::Connecting;
+                        entry.next_attempt_at = None;
+                        true
                     }
-                    entry.state = IntentState::Connecting;
-                    entry.next_attempt_at = None;
+                } else {
+                    false
+                };
+                if should_broadcast {
+                    Self::broadcast(&mut state, &addr);
+                } else {
+                    continue;
                 }
             }
             let engine = self.engine.clone();
@@ -705,6 +714,81 @@ mod tests {
                 assert!(
                     saw_connected,
                     "subscribe should have observed bob transition to Connected"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_observes_connecting_during_redial() {
+        use futures::StreamExt as _;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob = engine_with_addr(&net, b"bob", "bob");
+
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob.clone();
+                    async move { b.run().await }
+                });
+
+                // Tight backoff so the test doesn't take 1 s+ for the redial.
+                let policy = BackoffPolicy {
+                    initial: std::time::Duration::from_millis(50),
+                    max: std::time::Duration::from_millis(50),
+                    multiplier: 1.0,
+                    jitter: 0.0,
+                };
+                let sup = PeerSupervisor::new(alice.clone(), policy);
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let mut sub = sup.subscribe();
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                sup.add(bob_addr.clone()).await.unwrap();
+
+                // Look up bob's PeerId from the supervisor snapshot, then
+                // force a disconnect through the engine. The engine emits
+                // PeerRemoved, which drives the supervisor's intent to
+                // Backoff; the backoff timer then flips it to Connecting.
+                let bob_peer_id = {
+                    let snap = sup.snapshot().await;
+                    snap.iter()
+                        .find(|s| s.addr == bob_addr)
+                        .and_then(|s| s.peer_id.clone())
+                        .expect("bob should be Connected with a known PeerId")
+                };
+                alice.remove_peer(bob_peer_id).await.unwrap();
+
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                let mut saw_backoff = false;
+                let mut saw_connecting_after_backoff = false;
+                while tokio::time::Instant::now() < deadline {
+                    let timeout = deadline - tokio::time::Instant::now();
+                    match tokio::time::timeout(timeout, sub.next()).await {
+                        Ok(Some(snap)) if snap.addr == bob_addr => {
+                            if snap.state == IntentState::Backoff {
+                                saw_backoff = true;
+                            } else if snap.state == IntentState::Connecting && saw_backoff {
+                                saw_connecting_after_backoff = true;
+                                break;
+                            }
+                        }
+                        Ok(Some(_)) => continue,
+                        _ => break,
+                    }
+                }
+                assert!(
+                    saw_connecting_after_backoff,
+                    "subscribe should observe Connecting transition during redial after Backoff"
                 );
             })
             .await;
