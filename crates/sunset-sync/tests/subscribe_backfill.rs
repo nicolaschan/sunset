@@ -171,6 +171,19 @@ async fn registry_update_backfills_already_stored_entries() {
                 received,
                 "bob did not receive E after alice's registry learned bob's filter"
             );
+
+            // Backfill must also push the blob, not just the entry
+            // metadata. Otherwise the receiver would have to issue
+            // a follow-up BlobRequest, which would arrive after the
+            // 2-second deadline.
+            let blob = bob_store
+                .get_content(&block.hash())
+                .await
+                .unwrap();
+            assert!(
+                blob.is_some(),
+                "bob received E's entry but not its blob — backfill should push both"
+            );
         })
         .await;
 }

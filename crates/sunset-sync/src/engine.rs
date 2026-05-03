@@ -673,8 +673,12 @@ where
                     continue;
                 }
             };
-            if let Ok(Some(blob)) = self.store.get_content(&entry.value_hash).await {
-                blobs.push(blob);
+            match self.store.get_content(&entry.value_hash).await {
+                Ok(Some(blob)) => blobs.push(blob),
+                Ok(None) => {} // dangling ref — receiver will issue BlobRequest
+                Err(e) => {
+                    tracing::warn!(error = %e, "backfill: get_content failed");
+                }
             }
             entries.push(entry);
         }
