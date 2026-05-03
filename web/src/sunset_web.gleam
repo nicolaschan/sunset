@@ -62,9 +62,16 @@ pub type View {
 
 /// Per-room UI + engine state. The Model holds a
 /// `Dict(String, RoomState)` keyed by the room name (URL fragment).
+///
+/// `handle` is `None` between `JoinRoom` (which inserts a placeholder
+/// so the shell renders immediately) and `RoomOpened` (which fills it
+/// once the wasm side finishes Argon2id and the per-room subscription
+/// is published). SubmitDraft no-ops when `handle` is None — the
+/// composer is rendered but sends are queued/dropped until the room
+/// is ready (typically <100ms; longer on first-load with cold KDF).
 pub type RoomState {
   RoomState(
-    handle: RoomHandle,
+    handle: Option(RoomHandle),
     messages: List(domain.Message),
     members: List(domain.Member),
     receipts: Dict(String, Set(String)),
@@ -78,9 +85,9 @@ pub type RoomState {
   )
 }
 
-fn empty_room_state(handle: RoomHandle) -> RoomState {
+fn empty_room_state() -> RoomState {
   RoomState(
-    handle: handle,
+    handle: None,
     messages: [],
     members: [],
     receipts: dict.new(),
@@ -466,6 +473,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         RoomView(n) -> n
         LandingView -> ""
       }
+      // Insert a placeholder RoomState synchronously so the shell
+      // (header + drawers + composer) renders immediately. The handle
+      // arrives via RoomOpened later. Without this, the page would
+      // show a centered "loading…" with NO drawers between
+      // hash-change and Argon2id completion (~hundreds of ms on cold
+      // first-load), breaking any drawer interaction tests that race
+      // through that window.
+      let new_rooms_dict = case
+        new_name == "" || dict.has_key(model.rooms, new_name)
+      {
+        True -> model.rooms
+        False -> dict.insert(model.rooms, new_name, empty_room_state())
+      }
       let open_eff = case
         new_name,
         dict.has_key(model.rooms, new_name),
@@ -482,7 +502,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         _, False, None -> effect.none()
       }
       #(
-        Model(..model, view: new_view, joined_rooms: new_rooms),
+        Model(
+          ..model,
+          view: new_view,
+          joined_rooms: new_rooms,
+          rooms: new_rooms_dict,
+        ),
         effect.batch([persisted, open_eff]),
       )
     }
@@ -506,6 +531,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               Some(domain.ChannelsDrawer)
             _, _ -> None
           }
+          // Insert a placeholder RoomState synchronously so the shell
+          // renders immediately while the wasm side opens the room
+          // (Argon2id is ~hundreds of ms cold). See HashChanged for the
+          // full rationale.
+          let rooms_with_placeholder = case dict.has_key(model.rooms, name) {
+            True -> model.rooms
+            False -> dict.insert(model.rooms, name, empty_room_state())
+          }
           let new_model =
             Model(
               ..model,
@@ -514,6 +547,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               landing_input: "",
               sidebar_search: "",
               drawer: new_drawer,
+              rooms: rooms_with_placeholder,
             )
           let persist_eff = case was_new {
             True ->
@@ -707,8 +741,22 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         [] -> "disconnected"
         _ -> "connecting"
       }
+      // Insert placeholder RoomState for every joined room so the
+      // shell renders fully even before the first RoomOpened lands.
+      let rooms_with_placeholders =
+        list.fold(model.joined_rooms, model.rooms, fn(acc, name) {
+          case dict.has_key(acc, name) {
+            True -> acc
+            False -> dict.insert(acc, name, empty_room_state())
+          }
+        })
       #(
-        Model(..model, client: Some(client), relay_status: new_status),
+        Model(
+          ..model,
+          client: Some(client),
+          relay_status: new_status,
+          rooms: rooms_with_placeholders,
+        ),
         effect.batch([connect_eff, open_active_eff, open_others_eff]),
       )
     }
@@ -721,7 +769,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
     RoomOpened(name, handle) -> {
-      let state = empty_room_state(handle)
+      // Either fill the placeholder inserted by JoinRoom/HashChanged
+      // (preserving any UI state the user has built up while the room
+      // was opening — draft, selection, sheet) or insert a fresh empty
+      // state if the room isn't in the dict yet (shouldn't normally
+      // happen — RoomOpened follows JoinRoom or the bootstrap flow).
+      let state = case dict.get(model.rooms, name) {
+        Ok(existing) -> RoomState(..existing, handle: Some(handle))
+        Error(_) -> RoomState(..empty_room_state(), handle: Some(handle))
+      }
       let new_rooms = dict.insert(model.rooms, name, state)
       let #(interval, ttl, refresh) = sunset.presence_params_from_url()
       let wire_eff =
@@ -782,31 +838,40 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case active_name, dict.get(model.rooms, active_name) {
         "", _ -> #(model, effect.none())
         _, Error(_) -> #(model, effect.none())
-        _, Ok(state) -> {
-          let body = sanitize(state.draft)
-          case body {
-            "" -> #(model, effect.none())
-            _ -> {
-              let send_eff =
-                effect.from(fn(dispatch) {
-                  sunset.send_message(
-                    state.handle,
-                    body,
-                    current_time_ms(),
-                    fn(r) { dispatch(MessageSent(r)) },
+        _, Ok(state) ->
+          case state.handle {
+            // Room state exists (placeholder from JoinRoom) but the
+            // wasm handle hasn't arrived via RoomOpened yet — silently
+            // drop the send. The composer is rendered, so the user
+            // could submit before the engine is ready; defer/queue
+            // logic is out of scope for v1.
+            None -> #(model, effect.none())
+            Some(handle) -> {
+              let body = sanitize(state.draft)
+              case body {
+                "" -> #(model, effect.none())
+                _ -> {
+                  let send_eff =
+                    effect.from(fn(dispatch) {
+                      sunset.send_message(
+                        handle,
+                        body,
+                        current_time_ms(),
+                        fn(r) { dispatch(MessageSent(r)) },
+                      )
+                    })
+                  let cleared = RoomState(..state, draft: "")
+                  #(
+                    Model(
+                      ..model,
+                      rooms: dict.insert(model.rooms, active_name, cleared),
+                    ),
+                    send_eff,
                   )
-                })
-              let cleared = RoomState(..state, draft: "")
-              #(
-                Model(
-                  ..model,
-                  rooms: dict.insert(model.rooms, active_name, cleared),
-                ),
-                send_eff,
-              )
+                }
+              }
             }
           }
-        }
       }
     }
     MessageSent(_) -> #(model, effect.none())
@@ -1079,29 +1144,16 @@ fn view(model: Model) -> Element(Msg) {
 }
 
 fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
-  case dict.get(model.rooms, current_name) {
-    Error(_) -> loading_room_view(palette, current_name)
-    Ok(state) -> room_view_with_state(model, palette, current_name, state)
+  // RoomState is inserted as a placeholder synchronously by JoinRoom /
+  // HashChanged / ClientReady, so the lookup is virtually always Ok
+  // here. The Error branch is a safety net for the weird case where
+  // model.view points at a room that hasn't been added to the dict
+  // (shouldn't happen given the bootstrap flow, but be defensive).
+  let state = case dict.get(model.rooms, current_name) {
+    Ok(s) -> s
+    Error(_) -> empty_room_state()
   }
-}
-
-fn loading_room_view(palette: theme.Palette, name: String) -> Element(Msg) {
-  html.div(
-    [
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("justify-content", "center"),
-        #("height", "100vh"),
-        #("height", "100dvh"),
-        #("background", palette.bg),
-        #("color", palette.text_muted),
-        #("font-size", "1rem"),
-        #("font-family", "inherit"),
-      ]),
-    ],
-    [html.text("opening " <> name <> "…")],
-  )
+  room_view_with_state(model, palette, current_name, state)
 }
 
 fn room_view_with_state(

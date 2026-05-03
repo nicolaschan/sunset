@@ -7,17 +7,20 @@ export function isMobile(testInfo) {
 }
 
 // Read which drawer is currently rendered as open. Returns one of
-// "channels", "rooms", "members", or null. We probe the actual
-// transform CSS rather than the model state because the test only
-// has the DOM to work with.
+// "channels", "rooms", "members", or null. We probe `aria-hidden`
+// (set synchronously by the Lustre render based on model.drawer)
+// rather than `transform` CSS, which races with the 220ms slide
+// transition: mid-transition transforms like `matrix(1,0,0,1,-130,0)`
+// contain a "-" and would falsely report the drawer as closed.
+// aria-hidden reflects model intent and stabilises the moment the
+// drawer state changes, regardless of the visual transition state.
 async function activeDrawer(page) {
   for (const id of ["channels-drawer", "rooms-drawer", "members-drawer"]) {
-    const t = await page
+    const hidden = await page
       .getByTestId(id)
-      .evaluate((el) => getComputedStyle(el).transform)
-      .catch(() => "");
-    if (t && t !== "none" && !t.includes("-")) {
-      // matrix(1,0,0,1,0,0) = translateX(0); any negative tx means offscreen.
+      .getAttribute("aria-hidden")
+      .catch(() => null);
+    if (hidden === "false") {
       return id.replace("-drawer", "");
     }
   }
