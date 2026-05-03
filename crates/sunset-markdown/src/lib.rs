@@ -482,6 +482,43 @@ mod tests {
     }
 
     #[test]
+    fn unordered_list() {
+        assert_eq!(
+            parse("- one\n- two\n- three"),
+            Document(vec![Block::UnorderedList(vec![
+                vec![Block::Paragraph(vec![Inline::Text("one".to_owned())])],
+                vec![Block::Paragraph(vec![Inline::Text("two".to_owned())])],
+                vec![Block::Paragraph(vec![Inline::Text("three".to_owned())])],
+            ])])
+        );
+    }
+
+    #[test]
+    fn list_item_can_contain_inline_formatting() {
+        assert_eq!(
+            parse("- **bold** item"),
+            Document(vec![Block::UnorderedList(vec![vec![Block::Paragraph(vec![
+                Inline::Bold(vec![Inline::Text("bold".to_owned())]),
+                Inline::Text(" item".to_owned()),
+            ])]])])
+        );
+    }
+
+    #[test]
+    fn list_ends_at_non_list_line() {
+        assert_eq!(
+            parse("- one\n- two\nafter"),
+            Document(vec![
+                Block::UnorderedList(vec![
+                    vec![Block::Paragraph(vec![Inline::Text("one".to_owned())])],
+                    vec![Block::Paragraph(vec![Inline::Text("two".to_owned())])],
+                ]),
+                Block::Paragraph(vec![Inline::Text("after".to_owned())]),
+            ])
+        );
+    }
+
+    #[test]
     fn unclosed_fenced_code_falls_back_to_paragraph() {
         // Implementation choice: we treat the whole input as paragraphs
         // when the closing fence is missing, rather than swallowing

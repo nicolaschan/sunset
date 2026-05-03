@@ -66,6 +66,26 @@ pub(crate) fn split(input: &str) -> Vec<Block> {
             continue;
         }
 
+        if lines[i].starts_with("- ") {
+            if !buf.is_empty() {
+                blocks.push(paragraph_from_lines(&buf));
+                buf.clear();
+            }
+            let mut items: Vec<Vec<Block>> = Vec::new();
+            let mut j = i;
+            while j < lines.len() {
+                if let Some(rest) = lines[j].strip_prefix("- ") {
+                    items.push(split(rest));
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(Block::UnorderedList(items));
+            i = j;
+            continue;
+        }
+
         if lines[i].is_empty() {
             if !buf.is_empty() {
                 blocks.push(paragraph_from_lines(&buf));
