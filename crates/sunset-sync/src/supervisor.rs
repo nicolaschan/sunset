@@ -1174,4 +1174,266 @@ mod tests {
             unreachable!("parse-check should reject empty input before fetch")
         }
     }
+
+    /// Fake fetcher that fails the first `fail_first` calls with HTTP
+    /// 503 then returns `body`. `seen` counts every call so tests can
+    /// assert how many resolves the supervisor performed.
+    struct CountingFakeFetch {
+        body: String,
+        fail_first: std::cell::Cell<usize>,
+        seen: std::cell::Cell<usize>,
+    }
+
+    impl CountingFakeFetch {
+        fn new(body: String, fail_first: usize) -> Rc<Self> {
+            Rc::new(Self {
+                body,
+                fail_first: std::cell::Cell::new(fail_first),
+                seen: std::cell::Cell::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl sunset_relay_resolver::HttpFetch for CountingFakeFetch {
+        async fn get(&self, _url: &str) -> sunset_relay_resolver::Result<String> {
+            self.seen.set(self.seen.get() + 1);
+            let n = self.fail_first.get();
+            if n > 0 {
+                self.fail_first.set(n - 1);
+                return Err(sunset_relay_resolver::Error::Http("status 503".into()));
+            }
+            Ok(self.body.clone())
+        }
+    }
+
+    /// Resolver runs once per dial attempt — a rotated relay identity
+    /// is picked up automatically rather than getting cached forever.
+    /// We start a fetcher that fails twice with HTTP 503, then succeeds.
+    /// The supervisor should call the fetcher 3× total and end Connected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolving_intent_re_resolves_each_attempt() {
+        // Same real-time + tight-policy strategy as
+        // `first_dial_failure_enters_backoff_and_retries` — the
+        // supervisor's backoff scheduler reads `web_time::SystemTime::now()`,
+        // which `tokio::time::pause` doesn't virtualize.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+
+                // Body the resolver will eventually accept. The
+                // `address` field is unused by the resolver (it
+                // appends `#x25519=<hex>` to the parsed ws_url) so
+                // its content is irrelevant to canonicalization.
+                let body = format!(
+                    "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"ws://bob\"}}",
+                    "00".repeat(32),
+                    "ab".repeat(32),
+                );
+
+                // Pre-compute what the resolver will produce so we
+                // can register the engine at exactly that addr —
+                // TestNetwork routes by exact PeerAddr bytes.
+                let probe_fetch: Rc<dyn sunset_relay_resolver::HttpFetch> =
+                    CountingFakeFetch::new(body.clone(), 0);
+                let probe_resolver = sunset_relay_resolver::Resolver::new(probe_fetch);
+                let canonical = probe_resolver
+                    .resolve("bob")
+                    .await
+                    .expect("probe resolve must succeed");
+
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", &canonical);
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+
+                // Real fetcher: fails twice with HTTP 503, then succeeds.
+                let fetch = CountingFakeFetch::new(body, 2);
+
+                let policy = BackoffPolicy {
+                    initial: std::time::Duration::from_millis(50),
+                    max: std::time::Duration::from_millis(50),
+                    multiplier: 1.0,
+                    jitter: 0.0,
+                };
+                let sup = PeerSupervisor::new(alice.clone(), policy);
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let id = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "bob".into(),
+                        fetch: fetch.clone(),
+                    })
+                    .await
+                    .unwrap();
+
+                let mut connected = false;
+                for _ in 0..200 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
+                        connected = true;
+                        break;
+                    }
+                }
+                assert!(connected, "intent never reached Connected");
+                assert_eq!(
+                    fetch.seen.get(),
+                    3,
+                    "resolver should have been called once per attempt"
+                );
+            })
+            .await;
+    }
+
+    /// `subscribe_intents` replays the current snapshot of every
+    /// existing intent on subscribe — late subscribers don't miss
+    /// state. We register two intents (one that connects, one that
+    /// won't), wait for them to settle, then subscribe and verify
+    /// both intents' snapshots flow through.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_intents_replays_current_state() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", "bob");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+
+                let policy = BackoffPolicy {
+                    initial: std::time::Duration::from_millis(50),
+                    max: std::time::Duration::from_millis(50),
+                    multiplier: 1.0,
+                    jitter: 0.0,
+                };
+                let sup = PeerSupervisor::new(alice.clone(), policy);
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                // One intent connects ("bob"), one doesn't ("ghost").
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let ghost = PeerAddr::new(Bytes::from_static(b"ghost"));
+                let id_bob = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
+                let id_ghost = sup
+                    .add(crate::connectable::Connectable::Direct(ghost))
+                    .await
+                    .unwrap();
+
+                // Wait until both intents have settled into terminal
+                // pre-subscribe states (Connected for bob, Backoff for
+                // ghost after the first dial fails).
+                for _ in 0..100 {
+                    let snap = sup.snapshot().await;
+                    let ready = snap
+                        .iter()
+                        .any(|s| s.id == id_bob && s.state == IntentState::Connected)
+                        && snap
+                            .iter()
+                            .any(|s| s.id == id_ghost && s.state == IntentState::Backoff);
+                    if ready {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+
+                // Late subscribe — must receive a snapshot for both.
+                let mut rx = sup.subscribe_intents().await;
+                let mut seen_bob = false;
+                let mut seen_ghost = false;
+                // The subscriber may also pick up background transitions
+                // (ghost re-attempts on its 50 ms timer); accept up to
+                // 6 events before giving up.
+                for _ in 0..6 {
+                    let snap =
+                        match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                            .await
+                        {
+                            Ok(Some(s)) => s,
+                            Ok(None) => break,
+                            Err(_) => break,
+                        };
+                    if snap.id == id_bob {
+                        seen_bob = true;
+                    } else if snap.id == id_ghost {
+                        seen_ghost = true;
+                    }
+                    if seen_bob && seen_ghost {
+                        break;
+                    }
+                }
+                assert!(seen_bob, "bob's snapshot was not replayed");
+                assert!(seen_ghost, "ghost's snapshot was not replayed");
+            })
+            .await;
+    }
+
+    /// `add()` returns near-instant on `Resolving` even when the
+    /// resolver would block forever. Proves the API contract that
+    /// `add()` does not await the first dial. We use `start_paused`
+    /// so the spawned dial task can't actually run; if `add()` were
+    /// gated on the dial completing, the test would hang.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn add_returns_immediately_on_resolving() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+
+                // Always-failing fetcher — if `add()` were waiting for
+                // the first dial to complete, it would block forever.
+                let fetch = CountingFakeFetch::new(String::new(), usize::MAX);
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let started = tokio::time::Instant::now();
+                let _ = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "relay.example.com".into(),
+                        fetch,
+                    })
+                    .await
+                    .unwrap();
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed < std::time::Duration::from_millis(50),
+                    "add() returned in {elapsed:?}; should be near-instant"
+                );
+            })
+            .await;
+    }
 }
