@@ -9,6 +9,25 @@
 //! Once WebRTC is up, heartbeats flow through `membership_liveness`. Its
 //! Stale events are still used here for Gone/cleanup once the connection
 //! has been established — so the FSM consumes from both streams.
+//!
+//! ## Glare avoidance
+//!
+//! In a 2-peer auto-connect, both sides see each other's voice-presence
+//! and would call `connect_direct` simultaneously. The browser WebRTC
+//! transport handles glare by ignoring duplicate Offers from a peer it's
+//! already mid-handshake with — but that drops the *initiator-side*
+//! Offer too, so each side ends up with one connect-side handshake
+//! waiting for an Answer that's been suppressed and one accept-side
+//! handshake from the peer's Offer. The two independently-derived
+//! RTCPeerConnections then race ICE/SCTP setup against each other and
+//! neither completes within the test/UX budget.
+//!
+//! We avoid the collision by asymmetry: only the peer with the
+//! lexicographically smaller public key initiates the dial; the other
+//! waits for its accept-side handshake to complete. This is the
+//! cheapest possible tiebreak — no negotiation rounds, no clocks, no
+//! state. A future Perfect Negotiation implementation could replace
+//! this with proper rollback semantics.
 
 use std::rc::Weak;
 
@@ -53,6 +72,21 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     };
                     // Skip self.
                     if entry.verifying_key == self_pk {
+                        continue;
+                    }
+                    // Glare avoidance: only the side with the
+                    // lexicographically smaller public key initiates
+                    // the WebRTC dial; the other side accepts via the
+                    // accept path. Without this, both peers' WebRTC
+                    // `connect()` futures race, each creating an
+                    // RTCPeerConnection that the other side answers
+                    // through the accept worker — the two
+                    // independently-derived connections collide on
+                    // ICE/SCTP setup and neither completes within the
+                    // test budget. Asymmetry breaks the tie cheaply
+                    // without needing a full Perfect Negotiation
+                    // implementation.
+                    if self_pk.as_bytes() >= entry.verifying_key.as_bytes() {
                         continue;
                     }
                     // Extract peer PeerId from verifying_key.

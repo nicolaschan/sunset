@@ -148,6 +148,16 @@ pub struct SyncEngine<S: Store, T: Transport> {
     /// (`?Send`); a `RefCell<u64>` would also work, but `Arc<Mutex<…>>` keeps
     /// the same shape as the rest of the engine state.
     pub(crate) next_conn_id: Arc<Mutex<u64>>,
+    /// All filters that the local peer has called `publish_subscription`
+    /// with, deduped by `PartialEq`. The engine writes the **union** of
+    /// these as the single per-peer SUBSCRIBE_NAME entry, so a client
+    /// that subscribes to multiple disjoint namespaces (e.g. chat
+    /// `<fp>/`, voice frames `voice/<fp>/`, voice presence
+    /// `voice-presence/<fp>/`) gets all of them routed by the relay's
+    /// registry. Without this accumulation, each call would clobber the
+    /// previous (HashMap-per-peer in `SubscriptionRegistry`), silently
+    /// breaking sync for every prior subscription.
+    pub(crate) own_filters: Arc<Mutex<Vec<Filter>>>,
 }
 
 impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T>
@@ -179,6 +189,7 @@ where
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
             next_conn_id: Arc::new(Mutex::new(0)),
+            own_filters: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1063,7 +1074,30 @@ where
         use sunset_store::canonical::signing_payload;
         use sunset_store::{ContentBlock, SignedKvEntry};
 
-        let value = postcard::to_stdvec(&filter)
+        // Accumulate this filter into the local per-engine set, then
+        // publish the union of all locally-published filters. The
+        // SUBSCRIBE_NAME entry carries one filter per peer (LWW); without
+        // accumulation, a second `publish_subscription(other_filter)`
+        // would silently clobber the first peer's prior interest at the
+        // relay, breaking every higher-layer subsystem (chat / voice /
+        // signaling) that has its own subscribe call.
+        let union_filter = {
+            let mut filters = self.own_filters.lock().await;
+            if !filters.iter().any(|f| f == &filter) {
+                filters.push(filter.clone());
+            }
+            // Single-element optimization: avoid wrapping in Union when
+            // unnecessary, so the wire format stays identical to the
+            // pre-accumulation behavior in the common one-subsystem case
+            // and the existing test vectors aren't disturbed.
+            if filters.len() == 1 {
+                filters[0].clone()
+            } else {
+                Filter::Union(filters.clone())
+            }
+        };
+
+        let value = postcard::to_stdvec(&union_filter)
             .map_err(|e| Error::Decode(format!("encode filter: {e}")))?;
         let block = ContentBlock {
             data: Bytes::from(value),

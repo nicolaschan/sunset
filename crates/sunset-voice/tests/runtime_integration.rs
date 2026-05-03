@@ -195,6 +195,23 @@ fn make_identity_and_room(seed_byte: u8) -> (Identity, Rc<Room>) {
     (identity, room)
 }
 
+/// Build two identities sharing a room, with `self_pk < other_pk`. The
+/// auto-connect FSM only dials when our pubkey is lexicographically
+/// smaller than the peer's (glare avoidance), so tests that exercise
+/// the dial path need `self` (the runtime owner) to be the smaller side.
+/// Tries seed bytes deterministically until the inequality holds.
+fn make_pair_self_smaller(seed_a: u8, seed_b: u8) -> (Identity, Identity, Rc<Room>) {
+    let (cand_a, room) = make_identity_and_room(seed_a);
+    let (cand_b, _) = make_identity_and_room(seed_b);
+    let (self_id, other_id) =
+        if cand_a.store_verifying_key().as_bytes() < cand_b.store_verifying_key().as_bytes() {
+            (cand_a, cand_b)
+        } else {
+            (cand_b, cand_a)
+        };
+    (self_id, other_id, room)
+}
+
 /// Build a signed durable voice-presence entry for `sender` in `room`.
 fn make_presence_entry(sender: &Identity, room: &Room) -> SignedKvEntry {
     use sunset_store::canonical::signing_payload;
@@ -576,8 +593,10 @@ async fn combiner_emits_state_on_heartbeat() {
 async fn auto_connect_dials_on_voice_presence_only_once() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let (alice, room) = make_identity_and_room(8);
-            let (bob, _) = make_identity_and_room(9);
+            // bob is the runtime owner; alice is the remote peer whose
+            // voice-presence we'll inject. Glare avoidance only fires
+            // the dial when self_pk < peer_pk, so we force that ordering.
+            let (bob, alice, room) = make_pair_self_smaller(9, 8);
             let (bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
             let bus: Rc<dyn DynBus> = bus_impl.clone();
             let calls: DroppedSink = Rc::new(RefCell::new(vec![]));
@@ -616,6 +635,55 @@ async fn auto_connect_dials_on_voice_presence_only_once() {
                 calls.borrow().len(),
                 1,
                 "ensure_direct must be called exactly once"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn auto_connect_skips_dial_when_self_pk_is_larger() {
+    // Glare avoidance: when two peers see each other's voice-presence,
+    // only the lexicographically smaller pubkey initiates the dial; the
+    // other side waits for the WebRTC accept-side handshake. This test
+    // checks the "don't dial" branch.
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (smaller, larger, room) = make_pair_self_smaller(8, 9);
+            // The runtime owner is the LARGER pubkey here; the injected
+            // voice-presence is from the smaller one. Expectation: no
+            // dial fires.
+            let (bus_impl, _obs_tx) = TestBus::new(larger.store_verifying_key());
+            let bus: Rc<dyn DynBus> = bus_impl.clone();
+            let calls: DroppedSink = Rc::new(RefCell::new(vec![]));
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: calls.clone(),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bus,
+                room.clone(),
+                larger.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.auto_connect);
+            tokio::task::yield_now().await;
+
+            let entry = make_presence_entry(&smaller, &room);
+            bus_impl.inject_durable(entry).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            assert_eq!(
+                calls.borrow().len(),
+                0,
+                "auto_connect must not dial when self_pk > peer_pk; the smaller-pk side dials and we accept"
             );
         })
         .await;
