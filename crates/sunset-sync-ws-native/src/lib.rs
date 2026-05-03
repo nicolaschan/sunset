@@ -64,9 +64,13 @@ pub struct WebSocketRawTransport {
 
 enum TransportMode {
     DialOnly,
-    Listening { listener: Mutex<TcpListener> },
+    Listening {
+        listener: Mutex<TcpListener>,
+    },
     /// Accept pre-classified TcpStreams from an external dispatcher.
-    ExternalStreams { rx: Mutex<tokio::sync::mpsc::Receiver<TcpStream>> },
+    ExternalStreams {
+        rx: Mutex<tokio::sync::mpsc::Receiver<TcpStream>>,
+    },
 }
 
 impl WebSocketRawTransport {
@@ -94,9 +98,7 @@ impl WebSocketRawTransport {
     /// as transport failure.
     pub fn external_streams(rx: tokio::sync::mpsc::Receiver<TcpStream>) -> Self {
         Self {
-            mode: TransportMode::ExternalStreams {
-                rx: Mutex::new(rx),
-            },
+            mode: TransportMode::ExternalStreams { rx: Mutex::new(rx) },
         }
     }
 

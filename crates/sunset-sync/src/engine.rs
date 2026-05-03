@@ -400,7 +400,7 @@ where
                             // listener hangs forever because nothing
                             // drains the dispatch channel. Log and
                             // keep accepting.
-                            eprintln!("sunset-sync: transport accept failed; continuing: {e}");
+                            tracing::warn!(error = %e, "transport accept failed; continuing");
                         }
                         None => {
                             // Per-handshake timeout. The misbehaving
@@ -408,9 +408,9 @@ where
                             // never sent Noise IK) had its TCP
                             // dropped when the future was cancelled;
                             // the loop continues.
-                            eprintln!(
-                                "sunset-sync: transport accept timed out after {:?}; continuing",
-                                self.config.accept_handshake_timeout
+                            tracing::warn!(
+                                timeout = ?self.config.accept_handshake_timeout,
+                                "transport accept timed out; continuing",
                             );
                         }
                     }
@@ -593,7 +593,12 @@ where
                 conn_id,
                 reason,
             } => {
-                eprintln!("sunset-sync: peer {peer_id:?} disconnected ({conn_id}): {reason}");
+                tracing::info!(
+                    peer_id = ?peer_id,
+                    conn_id = %conn_id,
+                    reason = %reason,
+                    "peer disconnected",
+                );
                 let removed = {
                     let mut state = self.state.lock().await;
                     match state.peer_outbound.get(&peer_id) {
@@ -626,7 +631,7 @@ where
             let entry = match item {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("sunset-sync: replay_existing_subscriptions: {e}");
+                    tracing::warn!(error = %e, "replay_existing_subscriptions: store iteration");
                     continue;
                 }
             };
@@ -634,7 +639,7 @@ where
                 Ok(Some(b)) => b,
                 Ok(None) => continue,
                 Err(e) => {
-                    eprintln!("sunset-sync: replay_existing_subscriptions: {e}");
+                    tracing::warn!(error = %e, "replay_existing_subscriptions: get_content");
                     continue;
                 }
             };
@@ -732,7 +737,7 @@ where
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("sunset-sync: digest scan failed: {e}");
+                tracing::warn!(error = %e, "digest scan failed");
                 return;
             }
         };
@@ -808,9 +813,10 @@ where
                     // Already have a higher-priority version; drop silently.
                 }
                 Err(e) => {
-                    eprintln!(
-                        "sunset-sync: insert failed for entry from {:?}: {}",
-                        entry.verifying_key, e
+                    tracing::warn!(
+                        verifying_key = ?entry.verifying_key,
+                        error = %e,
+                        "insert failed for delivered entry",
                     );
                     continue;
                 }
@@ -983,7 +989,7 @@ where
             .verify_raw(&datagram.verifying_key, &payload, &datagram.signature)
             .is_err()
         {
-            eprintln!("sunset-sync: dropping ephemeral datagram from {from:?} — bad signature");
+            tracing::debug!(from = ?from, "dropping ephemeral datagram — bad signature");
             return;
         }
         self.dispatch_ephemeral_local(&datagram).await;

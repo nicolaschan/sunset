@@ -139,8 +139,15 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             // ---- alice composes + inserts ----
             let body = "hello bob via real ws + noise";
             let sent_at = 1_700_000_000_000u64;
-            let ComposedMessage { entry, block } =
-                compose_message(&alice, &alice_room, 0, sent_at, MessageBody::Text(body.to_owned()), &mut OsRng).unwrap();
+            let ComposedMessage { entry, block } = compose_message(
+                &alice,
+                &alice_room,
+                0,
+                sent_at,
+                MessageBody::Text(body.to_owned()),
+                &mut OsRng,
+            )
+            .unwrap();
             let expected_hash: Hash = block.hash();
             alice_store
                 .insert(entry.clone(), Some(block.clone()))

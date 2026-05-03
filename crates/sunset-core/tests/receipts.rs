@@ -4,7 +4,7 @@
 
 use rand_core::OsRng;
 use sunset_core::crypto::constants::test_fast_params;
-use sunset_core::{compose_receipt, compose_text, decode_message, Identity, MessageBody, Room};
+use sunset_core::{Identity, MessageBody, Room, compose_receipt, compose_text, decode_message};
 use sunset_store::Store as _;
 
 #[tokio::test(flavor = "current_thread")]

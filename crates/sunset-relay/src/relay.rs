@@ -124,7 +124,6 @@ impl Relay {
         let mut banner = identity::format_address(&bound, &identity);
         banner.push_str(&format!("\n  dashboard: http://{}/dashboard", bound));
         banner.push_str(&format!("\n  identity:  http://{}/", bound));
-        tracing::info!("\n{}", banner);
         println!("{}", banner);
 
         Ok(RelayHandle {
