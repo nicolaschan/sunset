@@ -337,6 +337,7 @@ impl RawConnection for WebSocketRawConnection {
 }
 
 #[cfg(test)]
+#[cfg(feature = "axum")]
 mod tests {
     use super::*;
 
@@ -345,17 +346,35 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let server = WebSocketRawTransport::listening_on("127.0.0.1:0".parse().unwrap())
-                    .await
-                    .unwrap();
-                let bound = server.local_addr().unwrap();
+                // Build a server-side transport that drains a channel of
+                // upgraded axum WebSockets, plus the Send sender used by
+                // the axum handler.
+                let (server_raw, ws_tx) = WebSocketRawTransport::serving();
 
+                // Mount the WS handler on an axum app and bind a port.
+                let app = axum::Router::new().route(
+                    "/",
+                    axum::routing::get({
+                        let ws_tx = ws_tx.clone();
+                        move |ws: axum::extract::WebSocketUpgrade| {
+                            crate::axum_integration::ws_handler(ws, ws_tx.clone())
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let bound = listener.local_addr().unwrap();
+                let serve_handle = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+
+                // Server-side: accept one upgraded connection + echo one message.
                 let server_handle = tokio::task::spawn_local(async move {
-                    let conn = server.accept().await.unwrap();
+                    let conn = server_raw.accept().await.unwrap();
                     let msg = conn.recv_reliable().await.unwrap();
                     conn.send_reliable(msg).await.unwrap();
                 });
 
+                // Client-side: dial via dial_only + roundtrip.
                 let client = WebSocketRawTransport::dial_only();
                 let addr = PeerAddr::new(Bytes::from(format!("ws://{bound}")));
                 let conn = client.connect(addr).await.unwrap();
@@ -367,6 +386,7 @@ mod tests {
                 assert_eq!(echo.as_ref(), b"hello ws");
 
                 server_handle.await.unwrap();
+                serve_handle.abort();
             })
             .await;
     }

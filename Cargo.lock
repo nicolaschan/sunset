@@ -2138,6 +2138,7 @@ dependencies = [
  "sunset-store",
  "sunset-store-memory",
  "sunset-sync",
+ "sunset-sync-ws-native",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
