@@ -175,6 +175,10 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                                 cb(*for_value_hash, &decoded.author_key);
                             }
                         }
+                        // Reactions are handled by ReactionTracker
+                        // (spawned separately, see sunset-core::reactions).
+                        // The per-room decode loop has nothing to do here.
+                        crate::MessageBody::Reaction { .. } => {}
                     }
                 }
 

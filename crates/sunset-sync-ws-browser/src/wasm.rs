@@ -37,11 +37,12 @@ impl RawTransport for WebSocketRawTransport {
         let ws = WebSocket::new(&url).map_err(|e| Error::Transport(format!("ws new: {:?}", e)))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
-        // Channels: open, error (one-shot), and message (continuous).
+        // Channels: open, error (one-shot), message (continuous), close
+        // (one-shot post-open detection — see recv_reliable).
         let (open_tx, mut open_rx) = mpsc::unbounded::<()>();
         let (err_tx, mut err_rx) = mpsc::unbounded::<String>();
         let (msg_tx, msg_rx) = mpsc::unbounded::<Bytes>();
-        let (close_tx, mut close_rx) = mpsc::unbounded::<()>();
+        let (close_tx, close_rx) = mpsc::unbounded::<()>();
 
         // Construct the closed flag before closures so on_close can clone it.
         let closed: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
@@ -103,6 +104,7 @@ impl RawTransport for WebSocketRawTransport {
         let conn = WebSocketRawConnection {
             ws,
             rx: RefCell::new(msg_rx),
+            close_rx: RefCell::new(close_rx),
             closed,
             _on_open: on_open,
             _on_message: on_message,
@@ -111,19 +113,25 @@ impl RawTransport for WebSocketRawTransport {
         };
 
         // Wait for open OR error OR close (whichever fires first).
-        futures::select! {
-            maybe_open = open_rx.next() => {
-                if maybe_open.is_none() {
-                    return Err(Error::Transport("ws open channel closed before open".into()));
+        // Hold close_rx via RefMut for the select; drop the borrow
+        // before returning conn so recv_reliable can re-borrow it
+        // post-open.
+        {
+            let mut close_rx = conn.close_rx.borrow_mut();
+            futures::select! {
+                maybe_open = open_rx.next() => {
+                    if maybe_open.is_none() {
+                        return Err(Error::Transport("ws open channel closed before open".into()));
+                    }
                 }
-            }
-            maybe_err = err_rx.next() => {
-                return Err(Error::Transport(
-                    maybe_err.unwrap_or_else(|| "ws unknown error".into()),
-                ));
-            }
-            _ = close_rx.next() => {
-                return Err(Error::Transport("ws closed before open".into()));
+                maybe_err = err_rx.next() => {
+                    return Err(Error::Transport(
+                        maybe_err.unwrap_or_else(|| "ws unknown error".into()),
+                    ));
+                }
+                _ = close_rx.next() => {
+                    return Err(Error::Transport("ws closed before open".into()));
+                }
             }
         }
 
@@ -152,6 +160,13 @@ fn parse_addr_url(addr: &PeerAddr) -> Result<String> {
 pub struct WebSocketRawConnection {
     ws: WebSocket,
     rx: RefCell<UnboundedReceiver<Bytes>>,
+    /// Signaled by `on_close` so `recv_reliable` can return Err the
+    /// moment the JS WebSocket reaches CLOSED, without waiting for
+    /// the next outbound write to fail. Without this, disconnect
+    /// detection is gated on the heartbeat tick (15s default), and
+    /// even then can take an extra tick because sends to a CLOSING
+    /// (not yet CLOSED) socket are silently dropped by the JS API.
+    close_rx: RefCell<UnboundedReceiver<()>>,
     /// True once close() has been called locally or peer initiated a close.
     closed: Rc<RefCell<bool>>,
 
@@ -196,9 +211,22 @@ impl RawConnection for WebSocketRawConnection {
     }
 
     async fn recv_reliable(&self) -> Result<Bytes> {
-        // Use poll_fn so the RefCell borrow is held only within each poll
-        // call and released before any suspension point.
+        // Poll close before the message stream so a peer-initiated
+        // close (or local ws.close()) gets propagated to the engine
+        // immediately on the on_close callback rather than waiting for
+        // the next outbound write to fail. Both polls register wakers
+        // for `cx`, so whichever fires first wakes this task.
+        // RefCell borrows are held only within the poll closure and
+        // released before any suspension point.
         poll_fn(|cx| {
+            {
+                let mut close_rx = self.close_rx.borrow_mut();
+                if let Poll::Ready(_) =
+                    futures::Stream::poll_next(std::pin::Pin::new(&mut *close_rx), cx)
+                {
+                    return Poll::Ready(Err(Error::Transport("ws closed".into())));
+                }
+            }
             let mut rx = self.rx.borrow_mut();
             match futures::Stream::poll_next(std::pin::Pin::new(&mut *rx), cx) {
                 Poll::Ready(Some(bytes)) => Poll::Ready(Ok(bytes)),

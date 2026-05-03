@@ -12,6 +12,8 @@ mod members;
 #[cfg(target_arch = "wasm32")]
 mod messages;
 #[cfg(target_arch = "wasm32")]
+mod reactions;
+#[cfg(target_arch = "wasm32")]
 pub(crate) mod resolver_adapter;
 #[cfg(target_arch = "wasm32")]
 mod room_handle;

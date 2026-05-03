@@ -1940,6 +1940,7 @@ dependencies = [
  "sunset-store",
  "sunset-store-memory",
  "sunset-sync",
+ "sunset-voice",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2087,6 +2088,7 @@ dependencies = [
  "sunset-store-memory",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tracing",
  "wasm-bindgen-futures",
  "wasmtimer",
@@ -2159,7 +2161,15 @@ dependencies = [
 name = "sunset-voice"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "hkdf",
+ "postcard",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2",
+ "sunset-core",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

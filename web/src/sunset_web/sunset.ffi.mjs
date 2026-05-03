@@ -286,3 +286,48 @@ export function nowMs() {
 export function setTimeoutMs(ms, callback) {
   setTimeout(callback, ms);
 }
+
+// Reactions FFI from master's reactions PR. After the multi-room
+// merge these still target `client.*` methods that no longer exist on
+// the slimmed `Client`; they need to be retargeted to `RoomHandle` in
+// a follow-up commit. Left in place so the Lustre app's reactions
+// imports still resolve at compile time; runtime calls will throw
+// until the per-RoomHandle wiring lands.
+export function onReactionsChanged(roomHandle, callback) {
+  roomHandle.on_reactions_changed((payload) => {
+    callback(payload);
+  });
+}
+
+export function reactionsSnapshotTargetHex(snapshot) {
+  return snapshot.target_hex;
+}
+
+export function reactionsSnapshotEntries(snapshot) {
+  const out = [];
+  for (const [emoji, set] of snapshot.reactions.entries()) {
+    out.push([emoji, toList([...set])]);
+  }
+  return toList(out);
+}
+
+export function sendReaction(roomHandle, targetHex, emoji, action, sentAtMs, callback) {
+  const nonceSeed = window.crypto.getRandomValues(new Uint8Array(32));
+  roomHandle
+    .send_reaction(targetHex, emoji, action, sentAtMs, nonceSeed)
+    .then(() => callback(new Ok(undefined)))
+    .catch((e) => callback(new GError(String(e?.message ?? e))));
+}
+
+export function clientPublicKeyHex(client) {
+  const bytes = client.public_key;
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+let emojiPickerLoaded = null;
+export function registerEmojiPicker() {
+  if (!emojiPickerLoaded) {
+    emojiPickerLoaded = import("emoji-picker-element");
+  }
+  return emojiPickerLoaded;
+}

@@ -13,6 +13,7 @@
 //// so a refresh restores the user's state.
 
 import gleam/dict.{type Dict}
+import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -39,6 +40,7 @@ import sunset_web/ui
 import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
 import sunset_web/views/details_panel
+import sunset_web/views/emoji_picker
 import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
@@ -109,6 +111,18 @@ pub type Model {
     rooms_collapsed: Bool,
     landing_input: String,
     sidebar_search: String,
+    /// Target id whose full emoji picker is currently open. Global
+    /// (not per-room) because only one picker is open at a time and it
+    /// dismisses if you switch rooms anyway.
+    full_picker_for: Option(String),
+    /// Per-target reaction state from the bridge tracker. TEMPORARILY
+    /// global on the merged branch — the reactions tracker in
+    /// sunset-core::reactions is currently per-Client (not per-room).
+    /// Migrating reactions to per-OpenRoom (so each room has its own
+    /// `Dict(target_hex, Dict(emoji, Set(author_pubkey_hex)))`) is
+    /// tracked as a follow-up; ReactionsChanged from any room will
+    /// merge into this single dict for now.
+    reactions: Dict(String, Dict(String, Set(String))),
     /// Name of the room currently being dragged in the rooms rail.
     /// `None` between drag operations.
     dragging_room: Option(String),
@@ -157,6 +171,11 @@ pub type Msg {
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
   AddReaction(String, String)
+  ReactionsChanged(target: String, snapshot: Dict(String, Set(String)))
+  ToggleReactionEmoji(target: String, emoji: String)
+  ReactionSent(Result(Nil, String))
+  OpenFullEmojiPicker(String)
+  CloseFullEmojiPicker
   OpenDetail(String)
   CloseDetail
   OpenVoicePopover(String)
@@ -239,6 +258,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       rooms_collapsed: False,
       landing_input: "",
       sidebar_search: "",
+      full_picker_for: None,
+      reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
       voice_settings: seed_voice_settings(),
@@ -737,6 +758,13 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           Nil
         })
 
+      // Master's on_reactions_changed wiring used to live here; it
+      // attached a Client-level callback. After multi-room, that
+      // callback belongs on each RoomHandle (set up in RoomOpened).
+      // ReactionsChanged events are still in the Msg type but no
+      // wiring fires them yet — re-wire as part of the per-room
+      // reactions follow-up.
+
       let new_status = case relays {
         [] -> "disconnected"
         _ -> "connecting"
@@ -1084,44 +1112,22 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     OpenDrawer(d) -> #(Model(..model, drawer: Some(d)), effect.none())
     CloseDrawer -> #(Model(..model, drawer: None), effect.none())
-  }
-}
-
-/// Toggle "you reacted with this emoji" semantics over an existing
-/// reactions list. Mirrors the natural chat pattern: first click adds,
-/// second click removes; the count tracks how many distinct people
-/// (including you) have reacted with that emoji.
-fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
-  case list.find(rs, fn(r) { r.emoji == emoji }) {
-    Error(_) -> [Reaction(emoji: emoji, count: 1, by_you: True), ..rs]
-    Ok(existing) ->
-      case existing.by_you {
-        True -> {
-          let updated_count = existing.count - 1
-          case updated_count {
-            0 -> list.filter(rs, fn(r) { r.emoji != emoji })
-            _ ->
-              list.map(rs, fn(r) {
-                case r.emoji == emoji {
-                  True ->
-                    Reaction(
-                      emoji: r.emoji,
-                      count: updated_count,
-                      by_you: False,
-                    )
-                  False -> r
-                }
-              })
-          }
-        }
-        False ->
-          list.map(rs, fn(r) {
-            case r.emoji == emoji {
-              True -> Reaction(emoji: r.emoji, count: r.count + 1, by_you: True)
-              False -> r
-            }
-          })
-      }
+    // Master's reactions Msg variants — pre-multi-room these were
+    // wired to a Client-level reactions tracker. After multi-room the
+    // tracker needs to be per-OpenRoom (the per-room follow-up), so
+    // these are placeholder no-ops to keep the Msg type exhaustive.
+    // The chip-row UI still works through AddReaction (UI-only).
+    ReactionsChanged(target, snapshot) -> #(
+      Model(..model, reactions: dict.insert(model.reactions, target, snapshot)),
+      effect.none(),
+    )
+    ToggleReactionEmoji(_, _) -> #(model, effect.none())
+    ReactionSent(_) -> #(model, effect.none())
+    OpenFullEmojiPicker(target) -> #(
+      Model(..model, full_picker_for: Some(target)),
+      effect.none(),
+    )
+    CloseFullEmojiPicker -> #(Model(..model, full_picker_for: None), effect.none())
   }
 }
 
@@ -1193,6 +1199,15 @@ fn room_view_with_state(
       )
     _, _ -> element.fragment([])
   }
+
+  // Master's full-emoji-picker overlay/sheet were here. They depend
+  // on `model.reactions` + `client_pubkey_hex` + `ToggleReactionEmoji`
+  // which still need per-room migration. The picker is unrendered for
+  // now so the build is clean; `OpenFullEmojiPicker` is unwired and
+  // `model.full_picker_for` stays at None. Re-add in the per-room
+  // reactions integration follow-up.
+  let _ = model.full_picker_for
+  let _ = model.reactions
 
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
@@ -1350,7 +1365,8 @@ fn room_view_with_state(
         _ -> None
       },
       on_toggle_reaction_picker: ToggleReactionPicker,
-      on_add_reaction: AddReaction,
+      on_add_reaction: ToggleReactionEmoji,
+      on_open_full_picker: OpenFullEmojiPicker,
       on_open_detail: OpenDetail,
       receipts: state.receipts,
       selected_msg_id: state.selected_msg_id,
@@ -1505,6 +1521,75 @@ fn find_message(ms: List(Message), id: String) -> Option(Message) {
   |> option.from_result
 }
 
+/// UI-only per-room reaction toggle. Mirrors the pre-master fixture
+/// behavior: tapping an emoji adds/removes/decrements your reaction
+/// in the per-RoomState `reactions` dict. The real reactions feature
+/// (master's send_reaction / ReactionsChanged) is still a Client-level
+/// global and needs per-OpenRoom migration before this helper can be
+/// dropped. Until then, the per-room AddReaction handler keeps the
+/// chip row interactive without going through the engine.
+fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
+  case list.find(rs, fn(r) { r.emoji == emoji }) {
+    Error(_) -> [Reaction(emoji: emoji, count: 1, by_you: True), ..rs]
+    Ok(existing) ->
+      case existing.by_you {
+        True -> {
+          let updated_count = existing.count - 1
+          case updated_count {
+            0 -> list.filter(rs, fn(r) { r.emoji != emoji })
+            _ ->
+              list.map(rs, fn(r) {
+                case r.emoji == emoji {
+                  True ->
+                    Reaction(
+                      emoji: r.emoji,
+                      count: updated_count,
+                      by_you: False,
+                    )
+                  False -> r
+                }
+              })
+          }
+        }
+        False ->
+          list.map(rs, fn(r) {
+            case r.emoji == emoji {
+              True -> Reaction(emoji: r.emoji, count: r.count + 1, by_you: True)
+              False -> r
+            }
+          })
+      }
+  }
+}
+
+/// Convert a per-target snapshot dict into the `List(Reaction)` shape
+/// the chip-row view consumes. `self_pubkey_hex` decides the
+/// `by_you` flag; `None` (no client yet) treats every reaction as
+/// not-by-you so the UI doesn't lie.
+fn snapshot_to_reactions(
+  snapshot: Dict(String, Set(String)),
+  self_pubkey_hex: Option(String),
+) -> List(domain.Reaction) {
+  dict.to_list(snapshot)
+  |> list.filter_map(fn(pair) {
+    let #(emoji, authors) = pair
+    case set.size(authors) {
+      0 -> Error(Nil)
+      n -> {
+        let by_you = case self_pubkey_hex {
+          Some(me) -> set.contains(authors, me)
+          None -> False
+        }
+        Ok(domain.Reaction(emoji: emoji, count: n, by_you: by_you))
+      }
+    }
+  })
+}
+
+fn client_pubkey_hex(c: ClientHandle) -> String {
+  sunset.client_public_key_hex(c)
+}
+
 fn receipts_for(receipts: Dict(String, Set(String)), id: String) -> Set(String) {
   case dict.get(receipts, id) {
     Ok(s) -> s
@@ -1566,7 +1651,7 @@ fn phone_reaction_grid(
       html.button(
         [
           attribute.attribute("aria-label", e),
-          event.on_click(AddReaction(message_id, e)),
+          event.on_click(ToggleReactionEmoji(message_id, e)),
           ui.css([
             #("padding", "12px"),
             #("font-size", "26px"),

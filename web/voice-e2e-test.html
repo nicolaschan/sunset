@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>sunset-voice E2E harness</title>
+  </head>
+  <body>
+    <h1>sunset-voice E2E harness</h1>
+    <p>This page is exercised by Playwright; do not load it manually.</p>
+    <script type="module">
+      import init, { Client } from "/sunset_web_wasm.js";
+
+      const incoming = new Map();
+      const voiceState = new Map();
+      const connState = new Map();
+      // Set of remote peer pubkey hex strings currently visible in the
+      // membership tracker. Real users wait for the peer to appear in the
+      // member rail before clicking "connect direct"; the test mirrors
+      // that wait via `members()` polling.
+      const visibleMembers = new Set();
+
+      function hex(uint8) {
+        return Array.from(uint8).map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+
+      window.__voice = {
+        async start({ seed, room, relay }) {
+          await init();
+          const bytes = new Uint8Array(seed.match(/.{2}/g).map((b) => parseInt(b, 16)));
+          // Multi-room API: Client::new takes only the seed; the room
+          // is opened via client.open_room(name) which publishes the
+          // <fp>/* subscription internally (replaces the old
+          // publish_room_subscription call).
+          const client = new Client(bytes);
+          window.__voice.client = client;
+          window.__voice.room = room;
+          window.__voice.publicKeyHex = hex(new Uint8Array(client.public_key));
+          await client.add_relay(relay);
+          const roomHandle = await client.open_room(room);
+          window.__voice.roomHandle = roomHandle;
+          client.on_peer_connection_state((snap) => {
+            connState.set(snap.addr, snap);
+          });
+          roomHandle.on_members_changed((members) => {
+            visibleMembers.clear();
+            for (const m of members) {
+              if (!m.is_self) visibleMembers.add(hex(new Uint8Array(m.pubkey)));
+            }
+          });
+          return { publicKey: window.__voice.publicKeyHex };
+        },
+        startVoice() {
+          window.__voice.client.voice_start(
+            window.__voice.room,
+            (fromPeerId, pcm) => {
+              const k = hex(new Uint8Array(fromPeerId));
+              if (!incoming.has(k)) incoming.set(k, []);
+              incoming.get(k).push(new Float32Array(pcm));
+            },
+            (peerId, in_call, talking) => {
+              voiceState.set(hex(new Uint8Array(peerId)), { in_call, talking });
+            },
+          );
+        },
+        framesFor(hexPeerId) {
+          return incoming.get(hexPeerId) ?? [];
+        },
+        voiceStateFor(hexPeerId) {
+          return voiceState.get(hexPeerId) ?? null;
+        },
+        connStateForAddr(addr) {
+          return connState.get(addr) ?? null;
+        },
+        async connectDirect(peerHex) {
+          const bytes = new Uint8Array(peerHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
+          // Multi-room API: connect_direct moved from Client to RoomHandle
+          // (signaling rides on the room's <fp>/webrtc/ namespace).
+          await window.__voice.roomHandle.connect_direct(bytes);
+        },
+        peerMode(peerHex) {
+          const bytes = new Uint8Array(peerHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
+          return window.__voice.roomHandle.peer_connection_mode(bytes);
+        },
+        async startPresence() {
+          // Tight intervals so the membership tracker converges quickly
+          // in the test (real Gleam UI uses 30s/60s/5s defaults).
+          // start_presence moved from Client to RoomHandle in multi-room.
+          await window.__voice.roomHandle.start_presence(300, 1500, 100);
+        },
+        memberVisible(peerHex) {
+          return visibleMembers.has(peerHex);
+        },
+        sendFrame(samples) {
+          window.__voice.client.voice_input(new Float32Array(samples));
+        },
+        stop() {
+          window.__voice.client.voice_stop();
+        },
+      };
+    </script>
+  </body>
+</html>

@@ -128,7 +128,16 @@ impl EncryptedMessage {
     }
 }
 
-/// Discriminator for the inner plaintext of a chat-room entry. Both
+/// Add or Remove for a `MessageBody::Reaction` event. The application
+/// layer folds a stream of these per `(author, target, emoji)` to derive
+/// "is this author currently reacting with this emoji on this target?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReactionAction {
+    Add,
+    Remove,
+}
+
+/// Discriminator for the inner plaintext of a chat-room entry. All
 /// variants ride the same `<room_fp>/msg/<value_hash>` namespace and
 /// share the AEAD envelope; only the plaintext shape differs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +148,16 @@ pub enum MessageBody {
     /// referenced `Text` message. The author of the receipt is the
     /// receiver of the original message.
     Receipt { for_value_hash: sunset_store::Hash },
+    /// An emoji reaction attached to the referenced message. The
+    /// author of the entry is the reactor; `for_value_hash` is the
+    /// `value_hash` of the message being reacted to. Per
+    /// `(author, for_value_hash, emoji)`, the application folds events
+    /// LWW by `(sent_at_ms, value_hash)` to derive current state.
+    Reaction {
+        for_value_hash: sunset_store::Hash,
+        emoji: String,
+        action: ReactionAction,
+    },
 }
 
 #[cfg(test)]
@@ -232,6 +251,73 @@ mod tests {
         let hash_hex: String = bytes[1..].iter().map(|b| format!("{b:02x}")).collect();
         let expected_hash: String = h.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hash_hex, expected_hash);
+    }
+
+    #[test]
+    fn message_body_reaction_add_postcard_hex_pin() {
+        let h: sunset_store::Hash = blake3::hash(b"x").into();
+        let body = MessageBody::Reaction {
+            for_value_hash: h,
+            emoji: "👍".to_owned(),
+            action: ReactionAction::Add,
+        };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        // 02 = Reaction variant tag (third variant after Text=00, Receipt=01).
+        assert_eq!(bytes[0], 0x02, "MessageBody::Reaction variant tag drifted");
+        // Then 32 hash bytes; then varint emoji-len (4 for 👍 = F0 9F 91 8D);
+        // then 4 emoji bytes; then enum-tag for ReactionAction (00 for Add).
+        assert_eq!(
+            bytes.len(),
+            1 + 32 + 1 + 4 + 1,
+            "Reaction Add encoding drifted: tag + hash + len + emoji + action"
+        );
+        assert_eq!(bytes[1 + 32], 0x04, "emoji length varint drifted");
+        assert_eq!(&bytes[1 + 32 + 1..1 + 32 + 1 + 4], "👍".as_bytes());
+        assert_eq!(
+            bytes[1 + 32 + 1 + 4],
+            0x00,
+            "ReactionAction::Add tag drifted"
+        );
+    }
+
+    #[test]
+    fn message_body_reaction_remove_postcard_hex_pin() {
+        let h: sunset_store::Hash = blake3::hash(b"x").into();
+        let body = MessageBody::Reaction {
+            for_value_hash: h,
+            emoji: "❤".to_owned(), // 3-byte emoji, no VS-16
+            action: ReactionAction::Remove,
+        };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        assert_eq!(bytes[0], 0x02);
+        assert_eq!(
+            *bytes.last().unwrap(),
+            0x01,
+            "ReactionAction::Remove tag drifted"
+        );
+    }
+
+    #[test]
+    fn message_body_reaction_roundtrips_via_postcard() {
+        let h: sunset_store::Hash = blake3::hash(b"target").into();
+        let body = MessageBody::Reaction {
+            for_value_hash: h,
+            emoji: "🎉".to_owned(),
+            action: ReactionAction::Add,
+        };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn message_body_text_postcard_hex_pin_unchanged() {
+        // Confirms that adding the Reaction variant did not reorder existing
+        // tag values: Text must still encode to 00026869.
+        let body = MessageBody::Text("hi".to_owned());
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "00026869");
     }
 
     /// Frozen wire-format vector for `EncryptedMessage`. Failing means the
