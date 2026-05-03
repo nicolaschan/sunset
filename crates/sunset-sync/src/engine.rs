@@ -576,7 +576,8 @@ where
                 }
             };
             if let Ok(parsed_filter) = parse_subscription_entry(&entry, &block) {
-                self.state
+                let _ = self
+                    .state
                     .lock()
                     .await
                     .registry
@@ -843,7 +844,8 @@ where
         if entry.name.as_ref() == reserved::SUBSCRIBE_NAME {
             if let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await {
                 if let Ok(filter) = parse_subscription_entry(&entry, &block) {
-                    self.state
+                    let _ = self
+                        .state
                         .lock()
                         .await
                         .registry
