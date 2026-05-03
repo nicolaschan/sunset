@@ -704,18 +704,16 @@ fn reaction_pill(
     True -> "Remove your " <> r.emoji <> " reaction"
     False -> "React with " <> r.emoji
   }
-  let pressed = case r.by_you {
-    True -> "true"
-    False -> "false"
-  }
-  // The pill sits inside the message-body click target (which toggles
-  // row selection), so we stop propagation — clicking the pill must
-  // only toggle the reaction, not the row.
+  // stop_propagation: the message body wrapper above us toggles row
+  // selection on click, which a pill click should not trigger.
   html.button(
     [
       attribute.attribute("data-testid", "reaction-pill"),
       attribute.attribute("data-emoji", r.emoji),
-      attribute.attribute("aria-pressed", pressed),
+      attribute.attribute("aria-pressed", case r.by_you {
+        True -> "true"
+        False -> "false"
+      }),
       attribute.title(title),
       event.stop_propagation(event.on_click(on_toggle_reaction(
         message_id,
