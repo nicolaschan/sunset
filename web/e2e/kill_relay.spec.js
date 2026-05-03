@@ -121,6 +121,9 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   // wasm bundle initialises asynchronously after the first FFI call.
   await pageA.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
   await pageB.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
+  // Wait for window.sunsetRoom to be exposed (set when the room is opened).
+  await pageA.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
+  await pageB.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
 
   // peer_connection_mode reads from the membership tracker's peer_kinds
   // map, which is only populated once start_presence is called (the
@@ -130,7 +133,7 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   // params (compressed cadence is harmless for this test).
   for (const p of [pageA, pageB]) {
     await p.evaluate(async () => {
-      await window.sunsetClient.start_presence(300, 900, 100);
+      await window.sunsetRoom.start_presence(300, 900, 100);
     });
   }
 
@@ -147,7 +150,7 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   // Both sides build a PC; A initiates, B's background accept worker
   // handles the inbound offer + completes the WebRTC handshake.
   await pageA.evaluate(async (pkArr) => {
-    await window.sunsetClient.connect_direct(new Uint8Array(pkArr));
+    await window.sunsetRoom.connect_direct(new Uint8Array(pkArr));
   }, bPub);
 
   // A reports "direct" once the engine.add_peer completes (set by
@@ -156,7 +159,7 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   // the real acceptance is whether messages flow after the relay dies.
   await pageA.waitForFunction(
     (pkArr) =>
-      window.sunsetClient.peer_connection_mode(new Uint8Array(pkArr)) === "direct",
+      window.sunsetRoom.peer_connection_mode(new Uint8Array(pkArr)) === "direct",
     bPub,
     { timeout: 30_000 },
   );

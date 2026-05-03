@@ -58,6 +58,11 @@ export async function createClient(seed, callback) {
 
 export async function clientOpenRoom(client, name, callback) {
   const handle = await client.open_room(name);
+  // Test-only hook: expose the most-recently-opened room handle to
+  // Playwright when SUNSET_TEST is set. No-op in production.
+  if (typeof window !== "undefined" && window.SUNSET_TEST) {
+    window.sunsetRoom = handle;
+  }
   callback(handle);
 }
 
