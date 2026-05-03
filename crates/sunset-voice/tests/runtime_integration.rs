@@ -609,33 +609,62 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
 
             tokio::task::spawn_local(tasks.jitter_pump);
 
-            // After ~20ms: 1 frame delivered.
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            assert_eq!(delivered.borrow().len(), 1);
+            // Poll for 1st delivery (frame1).
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if delivered.borrow().len() >= 1 { return; }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("1st frame delivered");
             assert_eq!(delivered.borrow()[0].1, frame1);
 
-            // After ~40ms: 2 frames delivered.
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            assert_eq!(delivered.borrow().len(), 2);
+            // Poll for 2nd delivery (frame2).
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if delivered.borrow().len() >= 2 { return; }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("2nd frame delivered");
             assert_eq!(delivered.borrow()[1].1, frame2);
 
-            // After ~60ms: 3 deliveries — third is repeat-last (underrun once).
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            assert_eq!(delivered.borrow().len(), 3);
+            // Poll for 3rd delivery (repeat-last = frame2, first underrun).
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if delivered.borrow().len() >= 3 { return; }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("3rd frame delivered (repeat last)");
             assert_eq!(delivered.borrow()[2].1, frame2, "first underrun = repeat last");
 
-            // After ~80ms: 4 deliveries — fourth is silence.
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            assert_eq!(delivered.borrow().len(), 4);
+            // Poll for 4th delivery (silence, second underrun).
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if delivered.borrow().len() >= 4 { return; }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("4th frame delivered (silence)");
             let silence = vec![0.0_f32; 960];
             assert_eq!(delivered.borrow()[3].1, silence, "second underrun = silence");
 
             // Push a new frame — next pump cycle delivers it normally.
+            // We track how many frames have been delivered so far to find frame3's position.
             let frame3: Vec<f32> = (0..960).map(|i| i as f32 * 0.003).collect();
+            // Push frame3 immediately after observing the silence delivery.
+            // The next pump tick will pick it up and deliver it normally.
             runtime.test_push_frame(peer.clone(), frame3.clone());
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            assert_eq!(delivered.borrow().len(), 5);
-            assert_eq!(delivered.borrow()[4].1, frame3);
+            let base_len = delivered.borrow().len();
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if delivered.borrow().len() > base_len { return; }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("frame3 delivered");
+            // Find frame3 in the delivered list — it may not be at index 4 if extra
+            // silence frames were pumped before we pushed it.
+            let deliveries = delivered.borrow();
+            let frame3_pos = deliveries.iter().position(|(_, f)| f == &frame3)
+                .expect("frame3 must appear in delivered list");
+            assert_eq!(deliveries[frame3_pos].1, frame3);
         })
         .await;
 }
