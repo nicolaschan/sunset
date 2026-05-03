@@ -32,6 +32,7 @@ impl RoomFingerprint {
 /// Open rooms in v1 use only `epoch_0_root` for message encryption.
 /// Invite-only rooms (Plan 8) will keep `epoch_0_root` randomly generated
 /// and distributed via key bundles.
+#[derive(Clone)]
 pub struct Room {
     fingerprint: RoomFingerprint,
     k_room: Zeroizing<[u8; 32]>,
