@@ -138,12 +138,154 @@ test("react button opens quick-picker and chip appears after picking", async ({
   // The picker should close after picking.
   await expect(picker).not.toBeVisible({ timeout: 5_000 });
 
-  // A reaction chip containing 👍 and the count "1" should appear on
+  // A reaction pill containing 👍 and the count "1" should appear on
   // the message row.
-  const chip = msgRow.locator("span").filter({ hasText: /👍/ }).first();
-  await expect(chip).toBeVisible({ timeout: 10_000 });
+  const pill = msgRow.locator(
+    '[data-testid="reaction-pill"][data-emoji="👍"]',
+  );
+  await expect(pill).toBeVisible({ timeout: 10_000 });
   // The count badge (a nested span) must show "1".
-  await expect(chip.locator("span")).toHaveText("1", { timeout: 5_000 });
+  await expect(pill.locator("span")).toHaveText("1", { timeout: 5_000 });
+
+  await ctx.close();
+});
+
+// Slack/Discord-style pill toggle: once a reaction exists on a message,
+// clicking the pill itself adds-or-removes the user's own reaction.
+// Skipped on mobile-chrome because the picker flow used to seed the
+// reaction is desktop-only in this implementation (matches the skip on
+// the picker test above). The click handler on the pill itself is the
+// same `<button>` on both viewports — a mobile user with a pill on a
+// message would tap it the same way.
+test("clicking own reaction pill removes the reaction", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "reaction picker is desktop-only in this implementation",
+  );
+
+  const url = `/?relay=${encodeURIComponent(relayAddress)}#sunset-demo`;
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+
+  page.on("pageerror", (err) =>
+    process.stderr.write(`[pageerror] ${err.stack || err}\n`),
+  );
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      process.stderr.write(`[console error] ${msg.text()}\n`);
+    }
+  });
+
+  await page.goto(url);
+
+  await expect(page.getByText("sunset", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+
+  const input = page.getByPlaceholder(/^Message #/);
+  await expect(input).toBeVisible({ timeout: 15_000 });
+
+  const msgText = `pill-toggle e2e — ${Date.now()}`;
+  await input.fill(msgText);
+  await input.press("Enter");
+
+  const msgRow = page.locator(".msg-row", { hasText: msgText }).first();
+  await expect(msgRow).toBeVisible({ timeout: 15_000 });
+
+  // Open quick-picker and seed a 👍 reaction (force=true bypasses the
+  // hover-only visibility on the toolbar — same pattern as the picker
+  // test above).
+  await msgRow.getByTitle("React").click({ force: true });
+  const picker = page.locator('[data-testid="reaction-picker"]');
+  await expect(picker).toBeVisible({ timeout: 5_000 });
+  await picker.getByTitle("React with 👍").click();
+  await expect(picker).not.toBeVisible({ timeout: 5_000 });
+
+  // The pill is now present, marked as our own reaction (aria-pressed),
+  // and shows count 1.
+  const pill = msgRow.locator(
+    '[data-testid="reaction-pill"][data-emoji="👍"]',
+  );
+  await expect(pill).toBeVisible({ timeout: 10_000 });
+  await expect(pill).toHaveAttribute("aria-pressed", "true");
+  await expect(pill.locator("span")).toHaveText("1", { timeout: 5_000 });
+
+  // Click the pill → engine sends "remove" → ReactionsChanged drops
+  // our pubkey from the snapshot → snapshot_to_reactions filters out
+  // the now-zero-count entry → the pill is no longer rendered.
+  await pill.click();
+  await expect(pill).toHaveCount(0, { timeout: 10_000 });
+
+  await ctx.close();
+});
+
+test("pill click toggles only the reaction, not row selection", async ({
+  browser,
+}, testInfo) => {
+  // Pills sit inside the message body's click target (which toggles
+  // row selection). Without event.stop_propagation a pill click would
+  // both toggle the reaction AND toggle selection — leaking UI state.
+  // This test pins selection via the action toolbar and verifies a
+  // pill click preserves it.
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "reaction picker is desktop-only in this implementation",
+  );
+
+  const url = `/?relay=${encodeURIComponent(relayAddress)}#sunset-demo`;
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+
+  page.on("pageerror", (err) =>
+    process.stderr.write(`[pageerror] ${err.stack || err}\n`),
+  );
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      process.stderr.write(`[console error] ${msg.text()}\n`);
+    }
+  });
+
+  await page.goto(url);
+
+  await expect(page.getByText("sunset", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+
+  const input = page.getByPlaceholder(/^Message #/);
+  await expect(input).toBeVisible({ timeout: 15_000 });
+
+  const msgText = `pill-selection e2e — ${Date.now()}`;
+  await input.fill(msgText);
+  await input.press("Enter");
+
+  const msgRow = page.locator(".msg-row", { hasText: msgText }).first();
+  await expect(msgRow).toBeVisible({ timeout: 15_000 });
+
+  // Seed a 👍 via picker (this also pins selection, but go via tap
+  // explicitly for clarity).
+  await msgRow.getByTitle("React").click({ force: true });
+  const picker = page.locator('[data-testid="reaction-picker"]');
+  await expect(picker).toBeVisible({ timeout: 5_000 });
+  await picker.getByTitle("React with 👍").click();
+  await expect(picker).not.toBeVisible({ timeout: 5_000 });
+
+  // Open the message details panel — that pins selection on the row
+  // (sunset_web.gleam OpenDetail also sets selected_msg_id). With the
+  // panel pinned, .is-selected is a stable expectation.
+  await msgRow.getByTitle("Message details").click({ force: true });
+  await expect(msgRow).toHaveClass(/is-selected/);
+
+  const pill = msgRow.locator(
+    '[data-testid="reaction-pill"][data-emoji="👍"]',
+  );
+  await expect(pill).toBeVisible({ timeout: 10_000 });
+
+  // Click the pill — selection must NOT toggle, even though the pill
+  // sits inside the message body's click target.
+  await pill.click();
+  await expect(msgRow).toHaveClass(/is-selected/);
 
   await ctx.close();
 });
