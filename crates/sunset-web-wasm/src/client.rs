@@ -295,7 +295,8 @@ impl Client {
     }
 
     pub fn on_reactions_changed(&self, callback: js_sys::Function) {
-        let bridge = move |target: &sunset_store::Hash, snapshot: &sunset_core::ReactionSnapshot| {
+        let bridge = move |target: &sunset_store::Hash,
+                           snapshot: &sunset_core::ReactionSnapshot| {
             let payload = crate::reactions::snapshot_to_js(target, snapshot);
             let _ = callback.call1(&JsValue::NULL, &payload);
         };
@@ -303,7 +304,10 @@ impl Client {
         // Clear the per-target debounce signatures so the tracker's next
         // applied event refires the snapshot. (Mirrors the on_members_changed
         // last_signature.clear() pattern.)
-        self.reaction_handles.last_target_signatures.borrow_mut().clear();
+        self.reaction_handles
+            .last_target_signatures
+            .borrow_mut()
+            .clear();
     }
 
     pub async fn publish_room_subscription(&self) -> Result<(), JsError> {
@@ -376,7 +380,9 @@ impl Client {
         let target_bytes = hex::decode(&target_value_hash_hex)
             .map_err(|e| JsError::new(&format!("send_reaction: bad target hex: {e}")))?;
         if target_bytes.len() != 32 {
-            return Err(JsError::new("send_reaction: target hex must decode to 32 bytes"));
+            return Err(JsError::new(
+                "send_reaction: target hex must decode to 32 bytes",
+            ));
         }
         let mut target_arr = [0u8; 32];
         target_arr.copy_from_slice(&target_bytes);
