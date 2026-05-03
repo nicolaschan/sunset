@@ -43,7 +43,7 @@ fn main() -> Result<()> {
                     }
                     None => Config::defaults()?,
                 };
-                let handle = Relay::new(config).await?;
+                let handle = Relay::start(config).await?;
                 handle.run().await
             })
             .await

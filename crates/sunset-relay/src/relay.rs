@@ -1,6 +1,6 @@
 //! Relay: identity + store + engine + axum HTTP/WS host.
 //!
-//! `Relay::new(config)` does setup synchronously (in async fn form):
+//! `Relay::start(config)` does setup synchronously (in async fn form):
 //! identity, store, engine, the SpawningAcceptor that wraps a
 //! WebSocketRawTransport::serving(), the command pump, and a bound
 //! TcpListener. The returned `RelayHandle` exposes the dial URL + a
@@ -124,8 +124,7 @@ impl Relay {
     /// The constructor spawns `spawn_local` tasks (the command pump and
     /// `SpawningAcceptor`'s internal handshake pump); calling it without
     /// an active LocalSet will panic.
-    #[allow(clippy::new_ret_no_self)]
-    pub async fn new(config: Config) -> Result<RelayHandle> {
+    pub async fn start(config: Config) -> Result<RelayHandle> {
         // 1. Identity (load-or-generate; persists to disk on first start).
         tokio::fs::create_dir_all(&config.data_dir).await?;
         let identity = identity::load_or_generate(&config.identity_secret_path).await?;
@@ -232,17 +231,15 @@ fn spawn_command_pump(mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>, ctx: Rc
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 RelayCommand::Snapshot { reply } => {
-                    let snap = build_dashboard_snapshot(
-                        &ctx.engine,
-                        &ctx.store,
-                        &ctx.data_dir,
-                        ctx.ed25519_public,
-                        ctx.x25519_public,
-                        ctx.listen_addr,
-                        &ctx.dial_url,
-                        &ctx.configured_peers,
-                    )
-                    .await;
+                    let meta = crate::snapshot::RelayMeta {
+                        data_dir: &ctx.data_dir,
+                        ed25519_public: ctx.ed25519_public,
+                        x25519_public: ctx.x25519_public,
+                        listen_addr: ctx.listen_addr,
+                        dial_url: &ctx.dial_url,
+                        configured_peers: &ctx.configured_peers,
+                    };
+                    let snap = build_dashboard_snapshot(&ctx.engine, &ctx.store, &meta).await;
                     let _ = reply.send(snap);
                 }
                 RelayCommand::Identity { reply } => {

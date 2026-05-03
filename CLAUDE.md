@@ -20,7 +20,16 @@ Run a single test: `cargo test -p sunset-store-memory store::tests::insert_repla
 
 The conformance suite lives at `crates/sunset-store/src/test_helpers.rs` behind feature `test-helpers`. Backends drive it via an integration test (e.g. `crates/sunset-store-memory/tests/conformance.rs`); use `--all-features` so the gate flips on.
 
-Workspace lints (`Cargo.toml`): `unsafe_code = deny`, `unused_must_use = deny`, plus a few clippy warnings. New crates should set `[lints] workspace = true`.
+Workspace lints (`Cargo.toml`): `unsafe_code = deny`, `unused_must_use = deny`, plus the workspace clippy policy. New crates should set `[lints] workspace = true`.
+
+### Clippy policy: no suppressions
+
+Every clippy warning must be fixed at the source. **`#[allow(clippy::...)]` and `#[expect(clippy::...)]` are forbidden in our source.** This is enforced two ways:
+
+1. `cargo clippy --workspace --all-features --all-targets -- -D warnings` runs in CI (`.github/workflows/test.yml`) and fails the build on any clippy warning.
+2. `scripts/check-no-clippy-allow.sh` greps `crates/` for clippy suppressions and fails CI if any are found. It only scans our source — `#[allow]`s emitted by macro expansions inside dependencies (clap, tokio, etc.) are unaffected.
+
+If clippy flags something, **fix the root cause**: refactor signatures (e.g. bundle args into a struct to drop below `too_many_arguments`), pick a different primitive (e.g. `tokio::sync::Mutex` instead of `RefCell` to avoid `await_holding_refcell_ref`), or rename the API (e.g. constructors that don't return `Self` should be named `start` / `open` / `connect`, not `new`). Do not suppress.
 
 ## What this repo is
 
