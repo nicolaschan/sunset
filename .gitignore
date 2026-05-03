@@ -1,6 +1,7 @@
 .superpowers/
 .worktrees/
 .direnv/
+.claude/
 
 # Nix build result
 result
