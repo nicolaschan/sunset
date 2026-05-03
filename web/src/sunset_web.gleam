@@ -1127,7 +1127,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, full_picker_for: Some(target)),
       effect.none(),
     )
-    CloseFullEmojiPicker -> #(Model(..model, full_picker_for: None), effect.none())
+    CloseFullEmojiPicker -> #(
+      Model(..model, full_picker_for: None),
+      effect.none(),
+    )
   }
 }
 
