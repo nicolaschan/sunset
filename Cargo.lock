@@ -1962,6 +1962,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunset-markdown"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sunset-noise"
 version = "0.1.0"
 dependencies = [
