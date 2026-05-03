@@ -64,9 +64,70 @@ pub fn parse(input: &str) -> Document {
 
 /// Render a `Document` back to a flat string with all formatting markers
 /// stripped. Idempotent on already-plain text.
-pub fn to_plain(_doc: &Document) -> String {
-    // Stub. Replaced by Task A16.
-    String::new()
+pub fn to_plain(doc: &Document) -> String {
+    let mut out = String::new();
+    for (i, block) in doc.0.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n\n");
+        }
+        write_block(&mut out, block);
+    }
+    out
+}
+
+fn write_block(out: &mut String, block: &Block) {
+    match block {
+        Block::Paragraph(inlines) | Block::Heading { content: inlines, .. } => {
+            for il in inlines {
+                write_inline(out, il);
+            }
+        }
+        Block::Quote(blocks) => {
+            for (i, b) in blocks.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("\n\n");
+                }
+                write_block(out, b);
+            }
+        }
+        Block::UnorderedList(items) => {
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                for (j, b) in item.iter().enumerate() {
+                    if j > 0 {
+                        out.push_str("\n\n");
+                    }
+                    write_block(out, b);
+                }
+            }
+        }
+        Block::CodeBlock { source, .. } => {
+            out.push_str(source);
+        }
+    }
+}
+
+fn write_inline(out: &mut String, il: &Inline) {
+    match il {
+        Inline::Text(s) | Inline::InlineCode(s) => out.push_str(s),
+        Inline::Bold(xs)
+        | Inline::Italic(xs)
+        | Inline::Underline(xs)
+        | Inline::Strikethrough(xs)
+        | Inline::Spoiler(xs) => {
+            for x in xs {
+                write_inline(out, x);
+            }
+        }
+        Inline::Link { label, .. } => {
+            for x in label {
+                write_inline(out, x);
+            }
+        }
+        Inline::LineBreak => out.push('\n'),
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +622,45 @@ mod tests {
                 ],
             }])
         );
+    }
+
+    #[test]
+    fn to_plain_strips_inline_formatting() {
+        let doc = parse("hello **bold** _italic_ `code`");
+        assert_eq!(to_plain(&doc), "hello bold italic code");
+    }
+
+    #[test]
+    fn to_plain_renders_paragraphs_with_blank_line_separator() {
+        let doc = parse("first\n\nsecond");
+        assert_eq!(to_plain(&doc), "first\n\nsecond");
+    }
+
+    #[test]
+    fn to_plain_renders_link_label() {
+        let doc = parse("[click](https://x.com)");
+        assert_eq!(to_plain(&doc), "click");
+    }
+
+    #[test]
+    fn to_plain_renders_autolink_url() {
+        let doc = parse("see https://x.com");
+        assert_eq!(to_plain(&doc), "see https://x.com");
+    }
+
+    #[test]
+    fn to_plain_renders_code_block() {
+        let doc = parse("```\nfn main() {}\n```");
+        assert_eq!(to_plain(&doc), "fn main() {}");
+    }
+
+    #[test]
+    fn to_plain_length_does_not_exceed_input() {
+        // Every character in `to_plain(parse(s))` is also in `s`. We can't
+        // assert byte equality, but we can assert the output isn't longer.
+        for input in &["hi", "**bold**", "[a](https://x.com)", "# title"] {
+            assert!(to_plain(&parse(input)).len() <= input.len(), "input: {input:?}");
+        }
     }
 
     #[test]
