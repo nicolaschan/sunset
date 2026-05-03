@@ -302,3 +302,100 @@ impl<S: Store + 'static> Signaler for RelaySignaler<S> {
             .ok_or_else(|| SyncError::Transport("signaler closed".into()))
     }
 }
+
+use std::cell::RefCell;
+use crate::crypto::room::RoomFingerprint;
+
+/// Routes signaling for a `WebRtcRawTransport` across N open rooms.
+/// Holds a per-room `RelaySignaler` for each open room. `send` picks any
+/// registered signaler (the receiver subscribes to all its open rooms,
+/// so the message reaches them via any one); `recv` fans across all
+/// per-room receivers via select!.
+///
+/// The Signaler trait impl comes in a follow-up task; this task only
+/// implements register/unregister + introspection.
+pub struct MultiRoomSignaler {
+    by_room: RefCell<HashMap<RoomFingerprint, Rc<dyn Signaler>>>,
+    /// Notifier fired when a new signaler is registered, so an in-flight
+    /// `recv` blocked on the current set can re-do its select!.
+    register_notify: tokio::sync::Notify,
+}
+
+impl MultiRoomSignaler {
+    pub fn new() -> Rc<Self> {
+        Rc::new(Self {
+            by_room: RefCell::new(HashMap::new()),
+            register_notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub fn register<S: Store + 'static>(
+        self: &Rc<Self>,
+        fp: RoomFingerprint,
+        signaler: Rc<RelaySignaler<S>>,
+    ) {
+        let dyn_signaler: Rc<dyn Signaler> = signaler;
+        self.by_room.borrow_mut().insert(fp, dyn_signaler);
+        self.register_notify.notify_waiters();
+    }
+
+    pub fn unregister(&self, fp: &RoomFingerprint) {
+        self.by_room.borrow_mut().remove(fp);
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_room.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_room.borrow().is_empty()
+    }
+
+    pub fn contains(&self, fp: &RoomFingerprint) -> bool {
+        self.by_room.borrow().contains_key(fp)
+    }
+}
+
+#[cfg(test)]
+mod multi_room_tests {
+    use super::*;
+    use crate::Identity;
+    use crate::Ed25519Verifier;
+    use crate::Room;
+    use crate::crypto::constants::test_fast_params;
+    use std::sync::Arc;
+    use sunset_store_memory::MemoryStore;
+
+    fn ident(seed: u8) -> Identity {
+        Identity::from_secret_bytes(&[seed; 32])
+    }
+
+    fn store() -> Arc<MemoryStore> {
+        Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_inserts_and_unregister_removes() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let dispatcher = MultiRoomSignaler::new();
+            let id = ident(1);
+            let st = store();
+            let room = Room::open_with_params("alpha", &test_fast_params())
+                .expect("Room::open_with_params");
+            let fp = room.fingerprint();
+            let signaler = RelaySignaler::new(id, fp.to_hex(), &st);
+
+            assert_eq!(dispatcher.len(), 0);
+            assert!(!dispatcher.contains(&fp));
+
+            dispatcher.register(fp, signaler);
+            assert_eq!(dispatcher.len(), 1);
+            assert!(dispatcher.contains(&fp));
+
+            dispatcher.unregister(&fp);
+            assert_eq!(dispatcher.len(), 0);
+            assert!(!dispatcher.contains(&fp));
+        }).await;
+    }
+}

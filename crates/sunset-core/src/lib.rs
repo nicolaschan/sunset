@@ -30,5 +30,5 @@ pub use liveness::{
 pub use message::{
     ComposedMessage, DecodedMessage, compose_message, compose_receipt, compose_text, decode_message,
 };
-pub use signaling::{RelaySignaler, signaling_filter};
+pub use signaling::{MultiRoomSignaler, RelaySignaler, signaling_filter};
 pub use verifier::Ed25519Verifier;
