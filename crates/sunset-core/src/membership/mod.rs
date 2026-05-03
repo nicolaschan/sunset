@@ -384,6 +384,11 @@ fn handle_engine_event(handles: &TrackerHandles, ev: &EngineEvent) {
         EngineEvent::PeerRemoved { peer_id } => {
             handles.peer_kinds.borrow_mut().remove(peer_id);
         }
+        EngineEvent::PongObserved { .. } => {
+            // Membership tracker is identity-only; per-peer liveness
+            // (last_pong/RTT) is consumed by the supervisor for
+            // IntentSnapshot, not here.
+        }
     }
 }
 
