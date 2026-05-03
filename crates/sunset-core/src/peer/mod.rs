@@ -305,6 +305,39 @@ mod tests {
         }).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_presence_publishes_a_heartbeat_entry() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let peer = helpers::mk_peer(ident(13)).await;
+            let room = peer.open_room("alpha").await.expect("open_room");
+            let my_hex = hex::encode(peer.public_key());
+
+            room.start_presence(50, 1000, 100).await;
+
+            // Wait for the publisher's first iteration.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            use futures::StreamExt;
+            use sunset_store::{Filter, Replay, Store as _};
+            let presence_filter = Filter::NamePrefix(bytes::Bytes::from(format!(
+                "{}/presence/{}",
+                room.fingerprint().to_hex(),
+                my_hex,
+            )));
+            let mut sub = peer
+                .store()
+                .subscribe(presence_filter, Replay::All)
+                .await
+                .expect("subscribe");
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), sub.next())
+                .await
+                .expect("no presence entry within 500ms")
+                .expect("subscription closed");
+            assert!(matches!(ev, Ok(sunset_store::Event::Inserted(_))));
+        }).await;
+    }
+
     pub(super) mod helpers {
         use super::*;
         use async_trait::async_trait;

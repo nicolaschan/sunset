@@ -174,6 +174,48 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             }
         });
     }
+
+    pub async fn start_presence(&self, interval_ms: u64, ttl_ms: u64, refresh_ms: u64) {
+        if self.inner.presence_started.replace(true) {
+            return;
+        }
+        let peer = match self.inner.peer_weak.upgrade() {
+            Some(p) => p,
+            None => return,
+        };
+        let room_fp_hex = self.inner.room.fingerprint().to_hex();
+        let local_peer = sunset_sync::PeerId(peer.identity().store_verifying_key());
+
+        crate::membership::spawn_publisher(
+            peer.identity().clone(),
+            room_fp_hex.clone(),
+            peer.store().clone(),
+            interval_ms,
+            ttl_ms,
+        );
+
+        let engine_events = peer.engine().subscribe_engine_events().await;
+        let snapshot = peer.engine().current_peers().await;
+        {
+            let mut peer_kinds = self.inner.tracker_handles.peer_kinds.borrow_mut();
+            for (pk, kind) in snapshot {
+                peer_kinds.insert(pk, kind);
+            }
+        }
+
+        crate::membership::spawn_tracker(
+            peer.store().clone(),
+            engine_events,
+            local_peer,
+            room_fp_hex,
+            interval_ms,
+            ttl_ms,
+            refresh_ms,
+            (*self.inner.tracker_handles).clone(),
+        );
+
+        crate::membership::fire_relay_status_now(&self.inner.tracker_handles);
+    }
 }
 
 impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
