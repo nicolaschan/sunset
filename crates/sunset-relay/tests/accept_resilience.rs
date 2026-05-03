@@ -88,7 +88,7 @@ async fn relay_accept_loop_survives_a_ws_client_that_skips_noise() {
     local
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
-            let mut relay = Relay::new(relay_config(dir.path()))
+            let mut relay = Relay::start(relay_config(dir.path()))
                 .await
                 .expect("relay new");
             let dial_addr = relay.dial_address();
@@ -155,7 +155,7 @@ async fn relay_accept_loop_survives_a_failed_ws_handshake() {
         .run_until(async {
             // Boot a relay on a random localhost port.
             let dir = tempfile::tempdir().unwrap();
-            let mut relay = Relay::new(relay_config(dir.path()))
+            let mut relay = Relay::start(relay_config(dir.path()))
                 .await
                 .expect("relay new");
             let dial_addr = relay.dial_address();

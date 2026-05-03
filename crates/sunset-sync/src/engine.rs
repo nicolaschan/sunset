@@ -48,30 +48,17 @@ impl ConnectionId {
 /// task. Extracted from `SyncEngine::spawn_peer` so the AddPeer command
 /// handler can call it from a `'static` spawned task without holding
 /// `&self`.
-#[allow(clippy::too_many_arguments)]
 fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     conn: C,
-    local_peer: PeerId,
-    proto: u32,
+    env: crate::peer::PeerEnv,
     conn_id: ConnectionId,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     hello_done: Option<oneshot::Sender<Result<PeerId>>>,
-    heartbeat_interval: std::time::Duration,
-    heartbeat_timeout: std::time::Duration,
 ) {
     let conn = Rc::new(conn);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
     crate::spawn::spawn_local(run_peer(
-        conn,
-        local_peer,
-        proto,
-        conn_id,
-        out_tx,
-        out_rx,
-        inbound_tx,
-        hello_done,
-        heartbeat_interval,
-        heartbeat_timeout,
+        conn, env, conn_id, out_tx, out_rx, inbound_tx, hello_done,
     ));
 }
 
@@ -201,6 +188,16 @@ where
         let id = *next;
         *next += 1;
         ConnectionId(id)
+    }
+
+    /// Snapshot of the engine-level config that every per-peer task needs.
+    fn peer_env(&self) -> crate::peer::PeerEnv {
+        crate::peer::PeerEnv {
+            local_peer: self.local_peer.clone(),
+            protocol_version: self.config.protocol_version,
+            heartbeat_interval: self.config.heartbeat_interval,
+            heartbeat_timeout: self.config.heartbeat_timeout,
+        }
     }
 
     /// Initiate an outbound connection to `addr`. Returns when the connection
@@ -436,10 +433,7 @@ where
                 // progress (e.g. WebRTC, where SDP/ICE flows over the
                 // existing CRDT replication).
                 let transport = self.transport.clone();
-                let local_peer = self.local_peer.clone();
-                let proto = self.config.protocol_version;
-                let hb_int = self.config.heartbeat_interval;
-                let hb_to = self.config.heartbeat_timeout;
+                let env = self.peer_env();
                 let inbound_tx = inbound_tx.clone();
                 let conn_id = self.alloc_conn_id().await;
                 crate::spawn::spawn_local(async move {
@@ -447,16 +441,7 @@ where
                     let r = match connect_res {
                         Ok(conn) => {
                             let (hello_tx, hello_rx) = oneshot::channel::<Result<PeerId>>();
-                            spawn_run_peer(
-                                conn,
-                                local_peer,
-                                proto,
-                                conn_id,
-                                inbound_tx,
-                                Some(hello_tx),
-                                hb_int,
-                                hb_to,
-                            );
+                            spawn_run_peer(conn, env, conn_id, inbound_tx, Some(hello_tx));
                             // Wait for the Hello exchange to complete.
                             match hello_rx.await {
                                 Ok(Ok(peer_id)) => Ok(peer_id),
@@ -498,16 +483,7 @@ where
         inbound_tx: mpsc::UnboundedSender<InboundEvent>,
     ) {
         let conn_id = self.alloc_conn_id().await;
-        spawn_run_peer(
-            conn,
-            self.local_peer.clone(),
-            self.config.protocol_version,
-            conn_id,
-            inbound_tx,
-            None,
-            self.config.heartbeat_interval,
-            self.config.heartbeat_timeout,
-        );
+        spawn_run_peer(conn, self.peer_env(), conn_id, inbound_tx, None);
     }
 
     async fn handle_inbound_event(&self, event: InboundEvent) {

@@ -93,5 +93,12 @@ unused_must_use = "deny"
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
-enum_glob_use = "warn"
-needless_pass_by_value = "warn"
+# Workspace policy: clippy lints cannot be ignored — see CLAUDE.md.
+# `cargo clippy ... -- -D warnings` in CI promotes any clippy warning to
+# an error, and a separate CI step (`scripts/check-no-clippy-allow.sh`)
+# rejects `#[allow(clippy::...)]` and `#[expect(clippy::...)]` in our
+# source. Lints from macro expansions inside dependencies (clap, tokio)
+# are not affected.
+all = { level = "deny", priority = -1 }
+enum_glob_use = "deny"
+needless_pass_by_value = "deny"

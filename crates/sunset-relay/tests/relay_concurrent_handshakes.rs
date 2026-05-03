@@ -67,7 +67,7 @@ async fn rude_clients_do_not_serialize_a_healthy_dial() {
             // Short timeout so the test runs fast even when rude clients
             // eventually time out.
             let dir = tempfile::tempdir().unwrap();
-            let mut relay = Relay::new(relay_config(dir.path(), 1))
+            let mut relay = Relay::start(relay_config(dir.path(), 1))
                 .await
                 .expect("relay new");
             let dial_addr = relay.dial_address();

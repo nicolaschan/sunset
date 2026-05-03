@@ -249,10 +249,12 @@ impl Client {
             self.store.clone(),
             engine_events,
             local_peer,
-            room_fp_hex,
-            interval_ms as u64,
-            ttl_ms as u64,
-            refresh_ms as u64,
+            sunset_core::membership::PresenceConfig {
+                room_fp_hex,
+                interval_ms: interval_ms as u64,
+                ttl_ms: ttl_ms as u64,
+                refresh_ms: refresh_ms as u64,
+            },
             (*self.tracker_handles).clone(),
         );
 
