@@ -332,6 +332,101 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn auto_ack_writes_a_receipt_for_inbound_text_from_peer() {
+        // When a Text from a different identity lands in the store, the
+        // decode loop must auto-write a Receipt back so the original
+        // sender's UI can flip out of "pending" / gray. Without this,
+        // delivery confirmations are silently broken (web/e2e/receipts.spec.js).
+        use rand_core::SeedableRng;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(30)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                // Register a no-op on_message so the decode loop spawns.
+                room.on_message(|_, _| {});
+
+                // Compose a Text from a DIFFERENT identity (peer doesn't
+                // ack its own messages) and insert into the store.
+                let other_identity = ident(31);
+                let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
+                let composed = crate::compose_message(
+                    &other_identity,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    1_700_000_000_000,
+                    crate::MessageBody::Text("from-other".to_owned()),
+                    &mut rng,
+                )
+                .expect("compose_message");
+                let text_value_hash = composed.entry.value_hash;
+                use sunset_store::Store as _;
+                peer.store()
+                    .insert(composed.entry, Some(composed.block))
+                    .await
+                    .expect("insert text");
+
+                // Yield so the decode loop runs the auto-ack.
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                }
+
+                // The store should now hold a Receipt entry authored by
+                // OUR identity (not other_identity) referencing the
+                // text's value_hash. Locate it via room_messages_filter
+                // — Receipts share the `<fp>/msg/` namespace.
+                use futures::StreamExt;
+                use sunset_store::Replay;
+                let filter = crate::filters::room_messages_filter(&room.inner.room);
+                let mut sub = peer
+                    .store()
+                    .subscribe(filter, Replay::All)
+                    .await
+                    .expect("subscribe");
+
+                let mut found_receipt = false;
+                let our_pubkey = peer.identity().public();
+                // Consume the replayed entries (text + receipt) and look
+                // for our auto-ack Receipt.
+                for _ in 0..5 {
+                    let ev = match tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        sub.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(ev)) => ev,
+                        _ => break,
+                    };
+                    let entry = match ev {
+                        Ok(sunset_store::Event::Inserted(e)) => e,
+                        _ => continue,
+                    };
+                    let block = peer
+                        .store()
+                        .get_content(&entry.value_hash)
+                        .await
+                        .expect("get_content")
+                        .expect("block");
+                    let decoded =
+                        crate::decode_message(&room.inner.room, &entry, &block).expect("decode");
+                    if let crate::MessageBody::Receipt { for_value_hash } = decoded.body {
+                        if for_value_hash == text_value_hash && decoded.author_key == our_pubkey {
+                            found_receipt = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(
+                    found_receipt,
+                    "expected an auto-ack Receipt by our identity for the inbound Text"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn on_receipt_fires_for_inserted_receipt() {
         use rand_core::SeedableRng;
         use std::cell::RefCell;

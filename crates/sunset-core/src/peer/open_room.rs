@@ -103,14 +103,26 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             None => return,
         };
         let store = peer.store().clone();
-        let identity_pub = peer.identity().public();
+        let identity = peer.identity().clone();
+        let identity_pub = identity.public();
         let room = inner.room.clone();
         let cancel = inner.cancel_decode.clone();
         let callbacks = inner.callbacks.clone();
 
         sunset_sync::spawn::spawn_local(async move {
             use futures::StreamExt;
+            use rand_chacha::ChaCha20Rng;
+            use rand_core::SeedableRng;
+            use std::collections::HashSet;
             use sunset_store::{Event, Replay};
+
+            // Session-only dedup: which Text value-hashes have we
+            // already auto-acked since this decode loop started?
+            // `Replay::All` redelivers them on subscribe; without this
+            // we'd write a fresh Receipt every time. Cross-session
+            // dedup is out of scope for v1.
+            let mut acked: HashSet<sunset_store::Hash> = HashSet::new();
+            let mut rng = ChaCha20Rng::from_entropy();
 
             let filter = crate::filters::room_messages_filter(&room);
             let mut events = match store.subscribe(filter, Replay::All).await {
@@ -150,17 +162,29 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                 };
 
                 let is_self = decoded.author_key == identity_pub;
-                let cbs = callbacks.borrow();
-                match &decoded.body {
-                    crate::MessageBody::Text(_) => {
-                        if let Some(cb) = cbs.on_message.as_ref() {
-                            cb(&decoded, is_self);
+                {
+                    let cbs = callbacks.borrow();
+                    match &decoded.body {
+                        crate::MessageBody::Text(_) => {
+                            if let Some(cb) = cbs.on_message.as_ref() {
+                                cb(&decoded, is_self);
+                            }
+                        }
+                        crate::MessageBody::Receipt { for_value_hash } => {
+                            if let Some(cb) = cbs.on_receipt.as_ref() {
+                                cb(*for_value_hash, &decoded.author_key);
+                            }
                         }
                     }
-                    crate::MessageBody::Receipt { for_value_hash } => {
-                        if let Some(cb) = cbs.on_receipt.as_ref() {
-                            cb(*for_value_hash, &decoded.author_key);
-                        }
+                }
+
+                // Auto-ack: when a Text from another peer lands, write
+                // a Receipt back so the sender's UI can flip out of
+                // "pending". Skip self-Texts (no point acking your own)
+                // and dedupe per-session against Replay::All re-emits.
+                if let crate::MessageBody::Text(_) = &decoded.body {
+                    if !is_self && acked.insert(entry.value_hash) {
+                        send_receipt(&store, &room, &identity, entry.value_hash, &mut rng).await;
                     }
                 }
             }
@@ -267,5 +291,40 @@ impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
             peer.rtc_signaler_dispatcher
                 .unregister(&self.room.fingerprint());
         }
+    }
+}
+
+/// Compose and insert a delivery Receipt acknowledging
+/// `for_value_hash` (the value_hash of the original Text). Used by the
+/// auto-ack path in `spawn_decode_loop`. Errors are logged via
+/// `tracing` and swallowed — receipts are best-effort; failing to ack
+/// is not fatal.
+async fn send_receipt<St: Store + 'static>(
+    store: &std::sync::Arc<St>,
+    room: &Room,
+    identity: &crate::Identity,
+    for_value_hash: sunset_store::Hash,
+    rng: &mut rand_chacha::ChaCha20Rng,
+) {
+    let now_ms = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let composed = match crate::compose_receipt(
+        identity,
+        room,
+        crate::V1_EPOCH_ID,
+        now_ms,
+        for_value_hash,
+        rng,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("compose_receipt failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = store.insert(composed.entry, Some(composed.block)).await {
+        tracing::error!("store.insert(receipt) failed: {e}");
     }
 }
