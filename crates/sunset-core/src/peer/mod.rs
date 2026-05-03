@@ -101,6 +101,7 @@ where
             )),
             signaler,
             cancel_decode: Rc::new(std::cell::Cell::new(false)),
+            callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
         });
 
         self.open_rooms.borrow_mut().insert(fp, Rc::downgrade(&state));
@@ -227,6 +228,37 @@ mod tests {
             assert_eq!(r1.fingerprint(), r2.fingerprint());
             // Internal: both handles share the same Rc<RoomState>.
             assert!(Rc::ptr_eq(&r1.inner, &r2.inner));
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_message_fires_for_self_send() {
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let peer = helpers::mk_peer(ident(11)).await;
+            let room = peer.open_room("alpha").await.expect("open_room");
+
+            let received: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+            let received_clone = received.clone();
+            room.on_message(move |decoded, is_self| {
+                if let crate::MessageBody::Text(t) = &decoded.body {
+                    received_clone.borrow_mut().push((t.clone(), is_self));
+                }
+            });
+
+            let _ = room
+                .send_text("hello self".to_owned(), 1_700_000_000_000)
+                .await
+                .expect("send_text");
+
+            // Yield repeatedly so the decode loop's spawn_local runs.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+
+            let got = received.borrow().clone();
+            assert_eq!(got, vec![("hello self".to_owned(), true)]);
         }).await;
     }
 
