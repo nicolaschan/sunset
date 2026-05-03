@@ -137,11 +137,14 @@ Add to `crates/sunset-web-wasm/src/lib.rs`:
 pub fn __sunset_web_wasm_start() {
     let mut config = wasm_tracing::WasmLayerConfig::default();
     config.set_max_level(tracing::Level::INFO);
-    wasm_tracing::set_as_global_default_with_config(config);
+    // The Result is `Err` only if a global subscriber was already set,
+    // which can't happen here: this function is the sole #[wasm_bindgen(start)]
+    // entrypoint and runs exactly once per module load.
+    let _ = wasm_tracing::set_as_global_default_with_config(config);
 }
 ```
 
-(API per `wasm-tracing` 2.1.0: `set_as_global_default_with_config(WasmLayerConfig)`. The implementation plan pins the exact version.) `wasm_bindgen(start)` guarantees one call per module load — by the time `Client::new` runs, the subscriber is live.
+(API per `wasm-tracing` 2.1.0: `set_as_global_default_with_config(WasmLayerConfig)` returns `Result<(), SetGlobalDefaultError>`; the workspace lint `unused_must_use = deny` requires the explicit `let _ =`. The implementation plan pins the exact version.) `wasm_bindgen(start)` guarantees one call per module load — by the time `Client::new` runs, the subscriber is live.
 
 ### Workspace `Cargo.toml`
 
