@@ -18,7 +18,7 @@ use sunset_sync_webrtc_browser::WebRtcRawTransport;
 use sunset_sync_ws_browser::WebSocketRawTransport;
 
 use crate::identity::identity_from_seed;
-use crate::relay_signaler::RelaySignaler;
+use sunset_core::RelaySignaler;
 
 type WsT = NoiseTransport<WebSocketRawTransport>;
 type RtcT = NoiseTransport<WebRtcRawTransport>;
@@ -69,7 +69,8 @@ impl Client {
         // Build the WebRTC transport (direct path), backed by the
         // RelaySignaler that drives Noise_KK over CRDT entries.
         let room_fp_hex = room.fingerprint().to_hex();
-        let signaler = RelaySignaler::new(identity.clone(), room_fp_hex.clone(), &store);
+        let signaler: Rc<RelaySignaler<MemoryStore>> =
+            RelaySignaler::new(identity.clone(), room_fp_hex.clone(), &store);
         let local_peer = PeerId(identity.store_verifying_key());
         let signaler_dyn: Rc<dyn sunset_sync::Signaler> = signaler;
         let rtc_raw = WebRtcRawTransport::new(

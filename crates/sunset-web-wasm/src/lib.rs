@@ -12,8 +12,6 @@ mod members;
 #[cfg(target_arch = "wasm32")]
 mod messages;
 #[cfg(target_arch = "wasm32")]
-mod relay_signaler;
-#[cfg(target_arch = "wasm32")]
 pub(crate) mod resolver_adapter;
 #[cfg(target_arch = "wasm32")]
 mod voice;
@@ -25,7 +23,7 @@ pub use members::MemberJs;
 #[cfg(target_arch = "wasm32")]
 pub use messages::IncomingMessage;
 #[cfg(target_arch = "wasm32")]
-pub use relay_signaler::{RelaySignaler, signaling_filter};
+pub use sunset_core::{RelaySignaler, signaling_filter};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Client;
