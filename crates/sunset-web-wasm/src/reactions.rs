@@ -15,11 +15,6 @@ use wasm_bindgen::prelude::*;
 /// }
 /// ```
 ///
-/// Currently unused on the multi-room branch — `on_reactions_changed`
-/// belongs on `RoomHandle` (per-room) and that wiring is the deferred
-/// reactions follow-up. Keep the helper so the follow-up doesn't have
-/// to re-author it.
-#[allow(dead_code)]
 pub fn snapshot_to_js(target: &Hash, snapshot: &ReactionSnapshot) -> JsValue {
     let map = Map::new();
     for (emoji, authors) in snapshot {

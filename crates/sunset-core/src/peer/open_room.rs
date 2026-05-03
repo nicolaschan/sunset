@@ -27,6 +27,7 @@ pub(crate) struct RoomState<St: Store + 'static, T: Transport + 'static> {
     pub(crate) peer_weak: Weak<super::Peer<St, T>>,
     pub(crate) presence_started: Cell<bool>,
     pub(crate) tracker_handles: Rc<TrackerHandles>,
+    pub(crate) reaction_handles: crate::reactions::ReactionHandles,
     pub(crate) cancel_decode: Rc<Cell<bool>>,
     pub(crate) callbacks: Rc<RefCell<RoomCallbacks>>,
 }
@@ -285,6 +286,71 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
 
     pub fn on_relay_status_changed<F: Fn(&str) + 'static>(&self, cb: F) {
         *self.inner.tracker_handles.on_relay_status.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Register a callback that fires whenever the per-target reaction
+    /// snapshot for any message in this room changes. The callback
+    /// receives the target message's `value_hash` and the new
+    /// `ReactionSnapshot` (emoji → set of author identity keys).
+    /// Mirrors `on_members_changed`'s "register late, get current
+    /// state" behaviour by clearing per-target debounce signatures so
+    /// the next event refires the snapshot.
+    pub fn on_reactions_changed<
+        F: Fn(&sunset_store::Hash, &crate::reactions::ReactionSnapshot) + 'static,
+    >(
+        &self,
+        cb: F,
+    ) {
+        *self
+            .inner
+            .reaction_handles
+            .on_reactions_changed
+            .borrow_mut() = Some(Box::new(cb));
+        self.inner
+            .reaction_handles
+            .last_target_signatures
+            .borrow_mut()
+            .clear();
+    }
+
+    /// Compose and insert a Reaction entry into the store. The
+    /// reaction tracker (spawned in `Peer::open_room`) picks it up via
+    /// its `<room_fp>/msg/` subscription and dispatches a snapshot
+    /// change to `on_reactions_changed`. `action` is "add" or "remove".
+    pub async fn send_reaction(
+        &self,
+        target: sunset_store::Hash,
+        emoji: String,
+        action: crate::ReactionAction,
+        sent_at_ms: u64,
+    ) -> crate::Result<()> {
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+
+        let peer = self
+            .inner
+            .peer_weak
+            .upgrade()
+            .ok_or_else(|| crate::Error::Other("peer dropped".into()))?;
+
+        let mut rng = ChaCha20Rng::from_entropy();
+        let composed = crate::compose_reaction(
+            peer.identity(),
+            &self.inner.room,
+            crate::V1_EPOCH_ID,
+            sent_at_ms,
+            &crate::ReactionPayload {
+                for_value_hash: target,
+                emoji: &emoji,
+                action,
+            },
+            &mut rng,
+        )?;
+        peer.store()
+            .insert(composed.entry, Some(composed.block))
+            .await
+            .map_err(|e| crate::Error::Other(format!("store insert: {e}")))?;
+        Ok(())
     }
 }
 

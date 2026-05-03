@@ -198,18 +198,18 @@ pub fn reactions_snapshot_entries(
 /// and again whenever the target's reaction state changes.
 @external(javascript, "./sunset.ffi.mjs", "onReactionsChanged")
 pub fn on_reactions_changed(
-  client: ClientHandle,
+  room: RoomHandle,
   callback: fn(IncomingReactionsSnapshot) -> Nil,
 ) -> Nil
 
-/// Send a reaction event. `action` is "add" or "remove".
+/// Send a reaction event. `action` is "add" or "remove". The wasm
+/// side generates the entry's nonce and sent_at_ms internally.
 @external(javascript, "./sunset.ffi.mjs", "sendReaction")
 pub fn send_reaction(
-  client: ClientHandle,
+  room: RoomHandle,
   target_hex: String,
   emoji: String,
   action: String,
-  sent_at_ms: Int,
   callback: fn(Result(Nil, String)) -> Nil,
 ) -> Nil
 

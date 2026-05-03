@@ -91,4 +91,47 @@ impl RoomHandle {
         };
         self.inner.peer_connection_mode(pk).to_owned()
     }
+
+    pub fn on_reactions_changed(&self, callback: js_sys::Function) {
+        self.inner.on_reactions_changed(move |target, snapshot| {
+            let payload = crate::reactions::snapshot_to_js(target, snapshot);
+            let _ = callback.call1(&JsValue::NULL, &payload);
+        });
+    }
+
+    pub async fn send_reaction(
+        &self,
+        target_value_hash_hex: String,
+        emoji: String,
+        action: String,
+    ) -> Result<(), JsError> {
+        let action = match action.as_str() {
+            "add" => sunset_core::ReactionAction::Add,
+            "remove" => sunset_core::ReactionAction::Remove,
+            other => {
+                return Err(JsError::new(&format!(
+                    "send_reaction: action must be \"add\" or \"remove\", got {other:?}"
+                )));
+            }
+        };
+        let target_bytes = hex::decode(&target_value_hash_hex)
+            .map_err(|e| JsError::new(&format!("send_reaction: bad target hex: {e}")))?;
+        if target_bytes.len() != 32 {
+            return Err(JsError::new(
+                "send_reaction: target hex must decode to 32 bytes",
+            ));
+        }
+        let mut target_arr = [0u8; 32];
+        target_arr.copy_from_slice(&target_bytes);
+        let target: sunset_store::Hash = target_arr.into();
+        let now_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.inner
+            .send_reaction(target, emoji, action, now_ms)
+            .await
+            .map_err(|e| JsError::new(&format!("send_reaction: {e}")))?;
+        Ok(())
+    }
 }

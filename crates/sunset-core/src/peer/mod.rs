@@ -141,6 +141,19 @@ where
         // alive until its store-subscribe stream ends.
         let _ = signaler;
 
+        // Spawn the per-room reaction tracker. It subscribes to
+        // <room_fp>/msg/, decodes Reaction entries, applies LWW per
+        // (author, target, emoji), and fires on_reactions_changed
+        // (registered via OpenRoom::on_reactions_changed) per
+        // debounced per-target snapshot change.
+        let reaction_handles = crate::reactions::ReactionHandles::default();
+        crate::reactions::spawn_reaction_tracker(
+            self.store.clone(),
+            (*room).clone(),
+            fp.to_hex(),
+            reaction_handles.clone(),
+        );
+
         let state = Rc::new(open_room::RoomState {
             room,
             peer_weak: Rc::downgrade(self),
@@ -148,6 +161,7 @@ where
             tracker_handles: Rc::new(crate::membership::TrackerHandles::new(
                 &self.relay_status.borrow(),
             )),
+            reaction_handles,
             cancel_decode: cancel,
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
         });

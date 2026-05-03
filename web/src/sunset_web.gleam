@@ -824,6 +824,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           sunset.on_relay_status_changed(handle, fn(s) {
             dispatch(RelayStatusUpdated(s))
           })
+          sunset.on_reactions_changed(handle, fn(snapshot_payload) {
+            let target = sunset.reactions_snapshot_target_hex(snapshot_payload)
+            let entries = sunset.reactions_snapshot_entries(snapshot_payload)
+            let inner_dict =
+              list.fold(entries, dict.new(), fn(d, pair) {
+                let #(emoji, authors) = pair
+                dict.insert(d, emoji, set.from_list(authors))
+              })
+            dispatch(ReactionsChanged(target, inner_dict))
+          })
           sunset.start_presence(handle, interval, ttl, refresh)
         })
       #(Model(..model, rooms: new_rooms), wire_eff)
@@ -1121,7 +1131,52 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, reactions: dict.insert(model.reactions, target, snapshot)),
       effect.none(),
     )
-    ToggleReactionEmoji(_, _) -> #(model, effect.none())
+    ToggleReactionEmoji(target, emoji) -> {
+      // Decide add-vs-remove from the current per-target snapshot:
+      // if our own pubkey already authored this emoji, send "remove",
+      // otherwise "add". The reaction tracker enforces LWW so even if
+      // the local snapshot is slightly stale the engine resolves it.
+      let active_name = active_room_name(model)
+      let self_pubkey_hex_opt =
+        option.map(model.client, fn(c) { client_pubkey_hex(c) })
+      let action = case dict.get(model.reactions, target) {
+        Ok(snap) ->
+          case dict.get(snap, emoji), self_pubkey_hex_opt {
+            Ok(authors), Some(me) ->
+              case set.contains(authors, me) {
+                True -> "remove"
+                False -> "add"
+              }
+            _, _ -> "add"
+          }
+        Error(_) -> "add"
+      }
+      let next_model = Model(..model, full_picker_for: None)
+      let send_eff = case dict.get(model.rooms, active_name) {
+        Ok(state) ->
+          case state.handle {
+            Some(handle) ->
+              effect.from(fn(dispatch) {
+                sunset.send_reaction(handle, target, emoji, action, fn(r) {
+                  dispatch(ReactionSent(r))
+                })
+              })
+            None -> effect.none()
+          }
+        Error(_) -> effect.none()
+      }
+      // Also clear per-room reacting_to (close the quick-picker).
+      let rooms = case dict.get(model.rooms, active_name) {
+        Ok(state) ->
+          dict.insert(
+            model.rooms,
+            active_name,
+            RoomState(..state, reacting_to: None),
+          )
+        Error(_) -> model.rooms
+      }
+      #(Model(..next_model, rooms: rooms), send_eff)
+    }
     ReactionSent(_) -> #(model, effect.none())
     OpenFullEmojiPicker(target) -> #(
       Model(..model, full_picker_for: Some(target)),
@@ -1176,12 +1231,27 @@ fn room_view_with_state(
   let active_room =
     lookup_room(displayed_rooms, current_name, model.relay_status)
 
+  let self_pubkey_hex = option.map(model.client, fn(c) { client_pubkey_hex(c) })
   let raw_messages = state.messages
+  // Two reaction sources are layered onto the message list:
+  //   1. `model.reactions[target]` — real reactions from the engine
+  //      tracker (preferred, drives chip counts + by_you).
+  //   2. `state.reactions[message_id]` — UI-only fixture toggle from
+  //      AddReaction. Falls back to this if the engine has nothing
+  //      yet (so the fixture row still pre-renders the seeded chips).
   let messages_with_live_reactions =
     list.map(raw_messages, fn(m) {
-      case dict.get(state.reactions, m.id) {
-        Ok(rs) -> domain.Message(..m, reactions: rs)
-        Error(_) -> m
+      case dict.get(model.reactions, m.id) {
+        Ok(snap) ->
+          domain.Message(
+            ..m,
+            reactions: snapshot_to_reactions(snap, self_pubkey_hex),
+          )
+        Error(_) ->
+          case dict.get(state.reactions, m.id) {
+            Ok(rs) -> domain.Message(..m, reactions: rs)
+            Error(_) -> m
+          }
       }
     })
 
