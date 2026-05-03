@@ -356,6 +356,60 @@ impl MultiRoomSignaler {
     }
 }
 
+#[async_trait(?Send)]
+impl Signaler for MultiRoomSignaler {
+    async fn send(&self, message: SignalMessage) -> SyncResult<()> {
+        // Pick the first registered per-room signaler. The receiver
+        // subscribes to all its open rooms, so any one is sufficient as
+        // a carrier as long as we both have it open. If no rooms are
+        // registered, fail with a clear error.
+        let signaler = {
+            let map = self.by_room.borrow();
+            map.values().next().cloned()
+        };
+        match signaler {
+            Some(s) => s.send(message).await,
+            None => Err(SyncError::Transport(
+                "MultiRoomSignaler::send with no rooms registered".into(),
+            )),
+        }
+    }
+
+    async fn recv(&self) -> SyncResult<SignalMessage> {
+        // Loop: snapshot the current set of per-room signalers, race
+        // their recv()s + the register_notify. If a new signaler
+        // registers, re-snapshot.
+        loop {
+            let signalers: Vec<Rc<dyn Signaler>> = {
+                self.by_room.borrow().values().cloned().collect()
+            };
+            if signalers.is_empty() {
+                // No signalers — wait for a registration.
+                self.register_notify.notified().await;
+                continue;
+            }
+            // Build a select! across N recvs + the notify.
+            let mut futures: futures::stream::FuturesUnordered<_> = signalers
+                .iter()
+                .map(|s| {
+                    let s = s.clone();
+                    async move { s.recv().await }
+                })
+                .collect();
+            tokio::select! {
+                biased;
+                _ = self.register_notify.notified() => {
+                    // New room registered; re-snapshot.
+                    continue;
+                }
+                Some(result) = futures::StreamExt::next(&mut futures) => {
+                    return result;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod multi_room_tests {
     use super::*;
@@ -396,6 +450,54 @@ mod multi_room_tests {
             dispatcher.unregister(&fp);
             assert_eq!(dispatcher.len(), 0);
             assert!(!dispatcher.contains(&fp));
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_routes_to_registered_signaler_and_reaches_via_recv() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            // Two peers (Alice, Bob) sharing one room. Each builds a
+            // MultiRoomSignaler with one entry. Alice sends to Bob; Bob
+            // recv's the message.
+            let alice_id = ident(1);
+            let bob_id = ident(2);
+            let alice_pk = PeerId(alice_id.store_verifying_key());
+            let bob_pk = PeerId(bob_id.store_verifying_key());
+
+            // Shared store, simulating a fully-replicated relay so both
+            // signalers see the same entries.
+            let st = store();
+            let room = Room::open_with_params("alpha", &test_fast_params()).expect("Room::open");
+            let fp = room.fingerprint();
+
+            let alice_signaler = RelaySignaler::new(alice_id, fp.to_hex(), &st);
+            let bob_signaler = RelaySignaler::new(bob_id, fp.to_hex(), &st);
+
+            let alice_dispatcher = MultiRoomSignaler::new();
+            alice_dispatcher.register(fp, alice_signaler);
+            let bob_dispatcher = MultiRoomSignaler::new();
+            bob_dispatcher.register(fp, bob_signaler);
+
+            let payload = bytes::Bytes::from_static(b"hello-bob");
+            alice_dispatcher.send(SignalMessage {
+                from: alice_pk.clone(),
+                to: bob_pk.clone(),
+                seq: 0,
+                payload: payload.clone(),
+            }).await.expect("alice.send");
+
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                bob_dispatcher.recv(),
+            ).await.expect("recv timed out").expect("recv error");
+
+            // The payload that arrives is decrypted Noise plaintext, which is
+            // our original `payload` bytes (KK first message carries an attached
+            // payload that's plaintext after decryption).
+            assert_eq!(received.from, alice_pk);
+            assert_eq!(received.to, bob_pk);
+            assert_eq!(received.payload.as_ref(), b"hello-bob");
         }).await;
     }
 }
