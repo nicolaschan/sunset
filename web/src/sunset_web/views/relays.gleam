@@ -273,3 +273,173 @@ fn state_attr(s: RelayConnState) -> String {
     RelayCancelled -> "cancelled"
   }
 }
+
+pub type Placement {
+  Floating
+  InSheet
+}
+
+pub fn popover(
+  palette p: Palette,
+  relay r: Relay,
+  now_ms now: Int,
+  placement placement: Placement,
+  on_close on_close: msg,
+) -> Element(msg) {
+  let body =
+    html.div(
+      [
+        ui.css([
+          #("display", "flex"),
+          #("flex-direction", "column"),
+          #("gap", "10px"),
+          #("padding", "14px 16px"),
+        ]),
+      ],
+      [
+        header(p, r.host, on_close),
+        status_pill(p, r.state, format_status(r.state, r.attempt)),
+        info_row(
+          p,
+          "relay-popover-heard-from",
+          "heard from " <> humanize_age(now, r.last_pong_at_ms),
+        ),
+        info_row(p, "relay-popover-rtt", format_rtt(r.last_rtt_ms)),
+        mono_row(p, "relay-popover-label", r.raw_label),
+        case r.peer_id_short {
+          option.Some(s) -> mono_row(p, "relay-popover-peer-id", s)
+          option.None -> element.fragment([])
+        },
+      ],
+    )
+
+  case placement {
+    Floating ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "relay-popover"),
+          ui.css([
+            #("position", "fixed"),
+            #("top", "120px"),
+            #("right", "260px"),
+            #("width", "300px"),
+            #("background", p.surface),
+            #("color", p.text),
+            #("border", "1px solid " <> p.border),
+            #("border-radius", "10px"),
+            #("box-shadow", p.shadow_lg),
+            #("z-index", "20"),
+          ]),
+        ],
+        [body],
+      )
+    InSheet ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "relay-popover"),
+          ui.css([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("background", p.surface),
+            #("color", p.text),
+          ]),
+        ],
+        [body],
+      )
+  }
+}
+
+fn header(p: Palette, host: String, on_close: msg) -> Element(msg) {
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("justify-content", "space-between"),
+        #("gap", "8px"),
+      ]),
+    ],
+    [
+      html.span(
+        [
+          ui.css([
+            #("font-weight", "600"),
+            #("font-size", "16px"),
+            #("color", p.text),
+            #("white-space", "nowrap"),
+            #("overflow", "hidden"),
+            #("text-overflow", "ellipsis"),
+          ]),
+        ],
+        [html.text(host)],
+      ),
+      html.button(
+        [
+          attribute.attribute("data-testid", "relay-popover-close"),
+          event.on_click(on_close),
+          ui.css([
+            #("background", "transparent"),
+            #("border", "none"),
+            #("color", p.text_faint),
+            #("cursor", "pointer"),
+            #("font-size", "16px"),
+            #("padding", "0 4px"),
+          ]),
+        ],
+        [html.text("×")],
+      ),
+    ],
+  )
+}
+
+fn status_pill(p: Palette, state: RelayConnState, label: String) -> Element(msg) {
+  let bg = case state {
+    RelayConnected -> p.live
+    RelayConnecting -> p.warn
+    RelayBackoff -> p.warn
+    RelayCancelled -> p.text_faint
+  }
+  html.span(
+    [
+      attribute.attribute("data-testid", "relay-popover-status"),
+      ui.css([
+        #("align-self", "flex-start"),
+        #("padding", "2px 8px"),
+        #("border-radius", "999px"),
+        #("background", bg),
+        #("color", p.accent_ink),
+        #("font-size", "13px"),
+        #("font-weight", "600"),
+      ]),
+    ],
+    [html.text(label)],
+  )
+}
+
+fn info_row(p: Palette, testid: String, text: String) -> Element(msg) {
+  html.div(
+    [
+      attribute.attribute("data-testid", testid),
+      ui.css([
+        #("font-size", "14px"),
+        #("color", p.text_muted),
+      ]),
+    ],
+    [html.text(text)],
+  )
+}
+
+fn mono_row(p: Palette, testid: String, text: String) -> Element(msg) {
+  html.div(
+    [
+      attribute.attribute("data-testid", testid),
+      ui.css([
+        #("font-family", "monospace"),
+        #("font-size", "13px"),
+        #("color", p.text_faint),
+        #("word-break", "break-all"),
+      ]),
+    ],
+    [html.text(text)],
+  )
+}

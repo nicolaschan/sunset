@@ -1473,6 +1473,30 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
+  let relay_sheet_el = case model.viewport, model.relays_popover {
+    domain.Phone, Some(id) -> {
+      let rs = relays_view.relays_for_view(model.intents)
+      case list.find(rs, fn(r) { r.id == id }) {
+        Ok(r) ->
+          bottom_sheet.view(
+            palette: palette,
+            open: True,
+            on_close: CloseRelayPopover,
+            test_id: "relay-sheet",
+            content: relays_view.popover(
+              palette: palette,
+              relay: r,
+              now_ms: model.now_ms,
+              placement: relays_view.InSheet,
+              on_close: CloseRelayPopover,
+            ),
+          )
+        Error(_) -> element.fragment([])
+      }
+    }
+    _, _ -> element.fragment([])
+  }
+
   let user_in_call = list.any(fixture.members(), fn(m) { m.you && m.in_call })
 
   let active_voice_channel_name =
@@ -1595,6 +1619,7 @@ fn room_view_with_state(
     element.fragment([
       voice_popover_overlay(palette, model, state),
       peer_status_popover_overlay(palette, model, state),
+      relay_popover_overlay(palette, model),
       full_picker_overlay_el,
     ]),
     phone_header.view(
@@ -1605,7 +1630,7 @@ fn room_view_with_state(
     ),
     details_sheet_el,
     voice_sheet_el,
-    peer_status_sheet_el,
+    element.fragment([peer_status_sheet_el, relay_sheet_el]),
     element.fragment([reaction_sheet_el, full_picker_sheet_el]),
   )
 }
@@ -1658,6 +1683,29 @@ fn peer_status_popover_overlay(
             on_close: ClosePeerStatusPopover,
           )
       }
+    _, _ -> element.fragment([])
+  }
+}
+
+fn relay_popover_overlay(
+  palette,
+  model: Model,
+) -> Element(Msg) {
+  case model.viewport, model.relays_popover {
+    domain.Desktop, Some(id) -> {
+      let rs = relays_view.relays_for_view(model.intents)
+      case list.find(rs, fn(r) { r.id == id }) {
+        Ok(r) ->
+          relays_view.popover(
+            palette: palette,
+            relay: r,
+            now_ms: model.now_ms,
+            placement: relays_view.Floating,
+            on_close: CloseRelayPopover,
+          )
+        Error(_) -> element.fragment([])
+      }
+    }
     _, _ -> element.fragment([])
   }
 }
