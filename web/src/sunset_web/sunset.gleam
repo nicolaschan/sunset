@@ -32,6 +32,11 @@ pub fn add_relay(
   callback: fn(Result(Nil, String)) -> Nil,
 ) -> Nil
 
+/// Schedule `callback()` after `ms` milliseconds (JS `setTimeout`).
+/// Used by the relay-connect retry loop in `sunset_web.gleam`.
+@external(javascript, "./sunset.ffi.mjs", "delayMs")
+pub fn delay_ms(ms: Int, callback: fn() -> Nil) -> Nil
+
 /// Subscribe the engine to "all messages in this room".
 @external(javascript, "./sunset.ffi.mjs", "publishRoomSubscription")
 pub fn publish_room_subscription(

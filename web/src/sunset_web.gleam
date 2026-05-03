@@ -150,7 +150,11 @@ pub type Msg {
   // sunset-web-wasm bridge wiring:
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
-  RelayConnectResult(Result(Nil, String))
+  /// Result of a `Client::add_relay` call. The URL is carried alongside
+  /// the result so the retry handler knows which relay to redial after a
+  /// transient failure (e.g. resolver fetch returning 503 during a relay
+  /// deploy).
+  RelayConnectResult(url: String, result: Result(Nil, String))
   SubscribePublishResult(Result(Nil, String))
   IncomingMsg(IncomingMessage)
   IncomingReceipt(message_id: String, from_pubkey: String)
@@ -621,7 +625,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         effect.from(fn(dispatch) {
           list.each(relays, fn(url) {
             sunset.add_relay(client, url, fn(r) {
-              dispatch(RelayConnectResult(r))
+              dispatch(RelayConnectResult(url, r))
             })
           })
         })
@@ -634,7 +638,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         effect.batch([on_receipt_eff, on_msg_eff, presence_eff, connect_eff]),
       )
     }
-    RelayConnectResult(Ok(_)) ->
+    RelayConnectResult(_url, Ok(_)) ->
       case model.client {
         Some(client) -> {
           let pub_eff =
@@ -647,10 +651,29 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
         None -> #(model, effect.none())
       }
-    RelayConnectResult(Error(_)) -> #(
-      Model(..model, relay_status: "error"),
-      effect.none(),
-    )
+    // The initial `add_relay` runs the resolver (`HTTP GET /` to learn
+    // the relay's x25519 key) and then the supervisor's first dial. If
+    // either fails — most commonly the resolver fetch returning 503 with
+    // no CORS during a relay deploy — the supervisor *removes* the
+    // intent (see `sunset-sync/src/supervisor.rs::handle_command`'s
+    // first-dial failure branch), so nothing else will retry on our
+    // behalf. Schedule a redial here with a short backoff so the client
+    // recovers automatically once the relay is healthy again.
+    RelayConnectResult(url, Error(_)) ->
+      case model.client {
+        Some(client) -> {
+          let retry_eff =
+            effect.from(fn(dispatch) {
+              sunset.delay_ms(2000, fn() {
+                sunset.add_relay(client, url, fn(r) {
+                  dispatch(RelayConnectResult(url, r))
+                })
+              })
+            })
+          #(Model(..model, relay_status: "reconnecting"), retry_eff)
+        }
+        None -> #(model, effect.none())
+      }
     SubscribePublishResult(_) -> #(model, effect.none())
     IncomingMsg(im) -> {
       let new_msg =
@@ -1255,6 +1278,7 @@ fn relay_status_to_conn(relay_status: String) -> domain.ConnStatus {
   case relay_status {
     "connected" -> domain.Connected
     "connecting" -> domain.Reconnecting
+    "reconnecting" -> domain.Reconnecting
     "error" -> domain.Offline
     "disconnected" -> domain.Offline
     _ -> domain.Connected

@@ -80,6 +80,13 @@ export async function addRelay(client, url, callback) {
   }
 }
 
+// Schedule `callback()` to fire after `ms` milliseconds. Used by the
+// frontend's `add_relay` retry loop to back off after a failed initial
+// connect (e.g. resolver fetch returning 503 during a relay deploy).
+export function delayMs(ms, callback) {
+  setTimeout(callback, ms);
+}
+
 export async function publishRoomSubscription(client, callback) {
   try {
     await client.publish_room_subscription();
