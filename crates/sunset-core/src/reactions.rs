@@ -125,6 +125,25 @@ pub(crate) fn derive_snapshot(state: &ReactionState, target: &Hash) -> ReactionS
     out
 }
 
+/// Stable signature of a snapshot used for debounce. Sorted lex on
+/// emoji, then on author key bytes. Equal snapshots produce equal
+/// signatures regardless of HashMap/BTreeSet iteration order quirks.
+pub fn reactions_signature(snapshot: &ReactionSnapshot) -> ReactionSig {
+    let mut emoji_keys: Vec<&String> = snapshot.keys().collect();
+    emoji_keys.sort();
+    emoji_keys
+        .into_iter()
+        .map(|emoji| {
+            let mut authors: Vec<Vec<u8>> = snapshot[emoji]
+                .iter()
+                .map(|k| k.as_bytes().to_vec())
+                .collect();
+            authors.sort();
+            (emoji.clone(), authors)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod apply_event_tests {
     use super::*;
@@ -336,5 +355,66 @@ mod apply_event_tests {
         let snap = derive_snapshot(&state, &target);
         assert!(snap.get("👍").unwrap().contains(&alice));
         assert!(snap.get("🎉").unwrap().contains(&alice));
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use rand_core::OsRng;
+
+    fn alice() -> IdentityKey {
+        crate::identity::Identity::generate(&mut OsRng).public()
+    }
+
+    #[test]
+    fn signature_equal_for_equivalent_snapshots() {
+        let mut a = ReactionSnapshot::new();
+        let mut b = ReactionSnapshot::new();
+        let alice = alice();
+        a.entry("👍".to_owned()).or_default().insert(alice.clone());
+        b.entry("👍".to_owned()).or_default().insert(alice.clone());
+        assert_eq!(reactions_signature(&a), reactions_signature(&b));
+    }
+
+    #[test]
+    fn signature_changes_when_emoji_added() {
+        let mut a = ReactionSnapshot::new();
+        let alice = alice();
+        a.entry("👍".to_owned()).or_default().insert(alice.clone());
+        let s1 = reactions_signature(&a);
+        a.entry("🎉".to_owned()).or_default().insert(alice.clone());
+        let s2 = reactions_signature(&a);
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn signature_changes_when_author_added() {
+        let mut a = ReactionSnapshot::new();
+        let key1 = alice();
+        let key2 = alice(); // distinct identity
+        a.entry("👍".to_owned()).or_default().insert(key1);
+        let s1 = reactions_signature(&a);
+        a.entry("👍".to_owned()).or_default().insert(key2);
+        let s2 = reactions_signature(&a);
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn signature_stable_under_iteration_order() {
+        let key1 = alice();
+        let key2 = alice();
+        let key3 = alice();
+        let mut snap = ReactionSnapshot::new();
+        for author in [key1.clone(), key2.clone(), key3.clone()] {
+            snap.entry("👍".to_owned()).or_default().insert(author);
+        }
+        let s1 = reactions_signature(&snap);
+        let mut snap2 = ReactionSnapshot::new();
+        for author in [key3, key1, key2] {
+            snap2.entry("👍".to_owned()).or_default().insert(author);
+        }
+        let s2 = reactions_signature(&snap2);
+        assert_eq!(s1, s2);
     }
 }
