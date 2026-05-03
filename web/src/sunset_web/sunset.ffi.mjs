@@ -198,6 +198,13 @@ export function formatTimeMs(ms) {
   return `${hh}:${mm}`;
 }
 
+/// Encode a BitArray (Uint8Array internally) as lowercase hex.
+/// Used by the relays popover to render the relay's peer_id.
+export function bitsToHex(bits) {
+  const bytes = bitsToBytes(bits);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // IncomingMessage accessors. The wasm-bindgen-generated class exposes
 // fields directly via getters.
 export function incAuthorPubkey(msg) { return new BitArray(msg.author_pubkey); }
