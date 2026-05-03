@@ -10,9 +10,7 @@ import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
-import sunset_web/theme.{
-  type Palette, type Pref, DarkPref, LightPref, System,
-}
+import sunset_web/theme.{type Palette, type Pref, DarkPref, LightPref, System}
 import sunset_web/ui
 
 pub type Placement {

@@ -548,10 +548,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // The reset wipes localStorage and reloads, so any in-flight
       // model state is discarded. We dispatch nothing else: the FFI
       // call ends in `location.reload()`.
-      #(
-        model,
-        effect.from(fn(_) { storage.reset_local_state_and_reload() }),
-      )
+      #(model, effect.from(fn(_) { storage.reset_local_state_and_reload() }))
     }
     HashChanged(hash) -> {
       let new_view = case hash {
@@ -1722,7 +1719,11 @@ fn room_view_with_state(
     details_sheet_el,
     voice_sheet_el,
     peer_status_sheet_el,
-    element.fragment([reaction_sheet_el, full_picker_sheet_el, settings_sheet_el]),
+    element.fragment([
+      reaction_sheet_el,
+      full_picker_sheet_el,
+      settings_sheet_el,
+    ]),
   )
 }
 
