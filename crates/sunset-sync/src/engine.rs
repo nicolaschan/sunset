@@ -666,7 +666,6 @@ where
     /// matching `replay_existing_subscriptions`.
     #[allow(dead_code)] // wired in next commit
     async fn own_published_filters(&self) -> Vec<Filter> {
-        use futures::StreamExt as _;
         let mut out = Vec::new();
         let filter = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
         let mut entries = match self.store.iter(filter).await {
@@ -680,7 +679,7 @@ where
             let entry = match item {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::warn!(error = %e, "own_published_filters: entry");
+                    tracing::warn!(error = %e, "own_published_filters: store iteration");
                     continue;
                 }
             };
