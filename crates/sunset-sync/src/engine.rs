@@ -573,8 +573,14 @@ where
                         .await;
                 }
             }
-            // Placeholder: real handler wired in Task 3.
-            InboundEvent::PongObserved { .. } => {}
+            InboundEvent::PongObserved { peer_id, rtt_ms, observed_at_unix_ms } => {
+                self.emit_engine_event(EngineEvent::PongObserved {
+                    peer_id,
+                    rtt_ms,
+                    observed_at_unix_ms,
+                })
+                .await;
+            }
         }
     }
 
@@ -2187,6 +2193,42 @@ mod tests {
                     filters.contains(&chat_filter),
                     "per-filter digest must fire on anti-entropy tick (got {filters:?})"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pong_observed_inbound_event_propagates_as_engine_event() {
+        use crate::engine::EngineEvent;
+        use crate::peer::InboundEvent;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let mut sub = engine.subscribe_engine_events().await;
+                let pid = PeerId(vk(b"bob"));
+
+                engine
+                    .handle_inbound_event(InboundEvent::PongObserved {
+                        peer_id: pid.clone(),
+                        rtt_ms: 42,
+                        observed_at_unix_ms: 1_700_000_000_000,
+                    })
+                    .await;
+
+                let ev = tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv())
+                    .await
+                    .expect("no engine event")
+                    .expect("subscriber closed");
+                match ev {
+                    EngineEvent::PongObserved { peer_id, rtt_ms, observed_at_unix_ms } => {
+                        assert_eq!(peer_id, pid);
+                        assert_eq!(rtt_ms, 42);
+                        assert_eq!(observed_at_unix_ms, 1_700_000_000_000);
+                    }
+                    other => panic!("unexpected event: {other:?}"),
+                }
             })
             .await;
     }
