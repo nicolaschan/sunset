@@ -24,6 +24,7 @@ import sunset_web/domain.{
   type ChannelId, type Message, type Reaction, ChannelId, HasBridge, Minecraft,
   NoBridge,
 }
+import sunset_web/markdown
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
@@ -47,6 +48,8 @@ pub fn view(
   receipts receipts: Dict(String, Set(String)),
   selected_msg_id selected_msg_id: Option(String),
   on_toggle_selected on_toggle_selected: fn(String) -> msg,
+  is_spoiler_revealed is_revealed: fn(markdown.SpoilerKey) -> Bool,
+  on_toggle_spoiler on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
   // Slot rendered between the channel header and the message list.
   // Used by the phone shell for the in-call voice mini-bar — voice
   // chat is a per-channel concern, so the banner sits inside the
@@ -90,6 +93,8 @@ pub fn view(
         receipts,
         selected_msg_id,
         on_toggle_selected,
+        is_revealed,
+        on_toggle_spoiler,
       ),
       composer(p, viewport, channel_name, draft, on_draft, on_submit, noop),
     ],
@@ -139,6 +144,8 @@ fn messages_list(
   receipts: Dict(String, Set(String)),
   selected_msg_id: Option(String),
   on_toggle_selected: fn(String) -> msg,
+  is_revealed: fn(markdown.SpoilerKey) -> Bool,
+  on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
 ) -> Element(msg) {
   let last_seen_index = last_own_seen_index(ms)
   // Pair each message with its index AND its predecessor's author (for grouping).
@@ -181,6 +188,8 @@ fn messages_list(
         on_open_detail,
         on_toggle_selected,
         receipts,
+        is_revealed,
+        on_toggle_spoiler,
       )
     })
 
@@ -218,6 +227,8 @@ fn message_view(
   on_open_detail: fn(String) -> msg,
   on_toggle_selected: fn(String) -> msg,
   receipts: Dict(String, Set(String)),
+  is_revealed: fn(markdown.SpoilerKey) -> Bool,
+  on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
 ) -> Element(msg) {
   let pending =
     m.you
@@ -294,7 +305,7 @@ fn message_view(
                   #("word-break", "break-word"),
                 ]),
               ],
-              [html.text(m.body)],
+              [markdown.render(m.body, m.id, is_revealed, on_toggle_spoiler, p)],
             ),
             case m.reactions {
               [] -> element.fragment([])

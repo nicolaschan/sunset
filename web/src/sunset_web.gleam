@@ -32,6 +32,7 @@ import sunset_web/fixture
 import sunset_web/scroll_anchor
 import sunset_web/storage
 import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
+import sunset_web/markdown
 import sunset_web/theme.{type Mode, Dark, Light}
 import sunset_web/ui
 import sunset_web/views/bottom_sheet
@@ -1223,6 +1224,12 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       receipts: model.receipts,
       selected_msg_id: model.selected_msg_id,
       on_toggle_selected: ToggleMessageSelected,
+      is_spoiler_revealed: fn(k: markdown.SpoilerKey) {
+        set.contains(model.revealed_spoilers, #(k.message_id, k.offset))
+      },
+      on_toggle_spoiler: fn(k: markdown.SpoilerKey) {
+        ToggleSpoiler(k.message_id, k.offset)
+      },
       voice_minibar: voice_minibar_el,
     ),
     case model.viewport, detail_msg {
