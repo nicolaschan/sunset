@@ -7,8 +7,6 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures::stream::LocalBoxStream;
 use rand_chacha::ChaCha20Rng;
 
 use sunset_core::liveness::Liveness;
@@ -16,6 +14,7 @@ use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
 use crate::VoiceEncoder;
+use crate::runtime::dyn_bus::DynBus;
 use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink};
 
 pub(crate) struct RuntimeInner {
@@ -91,21 +90,4 @@ impl RuntimeInner {
             false
         }
     }
-}
-
-/// Type-erased `Bus`. The runtime takes an `Arc<dyn DynBus>` so it
-/// doesn't need to be parameterized over `<S: Store, T: Transport>`.
-/// Browsers + native pass an `Arc<BusImpl<...>>` cast to `dyn DynBus`.
-#[async_trait::async_trait(?Send)]
-pub trait DynBus: Send + Sync {
-    async fn publish_ephemeral(
-        &self,
-        name: Bytes,
-        payload: Bytes,
-    ) -> Result<(), Box<dyn std::error::Error>>;
-
-    async fn subscribe_voice_prefix(
-        &self,
-        prefix: Bytes,
-    ) -> Result<LocalBoxStream<'static, sunset_core::bus::BusEvent>, Box<dyn std::error::Error>>;
 }

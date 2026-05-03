@@ -196,4 +196,4 @@ mod tests {
 pub mod packet;
 pub mod runtime;
 
-pub use runtime::{VoiceRuntime, VoiceTasks, VoicePeerState, Dialer, FrameSink, PeerStateSink};
+pub use runtime::{Dialer, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime, VoiceTasks};

@@ -12,6 +12,7 @@
 //! (`wasm_bindgen_futures::spawn_local` for browser, `LocalSet::spawn_local`
 //! for native).
 
+mod dyn_bus;
 mod state;
 mod traits;
 
@@ -28,7 +29,7 @@ use sunset_core::{Identity, Room};
 
 use crate::VoiceEncoder;
 
-pub use state::DynBus;
+pub use dyn_bus::DynBus;
 pub use traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -182,14 +183,21 @@ impl VoiceRuntime {
         *self.inner.deafened.borrow_mut() = deafened;
     }
 
-    /// Read mute state — used by heartbeat task and tests.
-    #[doc(hidden)]
+    /// Stop the runtime. Dropping `self` has the same effect — all tasks
+    /// observe the `Weak` upgrade failure and exit cleanly.
+    pub fn stop(self) {
+        drop(self);
+    }
+
+    /// Read mute state. Gated behind `test-hooks`; production code
+    /// reads `inner.muted` directly.
+    #[cfg(feature = "test-hooks")]
     pub fn is_muted(&self) -> bool {
         *self.inner.muted.borrow()
     }
 
     /// Test-only: report jitter buffer depth for a peer.
-    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
     pub fn test_jitter_len(&self, peer: &sunset_sync::PeerId) -> usize {
         self.inner
             .jitter
@@ -200,7 +208,7 @@ impl VoiceRuntime {
     }
 
     /// Test-only: push a PCM frame directly into the jitter buffer.
-    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
     pub fn test_push_frame(&self, peer: sunset_sync::PeerId, pcm: Vec<f32>) {
         self.inner
             .jitter
