@@ -13,6 +13,7 @@
 //// so a refresh restores the user's state.
 
 import gleam/dict.{type Dict}
+import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -25,8 +26,7 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
-  Reaction, Room, RoomId,
+  type ChannelId, type Message, type Room, ChannelId, NoBridge, Room, RoomId,
 }
 import sunset_web/fixture
 import sunset_web/scroll_anchor
@@ -69,7 +69,11 @@ pub type Model {
     current_channel: ChannelId,
     draft: String,
     reacting_to: Option(String),
-    reactions: Dict(String, List(Reaction)),
+    /// Per-target reaction state from the bridge tracker. Whole-snapshot
+    /// replacement on each `ReactionsChanged` — never partially merged in
+    /// the FE; the core tracker is the source of truth. Shape:
+    /// `Dict(target_hex, Dict(emoji, Set(author_pubkey_hex)))`.
+    reactions: Dict(String, Dict(String, Set(String))),
     /// Name of the room currently being dragged in the rooms rail.
     /// `None` between drag operations.
     dragging_room: Option(String),
@@ -135,7 +139,9 @@ pub type Msg {
   UpdateDraft(String)
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
-  AddReaction(String, String)
+  ReactionsChanged(target: String, snapshot: Dict(String, Set(String)))
+  ToggleReactionEmoji(target: String, emoji: String)
+  ReactionSent(Result(Nil, String))
   OpenDetail(String)
   CloseDetail
   OpenVoicePopover(String)
@@ -220,7 +226,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       current_channel: ChannelId(fixture.initial_channel_id),
       draft: "",
       reacting_to: None,
-      reactions: seed_reactions(),
+      reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
       voice_settings: seed_voice_settings(),
@@ -336,11 +342,6 @@ fn member_voice_settings(
     Error(_) ->
       domain.VoiceSettings(volume: 100, denoise: True, deafened: False)
   }
-}
-
-fn seed_reactions() -> Dict(String, List(Reaction)) {
-  fixture.messages()
-  |> list.fold(dict.new(), fn(d, m) { dict.insert(d, m.id, m.reactions) })
 }
 
 /// Add `name` to `existing` if it isn't already present (prepending
@@ -625,13 +626,32 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             })
           })
         })
+      let on_reactions_eff =
+        effect.from(fn(dispatch) {
+          sunset.on_reactions_changed(client, fn(snapshot_payload) {
+            let target = sunset.reactions_snapshot_target_hex(snapshot_payload)
+            let entries = sunset.reactions_snapshot_entries(snapshot_payload)
+            let inner_dict =
+              list.fold(entries, dict.new(), fn(d, pair) {
+                let #(emoji, authors) = pair
+                dict.insert(d, emoji, set.from_list(authors))
+              })
+            dispatch(ReactionsChanged(target, inner_dict))
+          })
+        })
       let new_status = case relays {
         [] -> "disconnected"
         _ -> "connecting"
       }
       #(
         Model(..model, client: Some(client), relay_status: new_status),
-        effect.batch([on_receipt_eff, on_msg_eff, presence_eff, connect_eff]),
+        effect.batch([
+          on_receipt_eff,
+          on_msg_eff,
+          presence_eff,
+          on_reactions_eff,
+          connect_eff,
+        ]),
       )
     }
     RelayConnectResult(Ok(_)) ->
@@ -748,19 +768,45 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(Model(..model, reacting_to: next), effect.none())
     }
-    AddReaction(id, emoji) -> {
-      let current = case dict.get(model.reactions, id) {
-        Ok(rs) -> rs
-        Error(_) -> []
+    ReactionsChanged(target, snapshot) -> {
+      #(
+        Model(..model, reactions: dict.insert(model.reactions, target, snapshot)),
+        effect.none(),
+      )
+    }
+    ToggleReactionEmoji(target, emoji) -> {
+      let self_pubkey_hex_opt = option.map(model.client, fn(c) {
+        client_pubkey_hex(c)
+      })
+      let action = case dict.get(model.reactions, target) {
+        Ok(snap) ->
+          case dict.get(snap, emoji), self_pubkey_hex_opt {
+            Ok(authors), Some(me) ->
+              case set.contains(authors, me) {
+                True -> "remove"
+                False -> "add"
+              }
+            _, _ -> "add"
+          }
+        Error(_) -> "add"
       }
-      let next = toggle_reaction(current, emoji)
-      let new_model =
-        Model(
-          ..model,
-          reactions: dict.insert(model.reactions, id, next),
-          reacting_to: None,
-        )
-      #(new_model, effect.none())
+      let next_model = Model(..model, reacting_to: None)
+      let send_effect = case model.client {
+        Some(c) ->
+          effect.from(fn(dispatch) {
+            let now = sunset.now_ms()
+            sunset.send_reaction(c, target, emoji, action, now, fn(result) {
+              dispatch(ReactionSent(result))
+            })
+          })
+        None -> effect.none()
+      }
+      #(next_model, send_effect)
+    }
+    ReactionSent(Ok(_)) -> #(model, effect.none())
+    ReactionSent(Error(msg)) -> {
+      io.println("send_reaction error: " <> msg)
+      #(model, effect.none())
     }
     OpenDetail(id) -> #(
       // Opening the details panel pins selection on the same id so the
@@ -874,44 +920,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   }
 }
 
-/// Toggle "you reacted with this emoji" semantics over an existing
-/// reactions list. Mirrors the natural chat pattern: first click adds,
-/// second click removes; the count tracks how many distinct people
-/// (including you) have reacted with that emoji.
-fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
-  case list.find(rs, fn(r) { r.emoji == emoji }) {
-    Error(_) -> [Reaction(emoji: emoji, count: 1, by_you: True), ..rs]
-    Ok(existing) ->
-      case existing.by_you {
-        True -> {
-          let updated_count = existing.count - 1
-          case updated_count {
-            0 -> list.filter(rs, fn(r) { r.emoji != emoji })
-            _ ->
-              list.map(rs, fn(r) {
-                case r.emoji == emoji {
-                  True ->
-                    Reaction(
-                      emoji: r.emoji,
-                      count: updated_count,
-                      by_you: False,
-                    )
-                  False -> r
-                }
-              })
-          }
-        }
-        False ->
-          list.map(rs, fn(r) {
-            case r.emoji == emoji {
-              True -> Reaction(emoji: r.emoji, count: r.count + 1, by_you: True)
-              False -> r
-            }
-          })
-      }
-  }
-}
-
 fn view(model: Model) -> Element(Msg) {
   let palette = theme.palette_for(model.mode)
   case model.view {
@@ -936,11 +944,18 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
   let active_room =
     lookup_room(displayed_rooms, current_name, model.relay_status)
 
+  let self_pubkey_hex = option.map(model.client, fn(c) {
+    client_pubkey_hex(c)
+  })
   let raw_messages = model.messages
   let messages_with_live_reactions =
     list.map(raw_messages, fn(m) {
       case dict.get(model.reactions, m.id) {
-        Ok(rs) -> domain.Message(..m, reactions: rs)
+        Ok(snap) ->
+          domain.Message(
+            ..m,
+            reactions: snapshot_to_reactions(snap, self_pubkey_hex),
+          )
         Error(_) -> m
       }
     })
@@ -1119,7 +1134,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
         _ -> None
       },
       on_toggle_reaction_picker: ToggleReactionPicker,
-      on_add_reaction: AddReaction,
+      on_add_reaction: ToggleReactionEmoji,
       on_open_detail: OpenDetail,
       receipts: model.receipts,
       selected_msg_id: model.selected_msg_id,
@@ -1266,6 +1281,34 @@ fn find_message(ms: List(Message), id: String) -> Option(Message) {
   |> option.from_result
 }
 
+/// Convert a per-target snapshot dict into the `List(Reaction)` shape
+/// the chip-row view consumes. `self_pubkey_hex` decides the
+/// `by_you` flag; `None` (no client yet) treats every reaction as
+/// not-by-you so the UI doesn't lie.
+fn snapshot_to_reactions(
+  snapshot: Dict(String, Set(String)),
+  self_pubkey_hex: Option(String),
+) -> List(domain.Reaction) {
+  dict.to_list(snapshot)
+  |> list.filter_map(fn(pair) {
+    let #(emoji, authors) = pair
+    case set.size(authors) {
+      0 -> Error(Nil)
+      n -> {
+        let by_you = case self_pubkey_hex {
+          Some(me) -> set.contains(authors, me)
+          None -> False
+        }
+        Ok(domain.Reaction(emoji: emoji, count: n, by_you: by_you))
+      }
+    }
+  })
+}
+
+fn client_pubkey_hex(c: ClientHandle) -> String {
+  sunset.client_public_key_hex(c)
+}
+
 fn receipts_for(receipts: Dict(String, Set(String)), id: String) -> Set(String) {
   case dict.get(receipts, id) {
     Ok(s) -> s
@@ -1327,7 +1370,7 @@ fn phone_reaction_grid(
       html.button(
         [
           attribute.attribute("aria-label", e),
-          event.on_click(AddReaction(message_id, e)),
+          event.on_click(ToggleReactionEmoji(message_id, e)),
           ui.css([
             #("padding", "12px"),
             #("font-size", "26px"),
