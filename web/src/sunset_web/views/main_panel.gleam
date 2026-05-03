@@ -715,10 +715,9 @@ fn reaction_pill(
         False -> "false"
       }),
       attribute.title(title),
-      event.stop_propagation(event.on_click(on_toggle_reaction(
-        message_id,
-        r.emoji,
-      ))),
+      event.stop_propagation(
+        event.on_click(on_toggle_reaction(message_id, r.emoji)),
+      ),
       ui.css([
         #("display", "inline-flex"),
         #("align-items", "center"),
