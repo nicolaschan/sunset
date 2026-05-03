@@ -45,14 +45,14 @@ pub enum Error {
     #[error("epoch {0} not present in room")]
     EpochMissing(u64),
     #[error("postcard encode/decode failed: {0}")]
-    Postcard(String),
+    Postcard(#[from] postcard::Error),
     #[error("AEAD authentication failed")]
     AeadAuthFailed,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// HKDF-SHA256(epoch_root || epoch_id_le, info=VOICE_KEY_DOMAIN || epoch_id_le).
+/// HKDF-SHA256(ikm=epoch_root, salt=None, info=VOICE_KEY_DOMAIN || epoch_id_le).
 /// Pinned to one epoch per call so future epoch rotation lifts cleanly.
 pub fn derive_voice_key(room: &Room, epoch_id: u64) -> Result<Zeroizing<[u8; 32]>> {
     use hkdf::Hkdf;
@@ -68,11 +68,12 @@ pub fn derive_voice_key(room: &Room, epoch_id: u64) -> Result<Zeroizing<[u8; 32]
     Ok(k)
 }
 
-fn build_voice_aad(room: &Room, sender: &IdentityKey) -> Vec<u8> {
+fn build_voice_aad(room: &Room, epoch_id: u64, sender: &IdentityKey) -> Vec<u8> {
     let fp = room.fingerprint();
-    let mut ad = Vec::with_capacity(VOICE_AAD_DOMAIN.len() + 32 + 32);
+    let mut ad = Vec::with_capacity(VOICE_AAD_DOMAIN.len() + 32 + 8 + 32);
     ad.extend_from_slice(VOICE_AAD_DOMAIN);
     ad.extend_from_slice(fp.as_bytes());
+    ad.extend_from_slice(&epoch_id.to_le_bytes());
     ad.extend_from_slice(&sender.as_bytes());
     ad
 }
@@ -91,9 +92,9 @@ pub fn encrypt<R: CryptoRngCore + ?Sized>(
     rng: &mut R,
 ) -> Result<EncryptedVoicePacket> {
     let key = derive_voice_key(room, epoch_id)?;
-    let pt = postcard::to_stdvec(packet).map_err(|e| Error::Postcard(format!("{e}")))?;
+    let pt = postcard::to_stdvec(packet)?;
     let nonce = fresh_nonce(rng);
-    let aad = build_voice_aad(room, sender);
+    let aad = build_voice_aad(room, epoch_id, sender);
     let ct = aead_encrypt(&key, &nonce, &aad, &pt);
     Ok(EncryptedVoicePacket {
         nonce,
@@ -108,10 +109,10 @@ pub fn decrypt(
     ev: &EncryptedVoicePacket,
 ) -> Result<VoicePacket> {
     let key = derive_voice_key(room, epoch_id)?;
-    let aad = build_voice_aad(room, sender);
+    let aad = build_voice_aad(room, epoch_id, sender);
     let pt = aead_decrypt(&key, &ev.nonce, &aad, &ev.ciphertext)
         .map_err(|_| Error::AeadAuthFailed)?;
-    postcard::from_bytes(&pt).map_err(|e| Error::Postcard(format!("{e}")))
+    Ok(postcard::from_bytes(&pt)?)
 }
 
 #[cfg(test)]
@@ -189,5 +190,37 @@ mod tests {
         let id = Identity::generate(&mut OsRng);
         let res = encrypt(&room, 999, &id.public(), &fixed_heartbeat(), &mut OsRng);
         assert!(matches!(res, Err(Error::EpochMissing(999))));
+    }
+
+    /// Frozen vector for `derive_voice_key`. If this fails, the per-voice
+    /// HKDF derivation has drifted — DO NOT update without a wire-format bump.
+    #[test]
+    fn derive_voice_key_frozen_vector() {
+        let room = Room::open("frozen-vector-room").unwrap();
+        let k = derive_voice_key(&room, 0).unwrap();
+        assert_eq!(
+            hex::encode(*k),
+            "1e2a809cf4a34aacd2620a2634b6ab47e7ff5566155007d42c02b5a01ebb54ec",
+            "If this fails, the per-voice HKDF derivation has drifted — DO NOT update without a wire-format bump.",
+        );
+    }
+
+    /// Frozen vector for the postcard encoding of a fixed `VoicePacket::Frame`.
+    /// If this fails, serde field order / postcard encoding drifted — DO NOT
+    /// update without a wire-format bump.
+    #[test]
+    fn voice_packet_frame_postcard_frozen_vector() {
+        let pkt = VoicePacket::Frame {
+            codec_id: "pcm-f32-le".to_string(),
+            seq: 7,
+            sender_time_ms: 1_700_000_000_000,
+            payload: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        };
+        let bytes = postcard::to_stdvec(&pkt).unwrap();
+        assert_eq!(
+            hex::encode(&bytes),
+            "000a70636d2d6633322d6c650780d095ffbc3104aabbccdd",
+            "If this fails, serde field order / postcard encoding drifted — DO NOT update without a wire-format bump.",
+        );
     }
 }
