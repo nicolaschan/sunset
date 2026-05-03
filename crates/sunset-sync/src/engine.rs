@@ -1164,6 +1164,14 @@ where
         }
         Ok(())
     }
+
+    /// Test-only entry point to emit an engine event from outside the
+    /// engine's own tests module. Mirrors what real engine internals do
+    /// (private `emit_engine_event`); restricted to `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(crate) async fn emit_engine_event_for_test(&self, ev: EngineEvent) {
+        self.emit_engine_event(ev).await;
+    }
 }
 
 #[cfg(all(test, feature = "test-helpers"))]
