@@ -1,10 +1,13 @@
 //! Native sunset.chat relay binary + library for in-process testing.
 //!
-//! The relay binds a single TCP port (default 8443). Connections are routed by
-//! `router.rs`: WebSocket upgrades go to the sync engine; `GET /dashboard`
-//! requests are answered inline with a plaintext status page.
+//! The relay binds a single TCP port (default 8443) and serves it via
+//! axum. `GET /dashboard` returns a plaintext status page; `GET /` either
+//! upgrades to a WebSocket (engine path) or returns a JSON identity
+//! descriptor. WebSocket upgrades are handed to a `SpawningAcceptor` that
+//! runs each Noise IK handshake on its own task, so slow clients can't
+//! serialize the inbound pipeline.
 //!
-//! See `docs/superpowers/specs/2026-04-27-sunset-relay-design.md`.
+//! See `docs/superpowers/specs/2026-05-02-relay-axum-and-concurrent-handshakes-design.md`.
 
 pub mod app;
 pub mod bridge;

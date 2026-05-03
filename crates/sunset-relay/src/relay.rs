@@ -53,6 +53,9 @@ type InboundTransport = SpawningAcceptor<
 type InboundPromote =
     Box<dyn Fn(sunset_sync_ws_native::WebSocketRawConnection) -> NoiseHandshakeFuture + 'static>;
 
+/// The future returned by the promote callback. `Pin<Box<dyn Future>>`
+/// because the closure body captures `Arc<dyn NoiseIdentity>`, so the
+/// concrete future type is unnameable; we erase it here.
 type NoiseHandshakeFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -116,6 +119,11 @@ impl NoiseIdentity for IdentityNoiseAdapter {
 impl Relay {
     /// Open store, load identity, bind listener, build engine. Returns a
     /// handle ready for `run()` / `run_for_test()`.
+    ///
+    /// **Precondition:** must be called from within a `tokio::task::LocalSet`.
+    /// The constructor spawns `spawn_local` tasks (the command pump and
+    /// `SpawningAcceptor`'s internal handshake pump); calling it without
+    /// an active LocalSet will panic.
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(config: Config) -> Result<RelayHandle> {
         // 1. Identity (load-or-generate; persists to disk on first start).
@@ -358,4 +366,16 @@ impl RelayHandle {
     pub fn engine(&self) -> &Rc<Engine> {
         &self.engine
     }
+}
+
+// `cmd_ctx` is held inside `RelayHandle` so the command pump's `Rc` graph
+// stays alive for the relay's lifetime. When `RelayHandle` drops:
+//   • `cmd_tx` drops → cmd_rx returns None → pump task exits.
+//   • `cmd_ctx` (this clone) drops → refcount drops by 1.
+//   • The pump task's own `cmd_ctx` clone drops when the task ends →
+//     refcount → 0 → CommandContext drops, releasing Rc<Engine> and Arc<FsStore>.
+// The empty Drop body marks this as a deliberate ownership shape, not an
+// oversight. tracing::trace! could go here in the future.
+impl Drop for RelayHandle {
+    fn drop(&mut self) {}
 }
