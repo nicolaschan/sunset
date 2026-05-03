@@ -70,8 +70,12 @@ async fn registry_update_backfills_already_stored_entries() {
             let alice_store = Arc::new(MemoryStore::with_accept_all());
             let bob_store = Arc::new(MemoryStore::with_accept_all());
 
-            let alice_signer = Arc::new(StubSigner { vk: alice_id.0.clone() });
-            let bob_signer = Arc::new(StubSigner { vk: bob_id.0.clone() });
+            let alice_signer = Arc::new(StubSigner {
+                vk: alice_id.0.clone(),
+            });
+            let bob_signer = Arc::new(StubSigner {
+                vk: bob_id.0.clone(),
+            });
 
             let alice_engine = Rc::new(SyncEngine::new(
                 alice_store.clone(),
@@ -176,10 +180,7 @@ async fn registry_update_backfills_already_stored_entries() {
             // metadata. Otherwise the receiver would have to issue
             // a follow-up BlobRequest, which would arrive after the
             // 2-second deadline.
-            let blob = bob_store
-                .get_content(&block.hash())
-                .await
-                .unwrap();
+            let blob = bob_store.get_content(&block.hash()).await.unwrap();
             assert!(
                 blob.is_some(),
                 "bob received E's entry but not its blob — backfill should push both"
