@@ -21,7 +21,7 @@ pub mod verifier;
 
 pub use bus::{Bus, BusEvent, BusImpl};
 pub use crypto::envelope::{EncryptedMessage, MessageBody, SignedMessage};
-pub use crypto::room::{Room, RoomFingerprint};
+pub use crypto::room::{Room, RoomFingerprint, V1_EPOCH_ID};
 pub use error::{Error, Result};
 pub use filters::{room_filter, room_messages_filter};
 pub use identity::{Identity, IdentityKey};

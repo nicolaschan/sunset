@@ -12,7 +12,6 @@ use sunset_sync::Transport;
 use crate::crypto::room::Room;
 use crate::membership::TrackerHandles;
 use crate::message::DecodedMessage;
-use crate::signaling::RelaySignaler;
 
 pub(crate) type MessageCallback = Box<dyn Fn(&DecodedMessage, bool /* is_self */)>;
 pub(crate) type ReceiptCallback = Box<dyn Fn(sunset_store::Hash, &crate::IdentityKey)>;
@@ -23,15 +22,11 @@ pub(crate) struct RoomCallbacks {
     pub(crate) on_receipt: Option<ReceiptCallback>,
 }
 
-// Fields presence_started, tracker_handles, signaler are read by
-// send_text, on_message, presence methods arriving in Phase 5+.
-#[allow(dead_code)]
 pub(crate) struct RoomState<St: Store + 'static, T: Transport + 'static> {
     pub(crate) room: Rc<Room>,
     pub(crate) peer_weak: Weak<super::Peer<St, T>>,
     pub(crate) presence_started: Cell<bool>,
     pub(crate) tracker_handles: Rc<TrackerHandles>,
-    pub(crate) signaler: Rc<RelaySignaler<St>>,
     pub(crate) cancel_decode: Rc<Cell<bool>>,
     pub(crate) callbacks: Rc<RefCell<RoomCallbacks>>,
 }
@@ -65,7 +60,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         let composed = compose_message(
             peer.identity(),
             &self.inner.room,
-            0u64,
+            crate::V1_EPOCH_ID,
             sent_at_ms,
             MessageBody::Text(body),
             &mut rng,

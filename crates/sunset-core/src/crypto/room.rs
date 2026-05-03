@@ -48,6 +48,12 @@ impl std::fmt::Debug for Room {
     }
 }
 
+/// The only epoch known to v1 chat. Group epochs (Plan 8) introduce
+/// rotating keys keyed by larger ids; everywhere a v1 caller needs an
+/// epoch id today, use this constant rather than a bare `0u64` so the
+/// future epoch-aware migration has a clean grep target.
+pub const V1_EPOCH_ID: u64 = 0;
+
 impl Room {
     /// Open-room construction with **production** Argon2id parameters.
     /// Slow (~tens to hundreds of ms). Use `open_with_params` in tests.

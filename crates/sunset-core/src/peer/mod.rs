@@ -133,6 +133,14 @@ where
             }
         });
 
+        // The per-room signaler doesn't need a strong ref on RoomState:
+        // RelaySignaler::new spawned its dispatcher task with its own
+        // strong Rc, and dispatcher.register stored another in the
+        // dispatcher's HashMap. RoomState::drop's `unregister` call
+        // drops the latter; the dispatcher task keeps the signaler
+        // alive until its store-subscribe stream ends.
+        let _ = signaler;
+
         let state = Rc::new(open_room::RoomState {
             room,
             peer_weak: Rc::downgrade(self),
@@ -140,7 +148,6 @@ where
             tracker_handles: Rc::new(crate::membership::TrackerHandles::new(
                 &self.relay_status.borrow(),
             )),
-            signaler,
             cancel_decode: cancel,
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
         });
@@ -172,12 +179,10 @@ where
         &self.store
     }
 
-    #[allow(dead_code)]
     pub(crate) fn engine(&self) -> &Rc<SyncEngine<St, T>> {
         &self.engine
     }
 
-    #[allow(dead_code)]
     pub(crate) fn supervisor(&self) -> &Rc<PeerSupervisor<St, T>> {
         &self.supervisor
     }

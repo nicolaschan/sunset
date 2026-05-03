@@ -92,8 +92,7 @@ export async function addRelay(client, url, callback) {
 
 export async function sendMessage(room, body, sentAtMs, callback) {
   try {
-    const nonce = window.crypto.getRandomValues(new Uint8Array(32));
-    const valueHashHex = await room.send_message(body, sentAtMs, nonce);
+    const valueHashHex = await room.send_message(body, sentAtMs);
     callback(new Ok(valueHashHex));
   } catch (e) {
     callback(new GError(String(e)));

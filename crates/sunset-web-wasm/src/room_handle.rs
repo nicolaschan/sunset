@@ -25,12 +25,7 @@ impl RoomHandle {
         &self,
         body: String,
         sent_at_ms: f64,
-        _nonce_seed: Vec<u8>,
     ) -> Result<String, JsError> {
-        // OpenRoom::send_text uses ChaCha20Rng::from_entropy internally;
-        // the caller-supplied nonce_seed is kept in the FFI signature
-        // for compat with the prior Client::send_message but is unused
-        // here. (Future cleanup: drop the param from FFI and Gleam.)
         let value_hash = self
             .inner
             .send_text(body, sent_at_ms as u64)
