@@ -1,6 +1,6 @@
 # Relay: axum + concurrent handshakes — design
 
-**Status:** draft, pending user review.
+**Status:** implemented (branch `feat/relay-axum-concurrent-handshakes`, 26 commits).
 **Authors:** Nicolas Chan & Claude (Opus 4.7).
 **Related:**
 - Supersedes the byte-peeking dispatcher in `crates/sunset-relay/src/router.rs`.
@@ -34,7 +34,9 @@ These show up in production: a freshly restarted relay degrades after public-int
 
 ## High-level architecture
 
-Two tokio runtimes, bridged by `Send`-able channels.
+> **Revision (2026-05-02, post-implementation):** the spec originally described "two runtimes." The as-built shape is a *single* tokio runtime with a `LocalSet`: axum's per-request tasks run via `tokio::spawn` (Send-bound, multi-threaded on the binary), engine + per-peer + acceptor-pump tasks run via `tokio::task::spawn_local` on a `LocalSet` pinned to one thread. Send-bridge channels still carry the load between Send axum handlers and the `?Send` engine work; the architectural insight is unchanged. The diagram below is preserved as the conceptual model — two execution domains, one runtime — and the "Why two runtimes" subsection retains the trade-off discussion that led there.
+
+Two execution domains, bridged by `Send`-able channels.
 
 ```
 ┌─────────────── multi-thread tokio runtime (axum) ───────────────┐
