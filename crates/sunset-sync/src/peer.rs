@@ -391,7 +391,8 @@ fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
         | SyncMessage::Fetch { .. }
         | SyncMessage::Goodbye {}
         | SyncMessage::Ping { .. }
-        | SyncMessage::Pong { .. } => ChannelKind::Reliable,
+        | SyncMessage::Pong { .. }
+        | SyncMessage::DigestRequest { .. } => ChannelKind::Reliable,
     }
 }
 

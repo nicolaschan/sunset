@@ -63,6 +63,17 @@ pub enum SyncMessage {
     Pong {
         nonce: u64,
     },
+    /// Request that the receiver send us a `DigestExchange` over `filter`.
+    /// Used by the registry-update backfill trigger: when our registry
+    /// just learned a peer's filter, we ask the peer for their digest so
+    /// the standard `handle_digest_exchange` path can compute the diff
+    /// (entries we have that they don't) and push only the missing ones.
+    /// Avoids the bandwidth waste of pushing entries the peer already
+    /// has from prior sessions or overlapping subscriptions.
+    DigestRequest {
+        filter: Filter,
+        range: DigestRange,
+    },
 }
 
 impl SyncMessage {
@@ -184,5 +195,16 @@ mod tests {
         let bytes = msg.encode().unwrap();
         let decoded = SyncMessage::decode(&bytes).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn digest_request_postcard_roundtrip() {
+        let m = SyncMessage::DigestRequest {
+            filter: Filter::Keyspace(vk(b"alice")),
+            range: DigestRange::All,
+        };
+        let encoded = m.encode().unwrap();
+        let decoded = SyncMessage::decode(&encoded).unwrap();
+        assert_eq!(m, decoded);
     }
 }
