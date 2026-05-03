@@ -63,12 +63,13 @@ async fn get_root_returns_identity_json() {
                 .expect("read");
             let response = String::from_utf8(buf).expect("utf8 response");
 
+            let response_lower = response.to_ascii_lowercase();
             assert!(
-                response.starts_with("HTTP/1.1 200 OK"),
-                "expected 200 OK, got: {response}"
+                response.starts_with("HTTP/1.1 200"),
+                "expected 200, got: {response}"
             );
             assert!(
-                response.contains("Content-Type: application/json"),
+                response_lower.contains("content-type: application/json"),
                 "expected json content-type: {response}"
             );
             // Browsers fetching this from a different origin (the
@@ -76,7 +77,7 @@ async fn get_root_returns_identity_json() {
             // read the body. The response is public identity info; no
             // credentials are honored.
             assert!(
-                response.contains("Access-Control-Allow-Origin: *"),
+                response_lower.contains("access-control-allow-origin: *"),
                 "expected CORS header on identity response: {response}"
             );
             // Body is after the blank line.
