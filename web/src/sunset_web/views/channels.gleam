@@ -10,12 +10,13 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Channel, type ChannelId, type ConnStatus, type Member, type Room,
-  type Viewport, Connected, Desktop, MutedP, Offline, Phone, Reconnecting,
-  Speaking, TextChannel, Voice,
+  type Channel, type ChannelId, type ConnStatus, type Member, type Relay,
+  type Room, type Viewport, Connected, Desktop, MutedP, Offline, Phone,
+  Reconnecting, Speaking, TextChannel, Voice,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
+import sunset_web/views/relays as relays_view
 
 pub fn view(
   palette p: Palette,
@@ -28,6 +29,8 @@ pub fn view(
   on_open_voice_popover on_open_voice_popover: fn(String) -> msg,
   viewport viewport: Viewport,
   on_open_rooms on_open_rooms: msg,
+  relays relays: List(Relay),
+  on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
@@ -84,7 +87,11 @@ pub fn view(
               }),
             ]),
           ),
-          element.fragment([]),
+          relays_view.rail_section(
+            palette: p,
+            relays: relays,
+            on_open: on_open_relay,
+          ),
         ],
       ),
       case viewport, active_voice {

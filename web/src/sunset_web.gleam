@@ -48,6 +48,7 @@ import sunset_web/views/main_panel
 import sunset_web/views/members
 import sunset_web/views/peer_status_popover
 import sunset_web/views/phone_header
+import sunset_web/views/relays as relays_view
 import sunset_web/views/rooms
 import sunset_web/views/shell
 import sunset_web/views/touch_drag
@@ -160,6 +161,9 @@ pub type Model {
     /// (draft, selected message, revealed spoilers) so it resets
     /// naturally when the user navigates to a different room.
     rooms: Dict(String, RoomState),
+    /// IntentId of the relay whose popover is currently open. Client-wide
+    /// (not per-room) because relays are a client-level concept.
+    relays_popover: option.Option(Float),
   )
 }
 
@@ -194,6 +198,8 @@ pub type Msg {
   CloseVoicePopover
   OpenPeerStatusPopover(domain.MemberId)
   ClosePeerStatusPopover
+  OpenRelayPopover(Float)
+  CloseRelayPopover
   Tick(Int)
   SetMemberVolume(String, Int)
   ToggleMemberDenoise(String)
@@ -287,6 +293,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       drawer: None,
       now_ms: 0,
       rooms: dict.new(),
+      relays_popover: None,
     )
 
   let subscribe_hash =
@@ -730,7 +737,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     IdentityReady(seed) -> {
       let create_client_eff =
         effect.from(fn(dispatch) {
-          sunset.create_client(seed, fn(client) {
+          sunset.create_client(seed, sunset.heartbeat_interval_ms_from_url(), fn(client) {
             dispatch(ClientReady(client))
           })
         })
@@ -1109,6 +1116,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       with_active_room(model, fn(state) {
         #(RoomState(..state, peer_status_popover: None), effect.none())
       })
+    OpenRelayPopover(id) -> #(
+      Model(..model, relays_popover: option.Some(id)),
+      effect.none(),
+    )
+    CloseRelayPopover -> #(
+      Model(..model, relays_popover: option.None),
+      effect.none(),
+    )
     Tick(now) -> #(Model(..model, now_ms: now), effect.none())
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
@@ -1528,6 +1543,8 @@ fn room_view_with_state(
       on_open_voice_popover: OpenVoicePopover,
       viewport: model.viewport,
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
+      relays: relays_view.relays_for_view(model.intents),
+      on_open_relay: OpenRelayPopover,
     ),
     main_panel.view(
       palette: palette,

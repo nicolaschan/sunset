@@ -10,11 +10,17 @@ import gleam/option.{type Option}
 import gleam/order
 import gleam/string
 import gleam/uri
+import lustre/attribute
+import lustre/element.{type Element}
+import lustre/element/html
+import lustre/event
 import sunset_web/domain.{
   type Relay, type RelayConnState, Relay, RelayBackoff, RelayCancelled,
   RelayConnected, RelayConnecting,
 }
 import sunset_web/sunset.{type IntentSnapshot}
+import sunset_web/theme.{type Palette}
+import sunset_web/ui
 
 /// True when `label` is a relay (not a direct WebRTC peer).
 /// Connectable::Direct(webrtc://…) carries that scheme on its label;
@@ -146,4 +152,124 @@ pub fn relays_for_view(
     }
   })
   |> list.map(from_intent)
+}
+
+pub fn rail_section(
+  palette p: Palette,
+  relays rs: List(Relay),
+  on_open on_open: fn(Float) -> msg,
+) -> Element(msg) {
+  case rs {
+    [] -> element.fragment([])
+    _ ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "relays-section"),
+          ui.css([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "4px"),
+          ]),
+        ],
+        [
+          html.div(
+            [
+              ui.css([
+                #("padding", "0 12px 4px 12px"),
+                #("font-size", "13.125px"),
+                #("color", p.text_faint),
+                #("text-transform", "uppercase"),
+                #("letter-spacing", "0.04em"),
+              ]),
+            ],
+            [html.text("Relays")],
+          ),
+          html.div(
+            [
+              ui.css([
+                #("display", "flex"),
+                #("flex-direction", "column"),
+                #("gap", "1px"),
+              ]),
+            ],
+            list.map(rs, fn(r) { rail_row(p, r, on_open) }),
+          ),
+        ],
+      )
+  }
+}
+
+fn rail_row(
+  p: Palette,
+  r: Relay,
+  on_open: fn(Float) -> msg,
+) -> Element(msg) {
+  html.button(
+    [
+      attribute.attribute("data-testid", "relay-row"),
+      attribute.attribute("data-relay-host", r.host),
+      attribute.attribute("data-relay-state", state_attr(r.state)),
+      event.on_click(on_open(r.id)),
+      ui.css([
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("gap", "8px"),
+        #("padding", "6px 12px"),
+        #("border", "none"),
+        #("background", "transparent"),
+        #("color", p.text_muted),
+        #("font-family", "inherit"),
+        #("font-size", "16.25px"),
+        #("text-align", "left"),
+        #("cursor", "pointer"),
+        #("border-radius", "6px"),
+      ]),
+    ],
+    [
+      conn_dot(p, r.state),
+      html.span(
+        [
+          ui.css([
+            #("flex", "1"),
+            #("min-width", "0"),
+            #("white-space", "nowrap"),
+            #("overflow", "hidden"),
+            #("text-overflow", "ellipsis"),
+          ]),
+        ],
+        [html.text(r.host)],
+      ),
+    ],
+  )
+}
+
+fn conn_dot(p: Palette, s: RelayConnState) -> Element(msg) {
+  let c = case s {
+    RelayConnected -> p.live
+    RelayConnecting -> p.warn
+    RelayBackoff -> p.warn
+    RelayCancelled -> p.text_faint
+  }
+  html.span(
+    [
+      ui.css([
+        #("width", "7px"),
+        #("height", "7px"),
+        #("border-radius", "999px"),
+        #("background", c),
+        #("display", "inline-block"),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [],
+  )
+}
+
+fn state_attr(s: RelayConnState) -> String {
+  case s {
+    RelayConnected -> "connected"
+    RelayConnecting -> "connecting"
+    RelayBackoff -> "backoff"
+    RelayCancelled -> "cancelled"
+  }
 }

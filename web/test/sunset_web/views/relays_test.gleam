@@ -3,9 +3,9 @@ import gleam/list
 import gleam/option
 import gleeunit/should
 import sunset_web/domain.{
-  Relay, RelayBackoff, RelayCancelled, RelayConnected, RelayConnecting,
+  RelayBackoff, RelayCancelled, RelayConnected, RelayConnecting,
 }
-import sunset_web/sunset.{IntentSnapshot}
+import sunset_web/sunset.{type IntentSnapshot, IntentSnapshot}
 import sunset_web/views/relays
 
 pub fn is_relay_label_bare_hostname_test() {
