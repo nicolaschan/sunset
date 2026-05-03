@@ -15,13 +15,15 @@ use sunset_core::bus::BusEvent;
 use sunset_core::identity::IdentityKey;
 use sunset_sync::PeerId;
 
+use super::{JITTER_MAX_DEPTH, state::RuntimeInner};
 use crate::packet::{EncryptedVoicePacket, VoicePacket, decrypt};
 use crate::runtime::traits::VoicePeerState;
-use super::{JITTER_MAX_DEPTH, state::RuntimeInner};
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
-        let Some(inner) = weak.upgrade() else { return; };
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
         let room_fp = inner.room.fingerprint().to_hex();
         let prefix = Bytes::from(format!("voice/{room_fp}/"));
         let bus = inner.bus.clone();
@@ -44,7 +46,9 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         };
 
         while let Some(ev) = stream.next().await {
-            let Some(inner) = weak.upgrade() else { return; };
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
             let datagram = match ev {
                 BusEvent::Ephemeral(d) => d,
                 BusEvent::Durable { .. } => continue,
@@ -69,9 +73,13 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 }
             };
             match packet {
-                VoicePacket::Frame { payload, sender_time_ms, .. } => {
-                    let st = SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_millis(sender_time_ms);
+                VoicePacket::Frame {
+                    payload,
+                    sender_time_ms,
+                    ..
+                } => {
+                    let st =
+                        SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sender_time_ms);
                     inner.frame_liveness.observe(peer.clone(), st).await;
                     match decoder.decode(&payload) {
                         Ok(pcm) => {
@@ -86,9 +94,11 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                         Err(e) => tracing::warn!(error = %e, "decode failed"),
                     }
                 }
-                VoicePacket::Heartbeat { sent_at_ms, is_muted } => {
-                    let st = SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_millis(sent_at_ms);
+                VoicePacket::Heartbeat {
+                    sent_at_ms,
+                    is_muted,
+                } => {
+                    let st = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sent_at_ms);
                     inner.membership_liveness.observe(peer.clone(), st).await;
 
                     // Notify auto-connect task.

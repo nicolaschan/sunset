@@ -14,7 +14,9 @@ use super::state::{AutoConnectState, RuntimeInner};
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
-        let Some(inner) = weak.upgrade() else { return; };
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
         let mut hb_rx = inner
             .auto_connect_chan
             .rx
@@ -28,14 +30,18 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         loop {
             tokio::select! {
                 Some(peer) = hb_rx.recv() => {
-                    let Some(inner) = weak.upgrade() else { return; };
-                    let mut state = inner.auto_connect_state.borrow_mut();
-                    let entry = state.entry(peer.clone()).or_insert(AutoConnectState::Unknown);
-                    if *entry == AutoConnectState::Unknown {
-                        *entry = AutoConnectState::Dialing;
-                        let dialer = inner.dialer.clone();
-                        drop(state);
-                        drop(inner);
+                    let dialer_to_call = {
+                        let Some(inner) = weak.upgrade() else { return; };
+                        let mut state = inner.auto_connect_state.borrow_mut();
+                        let entry = state.entry(peer.clone()).or_insert(AutoConnectState::Unknown);
+                        if *entry == AutoConnectState::Unknown {
+                            *entry = AutoConnectState::Dialing;
+                            Some(inner.dialer.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(dialer) = dialer_to_call {
                         dialer.ensure_direct(peer).await;
                     }
                 }

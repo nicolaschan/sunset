@@ -13,7 +13,9 @@ use super::traits::VoicePeerState;
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
-        let Some(inner) = weak.upgrade() else { return; };
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
         let frame_arc = inner.frame_liveness.clone();
         let membership_arc = inner.membership_liveness.clone();
         drop(inner);

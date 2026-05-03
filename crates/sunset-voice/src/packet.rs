@@ -200,11 +200,20 @@ mod tests {
 
     #[test]
     fn heartbeat_is_muted_round_trips() {
-        let p = VoicePacket::Heartbeat { sent_at_ms: 12345, is_muted: true };
+        let p = VoicePacket::Heartbeat {
+            sent_at_ms: 12345,
+            is_muted: true,
+        };
         let bytes = postcard::to_stdvec(&p).unwrap();
         let p2: VoicePacket = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(p, p2);
-        assert!(matches!(p2, VoicePacket::Heartbeat { is_muted: true, sent_at_ms: 12345 }));
+        assert!(matches!(
+            p2,
+            VoicePacket::Heartbeat {
+                is_muted: true,
+                sent_at_ms: 12345
+            }
+        ));
     }
 
     /// Frozen vector for `derive_voice_key`. If this fails, the per-voice

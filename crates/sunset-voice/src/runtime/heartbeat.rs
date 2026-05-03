@@ -8,8 +8,8 @@ use futures::FutureExt;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
-use crate::packet::{VoicePacket, encrypt};
 use super::{HEARTBEAT_INTERVAL, state::RuntimeInner};
+use crate::packet::{VoicePacket, encrypt};
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
@@ -22,13 +22,18 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         let mut rng = ChaCha20Rng::seed_from_u64(now_nanos ^ 0x55AA_55AA_55AA_55AA);
 
         loop {
-            let Some(inner) = weak.upgrade() else { return; };
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
             let now_ms = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let muted = *inner.muted.borrow();
-            let pkt = VoicePacket::Heartbeat { sent_at_ms: now_ms, is_muted: muted };
+            let pkt = VoicePacket::Heartbeat {
+                sent_at_ms: now_ms,
+                is_muted: muted,
+            };
             let public = inner.identity.public();
             let room = inner.room.clone();
             let bus = inner.bus.clone();

@@ -16,11 +16,18 @@ use rand_chacha::rand_core::SeedableRng;
 use sunset_core::Identity;
 use sunset_core::Room;
 use sunset_core::bus::BusEvent;
-use sunset_sync::PeerId;
 use sunset_store::SignedDatagram;
+use sunset_sync::PeerId;
 use sunset_voice::runtime::{
     Dialer, DynBus, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime,
 };
+
+/// Type alias to avoid clippy::type_complexity.
+type DeliveredSink = Rc<RefCell<Vec<(PeerId, Vec<f32>)>>>;
+/// Type alias to avoid clippy::type_complexity.
+type DroppedSink = Rc<RefCell<Vec<PeerId>>>;
+/// Type alias to avoid clippy::type_complexity.
+type EventSink = Rc<RefCell<Vec<VoicePeerState>>>;
 
 /// Minimal in-memory `DynBus` for tests. Supports `publish_ephemeral`
 /// and `subscribe_voice_prefix`. Loopback is included
@@ -38,7 +45,9 @@ struct TestBus {
 }
 
 impl TestBus {
-    fn new(self_pk: sunset_store::VerifyingKey) -> (Arc<Self>, tokio::sync::broadcast::Sender<SignedDatagram>) {
+    fn new(
+        self_pk: sunset_store::VerifyingKey,
+    ) -> (Arc<Self>, tokio::sync::broadcast::Sender<SignedDatagram>) {
         let (obs_tx, _) = tokio::sync::broadcast::channel(64);
         let bus = Arc::new(Self {
             self_pk,
@@ -103,7 +112,7 @@ impl DynBus for TestBus {
 }
 
 struct CountingDialer {
-    calls: Rc<RefCell<Vec<PeerId>>>,
+    calls: DroppedSink,
 }
 #[async_trait::async_trait(?Send)]
 impl Dialer for CountingDialer {
@@ -113,12 +122,14 @@ impl Dialer for CountingDialer {
 }
 
 struct RecordingFrameSink {
-    delivered: Rc<RefCell<Vec<(PeerId, Vec<f32>)>>>,
-    dropped: Rc<RefCell<Vec<PeerId>>>,
+    delivered: DeliveredSink,
+    dropped: DroppedSink,
 }
 impl FrameSink for RecordingFrameSink {
     fn deliver(&self, peer: &PeerId, pcm: &[f32]) {
-        self.delivered.borrow_mut().push((peer.clone(), pcm.to_vec()));
+        self.delivered
+            .borrow_mut()
+            .push((peer.clone(), pcm.to_vec()));
     }
     fn drop_peer(&self, peer: &PeerId) {
         self.dropped.borrow_mut().push(peer.clone());
@@ -126,7 +137,7 @@ impl FrameSink for RecordingFrameSink {
 }
 
 struct RecordingPeerStateSink {
-    events: Rc<RefCell<Vec<VoicePeerState>>>,
+    events: EventSink,
 }
 impl PeerStateSink for RecordingPeerStateSink {
     fn emit(&self, state: &VoicePeerState) {
@@ -150,17 +161,17 @@ async fn heartbeat_publishes_periodically_with_is_muted_flag() {
             let (bus_impl, tx) = TestBus::new(pk.clone());
             let bus: Arc<dyn DynBus> = bus_impl;
 
-            let dialer_calls: Rc<RefCell<Vec<PeerId>>> = Rc::new(RefCell::new(vec![]));
-            let dialer: Rc<dyn Dialer> =
-                Rc::new(CountingDialer { calls: dialer_calls });
+            let dialer_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: dialer_calls,
+            });
             let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
                 delivered: Rc::new(RefCell::new(vec![])),
                 dropped: Rc::new(RefCell::new(vec![])),
             });
-            let peer_state_sink: Rc<dyn PeerStateSink> =
-                Rc::new(RecordingPeerStateSink {
-                    events: Rc::new(RefCell::new(vec![])),
-                });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
 
             let (runtime, tasks) = VoiceRuntime::new(
                 bus,
@@ -191,8 +202,7 @@ async fn heartbeat_publishes_periodically_with_is_muted_flag() {
             // Decode and verify is_muted == false (default).
             let ev: sunset_voice::packet::EncryptedVoicePacket =
                 postcard::from_bytes(&hb.payload).unwrap();
-            let pkt =
-                sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev).unwrap();
+            let pkt = sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev).unwrap();
             match pkt {
                 sunset_voice::packet::VoicePacket::Heartbeat { is_muted, .. } => {
                     assert!(!is_muted, "default is_muted should be false");
@@ -214,8 +224,7 @@ async fn heartbeat_publishes_periodically_with_is_muted_flag() {
             .expect("second heartbeat within 4s");
             let ev2: sunset_voice::packet::EncryptedVoicePacket =
                 postcard::from_bytes(&hb2.payload).unwrap();
-            let pkt2 =
-                sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev2).unwrap();
+            let pkt2 = sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev2).unwrap();
             match pkt2 {
                 sunset_voice::packet::VoicePacket::Heartbeat { is_muted, .. } => {
                     assert!(is_muted);
@@ -243,10 +252,9 @@ async fn send_pcm_publishes_frame_when_unmuted() {
                 delivered: Rc::new(RefCell::new(vec![])),
                 dropped: Rc::new(RefCell::new(vec![])),
             });
-            let peer_state_sink: Rc<dyn PeerStateSink> =
-                Rc::new(RecordingPeerStateSink {
-                    events: Rc::new(RefCell::new(vec![])),
-                });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
 
             let (runtime, _tasks) = VoiceRuntime::new(
                 bus,
@@ -274,8 +282,7 @@ async fn send_pcm_publishes_frame_when_unmuted() {
 
             let ev: sunset_voice::packet::EncryptedVoicePacket =
                 postcard::from_bytes(&frame.payload).unwrap();
-            let pkt =
-                sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev).unwrap();
+            let pkt = sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev).unwrap();
             let bytes = match pkt {
                 sunset_voice::packet::VoicePacket::Frame { payload, .. } => payload,
                 _ => panic!("expected Frame"),
@@ -302,10 +309,9 @@ async fn send_pcm_drops_frames_when_muted() {
                 delivered: Rc::new(RefCell::new(vec![])),
                 dropped: Rc::new(RefCell::new(vec![])),
             });
-            let peer_state_sink: Rc<dyn PeerStateSink> =
-                Rc::new(RecordingPeerStateSink {
-                    events: Rc::new(RefCell::new(vec![])),
-                });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
             let (runtime, _tasks) = VoiceRuntime::new(
                 bus,
                 room.clone(),
@@ -329,8 +335,7 @@ async fn send_pcm_drops_frames_when_muted() {
                         let ev: sunset_voice::packet::EncryptedVoicePacket =
                             postcard::from_bytes(&d.payload).unwrap();
                         let pkt =
-                            sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev)
-                                .unwrap();
+                            sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev).unwrap();
                         if matches!(pkt, sunset_voice::packet::VoicePacket::Frame { .. }) {
                             return d;
                         }
@@ -356,16 +361,14 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
-            let delivered: Rc<RefCell<Vec<(PeerId, Vec<f32>)>>> =
-                Rc::new(RefCell::new(vec![]));
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
             let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
                 delivered: delivered.clone(),
                 dropped: Rc::new(RefCell::new(vec![])),
             });
-            let peer_state_sink: Rc<dyn PeerStateSink> =
-                Rc::new(RecordingPeerStateSink {
-                    events: Rc::new(RefCell::new(vec![])),
-                });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
 
             let (runtime, tasks) = VoiceRuntime::new(
                 bob_bus,
@@ -392,8 +395,7 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
             };
             let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(42);
             let ev =
-                sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng)
-                    .unwrap();
+                sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng).unwrap();
             let payload = postcard::to_stdvec(&ev).unwrap();
             let room_fp = room.fingerprint().to_hex();
             let sender_pk = hex::encode(alice_pk.as_bytes());
@@ -441,9 +443,10 @@ async fn combiner_emits_state_on_heartbeat() {
                 delivered: Rc::new(RefCell::new(vec![])),
                 dropped: Rc::new(RefCell::new(vec![])),
             });
-            let events: Rc<RefCell<Vec<VoicePeerState>>> = Rc::new(RefCell::new(vec![]));
-            let peer_state_sink: Rc<dyn PeerStateSink> =
-                Rc::new(RecordingPeerStateSink { events: events.clone() });
+            let events: EventSink = Rc::new(RefCell::new(vec![]));
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: events.clone(),
+            });
 
             let (_runtime, tasks) = VoiceRuntime::new(
                 bob_bus,
@@ -466,8 +469,7 @@ async fn combiner_emits_state_on_heartbeat() {
             };
             let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(99);
             let ev =
-                sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng)
-                    .unwrap();
+                sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng).unwrap();
             let payload = postcard::to_stdvec(&ev).unwrap();
             let room_fp = room.fingerprint().to_hex();
             let sender_pk = hex::encode(alice.store_verifying_key().as_bytes());
@@ -508,17 +510,17 @@ async fn auto_connect_dials_first_heartbeat_only_once() {
             let (bob, _) = make_identity_and_room(9);
             let (bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
             let bus: Arc<dyn DynBus> = bus_impl.clone();
-            let calls: Rc<RefCell<Vec<PeerId>>> = Rc::new(RefCell::new(vec![]));
-            let dialer: Rc<dyn Dialer> =
-                Rc::new(CountingDialer { calls: calls.clone() });
+            let calls: DroppedSink = Rc::new(RefCell::new(vec![]));
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: calls.clone(),
+            });
             let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
                 delivered: Rc::new(RefCell::new(vec![])),
                 dropped: Rc::new(RefCell::new(vec![])),
             });
-            let peer_state_sink: Rc<dyn PeerStateSink> =
-                Rc::new(RecordingPeerStateSink {
-                    events: Rc::new(RefCell::new(vec![])),
-                });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
             let (_runtime, tasks) = VoiceRuntime::new(
                 bus,
                 room.clone(),
@@ -540,24 +542,20 @@ async fn auto_connect_dials_first_heartbeat_only_once() {
                     is_muted: false,
                 };
                 let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xab);
-                let ev = sunset_voice::packet::encrypt(
-                    &room,
-                    0,
-                    &alice.public(),
-                    &pkt,
-                    &mut rng,
-                )
-                .unwrap();
+                let ev = sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng)
+                    .unwrap();
                 let payload = postcard::to_stdvec(&ev).unwrap();
                 let room_fp = room.fingerprint().to_hex();
                 let sender_pk = hex::encode(alice.store_verifying_key().as_bytes());
                 let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
-                bus_impl.inject(SignedDatagram {
-                    verifying_key: alice.store_verifying_key(),
-                    name,
-                    payload: Bytes::from(payload),
-                    signature: Bytes::new(),
-                }).await;
+                bus_impl
+                    .inject(SignedDatagram {
+                        verifying_key: alice.store_verifying_key(),
+                        name,
+                        payload: Bytes::from(payload),
+                        signature: Bytes::new(),
+                    })
+                    .await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -580,16 +578,14 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
-            let delivered: Rc<RefCell<Vec<(PeerId, Vec<f32>)>>> =
-                Rc::new(RefCell::new(vec![]));
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
             let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
                 delivered: delivered.clone(),
                 dropped: Rc::new(RefCell::new(vec![])),
             });
-            let peer_state_sink: Rc<dyn PeerStateSink> =
-                Rc::new(RecordingPeerStateSink {
-                    events: Rc::new(RefCell::new(vec![])),
-                });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
             let (runtime, tasks) = VoiceRuntime::new(
                 bus,
                 room,
@@ -612,39 +608,63 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
             // Poll for 1st delivery (frame1).
             tokio::time::timeout(Duration::from_millis(100), async {
                 loop {
-                    if delivered.borrow().len() >= 1 { return; }
+                    if !delivered.borrow().is_empty() {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-            }).await.expect("1st frame delivered");
+            })
+            .await
+            .expect("1st frame delivered");
             assert_eq!(delivered.borrow()[0].1, frame1);
 
             // Poll for 2nd delivery (frame2).
             tokio::time::timeout(Duration::from_millis(100), async {
                 loop {
-                    if delivered.borrow().len() >= 2 { return; }
+                    if delivered.borrow().len() >= 2 {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-            }).await.expect("2nd frame delivered");
+            })
+            .await
+            .expect("2nd frame delivered");
             assert_eq!(delivered.borrow()[1].1, frame2);
 
             // Poll for 3rd delivery (repeat-last = frame2, first underrun).
             tokio::time::timeout(Duration::from_millis(100), async {
                 loop {
-                    if delivered.borrow().len() >= 3 { return; }
+                    if delivered.borrow().len() >= 3 {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-            }).await.expect("3rd frame delivered (repeat last)");
-            assert_eq!(delivered.borrow()[2].1, frame2, "first underrun = repeat last");
+            })
+            .await
+            .expect("3rd frame delivered (repeat last)");
+            assert_eq!(
+                delivered.borrow()[2].1,
+                frame2,
+                "first underrun = repeat last"
+            );
 
             // Poll for 4th delivery (silence, second underrun).
             tokio::time::timeout(Duration::from_millis(100), async {
                 loop {
-                    if delivered.borrow().len() >= 4 { return; }
+                    if delivered.borrow().len() >= 4 {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-            }).await.expect("4th frame delivered (silence)");
+            })
+            .await
+            .expect("4th frame delivered (silence)");
             let silence = vec![0.0_f32; 960];
-            assert_eq!(delivered.borrow()[3].1, silence, "second underrun = silence");
+            assert_eq!(
+                delivered.borrow()[3].1,
+                silence,
+                "second underrun = silence"
+            );
 
             // Push a new frame — next pump cycle delivers it normally.
             // We track how many frames have been delivered so far to find frame3's position.
@@ -655,14 +675,20 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
             let base_len = delivered.borrow().len();
             tokio::time::timeout(Duration::from_millis(100), async {
                 loop {
-                    if delivered.borrow().len() > base_len { return; }
+                    if delivered.borrow().len() > base_len {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-            }).await.expect("frame3 delivered");
+            })
+            .await
+            .expect("frame3 delivered");
             // Find frame3 in the delivered list — it may not be at index 4 if extra
             // silence frames were pumped before we pushed it.
             let deliveries = delivered.borrow();
-            let frame3_pos = deliveries.iter().position(|(_, f)| f == &frame3)
+            let frame3_pos = deliveries
+                .iter()
+                .position(|(_, f)| f == &frame3)
                 .expect("frame3 must appear in delivered list");
             assert_eq!(deliveries[frame3_pos].1, frame3);
         })
@@ -683,25 +709,19 @@ async fn dropping_runtime_terminates_all_tasks() {
                 delivered: Rc::new(RefCell::new(vec![])),
                 dropped: Rc::new(RefCell::new(vec![])),
             });
-            let peer_state_sink: Rc<dyn PeerStateSink> =
-                Rc::new(RecordingPeerStateSink {
-                    events: Rc::new(RefCell::new(vec![])),
-                });
-            let (runtime, tasks) = VoiceRuntime::new(
-                bus,
-                room,
-                alice,
-                dialer,
-                frame_sink,
-                peer_state_sink,
-            );
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+            let (runtime, tasks) =
+                VoiceRuntime::new(bus, room, alice, dialer, frame_sink, peer_state_sink);
 
-            let mut handles = vec![];
-            handles.push(tokio::task::spawn_local(tasks.heartbeat));
-            handles.push(tokio::task::spawn_local(tasks.subscribe));
-            handles.push(tokio::task::spawn_local(tasks.combiner));
-            handles.push(tokio::task::spawn_local(tasks.auto_connect));
-            handles.push(tokio::task::spawn_local(tasks.jitter_pump));
+            let handles = vec![
+                tokio::task::spawn_local(tasks.heartbeat),
+                tokio::task::spawn_local(tasks.subscribe),
+                tokio::task::spawn_local(tasks.combiner),
+                tokio::task::spawn_local(tasks.auto_connect),
+                tokio::task::spawn_local(tasks.jitter_pump),
+            ];
 
             drop(runtime);
             // Allow each task to observe the upgrade failure.

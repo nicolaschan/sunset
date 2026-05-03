@@ -6,15 +6,17 @@ use std::rc::Weak;
 
 use futures::FutureExt;
 
-use crate::FRAME_SAMPLES;
 use super::JITTER_PUMP_INTERVAL;
 use super::state::{LastDelivered, RuntimeInner};
+use crate::FRAME_SAMPLES;
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
         loop {
             sleep(JITTER_PUMP_INTERVAL).await;
-            let Some(inner) = weak.upgrade() else { return; };
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
             if *inner.deafened.borrow() {
                 // Still drain so when un-deafened we don't burst stale frames.
                 let mut jitter = inner.jitter.borrow_mut();

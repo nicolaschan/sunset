@@ -76,8 +76,7 @@ impl VoiceRuntime {
             frame_sink,
             peer_state_sink,
             encoder: RefCell::new(
-                VoiceEncoder::new()
-                    .expect("passthrough encoder construction is infallible"),
+                VoiceEncoder::new().expect("passthrough encoder construction is infallible"),
             ),
             seq: RefCell::new(0),
             rng: RefCell::new(ChaCha20Rng::seed_from_u64(now_nanos)),
