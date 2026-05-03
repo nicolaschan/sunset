@@ -161,4 +161,7 @@ test("clicking a peer row opens the status popover with live age", async ({ brow
   // Close button works.
   await pageA.locator('[data-testid="peer-status-popover-close"]').click();
   await expect(popover).toHaveCount(0);
+
+  await ctxA.close();
+  await ctxB.close();
 });

@@ -196,4 +196,7 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
   await inputB.fill(msg2);
   await inputB.press("Enter");
   await expect(pageA.getByText(msg2)).toBeVisible({ timeout: 30_000 });
+
+  await ctxA.close();
+  await ctxB.close();
 });

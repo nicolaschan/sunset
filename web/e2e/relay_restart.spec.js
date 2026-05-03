@@ -202,4 +202,7 @@ test("chat resumes after relay restart without page reload", async ({ browser })
   await inputB.fill(msgPostB);
   await inputB.press("Enter");
   await expect(pageA.getByText(msgPostB)).toBeVisible({ timeout: 15_000 });
+
+  await ctxA.close();
+  await ctxB.close();
 });
