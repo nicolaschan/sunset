@@ -582,8 +582,15 @@ where
                 if let Some(s) = registered {
                     let _ = s.send(Ok(peer_id.clone()));
                 }
-                // Fire bootstrap digest exchange on the subscribe namespace.
+                // Fire bootstrap digest exchange on the subscribe namespace,
+                // then a per-filter digest for each of our own published
+                // subscriptions. The latter is what makes a (re)connected
+                // client catch up on chat (and any other room-namespace)
+                // entries that landed at the relay while we were offline.
                 self.send_bootstrap_digest(&peer_id).await;
+                for filter in self.own_published_filters().await {
+                    self.send_filter_digest(&peer_id, &filter).await;
+                }
             }
             InboundEvent::Message { from, message } => {
                 self.handle_peer_message(from, message).await;
@@ -664,7 +671,6 @@ where
     /// own their own catch-up, and this engine has no signing key for
     /// them. Iteration errors and parse errors are logged-and-skipped,
     /// matching `replay_existing_subscriptions`.
-    #[allow(dead_code)] // wired in next commit
     async fn own_published_filters(&self) -> Vec<Filter> {
         let mut out = Vec::new();
         let filter = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
@@ -2048,6 +2054,78 @@ mod tests {
 
                 let filters = engine.own_published_filters().await;
                 assert_eq!(filters, vec![mine]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_hello_fires_filter_digest_for_own_published_subscriptions() {
+        use crate::peer::InboundEvent;
+        use crate::transport::TransportKind;
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                // Pre-publish one self-authored subscribe entry over a chat-like filter.
+                let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
+                let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
+                let block = ContentBlock {
+                    data: Bytes::from(filter_bytes),
+                    references: vec![],
+                };
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"alice"),
+                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                engine.store.insert(entry, Some(block)).await.unwrap();
+
+                // Drive PeerHello with a captured outbound channel.
+                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
+                engine
+                    .handle_inbound_event(InboundEvent::PeerHello {
+                        peer_id: PeerId(vk(b"relay")),
+                        conn_id: ConnectionId::for_test(1),
+                        kind: TransportKind::Primary,
+                        out_tx: tx,
+                        registered: None,
+                    })
+                    .await;
+
+                // The engine sends both digests synchronously before
+                // `handle_inbound_event` returns (the per-peer fire path is
+                // async-but-in-memory: `send_filter_digest` awaits the
+                // state lock and then non-blocking-sends to an unbounded
+                // mpsc). By the time we get here, every digest the engine
+                // intends to fire is already queued — drain with try_recv
+                // so a missing fire produces an assertion failure, not a
+                // hang.
+                let mut filters: Vec<Filter> = Vec::new();
+                loop {
+                    match rx.try_recv() {
+                        Ok(SyncMessage::DigestExchange { filter, .. }) => {
+                            filters.push(filter);
+                        }
+                        Ok(other) => panic!("expected DigestExchange, got {other:?}"),
+                        Err(_) => break,
+                    }
+                }
+
+                let bootstrap = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
+                assert!(
+                    filters.contains(&bootstrap),
+                    "bootstrap digest must still fire (got {filters:?})"
+                );
+                assert!(
+                    filters.contains(&chat_filter),
+                    "per-filter digest must fire for own published subscription (got {filters:?})"
+                );
             })
             .await;
     }
