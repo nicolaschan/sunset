@@ -75,8 +75,19 @@ test.afterAll(async () => {
   }
 });
 
-const ALICE_SEED = "a1".repeat(32);
-const BOB_SEED = "b2".repeat(32);
+// Each test gets a fresh identity per peer. Reusing seeds across tests
+// would mean reusing identities — but the relay persists CRDT entries
+// keyed by identity (subscriptions, WebRTC SDP signaling), so test N+1
+// would inherit stale signaling entries from test N and intermittently
+// wedge the WebRTC handshake. Real production users have one identity
+// per browser session; this matches that model.
+function freshSeedHex() {
+  // 64 hex chars = 32 bytes. Math.random is fine for test fixtures.
+  let s = "";
+  for (let i = 0; i < 64; i++) s += Math.floor(Math.random() * 16).toString(16);
+  return s;
+}
+
 const ROOM = "voice-test-room";
 
 function syntheticPcm(seedByte) {
@@ -115,11 +126,11 @@ test("alice voice_input arrives at bob byte-equal", async ({ browser }) => {
 
   const aliceInfo = await alice.evaluate(
     async ({ seed, room, relay }) => window.__voice.start({ seed, room, relay }),
-    { seed: ALICE_SEED, room: ROOM, relay: relayAddress },
+    { seed: freshSeedHex(), room: ROOM, relay: relayAddress },
   );
   const bobInfo = await bob.evaluate(
     async ({ seed, room, relay }) => window.__voice.start({ seed, room, relay }),
-    { seed: BOB_SEED, room: ROOM, relay: relayAddress },
+    { seed: freshSeedHex(), room: ROOM, relay: relayAddress },
   );
 
   const alicePk = aliceInfo.publicKey;
@@ -206,11 +217,11 @@ test("voice peer state transitions in_call -> talking -> silent -> out", async (
 
   const aliceInfo = await alice.evaluate(
     async ({ seed, room, relay }) => window.__voice.start({ seed, room, relay }),
-    { seed: ALICE_SEED, room: ROOM, relay: relayAddress },
+    { seed: freshSeedHex(), room: ROOM, relay: relayAddress },
   );
   const bobInfo = await bob.evaluate(
     async ({ seed, room, relay }) => window.__voice.start({ seed, room, relay }),
-    { seed: BOB_SEED, room: ROOM, relay: relayAddress },
+    { seed: freshSeedHex(), room: ROOM, relay: relayAddress },
   );
 
   const alicePk = aliceInfo.publicKey;
