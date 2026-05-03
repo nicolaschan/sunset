@@ -216,6 +216,39 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
 
         crate::membership::fire_relay_status_now(&self.inner.tracker_handles);
     }
+
+    pub async fn connect_direct(&self, peer_pubkey: [u8; 32]) -> crate::Result<()> {
+        let peer = self
+            .inner
+            .peer_weak
+            .upgrade()
+            .ok_or_else(|| crate::Error::Other("peer dropped".into()))?;
+        let x_pub = sunset_noise::ed25519_public_to_x25519(&peer_pubkey)
+            .map_err(|e| crate::Error::Other(format!("x25519 derive: {e}")))?;
+        let addr_str = format!(
+            "webrtc://{}#x25519={}",
+            hex::encode(peer_pubkey),
+            hex::encode(x_pub)
+        );
+        let addr = sunset_sync::PeerAddr::new(bytes::Bytes::from(addr_str));
+        peer.supervisor()
+            .add(addr)
+            .await
+            .map_err(|e| crate::Error::Other(format!("connect_direct: {e}")))?;
+        Ok(())
+    }
+
+    pub fn peer_connection_mode(&self, peer_pubkey: [u8; 32]) -> &'static str {
+        use sunset_sync::TransportKind;
+        let peer_id = sunset_sync::PeerId(sunset_store::VerifyingKey::new(
+            bytes::Bytes::copy_from_slice(&peer_pubkey),
+        ));
+        match self.inner.tracker_handles.peer_kinds.borrow().get(&peer_id) {
+            Some(TransportKind::Secondary) => "direct",
+            Some(TransportKind::Primary) => "via_relay",
+            _ => "unknown",
+        }
+    }
 }
 
 impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {

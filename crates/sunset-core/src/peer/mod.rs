@@ -391,6 +391,24 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_connection_mode_reads_from_tracker() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let peer = helpers::mk_peer(ident(15)).await;
+            let room = peer.open_room("alpha").await.expect("open_room");
+            let bogus_pk = [9u8; 32];
+            // Without start_presence, peer_kinds is empty → "unknown"
+            assert_eq!(room.peer_connection_mode(bogus_pk), "unknown");
+
+            // Inject a kind manually (test-only, via the tracker handle).
+            use sunset_sync::{PeerId, TransportKind};
+            let pk = PeerId(sunset_store::VerifyingKey::new(bytes::Bytes::copy_from_slice(&bogus_pk)));
+            room.inner.tracker_handles.peer_kinds.borrow_mut().insert(pk, TransportKind::Secondary);
+            assert_eq!(room.peer_connection_mode(bogus_pk), "direct");
+        }).await;
+    }
+
     pub(super) mod helpers {
         use super::*;
         use async_trait::async_trait;
