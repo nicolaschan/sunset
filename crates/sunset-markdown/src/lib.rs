@@ -193,4 +193,28 @@ mod tests {
             ])])])
         );
     }
+
+    #[test]
+    fn underline_double_underscore() {
+        assert_eq!(
+            parse("a __b__ c"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::Underline(vec![Inline::Text("b".to_owned())]),
+                Inline::Text(" c".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn underline_wraps_italic() {
+        assert_eq!(
+            parse("__a _b_ c__"),
+            Document(vec![Block::Paragraph(vec![Inline::Underline(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::Italic(vec![Inline::Text("b".to_owned())]),
+                Inline::Text(" c".to_owned()),
+            ])])])
+        );
+    }
 }
