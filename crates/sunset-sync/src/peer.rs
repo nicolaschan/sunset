@@ -337,8 +337,14 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             let mut last_pong_at: Instant = Instant::now();
             // Time we sent the most recent Ping. Some only between Ping
             // send and corresponding Pong receipt (or the next Ping
-            // send, whichever comes first). At most one Ping is in
-            // flight because the loop sleeps `heartbeat_interval`.
+            // send, whichever comes first). Under healthy operation
+            // exactly one Ping is in flight at a time; under congestion
+            // we may send up to `heartbeat_timeout / heartbeat_interval`
+            // (default 3) before the timeout fires, in which case a
+            // late Pong's RTT is measured against the most recent send
+            // and so under-reports — acceptable for an observability
+            // signal where the precise lag matters less than "is the
+            // peer alive at all", which the timeout enforces separately.
             let mut last_ping_sent_at: Option<Instant> = None;
 
             loop {
