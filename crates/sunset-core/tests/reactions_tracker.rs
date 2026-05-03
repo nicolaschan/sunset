@@ -9,7 +9,7 @@ use std::sync::Arc;
 use rand_core::OsRng;
 use sunset_core::crypto::constants::test_fast_params;
 use sunset_core::reactions::{ReactionHandles, ReactionSnapshot, spawn_reaction_tracker};
-use sunset_core::{Identity, ReactionAction, Room, compose_reaction};
+use sunset_core::{Identity, ReactionAction, ReactionPayload, Room, compose_reaction};
 use sunset_store::Store as _;
 
 #[tokio::test(flavor = "current_thread")]
@@ -45,9 +45,11 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
                 &room,
                 0,
                 100,
-                target,
-                "👍",
-                ReactionAction::Add,
+                &ReactionPayload {
+                    for_value_hash: target,
+                    emoji: "👍",
+                    action: ReactionAction::Add,
+                },
                 &mut OsRng,
             )
             .unwrap();
@@ -75,9 +77,11 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
                 &room,
                 0,
                 200,
-                target,
-                "👍",
-                ReactionAction::Remove,
+                &ReactionPayload {
+                    for_value_hash: target,
+                    emoji: "👍",
+                    action: ReactionAction::Remove,
+                },
                 &mut OsRng,
             )
             .unwrap();
@@ -139,9 +143,11 @@ async fn tracker_debounces_duplicate_state() {
                 &room,
                 0,
                 100,
-                target,
-                "👍",
-                ReactionAction::Add,
+                &ReactionPayload {
+                    for_value_hash: target,
+                    emoji: "👍",
+                    action: ReactionAction::Add,
+                },
                 &mut OsRng,
             )
             .unwrap();

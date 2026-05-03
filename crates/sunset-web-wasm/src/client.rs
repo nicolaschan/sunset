@@ -393,9 +393,11 @@ impl Client {
             &self.room,
             0u64,
             sent_at_ms as u64,
-            target,
-            &emoji,
-            action,
+            &sunset_core::ReactionPayload {
+                for_value_hash: target,
+                emoji: &emoji,
+                action,
+            },
             &mut rng,
         )
         .map_err(|e| JsError::new(&format!("compose_reaction: {e}")))?;

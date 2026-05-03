@@ -28,8 +28,8 @@ pub use liveness::{
     Clock, HasSenderTime, Liveness, LivenessState, PeerLivenessChange, SystemClock,
 };
 pub use message::{
-    ComposedMessage, DecodedMessage, compose_message, compose_reaction, compose_receipt,
-    compose_text, decode_message,
+    ComposedMessage, DecodedMessage, ReactionPayload, compose_message, compose_reaction,
+    compose_receipt, compose_text, decode_message,
 };
 pub use reactions::{
     ReactionEvent, ReactionHandles, ReactionSnapshot, ReactionsCallback, ReactionsCallbackSlot,

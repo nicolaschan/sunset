@@ -129,23 +129,36 @@ pub fn compose_receipt<R: CryptoRngCore + ?Sized>(
     )
 }
 
-/// Compose a reaction event. `for_value_hash` is the `value_hash` of
-/// the message being reacted to; `emoji` is a free-form unicode string
-/// (caller-validated; we only enforce the 64-byte length cap which
-/// covers all unicode emoji including ZWJ family sequences).
-#[allow(clippy::too_many_arguments)]
+/// The reaction-specific payload passed to [`compose_reaction`]. Bundled
+/// to keep `compose_reaction`'s signature consistent with `compose_text`
+/// and `compose_receipt` (and below clippy's `too_many_arguments`
+/// threshold).
+#[derive(Clone, Debug)]
+pub struct ReactionPayload<'a> {
+    /// `value_hash` of the message being reacted to.
+    pub for_value_hash: Hash,
+    /// Free-form unicode emoji string. Caller-validated; we only
+    /// enforce the 64-byte length cap (covers all unicode emoji
+    /// including ZWJ family sequences).
+    pub emoji: &'a str,
+    /// Whether this event adds or removes the reaction.
+    pub action: ReactionAction,
+}
+
+/// Compose a reaction event. See [`ReactionPayload`] for the
+/// reaction-specific fields.
 pub fn compose_reaction<R: CryptoRngCore + ?Sized>(
     identity: &Identity,
     room: &Room,
     epoch_id: u64,
     sent_at_ms: u64,
-    for_value_hash: Hash,
-    emoji: &str,
-    action: ReactionAction,
+    payload: &ReactionPayload<'_>,
     rng: &mut R,
 ) -> Result<ComposedMessage> {
-    if emoji.len() > 64 {
-        return Err(Error::EmojiTooLong { len: emoji.len() });
+    if payload.emoji.len() > 64 {
+        return Err(Error::EmojiTooLong {
+            len: payload.emoji.len(),
+        });
     }
     compose_message(
         identity,
@@ -153,9 +166,9 @@ pub fn compose_reaction<R: CryptoRngCore + ?Sized>(
         epoch_id,
         sent_at_ms,
         MessageBody::Reaction {
-            for_value_hash,
-            emoji: emoji.to_owned(),
-            action,
+            for_value_hash: payload.for_value_hash,
+            emoji: payload.emoji.to_owned(),
+            action: payload.action,
         },
         rng,
     )
@@ -440,9 +453,11 @@ mod tests {
             &room,
             0,
             1_700_000_000_000,
-            target,
-            "👍",
-            crate::crypto::envelope::ReactionAction::Add,
+            &ReactionPayload {
+                for_value_hash: target,
+                emoji: "👍",
+                action: crate::crypto::envelope::ReactionAction::Add,
+            },
             &mut OsRng,
         )
         .unwrap();
@@ -468,9 +483,11 @@ mod tests {
             &room,
             0,
             2,
-            target,
-            "🎉",
-            crate::crypto::envelope::ReactionAction::Remove,
+            &ReactionPayload {
+                for_value_hash: target,
+                emoji: "🎉",
+                action: crate::crypto::envelope::ReactionAction::Remove,
+            },
             &mut OsRng,
         )
         .unwrap();
@@ -495,9 +512,11 @@ mod tests {
             &room,
             0,
             1,
-            target,
-            &oversized,
-            crate::crypto::envelope::ReactionAction::Add,
+            &ReactionPayload {
+                for_value_hash: target,
+                emoji: &oversized,
+                action: crate::crypto::envelope::ReactionAction::Add,
+            },
             &mut OsRng,
         )
         .unwrap_err();
@@ -515,9 +534,11 @@ mod tests {
             &room,
             0,
             1,
-            target,
-            &max_size,
-            crate::crypto::envelope::ReactionAction::Add,
+            &ReactionPayload {
+                for_value_hash: target,
+                emoji: &max_size,
+                action: crate::crypto::envelope::ReactionAction::Add,
+            },
             &mut OsRng,
         );
         assert!(

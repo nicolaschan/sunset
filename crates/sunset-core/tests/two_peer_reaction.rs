@@ -8,7 +8,7 @@ use std::sync::Arc;
 use rand_core::OsRng;
 use sunset_core::crypto::constants::test_fast_params;
 use sunset_core::reactions::{ReactionHandles, ReactionSnapshot, spawn_reaction_tracker};
-use sunset_core::{Identity, ReactionAction, Room, compose_reaction, compose_text};
+use sunset_core::{Identity, ReactionAction, ReactionPayload, Room, compose_reaction, compose_text};
 use sunset_store::Store as _;
 
 #[tokio::test(flavor = "current_thread")]
@@ -56,9 +56,11 @@ async fn reaction_round_trip_between_two_identities() {
                 &room,
                 0,
                 100,
-                target,
-                "👍",
-                ReactionAction::Add,
+                &ReactionPayload {
+                    for_value_hash: target,
+                    emoji: "👍",
+                    action: ReactionAction::Add,
+                },
                 &mut OsRng,
             )
             .unwrap();
@@ -91,9 +93,11 @@ async fn reaction_round_trip_between_two_identities() {
                 &room,
                 0,
                 200,
-                target,
-                "👍",
-                ReactionAction::Remove,
+                &ReactionPayload {
+                    for_value_hash: target,
+                    emoji: "👍",
+                    action: ReactionAction::Remove,
+                },
                 &mut OsRng,
             )
             .unwrap();
