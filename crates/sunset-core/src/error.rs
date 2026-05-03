@@ -31,6 +31,9 @@ pub enum Error {
     #[error("inner-signature payload too long for postcard encoding")]
     PayloadTooLarge,
 
+    #[error("emoji exceeds 64-byte limit: {len} bytes")]
+    EmojiTooLong { len: usize },
+
     #[error("store: {0}")]
     Store(String),
 

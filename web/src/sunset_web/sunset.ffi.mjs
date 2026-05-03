@@ -280,3 +280,45 @@ export function setIntervalMs(ms, callback) {
 export function nowMs() {
   return Date.now();
 }
+
+export function onReactionsChanged(client, callback) {
+  client.on_reactions_changed((payload) => {
+    callback(payload);
+  });
+}
+
+export function reactionsSnapshotTargetHex(snapshot) {
+  return snapshot.target_hex;
+}
+
+export function reactionsSnapshotEntries(snapshot) {
+  // snapshot.reactions is a Map<emoji, Set<author_hex>>. Flatten into
+  // a Gleam list of tuples for ergonomic consumption.
+  const out = [];
+  for (const [emoji, set] of snapshot.reactions.entries()) {
+    out.push([emoji, toList([...set])]);
+  }
+  return toList(out);
+}
+
+export function sendReaction(client, targetHex, emoji, action, sentAtMs, callback) {
+  const nonceSeed = window.crypto.getRandomValues(new Uint8Array(32));
+  client
+    .send_reaction(targetHex, emoji, action, sentAtMs, nonceSeed)
+    .then(() => callback(new Ok(undefined)))
+    .catch((e) => callback(new GError(String(e?.message ?? e))));
+}
+
+export function clientPublicKeyHex(client) {
+  // client.public_key returns Vec<u8>; hex-encode for FE comparison.
+  const bytes = client.public_key;
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+let emojiPickerLoaded = null;
+export function registerEmojiPicker() {
+  if (!emojiPickerLoaded) {
+    emojiPickerLoaded = import("emoji-picker-element");
+  }
+  return emojiPickerLoaded;
+}
