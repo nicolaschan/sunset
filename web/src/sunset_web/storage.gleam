@@ -40,6 +40,13 @@ pub fn is_phone_viewport() -> Bool
 @external(javascript, "./storage.ffi.mjs", "onViewportChange")
 pub fn on_viewport_change(callback: fn(Bool) -> Nil) -> Nil
 
+/// Wipe localStorage / sessionStorage / hash and reload the page so
+/// the user gets a clean slate. Triggered by the "reset local state"
+/// settings action — this also drops the persisted identity keypair,
+/// so the user comes back as a fresh peer.
+@external(javascript, "./storage.ffi.mjs", "resetLocalStateAndReload")
+pub fn reset_local_state_and_reload() -> Nil
+
 /// Replace the default `<meta name="viewport">` with a mobile-friendly
 /// one that enables safe-area insets and keyboard-aware resizing.
 @external(javascript, "./storage.ffi.mjs", "installMobileViewportMeta")

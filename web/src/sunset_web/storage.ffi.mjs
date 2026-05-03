@@ -146,6 +146,45 @@ export function onViewportChange(callback) {
   }
 }
 
+// Wipe all `sunset-web/` localStorage keys (and any other state
+// the app stores in local persistence) and reload the page so the
+// caller gets a clean slate. Triggered by the "reset local state"
+// settings action — equivalent to "log out + clear identity"
+// because the keypair is stored in localStorage too.
+export function resetLocalStateAndReload() {
+  try {
+    // Iterate forward then remove — calling removeItem inside a
+    // forward iteration mutates the indices, so collect keys first.
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const k = localStorage.key(i);
+      if (k !== null) keys.push(k);
+    }
+    for (const k of keys) {
+      localStorage.removeItem(k);
+    }
+  } catch {
+    // ignored: storage is best-effort.
+  }
+  try {
+    sessionStorage.clear();
+  } catch {
+    // ignored.
+  }
+  // Drop the URL fragment so the reload doesn't immediately re-enter
+  // the same room.
+  try {
+    history.replaceState(
+      "",
+      document.title,
+      location.pathname + location.search,
+    );
+  } catch {
+    // ignored.
+  }
+  location.reload();
+}
+
 // Override the default viewport meta tag with one that:
 //   * cover: enables env(safe-area-inset-*) under iOS notch / dynamic island.
 //   * interactive-widget=resizes-content: tells iOS/Android to resize the

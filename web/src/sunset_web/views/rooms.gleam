@@ -38,6 +38,7 @@ pub fn view(
   members members: List(domain.Member),
   mode mode: Mode,
   on_toggle_mode on_toggle_mode: msg,
+  on_open_settings on_open_settings: msg,
 ) -> Element(msg) {
   // On phone the rail lives inside a 320px-wide drawer, so it should
   // fill the drawer's width rather than the desktop 260px column.
@@ -100,7 +101,7 @@ pub fn view(
         on_drop,
         on_drag_end,
       ),
-      you_row(you, p, col),
+      you_row(you, p, col, on_open_settings),
       case viewport {
         domain.Phone -> phone_theme_toggle_row(p, mode, on_toggle_mode)
         domain.Desktop -> element.fragment([])
@@ -736,10 +737,13 @@ fn you_row(
   you: Option(domain.Member),
   p: Palette,
   collapsed: Bool,
+  on_open_settings: msg,
 ) -> Element(msg) {
   // Pinned at the bottom of the rooms rail. The fixed 64px height +
   // border-top is shared by the channels-rail self-bar and the main
   // panel composer so all three column-bottom rows visually align.
+  // The whole row is a button: clicking it opens the settings popover
+  // (theme + reset). Collapsed-rail variant centers a single dot.
   let padding = case collapsed {
     True -> "0"
     False -> "0 14px"
@@ -749,8 +753,12 @@ fn you_row(
     False -> "flex-start"
   }
   let your_name = you |> option.map(fn(a) { a.name }) |> option.unwrap("?")
-  html.div(
+  html.button(
     [
+      attribute.attribute("data-testid", "you-row"),
+      attribute.title("Settings"),
+      attribute.attribute("aria-label", "Open settings"),
+      event.on_click(on_open_settings),
       ui.css([
         #("box-sizing", "border-box"),
         #("height", "64px"),
@@ -760,7 +768,15 @@ fn you_row(
         #("justify-content", justify),
         #("gap", "8px"),
         #("padding", padding),
+        #("border", "none"),
         #("border-top", "1px solid " <> p.border_soft),
+        #("background", "transparent"),
+        #("color", p.text),
+        #("font-family", "inherit"),
+        #("font-size", "16.25px"),
+        #("text-align", "left"),
+        #("cursor", "pointer"),
+        #("width", "100%"),
       ]),
     ],
     [
