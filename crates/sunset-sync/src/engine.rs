@@ -589,6 +589,13 @@ where
                 // entries that landed at the relay while we were offline.
                 self.send_bootstrap_digest(&peer_id).await;
                 for filter in self.own_published_filters().await {
+                    // Skip when an own published filter exactly equals the
+                    // bootstrap one — `send_bootstrap_digest` above already
+                    // covered it, and re-firing would just spend wire
+                    // bandwidth on a redundant DigestExchange.
+                    if filter == self.config.bootstrap_filter {
+                        continue;
+                    }
                     self.send_filter_digest(&peer_id, &filter).await;
                 }
             }
@@ -2069,7 +2076,10 @@ mod tests {
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
 
-                // Pre-publish one self-authored subscribe entry over a chat-like filter.
+                // Pre-publish one self-authored subscribe entry over a
+                // chat-like filter. Empty signature is fine because
+                // `make_engine` uses `MemoryStore::with_accept_all()`; this
+                // test exercises the PeerHello fan-out, not the publish path.
                 let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
                 let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
                 let block = ContentBlock {
