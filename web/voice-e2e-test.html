@@ -33,8 +33,8 @@
           await client.add_relay(relay);
           const roomHandle = await client.open_room(room);
           window.__voice.roomHandle = roomHandle;
-          client.on_peer_connection_state((snap) => {
-            connState.set(snap.addr, snap);
+          client.on_intent_changed((snap) => {
+            connState.set(snap.label, snap);
           });
           return { publicKey: window.__voice.publicKeyHex };
         },

@@ -142,8 +142,10 @@ pub type Model {
     voice_settings: Dict(String, domain.VoiceSettings),
     /// Engine handle. None until the wasm bundle finishes initialising.
     client: Option(ClientHandle),
-    /// Relay connection status: "disconnected", "connecting", "connected", "error".
-    relay_status: String,
+    /// Per-intent state snapshots from the supervisor, keyed by
+    /// IntentId (Float on the JS side via wasm-bindgen). Updated on
+    /// each `IntentChanged` Msg.
+    intents: Dict(Float, sunset.IntentSnapshot),
     /// Viewport class — drives the desktop/phone branch in `shell.view`.
     viewport: domain.Viewport,
     /// Currently open drawer on phone. Ignored on desktop. Channels and
@@ -200,7 +202,7 @@ pub type Msg {
   // sunset-web-wasm bridge wiring:
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
-  RelayConnectResult(Result(Nil, String))
+  IntentChanged(snap: sunset.IntentSnapshot)
   /// A room's wasm-side handle is ready; register callbacks + start presence.
   RoomOpened(name: String, handle: RoomHandle)
   IncomingMsg(room: String, im: IncomingMessage)
@@ -208,7 +210,6 @@ pub type Msg {
   SubmitDraft
   MessageSent(Result(String, String))
   MembersUpdated(room: String, members: List(domain.Member))
-  RelayStatusUpdated(String)
   ViewportChanged(domain.Viewport)
   OpenDrawer(domain.Drawer)
   CloseDrawer
@@ -281,7 +282,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       drag_over_room: None,
       voice_settings: seed_voice_settings(),
       client: None,
-      relay_status: "disconnected",
+      intents: dict.new(),
       viewport: initial_viewport,
       drawer: None,
       now_ms: 0,
@@ -736,17 +737,29 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(model, create_client_eff)
     }
     ClientReady(client) -> {
-      // Connect to relays.
+      // The supervisor's intent stream is the source of truth for
+      // relay connection state. Subscribe once at Client level — the
+      // callback fires on every state transition regardless of which
+      // room is open.
+      let intent_eff =
+        effect.from(fn(dispatch) {
+          sunset.on_intent_changed(client, fn(snap) {
+            dispatch(IntentChanged(snap))
+          })
+        })
+      // Connect to relays. Default relays the client dials when no
+      // `?relay=…` query parameter is supplied. The query param, when
+      // present, replaces (does not extend) this list.
       let relays = case sunset.relay_url_param() {
         Ok(url) -> [url]
         Error(_) -> default_relays
       }
       let connect_eff =
-        effect.from(fn(dispatch) {
+        effect.from(fn(_dispatch) {
           list.each(relays, fn(url) {
-            sunset.add_relay(client, url, fn(r) {
-              dispatch(RelayConnectResult(r))
-            })
+            // Errors here are JS-side malformed-URL issues; ignore (the
+            // resolver+supervisor handle every transient case).
+            sunset.add_relay(client, url, fn(_r) { Nil })
           })
         })
 
@@ -791,10 +804,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // wiring fires them yet — re-wire as part of the per-room
       // reactions follow-up.
 
-      let new_status = case relays {
-        [] -> "disconnected"
-        _ -> "connecting"
-      }
       // Insert placeholder RoomState for every joined room so the
       // shell renders fully even before the first RoomOpened lands.
       let rooms_with_placeholders =
@@ -805,23 +814,23 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         })
       #(
-        Model(
-          ..model,
-          client: Some(client),
-          relay_status: new_status,
-          rooms: rooms_with_placeholders,
-        ),
-        effect.batch([connect_eff, open_active_eff, open_others_eff]),
+        Model(..model, client: Some(client), rooms: rooms_with_placeholders),
+        effect.batch([
+          intent_eff,
+          connect_eff,
+          open_active_eff,
+          open_others_eff,
+        ]),
       )
     }
-    RelayConnectResult(Ok(_)) -> #(
-      Model(..model, relay_status: "connected"),
-      effect.none(),
-    )
-    RelayConnectResult(Error(_)) -> #(
-      Model(..model, relay_status: "error"),
-      effect.none(),
-    )
+    IntentChanged(snap) -> {
+      // Source of truth for relay connection state. Keeps a per-id
+      // dict so the relay-status pill can derive the union state in
+      // one helper. No latch needed in the multi-room shape:
+      // open_room publishes the room subscription on every open.
+      let new_intents = dict.insert(model.intents, snap.id, snap)
+      #(Model(..model, intents: new_intents), effect.none())
+    }
     RoomOpened(name, handle) -> {
       // Either fill the placeholder inserted by JoinRoom/HashChanged
       // (preserving any UI state the user has built up while the room
@@ -846,9 +855,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           })
           sunset.on_members_changed(handle, fn(ms) {
             dispatch(MembersUpdated(name, map_members(ms)))
-          })
-          sunset.on_relay_status_changed(handle, fn(s) {
-            dispatch(RelayStatusUpdated(s))
           })
           sunset.on_reactions_changed(handle, fn(snapshot_payload) {
             let target = sunset.reactions_snapshot_target_hex(snapshot_payload)
@@ -982,7 +988,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
       }
     }
-    RelayStatusUpdated(s) -> #(Model(..model, relay_status: s), effect.none())
     ToggleMessageSelected(id) ->
       with_active_room(model, fn(state) {
         // Tap/click on a message body. Toggle selection — same id
@@ -1268,10 +1273,9 @@ fn room_view_with_state(
   current_name: String,
   state: RoomState,
 ) -> Element(Msg) {
-  let displayed_rooms = resolve_rooms(model.joined_rooms, model.relay_status)
+  let displayed_rooms = resolve_rooms(model.joined_rooms, model.intents)
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
-  let active_room =
-    lookup_room(displayed_rooms, current_name, model.relay_status)
+  let active_room = lookup_room(displayed_rooms, current_name, model.intents)
 
   let self_pubkey_hex = option.map(model.client, fn(c) { client_pubkey_hex(c) })
   let raw_messages = state.messages
@@ -1594,47 +1598,68 @@ fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
 /// Resolve a list of joined room names to rich Room records. Names
 /// that match a fixture room reuse its mock data; anything else falls
 /// back to a synthetic Room so the rail still renders something useful.
-fn resolve_rooms(names: List(String), relay_status: String) -> List(Room) {
+fn resolve_rooms(
+  names: List(String),
+  intents: Dict(Float, sunset.IntentSnapshot),
+) -> List(Room) {
   let fixture_rooms = fixture.rooms()
+  let conn = relay_status_pill(intents)
   list.map(names, fn(name) {
     case list.find(fixture_rooms, fn(r) { r.name == name }) {
-      Ok(r) ->
-        Room(..r, status: relay_status_to_conn(relay_status), id: RoomId(name))
-      Error(_) -> synthetic_room(name, relay_status)
+      Ok(r) -> Room(..r, status: conn, id: RoomId(name))
+      Error(_) -> synthetic_room(name, intents)
     }
   })
 }
 
-fn lookup_room(rs: List(Room), name: String, relay_status: String) -> Room {
+fn lookup_room(
+  rs: List(Room),
+  name: String,
+  intents: Dict(Float, sunset.IntentSnapshot),
+) -> Room {
   case list.find(rs, fn(r) { r.name == name }) {
     Ok(r) -> r
-    Error(_) -> synthetic_room(name, relay_status)
+    Error(_) -> synthetic_room(name, intents)
   }
 }
 
 /// Default Room record for a name we have no fixture entry for. Reads
 /// like a freshly-joined room with no observed activity yet.
-fn synthetic_room(name: String, relay_status: String) -> Room {
+fn synthetic_room(
+  name: String,
+  intents: Dict(Float, sunset.IntentSnapshot),
+) -> Room {
   Room(
     id: RoomId(name),
     name: name,
     members: 1,
     online: 1,
     in_call: 0,
-    status: relay_status_to_conn(relay_status),
+    status: relay_status_pill(intents),
     last_active: "now",
     unread: 0,
     bridge: NoBridge,
   )
 }
 
-fn relay_status_to_conn(relay_status: String) -> domain.ConnStatus {
-  case relay_status {
-    "connected" -> domain.Connected
-    "connecting" -> domain.Reconnecting
-    "error" -> domain.Offline
-    "disconnected" -> domain.Offline
-    _ -> domain.Connected
+/// Derive the room-status pill from the supervisor's per-intent
+/// snapshots. Connected wins outright; connecting/backoff falls back
+/// to Reconnecting; everything else (cancelled, empty) is Offline.
+pub fn relay_status_pill(
+  intents: Dict(Float, sunset.IntentSnapshot),
+) -> domain.ConnStatus {
+  let snaps = dict.values(intents)
+  case list.any(snaps, fn(s) { s.state == "connected" }) {
+    True -> domain.Connected
+    False ->
+      case
+        list.any(snaps, fn(s) {
+          s.state == "connecting" || s.state == "backoff"
+        })
+      {
+        True -> domain.Reconnecting
+        False -> domain.Offline
+      }
   }
 }
 

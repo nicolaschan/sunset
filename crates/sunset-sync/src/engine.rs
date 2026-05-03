@@ -53,7 +53,7 @@ fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     env: crate::peer::PeerEnv,
     conn_id: ConnectionId,
     inbound_tx: mpsc::UnboundedSender<InboundEvent>,
-    hello_done: Option<oneshot::Sender<Result<PeerId>>>,
+    hello_done: Option<oneshot::Sender<Result<(PeerId, crate::transport::TransportKind)>>>,
 ) {
     let conn = Rc::new(conn);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<SyncMessage>();
@@ -66,7 +66,7 @@ fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
 pub(crate) enum EngineCommand {
     AddPeer {
         addr: PeerAddr,
-        ack: oneshot::Sender<Result<PeerId>>,
+        ack: oneshot::Sender<Result<(PeerId, crate::transport::TransportKind)>>,
     },
     PublishSubscription {
         filter: Filter,
@@ -201,8 +201,16 @@ where
     }
 
     /// Initiate an outbound connection to `addr`. Returns when the connection
-    /// is established + Hello-exchanged, or fails.
-    pub async fn add_peer(&self, addr: PeerAddr) -> Result<PeerId> {
+    /// is established + Hello-exchanged, or fails. The success value carries
+    /// the peer's identity *and* its `TransportKind` so callers can record
+    /// both atomically; this is what lets the supervisor populate
+    /// `IntentSnapshot::kind` on the same write that flips `state` to
+    /// `Connected`, removing the otherwise-racy dependency on the
+    /// `EngineEvent::PeerAdded` broadcast arriving first.
+    pub async fn add_peer(
+        &self,
+        addr: PeerAddr,
+    ) -> Result<(PeerId, crate::transport::TransportKind)> {
         let (ack, rx) = oneshot::channel();
         self.cmd_tx
             .send(EngineCommand::AddPeer { addr, ack })
@@ -432,11 +440,13 @@ where
                     let connect_res = transport.connect(addr).await;
                     let r = match connect_res {
                         Ok(conn) => {
-                            let (hello_tx, hello_rx) = oneshot::channel::<Result<PeerId>>();
+                            let (hello_tx, hello_rx) = oneshot::channel::<
+                                Result<(PeerId, crate::transport::TransportKind)>,
+                            >();
                             spawn_run_peer(conn, env, conn_id, inbound_tx, Some(hello_tx));
                             // Wait for the Hello exchange to complete.
                             match hello_rx.await {
-                                Ok(Ok(peer_id)) => Ok(peer_id),
+                                Ok(Ok(pair)) => Ok(pair),
                                 Ok(Err(e)) => Err(e),
                                 Err(_) => Err(Error::Closed),
                             }
@@ -510,9 +520,15 @@ where
                 // Wake the `add_peer().await` caller now that
                 // `peer_outbound` is populated, so an immediately-
                 // following `publish_subscription` / `insert` lands a
-                // peer to push to.
+                // peer to push to. We also pass `kind` through the
+                // oneshot so the supervisor can write
+                // `(peer_id, kind)` atomically — without it, the
+                // supervisor would have to wait for the separate
+                // `EngineEvent::PeerAdded` broadcast to populate
+                // `IntentSnapshot::kind`, which races against
+                // `spawn_dial`'s post-await borrow_mut.
                 if let Some(s) = registered {
-                    let _ = s.send(Ok(peer_id.clone()));
+                    let _ = s.send(Ok((peer_id.clone(), kind)));
                 }
                 let own_filters = self.own_published_filters().await;
                 self.fan_out_digests_to_peer(&peer_id, &own_filters).await;
