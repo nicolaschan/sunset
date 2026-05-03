@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+axum = { workspace = true, optional = true }
 bytes.workspace = true
 futures-util.workspace = true
 sunset-sync.workspace = true
@@ -18,13 +19,18 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "net"] }
 tokio-tungstenite.workspace = true
 url.workspace = true
 
+[features]
+axum = ["dep:axum"]
+
 [dev-dependencies]
+axum = { workspace = true }
 curve25519-dalek.workspace = true
 hex.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 sunset-store = { workspace = true, features = ["test-helpers"] }
 sunset-store-memory.workspace = true
 sunset-sync = { workspace = true, features = ["test-helpers"] }
+sunset-sync-ws-native = { path = ".", features = ["axum"] }
 sunset-noise.workspace = true
 sunset-core.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "net"] }

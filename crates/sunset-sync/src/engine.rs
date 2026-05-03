@@ -44,27 +44,6 @@ impl ConnectionId {
     }
 }
 
-/// Wrap `transport.accept()` in a per-handshake deadline. Cross-platform:
-/// uses `tokio::time::timeout` natively and the `wasmtimer` drop-in on
-/// `wasm32`. Returns `None` on timeout; on timeout the future is dropped,
-/// which closes the underlying TCP/Noise resources for the misbehaving
-/// peer.
-async fn accept_with_timeout<T: Transport>(
-    timeout: std::time::Duration,
-    transport: &T,
-) -> Option<Result<T::Connection>> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        tokio::time::timeout(timeout, transport.accept()).await.ok()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        wasmtimer::tokio::timeout(timeout, transport.accept())
-            .await
-            .ok()
-    }
-}
-
 /// Free helper that spins up the outbound channel + spawns the per-peer
 /// task. Extracted from `SyncEngine::spawn_peer` so the AddPeer command
 /// handler can call it from a `'static` spawned task without holding
@@ -386,32 +365,17 @@ where
 
         loop {
             tokio::select! {
-                maybe_conn = accept_with_timeout(
-                    self.config.accept_handshake_timeout,
-                    &*self.transport,
-                ) => {
-                    match maybe_conn {
-                        Some(Ok(conn)) => self.spawn_peer(conn, inbound_tx.clone()).await,
-                        Some(Err(e)) => {
-                            // A single accept failure (e.g. a malformed
-                            // WS upgrade from a public-internet probe)
-                            // must not tear down the engine — otherwise
-                            // every subsequent connection on this
-                            // listener hangs forever because nothing
-                            // drains the dispatch channel. Log and
-                            // keep accepting.
+                accept_res = self.transport.accept() => {
+                    match accept_res {
+                        Ok(conn) => self.spawn_peer(conn, inbound_tx.clone()).await,
+                        Err(e) => {
+                            // A single accept failure (e.g. an upstream pump that's
+                            // shutting down) must not tear down the engine — log and
+                            // keep accepting. If the channel underneath has truly
+                            // closed, every subsequent accept will return an error
+                            // too; that's fine — eventually the engine task is
+                            // aborted by the host.
                             tracing::warn!(error = %e, "transport accept failed; continuing");
-                        }
-                        None => {
-                            // Per-handshake timeout. The misbehaving
-                            // peer (e.g. completed WS upgrade but
-                            // never sent Noise IK) had its TCP
-                            // dropped when the future was cancelled;
-                            // the loop continues.
-                            tracing::warn!(
-                                timeout = ?self.config.accept_handshake_timeout,
-                                "transport accept timed out; continuing",
-                            );
                         }
                     }
                 }
