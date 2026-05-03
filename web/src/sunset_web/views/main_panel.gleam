@@ -817,9 +817,25 @@ fn composer(
   noop: msg,
   on_shortcut: fn(String, String, String, Bool) -> msg,
 ) -> Element(msg) {
-  // Fixed 64px height with a 1px border-top — the rooms-rail you_row
-  // and channels-rail self-bar share the same shape so the three
-  // column-bottom rows align on the same horizontal seam.
+  // The composer's outer height drives the column-bottom seam shared
+  // with the rooms-rail you_row and channels-rail self-bar (64px); the
+  // empty-state container must stay at 64px (±1px) so the bottom seam
+  // reads as one horizontal line. Vertical padding is explicit (not
+  // derived from `align-items: center` against `min-height`) so a
+  // multi-line draft keeps the same bottom gutter as a single line —
+  // relying on the centering hack would collapse the gutter to zero
+  // once the textarea grows past 64px.
+  //
+  // Math: inner content ≈ 42px (one-line textarea + 8px ×2 inner pad +
+  // 1px ×2 inner border) + 1px outer border-top + 2 × v_pad. With
+  // v_pad = 10.5px the empty composer is 64px exactly; multi-line
+  // grows the container while preserving the same 10.5px gutter top
+  // and bottom.
+  let v_pad = "10.5px"
+  let h_pad = case viewport {
+    domain.Phone -> "12px"
+    domain.Desktop -> "20px"
+  }
   html.div(
     [
       ui.css([
@@ -828,11 +844,14 @@ fn composer(
         #("flex-shrink", "0"),
         #("display", "flex"),
         #("align-items", "center"),
-        #("padding", case viewport {
-          domain.Phone -> "0 12px"
-          domain.Desktop -> "0 20px"
-        }),
-        #("padding-bottom", "env(safe-area-inset-bottom)"),
+        #("padding", v_pad <> " " <> h_pad),
+        // Add safe-area-inset on top of the v_pad gutter; older WebKits
+        // can't safely embed `env()` in the `padding` shorthand, so we
+        // override just the bottom side here.
+        #(
+          "padding-bottom",
+          "calc(" <> v_pad <> " + env(safe-area-inset-bottom))",
+        ),
         #("border-top", "1px solid " <> p.border_soft),
       ]),
     ],

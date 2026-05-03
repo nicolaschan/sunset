@@ -930,13 +930,23 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                         fn(r) { dispatch(MessageSent(r)) },
                       )
                     })
+                  // Lustre re-renders the textarea with value="" but the
+                  // imperative inline `style.height` set by autoGrow on
+                  // input persists, so a multi-line composer stays tall
+                  // after submit. `reset_textarea` clears the inline
+                  // style override and the DOM value imperatively so
+                  // the CSS-declared 1-line height takes over.
+                  let resize_eff =
+                    effect.from(fn(_dispatch) {
+                      composer.reset_textarea("composer-textarea")
+                    })
                   let cleared = RoomState(..state, draft: "")
                   #(
                     Model(
                       ..model,
                       rooms: dict.insert(model.rooms, active_name, cleared),
                     ),
-                    send_eff,
+                    effect.batch([send_eff, resize_eff]),
                   )
                 }
               }
@@ -1225,10 +1235,28 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(Model(..next_model, rooms: rooms), send_eff)
     }
     ReactionSent(_) -> #(model, effect.none())
-    OpenFullEmojiPicker(target) -> #(
-      Model(..model, full_picker_for: Some(target)),
-      effect.none(),
-    )
+    OpenFullEmojiPicker(target) -> {
+      // Closing the per-room quick-picker prevents both pickers from
+      // rendering at once; full picker takes over.
+      let active_name = active_room_name(model)
+      let rooms = case dict.get(model.rooms, active_name) {
+        Ok(state) ->
+          dict.insert(
+            model.rooms,
+            active_name,
+            RoomState(..state, reacting_to: None),
+          )
+        Error(_) -> model.rooms
+      }
+      // Trigger the lazy import so the web component is registered by
+      // the time the picker mounts. Idempotent.
+      let register_eff =
+        effect.from(fn(_dispatch) { sunset.register_emoji_picker() })
+      #(
+        Model(..model, rooms: rooms, full_picker_for: Some(target)),
+        register_eff,
+      )
+    }
     CloseFullEmojiPicker -> #(
       Model(..model, full_picker_for: None),
       effect.none(),
@@ -1319,14 +1347,47 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
-  // Master's full-emoji-picker overlay/sheet were here. They depend
-  // on `model.reactions` + `client_pubkey_hex` + `ToggleReactionEmoji`
-  // which still need per-room migration. The picker is unrendered for
-  // now so the build is clean; `OpenFullEmojiPicker` is unwired and
-  // `model.full_picker_for` stays at None. Re-add in the per-room
-  // reactions integration follow-up.
-  let _ = model.full_picker_for
-  let _ = model.reactions
+  // Full emoji picker. Desktop renders a centered overlay; phone
+  // renders a bottom sheet. Each goes into its viewport's slot in
+  // `shell.view` (overlay / reaction_sheet) so only the right one is
+  // visible at a time.
+  let full_picker_overlay_el = case model.full_picker_for {
+    Some(target) ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "full-emoji-picker-overlay"),
+          ui.css([
+            #("position", "fixed"),
+            #("top", "50%"),
+            #("left", "50%"),
+            #("transform", "translate(-50%, -50%)"),
+            #("z-index", "100"),
+            #("background", palette.surface),
+            #("border", "1px solid " <> palette.border),
+            #("border-radius", "8px"),
+            #("box-shadow", palette.shadow_lg),
+          ]),
+        ],
+        [
+          emoji_picker.view(fn(emoji) { ToggleReactionEmoji(target, emoji) }),
+        ],
+      )
+    None -> element.fragment([])
+  }
+
+  let full_picker_sheet_el = case model.full_picker_for {
+    Some(target) ->
+      bottom_sheet.view(
+        palette: palette,
+        open: True,
+        on_close: CloseFullEmojiPicker,
+        test_id: "full-emoji-picker-sheet",
+        content: emoji_picker.view(fn(emoji) {
+          ToggleReactionEmoji(target, emoji)
+        }),
+      )
+    None -> element.fragment([])
+  }
 
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
@@ -1518,6 +1579,7 @@ fn room_view_with_state(
     element.fragment([
       voice_popover_overlay(palette, model, state),
       peer_status_popover_overlay(palette, model, state),
+      full_picker_overlay_el,
     ]),
     phone_header.view(
       palette: palette,
@@ -1528,7 +1590,7 @@ fn room_view_with_state(
     details_sheet_el,
     voice_sheet_el,
     peer_status_sheet_el,
-    reaction_sheet_el,
+    element.fragment([reaction_sheet_el, full_picker_sheet_el]),
   )
 }
 
@@ -1784,34 +1846,56 @@ fn phone_reaction_grid(
   message_id: String,
 ) -> Element(Msg) {
   let emojis = ["🌅", "👍", "👀", "🔥", "🌙"]
+  let emoji_button = fn(e: String) {
+    html.button(
+      [
+        attribute.attribute("aria-label", e),
+        event.on_click(ToggleReactionEmoji(message_id, e)),
+        ui.css([
+          #("padding", "12px"),
+          #("font-size", "26px"),
+          #("border", "1px solid " <> palette.border_soft),
+          #("background", palette.surface),
+          #("color", palette.text),
+          #("border-radius", "10px"),
+          #("font-family", "inherit"),
+          #("cursor", "pointer"),
+        ]),
+      ],
+      [html.text(e)],
+    )
+  }
+  let plus_button =
+    html.button(
+      [
+        attribute.title("More reactions"),
+        attribute.attribute("aria-label", "More reactions"),
+        attribute.attribute("data-testid", "reaction-picker-more"),
+        event.on_click(OpenFullEmojiPicker(message_id)),
+        ui.css([
+          #("padding", "12px"),
+          #("font-size", "26px"),
+          #("border", "1px solid " <> palette.border_soft),
+          #("background", palette.surface),
+          #("color", palette.text_muted),
+          #("border-radius", "10px"),
+          #("font-family", "inherit"),
+          #("cursor", "pointer"),
+        ]),
+      ],
+      [html.text("+")],
+    )
   html.div(
     [
       attribute.attribute("data-testid", "reaction-picker"),
       ui.css([
         #("display", "grid"),
-        #("grid-template-columns", "repeat(5, 1fr)"),
+        // Six cells: five quick emojis + the more-reactions plus button.
+        #("grid-template-columns", "repeat(6, 1fr)"),
         #("gap", "8px"),
         #("padding", "16px 16px 24px 16px"),
       ]),
     ],
-    list.map(emojis, fn(e) {
-      html.button(
-        [
-          attribute.attribute("aria-label", e),
-          event.on_click(ToggleReactionEmoji(message_id, e)),
-          ui.css([
-            #("padding", "12px"),
-            #("font-size", "26px"),
-            #("border", "1px solid " <> palette.border_soft),
-            #("background", palette.surface),
-            #("color", palette.text),
-            #("border-radius", "10px"),
-            #("font-family", "inherit"),
-            #("cursor", "pointer"),
-          ]),
-        ],
-        [html.text(e)],
-      )
-    }),
+    list.append(list.map(emojis, emoji_button), [plus_button]),
   )
 }
