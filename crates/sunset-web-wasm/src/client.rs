@@ -10,7 +10,8 @@ use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 use sunset_core::membership::{Member, TrackerHandles};
-use sunset_core::{Ed25519Verifier, Identity, MessageBody, Room};
+use sunset_core::reactions::ReactionHandles;
+use sunset_core::{Ed25519Verifier, Identity, MessageBody, ReactionAction, Room};
 use sunset_noise::{NoiseIdentity, NoiseTransport};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::{MultiTransport, PeerId, Signer, SyncConfig, SyncEngine};
@@ -53,6 +54,7 @@ pub struct Client {
     relay_status: Rc<RefCell<String>>,
     presence_started: Rc<RefCell<bool>>,
     tracker_handles: Rc<TrackerHandles>,
+    reaction_handles: ReactionHandles,
 }
 
 #[wasm_bindgen]
@@ -119,6 +121,14 @@ impl Client {
         let on_peer_connection_state = Rc::new(RefCell::<Option<js_sys::Function>>::new(None));
         spawn_peer_connection_state_forwarder(supervisor.clone(), on_peer_connection_state.clone());
 
+        let reaction_handles = ReactionHandles::default();
+        sunset_core::spawn_reaction_tracker(
+            store.clone(),
+            (*room).clone(),
+            room.fingerprint().to_hex(),
+            reaction_handles.clone(),
+        );
+
         Ok(Client {
             identity,
             room,
@@ -133,6 +143,7 @@ impl Client {
             relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
             presence_started: Rc::new(RefCell::new(false)),
             tracker_handles: Rc::new(TrackerHandles::new("disconnected")),
+            reaction_handles,
         })
     }
 
@@ -300,6 +311,22 @@ impl Client {
         *self.tracker_handles.on_relay_status.borrow_mut() = Some(Box::new(bridge));
     }
 
+    pub fn on_reactions_changed(&self, callback: js_sys::Function) {
+        let bridge = move |target: &sunset_store::Hash,
+                           snapshot: &sunset_core::ReactionSnapshot| {
+            let payload = crate::reactions::snapshot_to_js(target, snapshot);
+            let _ = callback.call1(&JsValue::NULL, &payload);
+        };
+        *self.reaction_handles.on_reactions_changed.borrow_mut() = Some(Box::new(bridge));
+        // Clear the per-target debounce signatures so the tracker's next
+        // applied event refires the snapshot. (Mirrors the on_members_changed
+        // last_signature.clear() pattern.)
+        self.reaction_handles
+            .last_target_signatures
+            .borrow_mut()
+            .clear();
+    }
+
     pub async fn publish_room_subscription(&self) -> Result<(), JsError> {
         use std::time::Duration;
         // Broader filter: covers <fp>/msg/ + <fp>/webrtc/ + future
@@ -346,6 +373,64 @@ impl Client {
             .map_err(|e| JsError::new(&format!("store insert: {e}")))?;
 
         Ok(value_hash_hex)
+    }
+
+    pub async fn send_reaction(
+        &self,
+        target_value_hash_hex: String,
+        emoji: String,
+        action: String,
+        sent_at_ms: f64,
+        nonce_seed: Vec<u8>,
+    ) -> Result<(), JsError> {
+        use sunset_store::Store as _;
+
+        let action = match action.as_str() {
+            "add" => ReactionAction::Add,
+            "remove" => ReactionAction::Remove,
+            other => {
+                return Err(JsError::new(&format!(
+                    "send_reaction: action must be \"add\" or \"remove\", got {other:?}"
+                )));
+            }
+        };
+        let target_bytes = hex::decode(&target_value_hash_hex)
+            .map_err(|e| JsError::new(&format!("send_reaction: bad target hex: {e}")))?;
+        if target_bytes.len() != 32 {
+            return Err(JsError::new(
+                "send_reaction: target hex must decode to 32 bytes",
+            ));
+        }
+        let mut target_arr = [0u8; 32];
+        target_arr.copy_from_slice(&target_bytes);
+        let target: sunset_store::Hash = target_arr.into();
+
+        let nonce_seed_arr: [u8; 32] = nonce_seed
+            .as_slice()
+            .try_into()
+            .map_err(|_| JsError::new("nonce_seed must be 32 bytes"))?;
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(nonce_seed_arr);
+
+        let composed = sunset_core::compose_reaction(
+            &self.identity,
+            &self.room,
+            0u64,
+            sent_at_ms as u64,
+            &sunset_core::ReactionPayload {
+                for_value_hash: target,
+                emoji: &emoji,
+                action,
+            },
+            &mut rng,
+        )
+        .map_err(|e| JsError::new(&format!("compose_reaction: {e}")))?;
+
+        self.store
+            .insert(composed.entry, Some(composed.block))
+            .await
+            .map_err(|e| JsError::new(&format!("store insert: {e}")))?;
+
+        Ok(())
     }
 
     pub fn on_message(&self, callback: js_sys::Function) {
@@ -516,6 +601,11 @@ impl Client {
                         if let Some(cb) = on_receipt.borrow().as_ref() {
                             let _ = cb.call1(&JsValue::NULL, &JsValue::from(incoming));
                         }
+                    }
+                    MessageBody::Reaction { .. } => {
+                        // Reactions are handled by sunset-core's ReactionTracker (spawned
+                        // separately in Client::new — see Phase C of the reactions plan).
+                        // The bridge subscription has nothing to do here.
                     }
                 }
             }
