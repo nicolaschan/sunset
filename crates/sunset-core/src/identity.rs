@@ -71,6 +71,18 @@ pub struct IdentityKey {
     verifying: DalekVerifyingKey,
 }
 
+impl PartialOrd for IdentityKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IdentityKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.verifying.as_bytes().cmp(other.verifying.as_bytes())
+    }
+}
+
 impl IdentityKey {
     /// Parse a 32-byte Ed25519 verifying key.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self> {
