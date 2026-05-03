@@ -10,11 +10,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use sunset_noise::NoiseTransport;
 use sunset_store::{Filter, Store};
 use sunset_store_fs::FsStore;
 use sunset_sync::SyncEngine;
-use sunset_sync_ws_native::WebSocketRawTransport;
 
 use crate::bridge::{DashboardSnapshot, EntryTtl, IdentitySnapshot, StoreStats};
 
@@ -143,20 +141,3 @@ fn dir_size(root: &Path) -> std::io::Result<u64> {
     }
     Ok(total)
 }
-
-/// Re-export of the `Engine` type alias the relay uses, parameterized
-/// over the (post-cutover) wrapping transport. Used as the `T` in
-/// `build_dashboard_snapshot`'s signature when invoked from `relay.rs`.
-///
-/// The relay's actual T is
-///   SpawningAcceptor<WebSocketRawTransport, NoiseTransport<WebSocketRawTransport>, _, _, _>
-/// — but this module doesn't need to spell it out because it works
-/// generically over any T: Transport. Keeping a placeholder alias here
-/// helps grepping.
-#[allow(dead_code)]
-pub type RelayEngine<T> = SyncEngine<FsStore, T>;
-
-// Imports the relay's outbound side might pull in for `T`. Listed here
-// only so unused imports don't drift when the builder type-erases.
-#[allow(dead_code)]
-type _DialOnlyConnector = NoiseTransport<WebSocketRawTransport>;
