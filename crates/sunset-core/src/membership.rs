@@ -1,8 +1,7 @@
-//! Membership + relay-status tracker. Platform-agnostic chat-semantics
-//! layer over the engine's presence-namespace store events and
+//! Membership tracker. Platform-agnostic chat-semantics layer over
+//! the engine's presence-namespace store events and
 //! `EngineEvent::PeerAdded` / `PeerRemoved` stream. Hosts (web-wasm,
-//! TUI, mod) plug in their own callback to render the member list and
-//! relay-status indicator.
+//! TUI, mod) plug in their own callback to render the member list.
 //!
 //! Three input streams drive the tracker task:
 //!
@@ -18,11 +17,14 @@
 //!
 //! On each input, re-derives the member list and (if it differs from
 //! the last fired signature) invokes the registered members callback.
-//! The relay-status callback is fired separately on engine events.
 //!
-//! Callbacks are typed as `Box<dyn Fn>` so the same tracker drives
-//! both wasm-bindgen `js_sys::Function` shims (in `sunset-web-wasm`)
-//! and native client-surface callbacks (TUI, mod).
+//! Relay connection state is no longer reported here — the
+//! `PeerSupervisor`'s intent stream is the single source of truth and
+//! is exposed directly to hosts.
+//!
+//! The members callback is typed as `Box<dyn Fn>` so the same tracker
+//! drives both wasm-bindgen `js_sys::Function` shims (in
+//! `sunset-web-wasm`) and native client-surface callbacks (TUI, mod).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -112,18 +114,10 @@ pub type MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode)>;
 /// changes (per `members_signature` debounce).
 pub type MembersCallback = Box<dyn Fn(&[Member])>;
 
-/// Callback fired with the current relay-status string whenever it
-/// changes. Values: `"connecting"`, `"connected"`, `"disconnected"`,
-/// `"error"`.
-pub type RelayStatusCallback = Box<dyn Fn(&str)>;
-
 /// Slot type for `TrackerHandles::on_members` — a re-assignable, lazy-
 /// initialized members callback shared between the tracker task and
 /// the host's public API surface.
 pub type MembersCallbackSlot = Rc<RefCell<Option<MembersCallback>>>;
-
-/// Slot type for `TrackerHandles::on_relay_status`.
-pub type RelayStatusCallbackSlot = Rc<RefCell<Option<RelayStatusCallback>>>;
 
 /// Bucket a heartbeat age into Online / Away / Offline.
 ///
@@ -218,8 +212,6 @@ pub fn members_signature(members: &[Member]) -> MemberSig {
 #[derive(Clone, Default)]
 pub struct TrackerHandles {
     pub on_members: MembersCallbackSlot,
-    pub on_relay_status: RelayStatusCallbackSlot,
-    pub last_relay_status: Rc<RefCell<String>>,
     pub peer_kinds: Rc<RefCell<HashMap<PeerId, TransportKind>>>,
     /// Per-member signature of the most recent fire. Lives on the handle
     /// (not as a tracker-task local) so a host's `on_members_changed`-
@@ -233,11 +225,9 @@ pub struct TrackerHandles {
 }
 
 impl TrackerHandles {
-    pub fn new(initial_relay_status: &str) -> Self {
+    pub fn new() -> Self {
         Self {
             on_members: Rc::new(RefCell::new(None)),
-            on_relay_status: Rc::new(RefCell::new(None)),
-            last_relay_status: Rc::new(RefCell::new(initial_relay_status.to_owned())),
             peer_kinds: Rc::new(RefCell::new(HashMap::new())),
             last_signature: Rc::new(RefCell::new(Vec::new())),
         }
@@ -333,7 +323,6 @@ pub fn spawn_tracker<S: Store + 'static>(
                 ev = recv_engine(&mut engine_events).fuse() => {
                     let Some(ev) = ev else { break };
                     handle_engine_event(&handles, &ev);
-                    maybe_fire_relay_status(&handles);
                     maybe_fire_members(
                         now_ms(),
                         interval_ms,
@@ -359,14 +348,6 @@ pub fn spawn_tracker<S: Store + 'static>(
             }
         }
     });
-}
-
-/// Public re-evaluation entry point used by hosts after seeding
-/// `peer_kinds` from the engine snapshot. Fires the relay-status
-/// callback if `peer_kinds` now resolves to a state different from
-/// `last_relay_status`. Idempotent: if nothing changed, no-op.
-pub fn fire_relay_status_now(handles: &TrackerHandles) {
-    maybe_fire_relay_status(handles);
 }
 
 fn now_ms() -> u64 {
@@ -399,31 +380,6 @@ fn handle_engine_event(handles: &TrackerHandles, ev: &EngineEvent) {
         }
         EngineEvent::PeerRemoved { peer_id } => {
             handles.peer_kinds.borrow_mut().remove(peer_id);
-        }
-    }
-}
-
-fn derive_relay_status(peer_kinds: &HashMap<PeerId, TransportKind>, prior: &str) -> String {
-    // Sticky "connecting"/"error" states are owned by the host (set
-    // at add-relay call time). We only flip between "connected" and
-    // "disconnected" based on whether any Primary connection exists.
-    if prior == "connecting" || prior == "error" {
-        return prior.to_owned();
-    }
-    if peer_kinds.values().any(|k| *k == TransportKind::Primary) {
-        "connected".to_owned()
-    } else {
-        "disconnected".to_owned()
-    }
-}
-
-fn maybe_fire_relay_status(handles: &TrackerHandles) {
-    let prior = handles.last_relay_status.borrow().clone();
-    let next = derive_relay_status(&handles.peer_kinds.borrow(), &prior);
-    if next != prior {
-        *handles.last_relay_status.borrow_mut() = next.clone();
-        if let Some(cb) = handles.on_relay_status.borrow().as_ref() {
-            cb(&next);
         }
     }
 }

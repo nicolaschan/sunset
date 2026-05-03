@@ -14,6 +14,4 @@ fn client_constructs() {
     let client = Client::new(&seed, "plan-e-test").expect("Client::new");
     let pk = client.public_key();
     assert_eq!(pk.len(), 32);
-    let status = client.relay_status();
-    assert_eq!(status, "disconnected");
 }

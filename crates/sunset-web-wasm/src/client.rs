@@ -51,7 +51,6 @@ pub struct Client {
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     on_receipt: Rc<RefCell<Option<js_sys::Function>>>,
     on_peer_connection_state: Rc<RefCell<Option<js_sys::Function>>>,
-    relay_status: Rc<RefCell<String>>,
     presence_started: Rc<RefCell<bool>>,
     tracker_handles: Rc<TrackerHandles>,
     reaction_handles: ReactionHandles,
@@ -140,9 +139,8 @@ impl Client {
             on_message: Rc::new(RefCell::new(None)),
             on_receipt: Rc::new(RefCell::new(None)),
             on_peer_connection_state,
-            relay_status: Rc::new(RefCell::new("disconnected".to_owned())),
             presence_started: Rc::new(RefCell::new(false)),
-            tracker_handles: Rc::new(TrackerHandles::new("disconnected")),
+            tracker_handles: Rc::new(TrackerHandles::new()),
             reaction_handles,
         })
     }
@@ -150,11 +148,6 @@ impl Client {
     #[wasm_bindgen(getter)]
     pub fn public_key(&self) -> Vec<u8> {
         self.identity.public().as_bytes().to_vec()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn relay_status(&self) -> String {
-        self.relay_status.borrow().clone()
     }
 
     /// Register a durable intent to keep connected to `url`. Returns
@@ -291,10 +284,6 @@ impl Client {
             },
             (*self.tracker_handles).clone(),
         );
-
-        // Fire an initial relay_status callback in case the seed
-        // pushed us into "connected" / "disconnected".
-        sunset_core::membership::fire_relay_status_now(&self.tracker_handles);
     }
 
     pub fn on_members_changed(&self, callback: js_sys::Function) {
@@ -318,13 +307,6 @@ impl Client {
         // signature changes only happen on heartbeat-vs-refresh-tick
         // jitter, which can be absent.
         self.tracker_handles.last_signature.borrow_mut().clear();
-    }
-
-    pub fn on_relay_status_changed(&self, callback: js_sys::Function) {
-        let bridge = move |status: &str| {
-            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(status));
-        };
-        *self.tracker_handles.on_relay_status.borrow_mut() = Some(Box::new(bridge));
     }
 
     pub fn on_reactions_changed(&self, callback: js_sys::Function) {
