@@ -161,14 +161,29 @@ test("chat survives relay death once direct WebRTC is up", async ({ browser }) =
     { timeout: 30_000 },
   );
 
-  // Give the WebRTC datachannel + Noise_IK a moment to fully settle
-  // before tearing down the relay.
-  await new Promise((r) => setTimeout(r, 1500));
-
-  // Kill the relay.
+  // Kill the relay. peer_connection_mode == "direct" already means A's
+  // engine has fired PeerAdded for the WebRTC peer, which only happens
+  // once the datachannel is open and the Hello handshake is complete —
+  // i.e. both sides have an established connection. Tearing the relay
+  // down at this point doesn't disturb the direct path; ICE/DTLS for
+  // the localhost peer-pair is settled by then.
   relayProcess.kill("SIGTERM");
-  // Give it a moment to fully exit so the WS connections die.
-  await new Promise((r) => setTimeout(r, 1000));
+  // Wait for the relay process to fully exit so the WS connections die,
+  // rather than guessing with a fixed sleep.
+  await new Promise((resolve, reject) => {
+    if (relayProcess.exitCode !== null) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(
+      () => reject(new Error("relay didn't exit within 5s of SIGTERM")),
+      5_000,
+    );
+    relayProcess.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 
   // Send a message in each direction; verify arrival via the direct
   // WebRTC datachannel.

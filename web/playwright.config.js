@@ -20,13 +20,17 @@ export default defineConfig({
   testDir: "e2e",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
+  // No retries — flakes are bugs, not noise. A test that doesn't pass on
+  // its first run is a regression we want surfaced, not papered over.
+  retries: 0,
   workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? "github" : "list",
   outputDir: "test-results",
   use: {
     baseURL: `http://127.0.0.1:${port}`,
-    trace: "on-first-retry",
+    // We never retry, so capture trace + screenshot whenever a test fails
+    // — that's the only forensic data we'll have.
+    trace: "retain-on-failure",
     screenshot: "only-on-failure",
   },
   projects: [
