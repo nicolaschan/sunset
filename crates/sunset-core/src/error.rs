@@ -36,6 +36,9 @@ pub enum Error {
 
     #[error("sync: {0}")]
     Sync(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

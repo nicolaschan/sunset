@@ -19,8 +19,6 @@ use crate::crypto::room::RoomFingerprint;
 use crate::signaling::MultiRoomSignaler;
 use crate::Identity;
 
-// Fields used by Phase 5+ methods (open_room, send_text, etc.).
-#[allow(dead_code)]
 pub struct Peer<St: Store + 'static, T: Transport + 'static> {
     identity: Identity,
     store: Arc<St>,
@@ -61,6 +59,52 @@ where
 
     pub fn relay_status(&self) -> String {
         self.relay_status.borrow().clone()
+    }
+
+    pub async fn open_room(self: &Rc<Self>, room_name: &str) -> crate::Result<OpenRoom<St, T>> {
+        // Open the Room (Argon2id derivation; expensive — ~tens to
+        // hundreds of ms with production params).
+        let room = Rc::new(crate::Room::open(room_name)?);
+        let fp = room.fingerprint();
+
+        // Idempotency check: if this fingerprint is already open and the
+        // weak still upgrades, return another handle to the same RoomState.
+        if let Some(weak) = self.open_rooms.borrow().get(&fp) {
+            if let Some(strong) = weak.upgrade() {
+                return Ok(OpenRoom { inner: strong });
+            }
+        }
+
+        // Build a fresh per-room signaler and register it with the
+        // dispatcher.
+        let signaler: Rc<crate::signaling::RelaySignaler<St>> =
+            crate::signaling::RelaySignaler::new(
+                self.identity.clone(),
+                fp.to_hex(),
+                &self.store,
+            );
+        self.rtc_signaler_dispatcher.register(fp, signaler.clone());
+
+        // Publish the room subscription. Renewal is wired in Task 19.
+        let filter = crate::filters::room_filter(&room);
+        self.engine
+            .publish_subscription(filter, std::time::Duration::from_secs(3600))
+            .await
+            .map_err(|e| crate::Error::Other(format!("publish_subscription: {e}")))?;
+
+        let state = Rc::new(open_room::RoomState {
+            room,
+            peer_weak: Rc::downgrade(self),
+            presence_started: std::cell::Cell::new(false),
+            tracker_handles: Rc::new(crate::membership::TrackerHandles::new(
+                &self.relay_status.borrow(),
+            )),
+            signaler,
+            cancel_decode: Rc::new(std::cell::Cell::new(false)),
+        });
+
+        self.open_rooms.borrow_mut().insert(fp, Rc::downgrade(&state));
+        Ok(OpenRoom { inner: state })
     }
 
     pub async fn add_relay(&self, addr: sunset_sync::PeerAddr) -> sunset_sync::Result<()> {
@@ -148,6 +192,19 @@ mod tests {
             )).await;
             assert!(result.is_err());
             assert_eq!(peer.relay_status(), "error");
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_room_twice_returns_same_state() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let peer = helpers::mk_peer(ident(9)).await;
+            let r1 = peer.open_room("alpha").await.expect("open_room r1");
+            let r2 = peer.open_room("alpha").await.expect("open_room r2");
+            assert_eq!(r1.fingerprint(), r2.fingerprint());
+            // Internal: both handles share the same Rc<RoomState>.
+            assert!(Rc::ptr_eq(&r1.inner, &r2.inner));
         }).await;
     }
 

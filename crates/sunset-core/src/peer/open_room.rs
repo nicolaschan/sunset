@@ -13,8 +13,8 @@ use crate::crypto::room::Room;
 use crate::membership::TrackerHandles;
 use crate::signaling::RelaySignaler;
 
-// Fields are placeholder data shape for Phase 5+. All will be read by
-// open_room, send_text, on_message, presence, etc. that arrive later.
+// Fields presence_started, tracker_handles, signaler are read by
+// send_text, on_message, presence methods arriving in Phase 5+.
 #[allow(dead_code)]
 pub(crate) struct RoomState<St: Store + 'static, T: Transport + 'static> {
     pub(crate) room: Rc<Room>,
@@ -25,10 +25,14 @@ pub(crate) struct RoomState<St: Store + 'static, T: Transport + 'static> {
     pub(crate) cancel_decode: Rc<Cell<bool>>,
 }
 
-// `inner` will be accessed by Phase 5+ methods added to `OpenRoom`.
-#[allow(dead_code)]
 pub struct OpenRoom<St: Store + 'static, T: Transport + 'static> {
     pub(crate) inner: Rc<RoomState<St, T>>,
+}
+
+impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
+    pub fn fingerprint(&self) -> crate::crypto::room::RoomFingerprint {
+        self.inner.room.fingerprint()
+    }
 }
 
 impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
