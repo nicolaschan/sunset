@@ -19,10 +19,7 @@ pub fn load_or_create_identity(callback: fn(BitArray) -> Nil) -> Nil
 /// Construct a Client. Seed must be 32 bytes. `callback` is called with
 /// the opaque ClientHandle once the wasm bundle is loaded + initialised.
 @external(javascript, "./sunset.ffi.mjs", "createClient")
-pub fn create_client(
-  seed: BitArray,
-  callback: fn(ClientHandle) -> Nil,
-) -> Nil
+pub fn create_client(seed: BitArray, callback: fn(ClientHandle) -> Nil) -> Nil
 
 /// Open a room by name. Returns a RoomHandle via `callback` once the room
 /// subscription is published and the wasm-side state is initialised.
@@ -55,10 +52,7 @@ pub fn send_message(
 /// Register the per-message callback. Fires once per current + future
 /// message in the room.
 @external(javascript, "./sunset.ffi.mjs", "onMessage")
-pub fn on_message(
-  room: RoomHandle,
-  callback: fn(IncomingMessage) -> Nil,
-) -> Nil
+pub fn on_message(room: RoomHandle, callback: fn(IncomingMessage) -> Nil) -> Nil
 
 /// Synchronous accessor for the current relay status. Returns one of
 /// "disconnected", "connecting", "connected", "error".
@@ -173,10 +167,7 @@ pub type IncomingReceipt
 /// authored by a peer other than us; self-receipts are dropped at the
 /// bridge layer.
 @external(javascript, "./sunset.ffi.mjs", "onReceipt")
-pub fn on_receipt(
-  room: RoomHandle,
-  callback: fn(IncomingReceipt) -> Nil,
-) -> Nil
+pub fn on_receipt(room: RoomHandle, callback: fn(IncomingReceipt) -> Nil) -> Nil
 
 /// Hex-encoded value_hash of the Text that this Receipt acknowledges.
 @external(javascript, "./sunset.ffi.mjs", "recForValueHashHex")

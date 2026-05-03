@@ -31,7 +31,9 @@ import sunset_web/domain.{
 import sunset_web/fixture
 import sunset_web/scroll_anchor
 import sunset_web/storage
-import sunset_web/sunset.{type ClientHandle, type IncomingMessage, type RoomHandle}
+import sunset_web/sunset.{
+  type ClientHandle, type IncomingMessage, type RoomHandle,
+}
 import sunset_web/theme.{type Mode, Dark, Light}
 import sunset_web/ui
 import sunset_web/views/bottom_sheet
@@ -464,7 +466,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         RoomView(n) -> n
         LandingView -> ""
       }
-      let open_eff = case new_name, dict.has_key(model.rooms, new_name), model.client {
+      let open_eff = case
+        new_name,
+        dict.has_key(model.rooms, new_name),
+        model.client
+      {
         "", _, _ -> effect.none()
         _, True, _ -> effect.none()
         _, False, Some(client) ->
@@ -706,7 +712,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         effect.batch([connect_eff, open_active_eff, open_others_eff]),
       )
     }
-    RelayConnectResult(Ok(_)) -> #(Model(..model, relay_status: "connected"), effect.none())
+    RelayConnectResult(Ok(_)) -> #(
+      Model(..model, relay_status: "connected"),
+      effect.none(),
+    )
     RelayConnectResult(Error(_)) -> #(
       Model(..model, relay_status: "error"),
       effect.none(),
@@ -717,9 +726,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let #(interval, ttl, refresh) = sunset.presence_params_from_url()
       let wire_eff =
         effect.from(fn(dispatch) {
-          sunset.on_message(handle, fn(im) {
-            dispatch(IncomingMsg(name, im))
-          })
+          sunset.on_message(handle, fn(im) { dispatch(IncomingMsg(name, im)) })
           sunset.on_receipt(handle, fn(r) {
             dispatch(IncomingReceipt(
               name,
@@ -756,11 +763,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               details: domain.NoDetails,
             )
           // Append; dedupe by id to handle Replay::All re-emits.
-          let updated =
-            case list.any(state.messages, fn(m) { m.id == new_msg.id }) {
-              True -> state.messages
-              False -> list.append(state.messages, [new_msg])
-            }
+          let updated = case
+            list.any(state.messages, fn(m) { m.id == new_msg.id })
+          {
+            True -> state.messages
+            False -> list.append(state.messages, [new_msg])
+          }
           let new_state = RoomState(..state, messages: updated)
           #(
             Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
