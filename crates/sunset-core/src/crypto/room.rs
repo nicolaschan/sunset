@@ -7,7 +7,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::crypto::constants::{
-    EPOCH_0_DOMAIN, FINGERPRINT_DOMAIN, ROOM_KEY_SALT, production_params,
+    production_params, EPOCH_0_DOMAIN, FINGERPRINT_DOMAIN, ROOM_KEY_SALT,
 };
 use crate::error::{Error, Result};
 
