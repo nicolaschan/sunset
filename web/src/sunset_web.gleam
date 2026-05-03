@@ -25,11 +25,13 @@ import lustre/effect.{type Effect}
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
+import sunset_web/composer
 import sunset_web/domain.{
   type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
   Reaction, Room, RoomId,
 }
 import sunset_web/fixture
+import sunset_web/markdown
 import sunset_web/scroll_anchor
 import sunset_web/storage
 import sunset_web/sunset.{
@@ -84,6 +86,11 @@ pub type RoomState {
     reacting_to: Option(String),
     sheet: Option(domain.Sheet),
     peer_status_popover: Option(domain.MemberId),
+    /// Spoiler keys whose content is currently visible in this room.
+    /// Keys are `#(message_id, path)` where path is a `/`-separated AST
+    /// index trail (e.g. `"0/2/1"`). Per-room so navigating to another
+    /// room and back re-hides spoilers.
+    revealed_spoilers: Set(#(String, String)),
   )
 }
 
@@ -100,6 +107,7 @@ fn empty_room_state() -> RoomState {
     reacting_to: None,
     sheet: None,
     peer_status_popover: None,
+    revealed_spoilers: set.new(),
   )
 }
 
@@ -146,7 +154,9 @@ pub type Model {
     /// `Tick(now_ms)` message so the popover's age readout stays live.
     now_ms: Int,
     /// Per-room state, keyed by room name. Populated as each RoomOpened
-    /// message arrives after bootstrap.
+    /// message arrives after bootstrap. Holds room-scoped UI state
+    /// (draft, selected message, revealed spoilers) so it resets
+    /// naturally when the user navigates to a different room.
     rooms: Dict(String, RoomState),
   )
 }
@@ -202,6 +212,13 @@ pub type Msg {
   ViewportChanged(domain.Viewport)
   OpenDrawer(domain.Drawer)
   CloseDrawer
+  ToggleSpoiler(message_id: String, path: String)
+  ApplyComposerShortcut(
+    before: String,
+    between: String,
+    after: String,
+    caret_at_between: Bool,
+  )
 }
 
 pub fn main() {
@@ -329,6 +346,11 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       sunset.set_interval_ms(1000, fn() { dispatch(Tick(sunset.now_ms())) })
     })
 
+  let attach_shortcuts_eff =
+    effect.from(fn(_dispatch) {
+      composer.attach_shortcut_prevent_default("composer-textarea")
+    })
+
   #(
     model,
     effect.batch([
@@ -339,6 +361,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       subscribe_viewport,
       subscribe_touch_drag,
       ticker_eff,
+      attach_shortcuts_eff,
     ]),
   )
 }
@@ -698,7 +721,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     )
     UpdateDraft(s) ->
       with_active_room(model, fn(state) {
-        #(RoomState(..state, draft: s), effect.none())
+        #(
+          RoomState(..state, draft: s),
+          effect.from(fn(_dispatch) { composer.auto_grow("composer-textarea") }),
+        )
       })
     IdentityReady(seed) -> {
       let create_client_eff =
@@ -1122,6 +1148,22 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     OpenDrawer(d) -> #(Model(..model, drawer: Some(d)), effect.none())
     CloseDrawer -> #(Model(..model, drawer: None), effect.none())
+    ToggleSpoiler(mid, path) ->
+      with_active_room(model, fn(state) {
+        let key = #(mid, path)
+        let next = case set.contains(state.revealed_spoilers, key) {
+          True -> set.delete(state.revealed_spoilers, key)
+          False -> set.insert(state.revealed_spoilers, key)
+        }
+        #(RoomState(..state, revealed_spoilers: next), effect.none())
+      })
+    ApplyComposerShortcut(b, m, a, caret) -> {
+      let new_value =
+        composer.apply_template("composer-textarea", b, m, a, caret)
+      with_active_room(model, fn(state) {
+        #(RoomState(..state, draft: new_value), effect.none())
+      })
+    }
     // Master's reactions Msg variants — pre-multi-room these were
     // wired to a Client-level reactions tracker. After multi-room the
     // tracker needs to be per-OpenRoom (the per-room follow-up), so
@@ -1432,6 +1474,7 @@ fn room_view_with_state(
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
       noop: NoOp,
+      on_shortcut: fn(b, m, a, caret) { ApplyComposerShortcut(b, m, a, caret) },
       reacting_to: state.reacting_to,
       detail_msg_id: case state.sheet {
         Some(domain.DetailsSheet(message_id: id)) -> Some(id)
@@ -1444,6 +1487,12 @@ fn room_view_with_state(
       receipts: state.receipts,
       selected_msg_id: state.selected_msg_id,
       on_toggle_selected: ToggleMessageSelected,
+      is_spoiler_revealed: fn(k: markdown.SpoilerKey) {
+        set.contains(state.revealed_spoilers, #(k.message_id, k.path))
+      },
+      on_toggle_spoiler: fn(k: markdown.SpoilerKey) {
+        ToggleSpoiler(k.message_id, k.path)
+      },
       voice_minibar: voice_minibar_el,
     ),
     case model.viewport, detail_msg {
