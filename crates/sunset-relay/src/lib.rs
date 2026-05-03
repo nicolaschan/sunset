@@ -13,6 +13,7 @@ pub mod identity;
 pub mod relay;
 pub(crate) mod resolver_adapter;
 pub(crate) mod router;
+pub mod snapshot;
 pub(crate) mod status;
 
 pub use config::Config;
