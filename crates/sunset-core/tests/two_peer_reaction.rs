@@ -87,7 +87,7 @@ async fn reaction_round_trip_between_two_identities() {
             assert_eq!(observed.borrow().len(), 1);
             let snap = observed.borrow()[0].clone();
             let alice_set = snap.get("👍").unwrap();
-            assert!(alice_set.contains(&alice.public()));
+            assert_eq!(alice_set.get(&alice.public()), Some(&100));
 
             // 5. Alice removes.
             let remove = compose_reaction(

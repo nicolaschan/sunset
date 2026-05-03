@@ -28,6 +28,10 @@ pub struct IncomingReceipt {
     /// Verifying key bytes of the peer who composed this receipt.
     #[wasm_bindgen(getter_with_clone)]
     pub from_pubkey: Vec<u8>,
+    /// Wall-clock unix-ms when the acknowledging peer composed this
+    /// receipt. Surfaced in the message-details panel as the
+    /// "delivered-at" stamp per recipient.
+    pub sent_at_ms: f64,
 }
 
 /// Build an IncomingMessage from a decoded Text. The text is passed in
@@ -50,9 +54,14 @@ pub fn from_decoded_text(
 }
 
 /// Build an IncomingReceipt JS object.
-pub fn receipt_to_js(for_value_hash_hex: String, from_pubkey: &IdentityKey) -> IncomingReceipt {
+pub fn receipt_to_js(
+    for_value_hash_hex: String,
+    from_pubkey: &IdentityKey,
+    sent_at_ms: u64,
+) -> IncomingReceipt {
     IncomingReceipt {
         for_value_hash_hex,
         from_pubkey: from_pubkey.as_bytes().to_vec(),
+        sent_at_ms: sent_at_ms as f64,
     }
 }

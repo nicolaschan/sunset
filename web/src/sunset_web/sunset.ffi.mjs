@@ -198,6 +198,16 @@ export function formatTimeMs(ms) {
   return `${hh}:${mm}`;
 }
 
+/// HH:MM:SS — used by the message-details panel where second-level
+/// precision matters for diffing delivery / reaction timestamps.
+export function formatTimeMsExact(ms) {
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
 /// Encode a BitArray (Uint8Array internally) as lowercase hex.
 /// Used by the relays popover to render the relay's peer_id.
 export function bitsToHex(bits) {
@@ -295,6 +305,7 @@ export function onReceipt(room, callback) {
     const plain = {
       for_value_hash_hex: incoming.for_value_hash_hex,
       from_pubkey: incoming.from_pubkey,
+      sent_at_ms: incoming.sent_at_ms,
     };
     incoming.free();
     callback(plain);
@@ -307,6 +318,10 @@ export function recForValueHashHex(rec) {
 
 export function recFromPubkey(rec) {
   return new BitArray(rec.from_pubkey);
+}
+
+export function recSentAtMs(rec) {
+  return rec.sent_at_ms;
 }
 
 /// Schedule a recurring callback every `ms` milliseconds. Returns
@@ -343,9 +358,15 @@ export function reactionsSnapshotTargetHex(snapshot) {
 }
 
 export function reactionsSnapshotEntries(snapshot) {
+  // Inner shape on the wasm side is `Map<author_pubkey_hex, sent_at_ms>`.
+  // Flatten each emoji's Map to a Gleam-friendly `List(#(author_hex, sent_at_ms))`.
   const out = [];
-  for (const [emoji, set] of snapshot.reactions.entries()) {
-    out.push([emoji, toList([...set])]);
+  for (const [emoji, authors] of snapshot.reactions.entries()) {
+    const pairs = [];
+    for (const [authorHex, sentAtMs] of authors.entries()) {
+      pairs.push([authorHex, sentAtMs]);
+    }
+    out.push([emoji, toList(pairs)]);
   }
   return toList(out);
 }

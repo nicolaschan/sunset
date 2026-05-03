@@ -14,7 +14,6 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
-import gleam/set.{type Set}
 import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
@@ -46,7 +45,7 @@ pub fn view(
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
   on_open_full_picker on_open_full_picker: fn(String) -> msg,
   on_open_detail on_open_detail: fn(String) -> msg,
-  receipts receipts: Dict(String, Set(String)),
+  receipts receipts: Dict(String, Dict(String, Int)),
   selected_msg_id selected_msg_id: Option(String),
   on_toggle_selected on_toggle_selected: fn(String) -> msg,
   is_spoiler_revealed is_revealed: fn(markdown.SpoilerKey) -> Bool,
@@ -155,7 +154,7 @@ fn messages_list(
   on_add_reaction: fn(String, String) -> msg,
   on_open_full_picker: fn(String) -> msg,
   on_open_detail: fn(String) -> msg,
-  receipts: Dict(String, Set(String)),
+  receipts: Dict(String, Dict(String, Int)),
   selected_msg_id: Option(String),
   on_toggle_selected: fn(String) -> msg,
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
@@ -242,7 +241,7 @@ fn message_view(
   on_open_full_picker: fn(String) -> msg,
   on_open_detail: fn(String) -> msg,
   on_toggle_selected: fn(String) -> msg,
-  receipts: Dict(String, Set(String)),
+  receipts: Dict(String, Dict(String, Int)),
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
   on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
   author_color: String,
@@ -251,7 +250,7 @@ fn message_view(
     m.you
     && {
       case dict.get(receipts, m.id) {
-        Ok(s) -> set.size(s) == 0
+        Ok(d) -> dict.size(d) == 0
         Error(_) -> True
       }
     }
