@@ -21,6 +21,9 @@ fn parse_markdown_round_trips_bold_text() {
         .expect("stringify")
         .as_string()
         .expect("stringify result");
-    assert!(json.contains("\"Bold\""), "expected Bold variant in JSON, got: {json}");
+    assert!(
+        json.contains("\"Bold\""),
+        "expected Bold variant in JSON, got: {json}"
+    );
     assert!(json.contains("\"hi\""), "expected payload, got: {json}");
 }

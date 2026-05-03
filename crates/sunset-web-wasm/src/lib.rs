@@ -6,9 +6,9 @@
 #[cfg(target_arch = "wasm32")]
 mod client;
 #[cfg(target_arch = "wasm32")]
-mod markdown;
-#[cfg(target_arch = "wasm32")]
 mod identity;
+#[cfg(target_arch = "wasm32")]
+mod markdown;
 #[cfg(target_arch = "wasm32")]
 mod members;
 #[cfg(target_arch = "wasm32")]
