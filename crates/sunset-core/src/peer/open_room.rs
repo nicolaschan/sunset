@@ -6,8 +6,8 @@
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
-use sunset_sync::Transport;
 use sunset_store::Store;
+use sunset_sync::Transport;
 
 use crate::crypto::room::Room;
 use crate::membership::TrackerHandles;
@@ -91,10 +91,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         }
     }
 
-    pub fn on_receipt<F: Fn(sunset_store::Hash, &crate::IdentityKey) + 'static>(
-        &self,
-        cb: F,
-    ) {
+    pub fn on_receipt<F: Fn(sunset_store::Hash, &crate::IdentityKey) + 'static>(&self, cb: F) {
         let mut cbs = self.inner.callbacks.borrow_mut();
         let was_unregistered = cbs.on_message.is_none() && cbs.on_receipt.is_none();
         cbs.on_receipt = Some(Box::new(cb));
@@ -207,10 +204,12 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             peer.store().clone(),
             engine_events,
             local_peer,
-            room_fp_hex,
-            interval_ms,
-            ttl_ms,
-            refresh_ms,
+            crate::membership::PresenceConfig {
+                room_fp_hex,
+                interval_ms,
+                ttl_ms,
+                refresh_ms,
+            },
             (*self.inner.tracker_handles).clone(),
         );
 
@@ -254,7 +253,11 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         *self.inner.tracker_handles.on_members.borrow_mut() = Some(Box::new(cb));
         // Match Client::on_members_changed: clear last_signature so the next
         // refresh tick fires the callback with the current snapshot.
-        self.inner.tracker_handles.last_signature.borrow_mut().clear();
+        self.inner
+            .tracker_handles
+            .last_signature
+            .borrow_mut()
+            .clear();
     }
 
     pub fn on_relay_status_changed<F: Fn(&str) + 'static>(&self, cb: F) {
@@ -266,7 +269,8 @@ impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
     fn drop(&mut self) {
         self.cancel_decode.set(true);
         if let Some(peer) = self.peer_weak.upgrade() {
-            peer.rtc_signaler_dispatcher.unregister(&self.room.fingerprint());
+            peer.rtc_signaler_dispatcher
+                .unregister(&self.room.fingerprint());
         }
     }
 }
