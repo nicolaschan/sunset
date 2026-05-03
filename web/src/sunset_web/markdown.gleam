@@ -273,9 +273,82 @@ fn render_block(b: Block, ctx: Ctx(msg), offset: Int) -> Element(msg) {
   case b {
     Paragraph(inlines) ->
       html.p([], render_inlines(inlines, ctx, offset))
-    _ -> html.text("")
-    // Block variants other than Paragraph filled in by Task C5.
+
+    Heading(level, content) -> {
+      let tag = case level {
+        1 -> html.h1
+        2 -> html.h2
+        _ -> html.h3
+      }
+      tag([], render_inlines(content, ctx, offset))
+    }
+
+    Quote(blocks) ->
+      html.blockquote(
+        [
+          attribute.attribute(
+            "style",
+            "border-left: 3px solid var(--border, #888); padding-left: 8px; color: var(--text-muted, inherit); margin: 0;",
+          ),
+        ],
+        list.index_map(blocks, fn(b, i) { render_block(b, ctx, offset * 100 + i) }),
+      )
+
+    UnorderedList(items) ->
+      html.ul(
+        [],
+        list.index_map(items, fn(item, i) {
+          html.li(
+            [],
+            list.index_map(item, fn(b, j) {
+              render_block(b, ctx, offset * 100 + i * 10 + j)
+            }),
+          )
+        }),
+      )
+
+    CodeBlock(language, source) -> render_code_block(language, source, ctx.palette)
   }
+}
+
+fn render_code_block(
+  language: Option(String),
+  source: String,
+  _p: Palette,
+) -> Element(msg) {
+  let pill = case language {
+    option.Some(lang) -> [
+      html.span(
+        [
+          attribute.attribute(
+            "style",
+            "position: absolute; top: 4px; right: 8px; font-size: 10px; text-transform: uppercase; opacity: 0.6;",
+          ),
+        ],
+        [html.text(lang)],
+      ),
+    ]
+    option.None -> []
+  }
+  html.div(
+    [
+      attribute.attribute(
+        "style",
+        "position: relative; background: rgba(0,0,0,0.06); border-radius: 6px; padding: 8px 12px; margin: 4px 0;",
+      ),
+    ],
+    list.append(pill, [
+      html.pre(
+        [attribute.attribute("style", "margin: 0; white-space: pre-wrap;")],
+        [
+          html.code(
+            [attribute.attribute("style", "font-family: " <> theme.font_mono <> ";")],
+            [html.text(source)],
+          ),
+        ],
+      ),
+    ]),
+  )
 }
 
 // ----- Inline rendering -----

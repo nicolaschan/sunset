@@ -5,6 +5,7 @@
 //// The full pipeline (body → WASM → AST → render) is covered by the
 //// Playwright e2e tests in `web/e2e/`.
 
+import gleam/option
 import gleam/string
 import gleeunit/should
 import lustre/element
@@ -160,4 +161,67 @@ pub fn render_disallowed_scheme_renders_as_text_test() {
   // No <a> tag, but the URL must still be visible somewhere.
   should.be_false(string.contains(html, "<a "))
   should.be_true(string.contains(html, "javascript:"))
+}
+
+pub fn render_heading_test() {
+  let html =
+    markdown.render_blocks(
+      [markdown.Heading(1, [markdown.Text("title")])],
+      "msg-1",
+      fn(_) { False },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  should.be_true(string.contains(html, "<h1"))
+  should.be_true(string.contains(html, "title"))
+}
+
+pub fn render_quote_test() {
+  let html =
+    markdown.render_blocks(
+      [markdown.Quote([markdown.Paragraph([markdown.Text("hello")])])],
+      "msg-1",
+      fn(_) { False },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  should.be_true(string.contains(html, "<blockquote"))
+  should.be_true(string.contains(html, "hello"))
+}
+
+pub fn render_unordered_list_test() {
+  let html =
+    markdown.render_blocks(
+      [markdown.UnorderedList([
+        [markdown.Paragraph([markdown.Text("one")])],
+        [markdown.Paragraph([markdown.Text("two")])],
+      ])],
+      "msg-1",
+      fn(_) { False },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  should.be_true(string.contains(html, "<ul"))
+  should.be_true(string.contains(html, "<li"))
+  should.be_true(string.contains(html, "one"))
+  should.be_true(string.contains(html, "two"))
+}
+
+pub fn render_code_block_with_language_test() {
+  let html =
+    markdown.render_blocks(
+      [markdown.CodeBlock(option.Some("rust"), "fn main() {}")],
+      "msg-1",
+      fn(_) { False },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  should.be_true(string.contains(html, "<pre"))
+  should.be_true(string.contains(html, "<code"))
+  should.be_true(string.contains(html, "rust"))
+  should.be_true(string.contains(html, "fn main()"))
 }
