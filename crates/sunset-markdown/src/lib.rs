@@ -144,4 +144,53 @@ mod tests {
             Document(vec![Block::Paragraph(vec![Inline::Text("a **** b".to_owned())])])
         );
     }
+
+    #[test]
+    fn italic_with_asterisk() {
+        assert_eq!(
+            parse("a *b* c"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::Italic(vec![Inline::Text("b".to_owned())]),
+                Inline::Text(" c".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn italic_with_underscore() {
+        assert_eq!(
+            parse("a _b_ c"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::Italic(vec![Inline::Text("b".to_owned())]),
+                Inline::Text(" c".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn underscore_inside_word_is_literal() {
+        // Discord behavior: `foo_bar` does NOT italicize — `_` only opens
+        // italic at a word boundary. We approximate with "preceding char
+        // is not alphanumeric".
+        assert_eq!(
+            parse("foo_bar_baz"),
+            Document(vec![Block::Paragraph(vec![Inline::Text(
+                "foo_bar_baz".to_owned()
+            )])])
+        );
+    }
+
+    #[test]
+    fn bold_wraps_italic() {
+        assert_eq!(
+            parse("**a *b* c**"),
+            Document(vec![Block::Paragraph(vec![Inline::Bold(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::Italic(vec![Inline::Text("b".to_owned())]),
+                Inline::Text(" c".to_owned()),
+            ])])])
+        );
+    }
 }

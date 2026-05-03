@@ -42,7 +42,9 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delim {
-    Bold, // **
+    Bold,        // **
+    ItalicStar,  // *
+    ItalicUnder, // _
 }
 
 fn match_delimiter(bytes: &[u8], i: usize) -> Option<(Delim, usize)> {
@@ -54,7 +56,27 @@ fn match_delimiter(bytes: &[u8], i: usize) -> Option<(Delim, usize)> {
         }
         return Some((Delim::Bold, 2));
     }
+    if bytes.get(i) == Some(&b'*') {
+        return Some((Delim::ItalicStar, 1));
+    }
+    if bytes.get(i) == Some(&b'_') && is_word_boundary(bytes, i) {
+        return Some((Delim::ItalicUnder, 1));
+    }
     None
+}
+
+fn is_word_boundary(bytes: &[u8], i: usize) -> bool {
+    // `_` only opens/closes italic if the previous (for opener) or
+    // next (for closer) character is not an ASCII alphanumeric.
+    // We use the same predicate for both because we re-enter
+    // match_delimiter at each scan position.
+    let prev = if i == 0 { None } else { bytes.get(i - 1).copied() };
+    let next = bytes.get(i + 1).copied();
+    !is_word_byte(prev) || !is_word_byte(next)
+}
+
+fn is_word_byte(b: Option<u8>) -> bool {
+    matches!(b, Some(c) if c.is_ascii_alphanumeric())
 }
 
 fn find_close(bytes: &[u8], start: usize, kind: Delim) -> Option<usize> {
@@ -77,5 +99,6 @@ fn find_close(bytes: &[u8], start: usize, kind: Delim) -> Option<usize> {
 fn wrap(kind: Delim, inner: Vec<Inline>) -> Inline {
     match kind {
         Delim::Bold => Inline::Bold(inner),
+        Delim::ItalicStar | Delim::ItalicUnder => Inline::Italic(inner),
     }
 }
