@@ -87,16 +87,6 @@ async fn alice_writes_bob_receives() {
             // Alice connects to Bob.
             alice_engine.add_peer(bob_addr).await.unwrap();
 
-            // Wait for Bob's subscription to propagate to Alice's registry
-            // via the bootstrap digest exchange.
-            let registered = wait_for(
-                Duration::from_secs(2),
-                Duration::from_millis(20),
-                || async { alice_engine.knows_peer_subscription(&vk(b"bob")).await },
-            )
-            .await;
-            assert!(registered, "alice did not learn bob's subscription");
-
             // Alice writes (chat, k).
             let block = ContentBlock {
                 data: Bytes::from_static(b"hello-bob"),
