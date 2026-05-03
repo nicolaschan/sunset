@@ -91,6 +91,19 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         }
     }
 
+    pub fn on_receipt<F: Fn(sunset_store::Hash, &crate::IdentityKey) + 'static>(
+        &self,
+        cb: F,
+    ) {
+        let mut cbs = self.inner.callbacks.borrow_mut();
+        let was_unregistered = cbs.on_message.is_none() && cbs.on_receipt.is_none();
+        cbs.on_receipt = Some(Box::new(cb));
+        drop(cbs);
+        if was_unregistered {
+            self.spawn_decode_loop();
+        }
+    }
+
     fn spawn_decode_loop(&self) {
         let inner = self.inner.clone();
         let peer = match inner.peer_weak.upgrade() {
@@ -152,9 +165,9 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                             cb(&decoded, is_self);
                         }
                     }
-                    crate::MessageBody::Receipt { for_value_hash: _ } => {
+                    crate::MessageBody::Receipt { for_value_hash } => {
                         if let Some(cb) = cbs.on_receipt.as_ref() {
-                            cb(decoded.value_hash, &decoded.author_key);
+                            cb(*for_value_hash, &decoded.author_key);
                         }
                     }
                 }

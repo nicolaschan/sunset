@@ -262,6 +262,49 @@ mod tests {
         }).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_receipt_fires_for_inserted_receipt() {
+        use std::cell::RefCell;
+        use rand_core::SeedableRng;
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let peer = helpers::mk_peer(ident(12)).await;
+            let room = peer.open_room("alpha").await.expect("open_room");
+
+            let received: Rc<RefCell<Vec<sunset_store::Hash>>> = Rc::new(RefCell::new(Vec::new()));
+            let received_clone = received.clone();
+            // Register a no-op on_message so the decode loop spawns even
+            // though we only care about receipts here. (The loop spawns on
+            // first on_message OR on_receipt registration — either works.)
+            room.on_message(|_, _| {});
+            room.on_receipt(move |for_hash, _from: &crate::IdentityKey| {
+                received_clone.borrow_mut().push(for_hash);
+            });
+
+            // Compose+insert a Receipt referencing some target hash.
+            let target: sunset_store::Hash = blake3::hash(b"target").into();
+            let mut rng = rand_chacha::ChaCha20Rng::from_seed([42; 32]);
+            let composed = crate::compose_receipt(
+                peer.identity(),
+                &room.inner.room,
+                0,
+                1_700_000_000_000,
+                target,
+                &mut rng,
+            ).expect("compose_receipt");
+            use sunset_store::Store as _;
+            peer.store()
+                .insert(composed.entry, Some(composed.block))
+                .await
+                .expect("insert receipt");
+
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(received.borrow().clone(), vec![target]);
+        }).await;
+    }
+
     pub(super) mod helpers {
         use super::*;
         use async_trait::async_trait;
