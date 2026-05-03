@@ -12,6 +12,8 @@ use wasm_bindgen::prelude::*;
 use sunset_core::liveness::{Liveness, LivenessState};
 use sunset_sync::PeerId;
 
+use super::VoiceCell;
+
 pub(crate) const FRAME_STALE_AFTER: Duration = Duration::from_millis(1000);
 pub(crate) const MEMBERSHIP_STALE_AFTER: Duration = Duration::from_secs(5);
 
@@ -31,8 +33,14 @@ impl VoiceLiveness {
 
 /// Spawn the state combiner. Listens to both Liveness streams and emits
 /// `(peer_id_uint8array, in_call, talking)` whenever the combined state
-/// for any peer changes. Exits when both upstream streams end.
-pub(crate) fn spawn_combiner(arcs: &VoiceLiveness, on_voice_peer_state: Function) {
+/// for any peer changes. Exits when both upstream streams end OR when
+/// `state.borrow().is_none()` (voice_stop has cleared the cell, dropping
+/// the only outside refs to the Liveness arcs).
+pub(crate) fn spawn_combiner(
+    state: VoiceCell,
+    arcs: &VoiceLiveness,
+    on_voice_peer_state: Function,
+) {
     let frame = arcs.frame.clone();
     let membership = arcs.membership.clone();
     wasm_bindgen_futures::spawn_local(async move {
@@ -45,6 +53,7 @@ pub(crate) fn spawn_combiner(arcs: &VoiceLiveness, on_voice_peer_state: Function
         loop {
             tokio::select! {
                 Some(ev) = frame_sub.next() => {
+                    if state.borrow().is_none() { return; }
                     let alive = ev.state == LivenessState::Live;
                     frame_state.insert(ev.peer.clone(), alive);
                     emit_if_changed(
@@ -56,6 +65,7 @@ pub(crate) fn spawn_combiner(arcs: &VoiceLiveness, on_voice_peer_state: Function
                     );
                 }
                 Some(ev) = membership_sub.next() => {
+                    if state.borrow().is_none() { return; }
                     let alive = ev.state == LivenessState::Live;
                     membership_state.insert(ev.peer.clone(), alive);
                     emit_if_changed(

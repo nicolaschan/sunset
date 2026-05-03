@@ -27,12 +27,10 @@ pub(crate) type BusArc = Rc<BusImpl<MemoryStore, MultiTransport<WsT, RtcT>>>;
 
 /// Heartbeat cadence. Liveness considers a peer "in-call" if heartbeats
 /// arrive within ~5 s, so 2 s leaves room for one or two losses.
-#[allow(dead_code)] // Used by spawn_heartbeat once Task 6 wires the FFI.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Spawn the periodic heartbeat task. Exits when `state` becomes None
 /// (voice_stop has been called and the cell content has been dropped).
-#[allow(dead_code)] // Wired up by Client in Task 6.
 pub(crate) fn spawn_heartbeat(state: VoiceCell, identity: Identity, room: Rc<Room>, bus: BusArc) {
     wasm_bindgen_futures::spawn_local(async move {
         let now_nanos = web_time::SystemTime::now()

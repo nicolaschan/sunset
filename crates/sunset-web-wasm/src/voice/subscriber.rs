@@ -29,6 +29,7 @@ pub(crate) fn spawn_subscriber(
     bus: BusArc,
     arcs: VoiceLiveness,
     on_frame: Function,
+    self_pk: sunset_store::VerifyingKey,
 ) {
     wasm_bindgen_futures::spawn_local(async move {
         let room_fp_hex = room.fingerprint().to_hex();
@@ -58,6 +59,11 @@ pub(crate) fn spawn_subscriber(
                 BusEvent::Ephemeral(d) => d,
                 BusEvent::Durable { .. } => continue,
             };
+            // Skip self-loopback: the user's own audio is already
+            // played by the worklet locally.
+            if datagram.verifying_key == self_pk {
+                continue;
+            }
             let peer = PeerId(datagram.verifying_key.clone());
             let sender = match IdentityKey::from_store_verifying_key(&datagram.verifying_key) {
                 Ok(s) => s,

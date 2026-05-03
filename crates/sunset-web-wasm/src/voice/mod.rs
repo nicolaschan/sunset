@@ -29,7 +29,6 @@ pub(crate) use transport::{BusArc, spawn_heartbeat};
 
 /// Per-`Client` voice runtime state. `None` until `voice_start` is
 /// called; cleared on `voice_stop` (Drop on inner Rc cancels everything).
-#[allow(dead_code)] // Wired up by Client in Task 6.
 pub(crate) struct VoiceState {
     encoder: VoiceEncoder,
     /// Monotonic frame sequence; incremented per voice_input call.
@@ -43,6 +42,12 @@ pub(crate) struct VoiceState {
     /// Per-process RNG for nonces. ChaCha20Rng implements CryptoRngCore
     /// and is wasm-friendly (no OsRng dependency at construction time).
     rng: ChaCha20Rng,
+    /// Liveness arcs held here so that `voice_stop` (which clears the
+    /// cell) drops the only outside strong refs. The combiner task holds
+    /// its own clones for its stream subscriptions; it exits on the next
+    /// event after `state.borrow().is_none()` becomes true.
+    #[allow(dead_code)]
+    liveness: liveness::VoiceLiveness,
 }
 
 pub(crate) type VoiceCell = Rc<RefCell<Option<VoiceState>>>;
@@ -54,7 +59,6 @@ pub(crate) fn new_voice_cell() -> VoiceCell {
 /// Start the voice subsystem. Constructs the encoder, spawns the
 /// heartbeat task, the Bus subscribe loop, and the Liveness state
 /// combiner.
-#[allow(dead_code)] // Wired up by Client in Task 6.
 pub(crate) fn voice_start(
     state: &VoiceCell,
     identity: &Identity,
@@ -75,6 +79,8 @@ pub(crate) fn voice_start(
         .unwrap_or(0);
     let rng = ChaCha20Rng::seed_from_u64(now_nanos);
 
+    let arcs = liveness::VoiceLiveness::new();
+
     *state.borrow_mut() = Some(VoiceState {
         encoder,
         seq: 0,
@@ -82,12 +88,15 @@ pub(crate) fn voice_start(
         room: room.clone(),
         bus: bus.clone(),
         rng,
+        liveness: liveness::VoiceLiveness {
+            frame: arcs.frame.clone(),
+            membership: arcs.membership.clone(),
+        },
     });
 
     spawn_heartbeat(state.clone(), identity.clone(), room.clone(), bus.clone());
 
-    let arcs = liveness::VoiceLiveness::new();
-    liveness::spawn_combiner(&arcs, on_voice_peer_state.clone());
+    liveness::spawn_combiner(state.clone(), &arcs, on_voice_peer_state.clone());
     subscriber::spawn_subscriber(
         state.clone(),
         room.clone(),
@@ -97,6 +106,7 @@ pub(crate) fn voice_start(
             membership: arcs.membership.clone(),
         },
         on_frame.clone(),
+        identity.store_verifying_key(),
     );
 
     Ok(())
@@ -107,7 +117,6 @@ pub(crate) fn voice_stop(state: &VoiceCell) -> Result<(), JsError> {
     Ok(())
 }
 
-#[allow(dead_code)] // Wired up by Client in Task 6.
 pub(crate) fn voice_input(state: &VoiceCell, pcm: &Float32Array) -> Result<(), JsError> {
     let mut slot = state.borrow_mut();
     let voice = slot

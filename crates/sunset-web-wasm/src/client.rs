@@ -49,6 +49,7 @@ pub struct Client {
     presence_started: Rc<RefCell<bool>>,
     tracker_handles: Rc<TrackerHandles>,
     voice: crate::voice::VoiceCell,
+    bus: crate::voice::BusArc,
 }
 
 #[wasm_bindgen]
@@ -106,6 +107,12 @@ impl Client {
             async move { s.run().await }
         });
 
+        let bus: crate::voice::BusArc = std::rc::Rc::new(sunset_core::bus::BusImpl::new(
+            store.clone(),
+            engine.clone(),
+            identity.clone(),
+        ));
+
         Ok(Client {
             identity,
             room,
@@ -118,6 +125,7 @@ impl Client {
             presence_started: Rc::new(RefCell::new(false)),
             tracker_handles: Rc::new(TrackerHandles::new("disconnected")),
             voice: crate::voice::new_voice_cell(),
+            bus,
         })
     }
 
@@ -342,12 +350,25 @@ impl Client {
         // both Text and Receipt variants.
     }
 
-    /// Voice FFI is being migrated from loopback to network mode. The
-    /// real signature lands in Task 6 of the C2b plan.
-    pub fn voice_start(&self, _output_handler: &js_sys::Function) -> Result<(), JsError> {
-        Err(JsError::new(
-            "voice FFI being migrated to network mode (C2b)",
-        ))
+    /// Start voice in this client's room. Spawns the heartbeat task,
+    /// subscribe loop, and Liveness state combiner. Errors if voice is
+    /// already started.
+    ///
+    /// `on_frame` called as `on_frame(from_peer_id_bytes: Uint8Array, pcm: Float32Array)`.
+    /// `on_voice_peer_state` called as `(peer_id: Uint8Array, in_call: bool, talking: bool)`.
+    pub fn voice_start(
+        &self,
+        on_frame: &js_sys::Function,
+        on_voice_peer_state: &js_sys::Function,
+    ) -> Result<(), JsError> {
+        crate::voice::voice_start(
+            &self.voice,
+            &self.identity,
+            &self.room,
+            &self.bus,
+            on_frame,
+            on_voice_peer_state,
+        )
     }
 
     /// Stop the voice subsystem and release its resources.
@@ -355,12 +376,79 @@ impl Client {
         crate::voice::voice_stop(&self.voice)
     }
 
-    /// Voice FFI is being migrated from loopback to network mode. The
-    /// real signature lands in Task 6 of the C2b plan.
-    pub fn voice_input(&self, _pcm: &js_sys::Float32Array) -> Result<(), JsError> {
-        Err(JsError::new(
-            "voice FFI being migrated to network mode (C2b)",
-        ))
+    pub fn voice_input(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
+        crate::voice::voice_input(&self.voice, pcm)
+    }
+
+    /// Snapshot all current peer connection intents. Returns a JS array
+    /// of objects: `{ addr, state, peer_id?, attempt }`.
+    pub async fn peer_connection_snapshot(&self) -> Result<JsValue, JsError> {
+        let snaps = self.supervisor.snapshot().await;
+        let arr = js_sys::Array::new();
+        for s in snaps {
+            let obj = js_sys::Object::new();
+            let addr_str = String::from_utf8_lossy(s.addr.as_bytes()).into_owned();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("addr"),
+                &JsValue::from_str(&addr_str),
+            )
+            .map_err(|_| JsError::new("Reflect::set addr failed"))?;
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("state"),
+                &JsValue::from_str(intent_state_str(s.state)),
+            )
+            .map_err(|_| JsError::new("Reflect::set state failed"))?;
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("attempt"),
+                &JsValue::from_f64(s.attempt as f64),
+            )
+            .map_err(|_| JsError::new("Reflect::set attempt failed"))?;
+            if let Some(pid) = s.peer_id {
+                let pk_arr = js_sys::Uint8Array::from(pid.0.as_bytes());
+                js_sys::Reflect::set(&obj, &JsValue::from_str("peer_id"), &pk_arr)
+                    .map_err(|_| JsError::new("Reflect::set peer_id failed"))?;
+            }
+            arr.push(&obj);
+        }
+        Ok(arr.into())
+    }
+
+    /// Subscribe to live intent state changes. The handler receives one
+    /// object per transition with the same shape as `peer_connection_snapshot`'s
+    /// elements.
+    pub fn on_peer_connection_state(&self, handler: js_sys::Function) -> Result<(), JsError> {
+        use futures::StreamExt as _;
+        let mut sub = self.supervisor.subscribe();
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(snap) = sub.next().await {
+                let obj = js_sys::Object::new();
+                let addr_str = String::from_utf8_lossy(snap.addr.as_bytes()).into_owned();
+                let _ = js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("addr"),
+                    &JsValue::from_str(&addr_str),
+                );
+                let _ = js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("state"),
+                    &JsValue::from_str(intent_state_str(snap.state)),
+                );
+                let _ = js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("attempt"),
+                    &JsValue::from_f64(snap.attempt as f64),
+                );
+                if let Some(pid) = snap.peer_id {
+                    let pk_arr = js_sys::Uint8Array::from(pid.0.as_bytes());
+                    let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("peer_id"), &pk_arr);
+                }
+                let _ = handler.call1(&JsValue::NULL, &obj);
+            }
+        });
+        Ok(())
     }
 
     fn spawn_message_subscription(&self) {
@@ -466,6 +554,15 @@ impl Client {
                 }
             }
         });
+    }
+}
+
+fn intent_state_str(s: sunset_sync::IntentState) -> &'static str {
+    match s {
+        sunset_sync::IntentState::Connecting => "connecting",
+        sunset_sync::IntentState::Connected => "connected",
+        sunset_sync::IntentState::Backoff => "backoff",
+        sunset_sync::IntentState::Cancelled => "cancelled",
     }
 }
 
