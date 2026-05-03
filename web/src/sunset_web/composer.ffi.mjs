@@ -30,8 +30,10 @@ export function applyTemplate(elementId, before, between, after, caretAtBetween)
       : start + before.length;
   el.selectionStart = caret;
   el.selectionEnd = caret;
-  // Re-fire input so Gleam's on_input handler updates the model.
-  el.dispatchEvent(new Event("input", { bubbles: true }));
+  // Single source of truth: ApplyComposerShortcut writes the returned
+  // value into model.draft. We don't dispatch a synthetic input event.
+  // We do trigger auto-grow ourselves since on_input won't fire.
+  autoGrow(elementId);
   el.focus();
   return el.value;
 }

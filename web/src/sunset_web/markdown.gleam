@@ -37,8 +37,12 @@ pub fn parse(body: String) -> List(Block) {
 
 /// A key uniquely identifying a spoiler span within a message.
 /// Used to track revealed state in the top-level Model.
+///
+/// `path` is a `/`-separated index trail through the AST: `"0"` for the
+/// first top-level block, `"0/2"` for its third child, `"0/2/1"` for the
+/// second grandchild, etc. Structurally injective by construction.
 pub type SpoilerKey {
-  SpoilerKey(message_id: String, offset: Int)
+  SpoilerKey(message_id: String, path: String)
 }
 
 /// Rendering context threaded through all render functions.
@@ -80,7 +84,7 @@ pub fn render_blocks(
     )
   html.div(
     [],
-    list.index_map(blocks, fn(b, i) { render_block(b, ctx, i * 1_000_000) }),
+    list.index_map(blocks, fn(b, i) { render_block(b, ctx, int.to_string(i)) }),
   )
 }
 
@@ -268,10 +272,10 @@ fn link_payload_decoder() -> decode.Decoder(Inline) {
 
 // ----- Block rendering -----
 
-fn render_block(b: Block, ctx: Ctx(msg), offset: Int) -> Element(msg) {
+fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
   case b {
     Paragraph(inlines) ->
-      html.p([], render_inlines(inlines, ctx, offset))
+      html.p([], render_inlines(inlines, ctx, path))
 
     Heading(level, content) -> {
       let tag = case level {
@@ -279,7 +283,7 @@ fn render_block(b: Block, ctx: Ctx(msg), offset: Int) -> Element(msg) {
         2 -> html.h2
         _ -> html.h3
       }
-      tag([], render_inlines(content, ctx, offset))
+      tag([], render_inlines(content, ctx, path))
     }
 
     Quote(blocks) ->
@@ -290,7 +294,9 @@ fn render_block(b: Block, ctx: Ctx(msg), offset: Int) -> Element(msg) {
             "border-left: 3px solid var(--border, #888); padding-left: 8px; color: var(--text-muted, inherit); margin: 0;",
           ),
         ],
-        list.index_map(blocks, fn(b, i) { render_block(b, ctx, offset * 100 + i) }),
+        list.index_map(blocks, fn(b, i) {
+          render_block(b, ctx, path <> "/" <> int.to_string(i))
+        }),
       )
 
     UnorderedList(items) ->
@@ -300,7 +306,11 @@ fn render_block(b: Block, ctx: Ctx(msg), offset: Int) -> Element(msg) {
           html.li(
             [],
             list.index_map(item, fn(b, j) {
-              render_block(b, ctx, offset * 100 + i * 10 + j)
+              render_block(
+                b,
+                ctx,
+                path <> "/" <> int.to_string(i) <> "/" <> int.to_string(j),
+              )
             }),
           )
         }),
@@ -355,25 +365,21 @@ fn render_code_block(
 fn render_inlines(
   is: List(Inline),
   ctx: Ctx(msg),
-  offset_base: Int,
+  path: String,
 ) -> List(Element(msg)) {
-  list.index_map(is, fn(i, idx) { render_inline(i, ctx, offset_base + idx) })
+  list.index_map(is, fn(i, idx) {
+    render_inline(i, ctx, path <> "/" <> int.to_string(idx))
+  })
   |> list.flatten()
 }
 
-fn render_inline(i: Inline, ctx: Ctx(msg), offset: Int) -> List(Element(msg)) {
+fn render_inline(i: Inline, ctx: Ctx(msg), path: String) -> List(Element(msg)) {
   case i {
     Text(s) -> [html.text(s)]
-    Bold(xs) -> [
-      html.strong([], render_inlines(xs, ctx, offset * 100)),
-    ]
-    Italic(xs) -> [html.em([], render_inlines(xs, ctx, offset * 100))]
-    Underline(xs) -> [
-      html.u([], render_inlines(xs, ctx, offset * 100)),
-    ]
-    Strikethrough(xs) -> [
-      html.s([], render_inlines(xs, ctx, offset * 100)),
-    ]
+    Bold(xs) -> [html.strong([], render_inlines(xs, ctx, path))]
+    Italic(xs) -> [html.em([], render_inlines(xs, ctx, path))]
+    Underline(xs) -> [html.u([], render_inlines(xs, ctx, path))]
+    Strikethrough(xs) -> [html.s([], render_inlines(xs, ctx, path))]
     InlineCode(s) -> [
       html.code(
         [
@@ -388,8 +394,8 @@ fn render_inline(i: Inline, ctx: Ctx(msg), offset: Int) -> List(Element(msg)) {
       ),
     ]
     LineBreak -> [html.br([])]
-    Spoiler(xs) -> [render_spoiler(xs, ctx, offset)]
-    Link(label, url, autolink) -> [render_link(label, url, autolink, ctx, offset)]
+    Spoiler(xs) -> [render_spoiler(xs, ctx, path)]
+    Link(label, url, autolink) -> [render_link(label, url, autolink, ctx, path)]
   }
 }
 
@@ -398,7 +404,7 @@ fn render_link(
   url: String,
   autolink: Bool,
   ctx: Ctx(msg),
-  offset: Int,
+  path: String,
 ) -> Element(msg) {
   case allowed_scheme(url) {
     True -> {
@@ -411,7 +417,7 @@ fn render_link(
         True -> base_attrs
         False -> [attribute.title(url), ..base_attrs]
       }
-      html.a(attrs, render_inlines(label, ctx, offset * 100))
+      html.a(attrs, render_inlines(label, ctx, path))
     }
     False -> {
       // Render as plain text: label + " (" + url + ")" so the user can
@@ -419,7 +425,7 @@ fn render_link(
       html.span(
         [],
         list.append(
-          render_inlines(label, ctx, offset * 100),
+          render_inlines(label, ctx, path),
           [html.text(" (" <> url <> ")")],
         ),
       )
@@ -436,9 +442,9 @@ fn allowed_scheme(url: String) -> Bool {
 fn render_spoiler(
   xs: List(Inline),
   ctx: Ctx(msg),
-  offset: Int,
+  path: String,
 ) -> Element(msg) {
-  let key = SpoilerKey(ctx.message_id, offset)
+  let key = SpoilerKey(ctx.message_id, path)
   let revealed = ctx.is_revealed(key)
   let style = case revealed {
     True -> "background: rgba(0,0,0,0.05); border-radius: 3px; padding: 0 2px;"
@@ -449,10 +455,10 @@ fn render_spoiler(
     [
       attribute.class("spoiler"),
       attribute.attribute("data-msg-id", ctx.message_id),
-      attribute.attribute("data-offset", int.to_string(offset)),
+      attribute.attribute("data-path", path),
       attribute.attribute("style", style),
       event.on_click(ctx.on_toggle(key)),
     ],
-    render_inlines(xs, ctx, offset * 100),
+    render_inlines(xs, ctx, path),
   )
 }

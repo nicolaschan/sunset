@@ -123,10 +123,10 @@ pub type Model {
     /// `Tick(now_ms)` message so the popover's age readout stays live.
     now_ms: Int,
     /// Set of spoiler keys whose content is currently visible.
-    /// Each key is `#(message_id, offset)` where offset is the
-    /// character position of the `||` in the original message text.
-    /// Reset to empty whenever the user navigates to a different room.
-    revealed_spoilers: set.Set(#(String, Int)),
+    /// Each key is `#(message_id, path)` where path is a `/`-separated
+    /// AST index trail (`"0/2/1"`). Reset to empty whenever the user
+    /// navigates to a different room.
+    revealed_spoilers: set.Set(#(String, String)),
   )
 }
 
@@ -179,7 +179,7 @@ pub type Msg {
   ViewportChanged(domain.Viewport)
   OpenDrawer(domain.Drawer)
   CloseDrawer
-  ToggleSpoiler(message_id: String, offset: Int)
+  ToggleSpoiler(message_id: String, path: String)
   ApplyComposerShortcut(
     before: String,
     between: String,
@@ -971,8 +971,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     OpenDrawer(d) -> #(Model(..model, drawer: Some(d)), effect.none())
     CloseDrawer -> #(Model(..model, drawer: None), effect.none())
-    ToggleSpoiler(mid, off) -> {
-      let key = #(mid, off)
+    ToggleSpoiler(mid, path) -> {
+      let key = #(mid, path)
       let next = case set.contains(model.revealed_spoilers, key) {
         True -> set.delete(model.revealed_spoilers, key)
         False -> set.insert(model.revealed_spoilers, key)
@@ -1247,10 +1247,10 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       selected_msg_id: model.selected_msg_id,
       on_toggle_selected: ToggleMessageSelected,
       is_spoiler_revealed: fn(k: markdown.SpoilerKey) {
-        set.contains(model.revealed_spoilers, #(k.message_id, k.offset))
+        set.contains(model.revealed_spoilers, #(k.message_id, k.path))
       },
       on_toggle_spoiler: fn(k: markdown.SpoilerKey) {
-        ToggleSpoiler(k.message_id, k.offset)
+        ToggleSpoiler(k.message_id, k.path)
       },
       voice_minibar: voice_minibar_el,
     ),
