@@ -79,6 +79,15 @@ pub struct IntentSnapshot {
     /// Display label — `Connectable::label()` of the intent that
     /// created this snapshot. Stable across reconnect cycles.
     pub label: String,
+    /// Wall-clock ms of the most recent Pong observed from this peer.
+    /// `None` until the first Pong of the *first* connection lands.
+    /// Preserved across Backoff transitions (the popover should show
+    /// "heard from 12s ago" while reconnecting), cleared only when
+    /// the intent itself is removed (`SupervisorCommand::Remove`).
+    pub last_pong_at_unix_ms: Option<u64>,
+    /// Round-trip time of the most recent Pong, in milliseconds.
+    /// `None` under the same conditions as `last_pong_at_unix_ms`.
+    pub last_rtt_ms: Option<u64>,
 }
 
 /// Key used to clean up either dedup map without a second branch on the
@@ -104,6 +113,8 @@ pub(crate) struct IntentEntry {
     pub connectable: crate::connectable::Connectable,
     /// Cached `Connectable::label()` for snapshot construction.
     pub label: String,
+    pub last_pong_at_unix_ms: Option<u64>,
+    pub last_rtt_ms: Option<u64>,
 }
 
 pub(crate) struct SupervisorState {
@@ -251,6 +262,8 @@ where
             kind: entry.kind,
             attempt: entry.attempt,
             label: entry.label.clone(),
+            last_pong_at_unix_ms: entry.last_pong_at_unix_ms,
+            last_rtt_ms: entry.last_rtt_ms,
         };
         state.subscribers.retain(|tx| tx.send(snap.clone()).is_ok());
     }
@@ -422,6 +435,8 @@ where
                             next_attempt_at: None,
                             connectable: connectable.clone(),
                             label,
+                            last_pong_at_unix_ms: None,
+                            last_rtt_ms: None,
                         },
                     );
                     Self::broadcast(&mut state, id);
@@ -491,6 +506,8 @@ where
                         kind: e.kind,
                         attempt: e.attempt,
                         label: e.label.clone(),
+                        last_pong_at_unix_ms: e.last_pong_at_unix_ms,
+                        last_rtt_ms: e.last_rtt_ms,
                     })
                     .collect();
                 let _ = ack.send(snap);
@@ -514,6 +531,8 @@ where
                             kind: e.kind,
                             attempt: e.attempt,
                             label: e.label.clone(),
+                            last_pong_at_unix_ms: e.last_pong_at_unix_ms,
+                            last_rtt_ms: e.last_rtt_ms,
                         })
                         .collect();
                     for snap in snaps {
