@@ -11,6 +11,7 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option}
+import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
@@ -316,9 +317,48 @@ fn render_inline(i: Inline, ctx: Ctx(msg), offset: Int) -> List(Element(msg)) {
     ]
     LineBreak -> [html.br([])]
     Spoiler(xs) -> [render_spoiler(xs, ctx, offset)]
-    Link(_, _, _) -> [html.text("")]
-    // Link rendering in Task C4.
+    Link(label, url, autolink) -> [render_link(label, url, autolink, ctx, offset)]
   }
+}
+
+fn render_link(
+  label: List(Inline),
+  url: String,
+  autolink: Bool,
+  ctx: Ctx(msg),
+  offset: Int,
+) -> Element(msg) {
+  case allowed_scheme(url) {
+    True -> {
+      let base_attrs = [
+        attribute.href(url),
+        attribute.target("_blank"),
+        attribute.rel("noopener noreferrer"),
+      ]
+      let attrs = case autolink {
+        True -> base_attrs
+        False -> [attribute.title(url), ..base_attrs]
+      }
+      html.a(attrs, render_inlines(label, ctx, offset * 100))
+    }
+    False -> {
+      // Render as plain text: label + " (" + url + ")" so the user can
+      // still see what was sent.
+      html.span(
+        [],
+        list.append(
+          render_inlines(label, ctx, offset * 100),
+          [html.text(" (" <> url <> ")")],
+        ),
+      )
+    }
+  }
+}
+
+fn allowed_scheme(url: String) -> Bool {
+  string.starts_with(url, "http://")
+  || string.starts_with(url, "https://")
+  || string.starts_with(url, "mailto:")
 }
 
 fn render_spoiler(

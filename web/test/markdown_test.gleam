@@ -112,3 +112,52 @@ pub fn render_spoiler_revealed_test() {
   should.be_false(string.contains(html, "color: transparent"))
   should.be_true(string.contains(html, "secret"))
 }
+
+pub fn render_masked_link_test() {
+  let html =
+    markdown.render_blocks(
+      [markdown.Paragraph([markdown.Link([markdown.Text("click")], "https://example.com", False)])],
+      "msg-1",
+      fn(_) { False },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  should.be_true(string.contains(html, "<a "))
+  should.be_true(string.contains(html, "href=\"https://example.com\""))
+  should.be_true(string.contains(html, "target=\"_blank\""))
+  should.be_true(string.contains(html, "rel=\"noopener noreferrer\""))
+  should.be_true(string.contains(html, "title=\"https://example.com\""))
+  should.be_true(string.contains(html, ">click</a>"))
+}
+
+pub fn render_autolink_omits_title_test() {
+  let url = "https://example.com"
+  let html =
+    markdown.render_blocks(
+      [markdown.Paragraph([markdown.Link([markdown.Text(url)], url, True)])],
+      "msg-1",
+      fn(_) { False },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  should.be_true(string.contains(html, "<a "))
+  should.be_true(string.contains(html, "href=\"https://example.com\""))
+  should.be_false(string.contains(html, "title="))
+}
+
+pub fn render_disallowed_scheme_renders_as_text_test() {
+  let html =
+    markdown.render_blocks(
+      [markdown.Paragraph([markdown.Link([markdown.Text("bad")], "javascript:alert(1)", False)])],
+      "msg-1",
+      fn(_) { False },
+      fn(_) { Nil },
+      p(),
+    )
+    |> element.to_string()
+  // No <a> tag, but the URL must still be visible somewhere.
+  should.be_false(string.contains(html, "<a "))
+  should.be_true(string.contains(html, "javascript:"))
+}
