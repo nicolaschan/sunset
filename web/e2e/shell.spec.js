@@ -236,6 +236,98 @@ test("favicon link points at favicon.svg", async ({ page }) => {
   expect(href).toMatch(/favicon\.svg$/);
 });
 
+test("apple-touch-icon link points at a 180x180 PNG that exists", async ({
+  page,
+}) => {
+  // Apple home-screen icons must be a full-bleed opaque PNG; iOS
+  // applies its own corner mask, so any rounding in the source PNG
+  // shows up as a doubled edge. The PNG is baked from
+  // priv/apple-touch-icon.svg by the flake's webDist installPhase.
+  const link = await page.evaluate(() => {
+    const el = document.querySelector('link[rel="apple-touch-icon"]');
+    return el
+      ? { href: el.getAttribute("href"), sizes: el.getAttribute("sizes") }
+      : null;
+  });
+  expect(link).not.toBeNull();
+  expect(link.href).toMatch(/apple-touch-icon\.png$/);
+  expect(link.sizes).toBe("180x180");
+
+  // The icon must actually be served alongside the build artefact.
+  const resolved = new URL(link.href, page.url()).toString();
+  const response = await page.request.get(resolved);
+  expect(response.ok()).toBe(true);
+  expect(response.headers()["content-type"]).toContain("image/png");
+
+  // Decode the PNG to verify the dimensions match the link's sizes
+  // attribute. We use createImageBitmap rather than Buffer-parsing so
+  // the test stays portable across Playwright environments.
+  const dims = await page.evaluate(async (url) => {
+    const r = await fetch(url);
+    const blob = await r.blob();
+    const bm = await createImageBitmap(blob);
+    return { width: bm.width, height: bm.height };
+  }, resolved);
+  expect(dims).toEqual({ width: 180, height: 180 });
+});
+
+test("manifest link points at a valid web app manifest", async ({ page }) => {
+  // Add-to-Home-Screen on Chrome/Android reads `<link rel="manifest">`
+  // for the icon set, name, and display mode.
+  const href = await page.evaluate(
+    () => document.querySelector('link[rel="manifest"]')?.getAttribute("href"),
+  );
+  expect(href).toMatch(/manifest\.webmanifest$/);
+
+  const resolved = new URL(href, page.url()).toString();
+  const response = await page.request.get(resolved);
+  expect(response.ok()).toBe(true);
+  // Some servers serve .webmanifest as text/plain; accept either as
+  // long as the body is valid JSON with the required fields.
+  const manifest = await response.json();
+  expect(manifest.name).toBe("sunset.chat");
+  expect(manifest.short_name).toBeTruthy();
+  expect(manifest.display).toBe("standalone");
+  // At minimum the iOS-sized icon and one square PWA icon must be
+  // declared, and each must reference a fetchable PNG.
+  const sizes = manifest.icons.map((i) => i.sizes);
+  expect(sizes).toContain("180x180");
+  expect(sizes.some((s) => s === "192x192" || s === "512x512")).toBe(true);
+
+  for (const icon of manifest.icons) {
+    if (icon.type !== "image/png") continue;
+    const iconUrl = new URL(icon.src, resolved).toString();
+    const iconResp = await page.request.get(iconUrl);
+    expect(iconResp.ok()).toBe(true);
+    expect(iconResp.headers()["content-type"]).toContain("image/png");
+  }
+});
+
+test("PWA / Apple home-screen meta tags are present", async ({ page }) => {
+  // theme-color paints the browser chrome; the `apple-mobile-web-app-*`
+  // metas are what iOS reads when the page is launched as a standalone
+  // home-screen app — without them the title bar shows the truncated
+  // page title and the status bar reverts to the system default.
+  const metas = await page.evaluate(() => {
+    const get = (name) =>
+      document
+        .querySelector(`meta[name="${name}"]`)
+        ?.getAttribute("content") ?? null;
+    return {
+      themeColor: get("theme-color"),
+      appleCapable: get("apple-mobile-web-app-capable"),
+      mobileCapable: get("mobile-web-app-capable"),
+      statusBar: get("apple-mobile-web-app-status-bar-style"),
+      title: get("apple-mobile-web-app-title"),
+    };
+  });
+  expect(metas.themeColor).toMatch(/^#[0-9a-fA-F]{3,8}$/);
+  expect(metas.appleCapable).toBe("yes");
+  expect(metas.mobileCapable).toBe("yes");
+  expect(metas.statusBar).toBe("black-translucent");
+  expect(metas.title).toBeTruthy();
+});
+
 test("viewport meta is mobile-friendly (safe-area + keyboard resize)", async ({
   page,
 }) => {
