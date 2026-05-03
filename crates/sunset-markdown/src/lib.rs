@@ -262,4 +262,42 @@ mod tests {
             ])])])
         );
     }
+
+    #[test]
+    fn inline_code() {
+        assert_eq!(
+            parse("a `b` c"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::InlineCode("b".to_owned()),
+                Inline::Text(" c".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn inline_code_does_not_parse_markdown_inside() {
+        assert_eq!(
+            parse("`**not bold**`"),
+            Document(vec![Block::Paragraph(vec![Inline::InlineCode(
+                "**not bold**".to_owned()
+            )])])
+        );
+    }
+
+    #[test]
+    fn unclosed_backtick_is_literal() {
+        assert_eq!(
+            parse("a `b c"),
+            Document(vec![Block::Paragraph(vec![Inline::Text("a `b c".to_owned())])])
+        );
+    }
+
+    #[test]
+    fn empty_backtick_pair_is_literal() {
+        assert_eq!(
+            parse("``"),
+            Document(vec![Block::Paragraph(vec![Inline::Text("``".to_owned())])])
+        );
+    }
 }

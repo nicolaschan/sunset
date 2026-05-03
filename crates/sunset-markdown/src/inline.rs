@@ -19,6 +19,22 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
     let mut text_start = 0;
 
     while i < bytes.len() {
+        // Inline code: scan to next backtick, no markdown inside.
+        // Reject empty pair `` so it stays literal.
+        if bytes[i] == b'`' {
+            if let Some(end) = find_byte(bytes, b'`', i + 1) {
+                if end > i + 1 {
+                    if text_start < i {
+                        out.push(Inline::Text(input[text_start..i].to_owned()));
+                    }
+                    out.push(Inline::InlineCode(input[i + 1..end].to_owned()));
+                    i = end + 1;
+                    text_start = i;
+                    continue;
+                }
+            }
+        }
+
         if let Some((kind, marker_len)) = match_delimiter(bytes, i) {
             if let Some(close) = find_close(bytes, i + marker_len, kind) {
                 // Flush pending plain text.
@@ -38,6 +54,10 @@ pub(crate) fn parse_inlines(input: &str) -> Vec<Inline> {
         out.push(Inline::Text(input[text_start..].to_owned()));
     }
     out
+}
+
+fn find_byte(bytes: &[u8], target: u8, from: usize) -> Option<usize> {
+    bytes[from..].iter().position(|&b| b == target).map(|p| p + from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
