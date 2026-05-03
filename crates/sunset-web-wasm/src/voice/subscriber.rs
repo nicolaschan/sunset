@@ -37,7 +37,7 @@ pub(crate) fn spawn_subscriber(
         let mut stream = match bus.subscribe(Filter::NamePrefix(prefix)).await {
             Ok(s) => s,
             Err(e) => {
-                web_sys::console::error_1(&format!("voice subscribe failed: {e}").into());
+                tracing::error!(error = %e, "voice subscribe failed");
                 return;
             }
         };
@@ -45,7 +45,7 @@ pub(crate) fn spawn_subscriber(
         let mut decoder = match VoiceDecoder::new() {
             Ok(d) => d,
             Err(e) => {
-                web_sys::console::error_1(&format!("voice decoder init failed: {e}").into());
+                tracing::error!(error = %e, "voice decoder init failed");
                 return;
             }
         };
@@ -78,9 +78,7 @@ pub(crate) fn spawn_subscriber(
             let packet = match sunset_voice::packet::decrypt(&room, 0, &sender, &ev) {
                 Ok(p) => p,
                 Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("voice decrypt failed (drop frame): {e}").into(),
-                    );
+                    tracing::warn!(error = %e, "voice decrypt failed (drop frame)");
                     continue;
                 }
             };
@@ -100,7 +98,7 @@ pub(crate) fn spawn_subscriber(
                             let _ = on_frame.call2(&JsValue::NULL, &id_arr, &pcm_arr);
                         }
                         Err(e) => {
-                            web_sys::console::warn_1(&format!("voice decode failed: {e}").into());
+                            tracing::warn!(error = %e, "voice decode failed");
                         }
                     }
                 }

@@ -167,7 +167,7 @@ pub(crate) fn voice_input(state: &VoiceCell, pcm: &Float32Array) -> Result<(), J
     let payload = Bytes::from(payload_bytes);
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(e) = bus.publish_ephemeral(name, payload).await {
-            web_sys::console::warn_1(&format!("voice_input publish_ephemeral failed: {e}").into());
+            tracing::warn!(error = %e, "voice_input publish_ephemeral failed");
         }
     });
 

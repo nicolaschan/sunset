@@ -63,21 +63,15 @@ pub(crate) fn spawn_heartbeat(state: VoiceCell, identity: Identity, room: Rc<Roo
                             .publish_ephemeral(name.clone(), Bytes::from(payload))
                             .await
                         {
-                            web_sys::console::warn_1(
-                                &format!("voice heartbeat publish failed: {e}").into(),
-                            );
+                            tracing::warn!(error = %e, "voice heartbeat publish failed");
                         }
                     }
                     Err(e) => {
-                        web_sys::console::warn_1(
-                            &format!("voice heartbeat postcard encode failed: {e}").into(),
-                        );
+                        tracing::warn!(error = %e, "voice heartbeat postcard encode failed");
                     }
                 },
                 Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("voice heartbeat encrypt failed: {e}").into(),
-                    );
+                    tracing::warn!(error = %e, "voice heartbeat encrypt failed");
                 }
             }
 

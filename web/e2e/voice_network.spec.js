@@ -87,25 +87,15 @@ function syntheticPcm(seedByte) {
   return arr;
 }
 
-// Voice frames flow over the unreliable channel of SyncMessage::EphemeralDelivery
-// (sunset-sync/src/peer.rs:371). The browser WebSocket transport
-// (sunset-sync-ws-browser/src/wasm.rs:212-221) does NOT support an unreliable
-// channel — it returns "websocket: unreliable channel unsupported" and the
-// outbound send error is silently dropped at peer.rs:282. So voice between two
-// browsers requires a direct WebRTC P2P connection via Client::connect_direct.
+// Voice frames flow over the unreliable channel of
+// SyncMessage::EphemeralDelivery (sunset-sync/src/peer.rs:371). The browser
+// WebSocket transport doesn't support an unreliable channel, so two-browser
+// voice requires a direct WebRTC P2P connection via Client::connect_direct.
 //
-// connect_direct currently hangs in this test environment for reasons not yet
-// diagnosed (the existing presence.spec.js connect_direct test works, suggesting
-// it's a setup-order issue in this harness). Skipping until investigated.
-//
-// What IS verified by the C2b plan:
-// - Wire format + AEAD: sunset-voice unit tests (Task 1)
-// - Bus + Liveness round-trip: sunset-core/tests/voice_two_peer.rs (Task 3)
-// - FFI + voice_start/voice_input/voice_stop wiring: Task 6 (compiles + clippy clean)
-//
-// Remaining for full e2e: get connect_direct to complete in this harness so
-// frames can flow over the WebRTC unreliable channel between alice and bob.
-test.skip("alice voice_input arrives at bob byte-equal", async ({ browser }) => {
+// For connect_direct to succeed, both peers must call publish_room_subscription
+// after add_relay so the relay forwards <fp>/webrtc/ signaling entries. The
+// harness does this in its start() shim.
+test("alice voice_input arrives at bob byte-equal", async ({ browser }) => {
   const aliceCtx = await browser.newContext();
   const bobCtx = await browser.newContext();
   const alice = await aliceCtx.newPage();
@@ -139,6 +129,8 @@ test.skip("alice voice_input arrives at bob byte-equal", async ({ browser }) => 
   // membership work). Then alice triggers WebRTC P2P to bob.
   // Voice frames need WebRTC P2P because the WS-to-relay channel can't
   // carry unreliable EphemeralDelivery messages.
+  // voice_start runs AFTER connect_direct, matching presence.spec.js's
+  // working order.
   await alice.evaluate(async () => await window.__voice.startPresence());
   await bob.evaluate(async () => await window.__voice.startPresence());
 
@@ -155,6 +147,9 @@ test.skip("alice voice_input arrives at bob byte-equal", async ({ browser }) => 
     await alice.waitForTimeout(200);
   }
   expect(aliceDirect, "alice→bob WebRTC P2P should be direct").toBe(true);
+
+  await alice.evaluate(() => window.__voice.startVoice());
+  await bob.evaluate(() => window.__voice.startVoice());
 
   // Send one frame from alice every 50 ms for 3 s.
   const sample = Array.from(syntheticPcm(0x42));
@@ -189,9 +184,7 @@ test.skip("alice voice_input arrives at bob byte-equal", async ({ browser }) => 
   await bobCtx.close();
 });
 
-// Same WebRTC P2P prerequisite as the byte-equal test above. Skipped for
-// the same reason.
-test.skip("voice peer state transitions in_call -> talking -> silent -> out", async ({
+test("voice peer state transitions in_call -> talking -> silent -> out", async ({
   browser,
 }) => {
   const aliceCtx = await browser.newContext();
@@ -215,12 +208,31 @@ test.skip("voice peer state transitions in_call -> talking -> silent -> out", as
     async ({ seed, room, relay }) => window.__voice.start({ seed, room, relay }),
     { seed: ALICE_SEED, room: ROOM, relay: relayAddress },
   );
-  await bob.evaluate(
+  const bobInfo = await bob.evaluate(
     async ({ seed, room, relay }) => window.__voice.start({ seed, room, relay }),
     { seed: BOB_SEED, room: ROOM, relay: relayAddress },
   );
 
   const alicePk = aliceInfo.publicKey;
+  const bobPk = bobInfo.publicKey;
+
+  // Same setup as the byte-equal test: presence + connect_direct + voice_start.
+  await alice.evaluate(async () => await window.__voice.startPresence());
+  await bob.evaluate(async () => await window.__voice.startPresence());
+  await alice.evaluate(async (pk) => await window.__voice.connectDirect(pk), bobPk);
+  const directDeadline = Date.now() + 15_000;
+  let aliceDirect = false;
+  while (Date.now() < directDeadline) {
+    const mode = await alice.evaluate((pk) => window.__voice.peerMode(pk), bobPk);
+    if (mode === "direct") {
+      aliceDirect = true;
+      break;
+    }
+    await alice.waitForTimeout(200);
+  }
+  expect(aliceDirect, "alice→bob WebRTC P2P should be direct").toBe(true);
+  await alice.evaluate(() => window.__voice.startVoice());
+  await bob.evaluate(() => window.__voice.startVoice());
 
   // Wait for bob to see alice as in_call (one heartbeat interval ≈ 2 s).
   const inCallDeadline = Date.now() + 4_000;

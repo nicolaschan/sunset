@@ -26,10 +26,19 @@
           window.__voice.client = client;
           window.__voice.publicKeyHex = hex(new Uint8Array(client.public_key));
           await client.add_relay(relay);
+          // Subscribe to the room namespace so peers learn we want
+          // <fp>/msg/ AND <fp>/webrtc/ entries from them. Without
+          // this, WebRTC signaling SDP offers never reach the remote
+          // peer and connect_direct hangs forever (the Gleam UI does
+          // this same call right after relay_status: "connected").
+          await client.publish_room_subscription();
           client.on_peer_connection_state((snap) => {
             connState.set(snap.addr, snap);
           });
-          client.voice_start(
+          return { publicKey: window.__voice.publicKeyHex };
+        },
+        startVoice() {
+          window.__voice.client.voice_start(
             (fromPeerId, pcm) => {
               const k = hex(new Uint8Array(fromPeerId));
               if (!incoming.has(k)) incoming.set(k, []);
@@ -39,7 +48,6 @@
               voiceState.set(hex(new Uint8Array(peerId)), { in_call, talking });
             },
           );
-          return { publicKey: window.__voice.publicKeyHex };
         },
         framesFor(hexPeerId) {
           return incoming.get(hexPeerId) ?? [];
