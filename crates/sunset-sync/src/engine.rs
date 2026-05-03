@@ -573,7 +573,11 @@ where
                         .await;
                 }
             }
-            InboundEvent::PongObserved { peer_id, rtt_ms, observed_at_unix_ms } => {
+            InboundEvent::PongObserved {
+                peer_id,
+                rtt_ms,
+                observed_at_unix_ms,
+            } => {
                 self.emit_engine_event(EngineEvent::PongObserved {
                     peer_id,
                     rtt_ms,
@@ -2232,7 +2236,11 @@ mod tests {
                     .expect("no engine event")
                     .expect("subscriber closed");
                 match ev {
-                    EngineEvent::PongObserved { peer_id, rtt_ms, observed_at_unix_ms } => {
+                    EngineEvent::PongObserved {
+                        peer_id,
+                        rtt_ms,
+                        observed_at_unix_ms,
+                    } => {
                         assert_eq!(peer_id, pid);
                         assert_eq!(rtt_ms, 42);
                         assert_eq!(observed_at_unix_ms, 1_700_000_000_000);

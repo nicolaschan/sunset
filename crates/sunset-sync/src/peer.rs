@@ -1016,12 +1016,9 @@ mod tests {
                     }
                 };
                 // 5) Reply Pong.
-                super::send_reliable_message(
-                    &bob_conn,
-                    &SyncMessage::Pong { nonce: ping_nonce },
-                )
-                .await
-                .unwrap();
+                super::send_reliable_message(&bob_conn, &SyncMessage::Pong { nonce: ping_nonce })
+                    .await
+                    .unwrap();
                 // 6) Expect PongObserved on alice's inbound, within reasonable time.
                 let mut found = None;
                 for _ in 0..50 {
@@ -1034,10 +1031,7 @@ mod tests {
                             assert_eq!(peer_id, PeerId(vk(b"bob")));
                             // observed_at_unix_ms is wall-clock; non-zero in any
                             // realistic test environment.
-                            assert!(
-                                observed_at_unix_ms > 0,
-                                "observed_at_unix_ms should be set"
-                            );
+                            assert!(observed_at_unix_ms > 0, "observed_at_unix_ms should be set");
                             found = Some(rtt_ms);
                             break;
                         }

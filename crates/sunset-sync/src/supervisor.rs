@@ -1230,7 +1230,10 @@ mod tests {
                 // Wait for Connected so peer_to_intent has bob_pid → id.
                 for _ in 0..200 {
                     let snap = sup.snapshot().await;
-                    if snap.iter().any(|s| s.id == id && s.state == IntentState::Connected) {
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1294,7 +1297,8 @@ mod tests {
                     })
                     .await;
                 // Within a short window, no broadcast should arrive.
-                let r = tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv()).await;
+                let r =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv()).await;
                 assert!(r.is_err(), "expected no broadcast for unknown peer");
             })
             .await;
@@ -1329,7 +1333,10 @@ mod tests {
                 // Wait for Connected.
                 for _ in 0..200 {
                     let snap = sup.snapshot().await;
-                    if snap.iter().any(|s| s.id == id && s.state == IntentState::Connected) {
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
