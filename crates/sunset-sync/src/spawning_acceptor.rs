@@ -50,8 +50,10 @@ where
 {
     connector: Rc<T>,
     auth_rx: Mutex<mpsc::UnboundedReceiver<C>>,
-    /// Held to keep the pump task alive. Aborted on drop, so SpawningAcceptor
-    /// has the same lifecycle semantics as any owned task handle.
+    /// Held so the pump task can be aborted when SpawningAcceptor drops.
+    /// Without an explicit abort the pump would detach (tokio's default)
+    /// and continue calling raw.accept() forever; the manual Drop impl
+    /// below ensures RAII cleanup.
     _pump: JoinHandle<()>,
     _markers: PhantomData<(R, F, Fut)>,
 }
@@ -82,6 +84,20 @@ where
     }
 }
 
+impl<R, T, F, Fut, C> Drop for SpawningAcceptor<R, T, F, Fut, C>
+where
+    R: RawTransport + 'static,
+    R::Connection: 'static,
+    T: Transport<Connection = C> + 'static,
+    F: Fn(R::Connection) -> Fut + 'static,
+    Fut: Future<Output = Result<C>> + 'static,
+    C: TransportConnection + 'static,
+{
+    fn drop(&mut self) {
+        self._pump.abort();
+    }
+}
+
 async fn pump_loop<R, F, Fut, C>(
     raw: Rc<R>,
     promote: Rc<F>,
@@ -94,16 +110,26 @@ async fn pump_loop<R, F, Fut, C>(
     Fut: Future<Output = Result<C>> + 'static,
     C: TransportConnection + 'static,
 {
+    /// Pump exits after this many back-to-back accept errors. With
+    /// the 100 ms backoff per error, that's ~1.6 seconds of tight
+    /// failure before we conclude the underlying transport is dead.
+    const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 16;
+
+    let mut consecutive_errors: u32 = 0;
     loop {
         match raw.accept().await {
             Ok(rc) => {
+                consecutive_errors = 0;
                 let auth_tx = auth_tx.clone();
                 let promote = promote.clone();
                 spawn_local(async move {
                     match with_timeout(handshake_timeout, promote(rc)).await {
                         Some(Ok(conn)) => {
-                            // Receiver gone => acceptor dropped => discard.
-                            let _ = auth_tx.send(conn);
+                            if auth_tx.send(conn).is_err() {
+                                eprintln!(
+                                    "sunset-sync: accepted connection arrived after acceptor was dropped; discarding"
+                                );
+                            }
                         }
                         Some(Err(e)) => {
                             eprintln!("sunset-sync: promote failed: {e}");
@@ -118,10 +144,15 @@ async fn pump_loop<R, F, Fut, C>(
                 });
             }
             Err(e) => {
-                // Don't tear down the pump on a single accept error; transient
-                // failures (probe with a malformed prologue, kernel ICMP, etc.)
-                // are normal on the public internet.
-                eprintln!("sunset-sync: raw accept failed: {e}; continuing");
+                consecutive_errors += 1;
+                eprintln!(
+                    "sunset-sync: raw accept failed: {e} (consecutive: {consecutive_errors}); continuing"
+                );
+                if consecutive_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                    eprintln!("sunset-sync: too many consecutive accept errors; pump exiting");
+                    return;
+                }
+                with_sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -135,6 +166,16 @@ async fn with_timeout<F: Future>(d: Duration, f: F) -> Option<F::Output> {
 #[cfg(target_arch = "wasm32")]
 async fn with_timeout<F: Future>(d: Duration, f: F) -> Option<F::Output> {
     wasmtimer::tokio::timeout(d, f).await.ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn with_sleep(d: Duration) {
+    tokio::time::sleep(d).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn with_sleep(d: Duration) {
+    wasmtimer::tokio::sleep(d).await
 }
 
 #[async_trait(?Send)]
