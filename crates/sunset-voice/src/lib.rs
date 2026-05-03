@@ -172,7 +172,10 @@ mod tests {
         let result = enc.encode(&[0.0_f32; 480]);
         assert!(matches!(
             result,
-            Err(Error::BadFrameSize { expected: 960, got: 480 })
+            Err(Error::BadFrameSize {
+                expected: 960,
+                got: 480
+            })
         ));
     }
 
@@ -182,7 +185,10 @@ mod tests {
         let result = dec.decode(&[0_u8; 100]);
         assert!(matches!(
             result,
-            Err(Error::BadEncodedSize { expected: 3840, got: 100 })
+            Err(Error::BadEncodedSize {
+                expected: 3840,
+                got: 100
+            })
         ));
     }
 }

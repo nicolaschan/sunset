@@ -96,7 +96,7 @@ impl Client {
         let engine_clone = engine.clone();
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = engine_clone.run().await {
-                web_sys::console::error_1(&JsValue::from_str(&format!("sync engine exited: {e}")));
+                tracing::error!(error = %e, "sync engine exited");
             }
         });
 
@@ -476,7 +476,7 @@ impl Client {
             let mut events = match store.subscribe(filter, Replay::All).await {
                 Ok(s) => s,
                 Err(e) => {
-                    web_sys::console::error_1(&JsValue::from_str(&format!("store.subscribe: {e}")));
+                    tracing::error!(error = %e, "store.subscribe failed");
                     return;
                 }
             };
@@ -489,7 +489,7 @@ impl Client {
                     Ok(Event::Replaced { new, .. }) => new,
                     Ok(_) => continue,
                     Err(e) => {
-                        web_sys::console::error_1(&JsValue::from_str(&format!("store event: {e}")));
+                        tracing::error!(error = %e, "store event");
                         continue;
                     }
                 };
@@ -498,7 +498,7 @@ impl Client {
                     Ok(Some(b)) => b,
                     Ok(None) => continue,
                     Err(e) => {
-                        web_sys::console::error_1(&JsValue::from_str(&format!("get_content: {e}")));
+                        tracing::error!(error = %e, "get_content");
                         continue;
                     }
                 };
@@ -506,9 +506,7 @@ impl Client {
                 let decoded = match decode_message(&room, &entry, &block) {
                     Ok(d) => d,
                     Err(e) => {
-                        web_sys::console::error_1(&JsValue::from_str(&format!(
-                            "decode_message: {e}"
-                        )));
+                        tracing::error!(error = %e, "decode_message");
                         continue;
                     }
                 };
@@ -568,7 +566,7 @@ fn intent_state_str(s: sunset_sync::IntentState) -> &'static str {
 
 /// Compose and insert a Receipt for `for_value_hash` into the local
 /// store. Used by the auto-ack path in `spawn_message_subscription`.
-/// Errors are logged via `web_sys::console` and swallowed — receipts
+/// Errors are logged via `tracing` and swallowed — receipts
 /// are best-effort; failing to ack is not fatal.
 async fn send_receipt(
     store: &std::sync::Arc<sunset_store_memory::MemoryStore>,
@@ -583,15 +581,11 @@ async fn send_receipt(
         match sunset_core::compose_receipt(identity, room, 0, now_ms, for_value_hash, rng) {
             Ok(c) => c,
             Err(e) => {
-                web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
-                    "compose_receipt failed: {e}"
-                )));
+                tracing::error!(error = %e, "compose_receipt failed");
                 return;
             }
         };
     if let Err(e) = store.insert(composed.entry, Some(composed.block)).await {
-        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "store.insert(receipt) failed: {e}"
-        )));
+        tracing::error!(error = %e, "store.insert(receipt) failed");
     }
 }

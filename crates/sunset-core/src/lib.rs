@@ -26,5 +26,7 @@ pub use identity::{Identity, IdentityKey};
 pub use liveness::{
     Clock, HasSenderTime, Liveness, LivenessState, PeerLivenessChange, SystemClock,
 };
-pub use message::{ComposedMessage, DecodedMessage, compose_message, compose_receipt, compose_text, decode_message};
+pub use message::{
+    ComposedMessage, DecodedMessage, compose_message, compose_receipt, compose_text, decode_message,
+};
 pub use verifier::Ed25519Verifier;

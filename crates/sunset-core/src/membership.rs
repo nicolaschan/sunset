@@ -284,7 +284,7 @@ pub fn spawn_tracker<S: Store + 'static>(
         let presence_sub = match store.subscribe(presence_filter, Replay::All).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("MembershipTracker: presence subscribe failed: {e}");
+                tracing::warn!(error = %e, "presence subscribe failed");
                 return;
             }
         };
@@ -302,7 +302,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         Ok(sunset_store::Event::Replaced { new, .. }) => new,
                         Ok(_) => continue,
                         Err(e) => {
-                            eprintln!("MembershipTracker presence event: {e}");
+                            tracing::warn!(error = %e, "presence event error");
                             continue;
                         }
                     };

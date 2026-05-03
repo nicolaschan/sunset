@@ -10,6 +10,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 async-trait = "0.1"
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 async-stream = "0.3"
 blake3 = { version = "1", features = ["serde"] }
@@ -32,7 +33,6 @@ web-sys = { version = "0.3", features = [
   "BinaryType",
   "CloseEvent",
   "Event",
-  "console",
   "RtcPeerConnection",
   "RtcConfiguration",
   "RtcIceServer",
@@ -71,6 +71,7 @@ web-time = "1"
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+wasm-tracing = "2.1"
 tokio-rusqlite = { version = "0.6", features = ["bundled"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }

@@ -31,6 +31,7 @@ sunset-sync.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { workspace = true }
+tracing.workspace = true
 web-time.workspace = true
 zeroize.workspace = true
 

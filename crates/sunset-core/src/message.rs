@@ -10,7 +10,9 @@ use sunset_store::{ContentBlock, Hash, SignedKvEntry};
 
 use crate::canonical::signing_payload;
 use crate::crypto::aead::{aead_decrypt, aead_encrypt, build_msg_aad, derive_msg_key, fresh_nonce};
-use crate::crypto::envelope::{EncryptedMessage, MessageBody, SignedMessage, inner_sig_payload_bytes};
+use crate::crypto::envelope::{
+    EncryptedMessage, MessageBody, SignedMessage, inner_sig_payload_bytes,
+};
 use crate::crypto::room::{Room, RoomFingerprint};
 use crate::error::{Error, Result};
 use crate::identity::{Identity, IdentityKey};
@@ -212,7 +214,15 @@ mod tests {
     fn compose_then_decode_roundtrip() {
         let id = alice();
         let room = general();
-        let composed = compose_message(&id, &room, 0, 1_700_000_000_000, MessageBody::Text("hi".to_owned()), &mut OsRng).unwrap();
+        let composed = compose_message(
+            &id,
+            &room,
+            0,
+            1_700_000_000_000,
+            MessageBody::Text("hi".to_owned()),
+            &mut OsRng,
+        )
+        .unwrap();
         let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
         assert_eq!(decoded.author_key, id.public());
         assert_eq!(decoded.room_fingerprint, room.fingerprint());
@@ -225,7 +235,15 @@ mod tests {
     fn composed_entry_passes_ed25519_verifier() {
         let id = alice();
         let room = general();
-        let composed = compose_message(&id, &room, 0, 1, MessageBody::Text("x".to_owned()), &mut OsRng).unwrap();
+        let composed = compose_message(
+            &id,
+            &room,
+            0,
+            1,
+            MessageBody::Text("x".to_owned()),
+            &mut OsRng,
+        )
+        .unwrap();
         assert!(Ed25519Verifier.verify(&composed.entry).is_ok());
     }
 
@@ -234,7 +252,15 @@ mod tests {
         let id = alice();
         let alice_room = general();
         let other_room = Room::open_with_params("random", &test_fast_params()).unwrap();
-        let composed = compose_message(&id, &alice_room, 0, 1, MessageBody::Text("x".to_owned()), &mut OsRng).unwrap();
+        let composed = compose_message(
+            &id,
+            &alice_room,
+            0,
+            1,
+            MessageBody::Text("x".to_owned()),
+            &mut OsRng,
+        )
+        .unwrap();
         let err = decode_message(&other_room, &composed.entry, &composed.block).unwrap_err();
         assert!(matches!(err, Error::BadName(_) | Error::AeadAuthFailed));
     }
@@ -243,7 +269,15 @@ mod tests {
     fn decode_rejects_block_hash_mismatch() {
         let id = alice();
         let room = general();
-        let composed = compose_message(&id, &room, 0, 1, MessageBody::Text("x".to_owned()), &mut OsRng).unwrap();
+        let composed = compose_message(
+            &id,
+            &room,
+            0,
+            1,
+            MessageBody::Text("x".to_owned()),
+            &mut OsRng,
+        )
+        .unwrap();
         let mut bad_block = composed.block.clone();
         bad_block.data = Bytes::from_static(b"junk");
         let err = decode_message(&room, &composed.entry, &bad_block).unwrap_err();
@@ -254,7 +288,15 @@ mod tests {
     fn decode_rejects_tampered_ciphertext() {
         let id = alice();
         let room = general();
-        let composed = compose_message(&id, &room, 0, 1, MessageBody::Text("x".to_owned()), &mut OsRng).unwrap();
+        let composed = compose_message(
+            &id,
+            &room,
+            0,
+            1,
+            MessageBody::Text("x".to_owned()),
+            &mut OsRng,
+        )
+        .unwrap();
         let mut envelope = EncryptedMessage::from_bytes(&composed.block.data).unwrap();
         let mut ct = envelope.ciphertext.to_vec();
         ct[0] ^= 1;
@@ -273,7 +315,15 @@ mod tests {
         let mallory = Identity::generate(&mut OsRng);
         let room = general();
 
-        let composed = compose_message(&alice, &room, 0, 1, MessageBody::Text("real".to_owned()), &mut OsRng).unwrap();
+        let composed = compose_message(
+            &alice,
+            &room,
+            0,
+            1,
+            MessageBody::Text("real".to_owned()),
+            &mut OsRng,
+        )
+        .unwrap();
 
         let mut forged = composed.clone();
         let env = EncryptedMessage::from_bytes(&forged.block.data).unwrap();
@@ -321,9 +371,15 @@ mod tests {
         let id = alice();
         let room = general();
         let target: Hash = blake3::hash(b"original message").into();
-        let composed = compose_receipt(&id, &room, 0, 1_700_000_000_000, target, &mut OsRng).unwrap();
+        let composed =
+            compose_receipt(&id, &room, 0, 1_700_000_000_000, target, &mut OsRng).unwrap();
         let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
-        assert_eq!(decoded.body, MessageBody::Receipt { for_value_hash: target });
+        assert_eq!(
+            decoded.body,
+            MessageBody::Receipt {
+                for_value_hash: target
+            }
+        );
         assert_eq!(decoded.author_key, id.public());
     }
 
@@ -340,7 +396,15 @@ mod tests {
     fn decode_rejects_unknown_epoch() {
         let id = alice();
         let room = general();
-        let mut composed = compose_message(&id, &room, 0, 1, MessageBody::Text("x".to_owned()), &mut OsRng).unwrap();
+        let mut composed = compose_message(
+            &id,
+            &room,
+            0,
+            1,
+            MessageBody::Text("x".to_owned()),
+            &mut OsRng,
+        )
+        .unwrap();
         let mut env = EncryptedMessage::from_bytes(&composed.block.data).unwrap();
         env.epoch_id = 99;
         composed.block = ContentBlock {

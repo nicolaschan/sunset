@@ -18,6 +18,7 @@ pub struct Config {
     pub interest_filter: InterestFilter,
     pub identity_secret_path: PathBuf,
     pub peers: Vec<String>,
+    pub accept_handshake_timeout_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +36,7 @@ struct RawConfig {
     identity_secret: Option<String>,
     #[serde(default)]
     peers: Vec<String>,
+    accept_handshake_timeout_secs: Option<u64>,
 }
 
 impl Config {
@@ -73,12 +75,15 @@ impl Config {
             Some(path) => PathBuf::from(path),
         };
 
+        let accept_handshake_timeout_secs = raw.accept_handshake_timeout_secs.unwrap_or(15);
+
         Ok(Config {
             listen_addr,
             data_dir,
             interest_filter,
             identity_secret_path,
             peers: raw.peers,
+            accept_handshake_timeout_secs,
         })
     }
 }
@@ -138,5 +143,21 @@ mod tests {
         "#;
         let err = Config::from_toml(toml).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn accept_handshake_timeout_defaults_to_15s() {
+        let c = Config::defaults().unwrap();
+        assert_eq!(c.accept_handshake_timeout_secs, 15);
+    }
+
+    #[test]
+    fn accept_handshake_timeout_parses_from_toml() {
+        let toml = r#"
+            listen_addr = "0.0.0.0:8443"
+            accept_handshake_timeout_secs = 1
+        "#;
+        let c = Config::from_toml(toml).unwrap();
+        assert_eq!(c.accept_handshake_timeout_secs, 1);
     }
 }
