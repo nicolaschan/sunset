@@ -27,8 +27,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
-  Reaction, Room, RoomId,
+  type ChannelId, type Message, type Reaction, type Room, ChannelId, Reaction,
+  Room, RoomId,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -885,7 +885,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               you: sunset.inc_is_self(im),
               pending: False,
               reactions: [],
-              bridge: NoBridge,
               details: domain.NoDetails,
             )
           // Append; dedupe by id to handle Replay::All re-emits.
@@ -1700,7 +1699,6 @@ fn synthetic_room(
     status: relay_status_pill(intents),
     last_active: "now",
     unread: 0,
-    bridge: NoBridge,
   )
 }
 
@@ -1817,7 +1815,6 @@ fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
       relay: connection_mode_to_relay(sunset.mem_connection_mode(m)),
       you: sunset.mem_is_self(m),
       in_call: False,
-      bridge: domain.NoBridge,
       role: domain.NoRole,
       last_heartbeat_ms: sunset.mem_last_heartbeat_ms(m),
     )

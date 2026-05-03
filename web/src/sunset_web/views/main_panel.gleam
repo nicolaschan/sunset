@@ -21,8 +21,7 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, ChannelId, HasBridge, Minecraft,
-  NoBridge,
+  type ChannelId, type Message, type Reaction, ChannelId,
 }
 import sunset_web/markdown
 import sunset_web/theme.{type Palette}
@@ -644,10 +643,7 @@ fn message_header(p: Palette, m: Message) -> Element(msg) {
           [html.text(m.author)],
         ),
       ],
-      case m.bridge {
-        HasBridge(Minecraft) -> [bridge_tag(p, "⛏ minecraft")]
-        NoBridge -> []
-      },
+      [],
       case m.you {
         True -> [you_tag(p)]
         False -> []
@@ -1038,22 +1034,6 @@ fn attach_button(p: Palette) -> Element(msg) {
         ],
       ),
     ],
-  )
-}
-
-fn bridge_tag(p: Palette, label: String) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("padding", "1px 5px"),
-        #("border-radius", "3px"),
-        #("background", p.accent_soft),
-        #("color", p.accent_deep),
-        #("font-size", "13.125px"),
-        #("font-weight", "500"),
-      ]),
-    ],
-    [html.text(label)],
   )
 }
 
