@@ -3,6 +3,7 @@
 //!
 //! See `docs/superpowers/specs/2026-04-25-sunset-store-and-sync-design.md` for design.
 
+mod connectable;
 pub mod digest;
 pub mod engine;
 pub mod error;
@@ -25,6 +26,7 @@ pub mod test_transport;
 #[cfg(test)]
 mod test_fixtures;
 
+pub use connectable::{Connectable, ResolveErr};
 pub use engine::{EngineEvent, SyncEngine};
 pub use error::{Error, Result};
 pub use message::{DigestRange, SyncMessage};

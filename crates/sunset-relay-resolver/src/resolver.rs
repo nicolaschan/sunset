@@ -3,6 +3,8 @@
 //! and unit-testable; consumers (`sunset-relay`, `sunset-web-wasm`)
 //! supply concrete `reqwest` / `web-sys::fetch` implementations.
 
+use std::rc::Rc;
+
 use async_trait::async_trait;
 
 use crate::error::Result;
@@ -17,6 +19,16 @@ use crate::parse::{ParsedInput, parse_input};
 #[async_trait(?Send)]
 pub trait HttpFetch {
     async fn get(&self, url: &str) -> Result<String>;
+}
+
+/// Blanket forwarding impl so callers can hand a shared `Rc<dyn HttpFetch>`
+/// to [`Resolver::new`] (the supervisor's `Connectable::Resolving` variant
+/// stores the fetcher as `Rc<dyn HttpFetch>` and clones it per dial).
+#[async_trait(?Send)]
+impl HttpFetch for Rc<dyn HttpFetch> {
+    async fn get(&self, url: &str) -> Result<String> {
+        (**self).get(url).await
+    }
 }
 
 pub struct Resolver<F: HttpFetch> {
