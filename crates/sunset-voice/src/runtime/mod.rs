@@ -232,17 +232,7 @@ mod auto_connect {
         Box::pin(async {})
     }
 }
-mod combiner {
-    use std::rc::Weak;
-
-    use super::state::RuntimeInner;
-
-    pub(crate) fn spawn(
-        _inner: Weak<RuntimeInner>,
-    ) -> futures::future::LocalBoxFuture<'static, ()> {
-        Box::pin(async {})
-    }
-}
+mod combiner;
 mod heartbeat;
 mod jitter {
     use std::rc::Weak;
