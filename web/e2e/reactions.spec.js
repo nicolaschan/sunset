@@ -1,10 +1,12 @@
 // Reactions e2e: one tab sends a message, opens the quick-picker via
-// the "React" toolbar button, picks 👍, and the reaction chip appears
-// on the message row.
+// the "React" toolbar button, picks 👍, and the reaction pill appears
+// on the message row. Pill click toggles the user's own reaction
+// (Slack/Discord style).
 //
 // Single-browser (single context) — cross-peer propagation is covered
 // by the Rust two_peer_reaction integration test; this e2e verifies the
-// full FE loop: send → react toolbar → picker → chip renders.
+// full FE loop: send → react toolbar → picker → pill renders → click
+// pill → reaction removed.
 
 import { test, expect } from "@playwright/test";
 import { spawn } from "child_process";
@@ -75,17 +77,7 @@ test.afterAll(async () => {
   }
 });
 
-test("react button opens quick-picker and chip appears after picking", async ({
-  browser,
-}, testInfo) => {
-  // The reaction toolbar and picker are desktop-only in the current
-  // implementation (main_panel.gleam renders the picker only on Desktop
-  // viewport). Skip on mobile-chrome.
-  test.skip(
-    testInfo.project.name === "mobile-chrome",
-    "reaction picker is desktop-only in this implementation",
-  );
-
+async function openChatPage(browser) {
   const url = `/?relay=${encodeURIComponent(relayAddress)}#sunset-demo`;
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
@@ -101,7 +93,6 @@ test("react button opens quick-picker and chip appears after picking", async ({
 
   await page.goto(url);
 
-  // Wait for the app shell to mount.
   await expect(page.getByText("sunset", { exact: true })).toBeVisible({
     timeout: 15_000,
   });
@@ -109,41 +100,113 @@ test("react button opens quick-picker and chip appears after picking", async ({
   const input = page.getByPlaceholder(/^Message #/);
   await expect(input).toBeVisible({ timeout: 15_000 });
 
-  // Send a message.
-  const msgText = `reactions e2e — ${Date.now()}`;
-  await input.fill(msgText);
+  return { ctx, page, input };
+}
+
+async function sendMessage(page, input, text) {
+  await input.fill(text);
   await input.press("Enter");
-
-  // The message row must appear.
-  const msgRow = page.locator(".msg-row", { hasText: msgText }).first();
+  const msgRow = page.locator(".msg-row", { hasText: text }).first();
   await expect(msgRow).toBeVisible({ timeout: 15_000 });
+  return msgRow;
+}
 
-  // Hover the message row to reveal the action toolbar. The toolbar is
-  // CSS-hidden (opacity 0) until the row is hovered; use `force: true`
-  // when clicking the button because hover-reveal via CSS may not
-  // respond to Playwright's synthetic pointer events in all rendering
-  // modes — clicking with force bypasses the visibility check and lets
-  // us drive the button directly.
-  const reactButton = msgRow.getByTitle("React");
-  await reactButton.click({ force: true });
-
-  // The quick-picker should now be visible.
+// force=true: the action toolbar is opacity:0 until :hover; without
+// force, Playwright's actionability check rejects the click. The click
+// itself still dispatches because the toolbar's pointer-events flips
+// on at the same time.
+async function seedThumbsUpReaction(page, msgRow) {
+  await msgRow.getByTitle("React").click({ force: true });
   const picker = page.locator('[data-testid="reaction-picker"]');
   await expect(picker).toBeVisible({ timeout: 5_000 });
-
-  // Pick the 👍 emoji (first quick-reaction button inside the picker).
-  const thumbsUpButton = picker.getByTitle("React with 👍");
-  await thumbsUpButton.click();
-
-  // The picker should close after picking.
+  await picker.getByTitle("React with 👍").click();
   await expect(picker).not.toBeVisible({ timeout: 5_000 });
+}
 
-  // A reaction chip containing 👍 and the count "1" should appear on
-  // the message row.
-  const chip = msgRow.locator("span").filter({ hasText: /👍/ }).first();
-  await expect(chip).toBeVisible({ timeout: 10_000 });
-  // The count badge (a nested span) must show "1".
-  await expect(chip.locator("span")).toHaveText("1", { timeout: 5_000 });
+const skipOnMobile = (testInfo) =>
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "reaction picker is desktop-only in this implementation",
+  );
+
+test("react button opens quick-picker and pill appears after picking", async ({
+  browser,
+}, testInfo) => {
+  skipOnMobile(testInfo);
+
+  const { ctx, page, input } = await openChatPage(browser);
+  const msgRow = await sendMessage(page, input, `reactions e2e — ${Date.now()}`);
+  await seedThumbsUpReaction(page, msgRow);
+
+  const pill = msgRow.locator(
+    '[data-testid="reaction-pill"][data-emoji="👍"]',
+  );
+  await expect(pill).toBeVisible({ timeout: 10_000 });
+  await expect(pill.locator("span")).toHaveText("1", { timeout: 5_000 });
+
+  await ctx.close();
+});
+
+// Slack/Discord-style pill toggle: clicking a pill you've already
+// reacted with removes your reaction. The mobile skip is for the
+// picker-driven seeding step — the pill itself is the same `<button>`
+// on both viewports.
+test("clicking own reaction pill removes the reaction", async ({
+  browser,
+}, testInfo) => {
+  skipOnMobile(testInfo);
+
+  const { ctx, page, input } = await openChatPage(browser);
+  const msgRow = await sendMessage(
+    page,
+    input,
+    `pill-toggle e2e — ${Date.now()}`,
+  );
+  await seedThumbsUpReaction(page, msgRow);
+
+  const pill = msgRow.locator(
+    '[data-testid="reaction-pill"][data-emoji="👍"]',
+  );
+  await expect(pill).toBeVisible({ timeout: 10_000 });
+  await expect(pill).toHaveAttribute("aria-pressed", "true");
+  await expect(pill.locator("span")).toHaveText("1", { timeout: 5_000 });
+
+  await pill.click();
+  await expect(pill).toHaveCount(0, { timeout: 10_000 });
+
+  await ctx.close();
+});
+
+// Pills sit inside the message body's click target (which toggles
+// row selection). Without event.stop_propagation a pill click would
+// both toggle the reaction AND toggle selection — leaking UI state.
+// This test pins selection via the message-details button and verifies
+// a pill click preserves it.
+test("pill click toggles only the reaction, not row selection", async ({
+  browser,
+}, testInfo) => {
+  skipOnMobile(testInfo);
+
+  const { ctx, page, input } = await openChatPage(browser);
+  const msgRow = await sendMessage(
+    page,
+    input,
+    `pill-selection e2e — ${Date.now()}`,
+  );
+  await seedThumbsUpReaction(page, msgRow);
+
+  // Opening the details panel sets selected_msg_id, giving us a stable
+  // .is-selected baseline to assert against after the pill click.
+  await msgRow.getByTitle("Message details").click({ force: true });
+  await expect(msgRow).toHaveClass(/is-selected/);
+
+  const pill = msgRow.locator(
+    '[data-testid="reaction-pill"][data-emoji="👍"]',
+  );
+  await expect(pill).toBeVisible({ timeout: 10_000 });
+
+  await pill.click();
+  await expect(msgRow).toHaveClass(/is-selected/);
 
   await ctx.close();
 });

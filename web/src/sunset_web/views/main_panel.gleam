@@ -319,7 +319,7 @@ fn message_view(
             ),
             case m.reactions {
               [] -> element.fragment([])
-              rs -> reactions_row(p, rs)
+              rs -> reactions_row(p, m.id, rs, on_add_reaction)
             },
           ],
         ),
@@ -683,7 +683,12 @@ fn message_header(p: Palette, m: Message) -> Element(msg) {
   )
 }
 
-fn reactions_row(p: Palette, rs: List(Reaction)) -> Element(msg) {
+fn reactions_row(
+  p: Palette,
+  message_id: String,
+  rs: List(Reaction),
+  on_toggle_reaction: fn(String, String) -> msg,
+) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -694,11 +699,16 @@ fn reactions_row(p: Palette, rs: List(Reaction)) -> Element(msg) {
         #("margin-bottom", "4px"),
       ]),
     ],
-    list.map(rs, fn(r) { reaction_pill(p, r) }),
+    list.map(rs, fn(r) { reaction_pill(p, message_id, r, on_toggle_reaction) }),
   )
 }
 
-fn reaction_pill(p: Palette, r: Reaction) -> Element(msg) {
+fn reaction_pill(
+  p: Palette,
+  message_id: String,
+  r: Reaction,
+  on_toggle_reaction: fn(String, String) -> msg,
+) -> Element(msg) {
   let bg = case r.by_you {
     True -> p.accent_soft
     False -> p.surface_alt
@@ -711,8 +721,24 @@ fn reaction_pill(p: Palette, r: Reaction) -> Element(msg) {
     True -> p.accent
     False -> p.border_soft
   }
-  html.span(
+  let title = case r.by_you {
+    True -> "Remove your " <> r.emoji <> " reaction"
+    False -> "React with " <> r.emoji
+  }
+  // stop_propagation: the message body wrapper above us toggles row
+  // selection on click, which a pill click should not trigger.
+  html.button(
     [
+      attribute.attribute("data-testid", "reaction-pill"),
+      attribute.attribute("data-emoji", r.emoji),
+      attribute.attribute("aria-pressed", case r.by_you {
+        True -> "true"
+        False -> "false"
+      }),
+      attribute.title(title),
+      event.stop_propagation(
+        event.on_click(on_toggle_reaction(message_id, r.emoji)),
+      ),
       ui.css([
         #("display", "inline-flex"),
         #("align-items", "center"),
@@ -723,6 +749,8 @@ fn reaction_pill(p: Palette, r: Reaction) -> Element(msg) {
         #("color", color),
         #("border", "1px solid " <> border),
         #("font-size", "13.75px"),
+        #("font-family", "inherit"),
+        #("cursor", "pointer"),
       ]),
     ],
     [
