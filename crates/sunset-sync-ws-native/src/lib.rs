@@ -39,15 +39,19 @@ impl WsSink {
                 let axum_msg = match msg {
                     Message::Binary(b) => axum::extract::ws::Message::Binary(b),
                     Message::Close(_) => axum::extract::ws::Message::Close(None),
-                    _ => return Err(tokio_tungstenite::tungstenite::Error::Io(
-                        std::io::Error::other("ws-native: refusing to send unsupported message kind across axum bridge"),
-                    )),
+                    _ => {
+                        return Err(tokio_tungstenite::tungstenite::Error::Io(
+                            std::io::Error::other(
+                                "ws-native: refusing to send unsupported message kind across axum bridge",
+                            ),
+                        ));
+                    }
                 };
-                s.send(axum_msg)
-                    .await
-                    .map_err(|e| tokio_tungstenite::tungstenite::Error::Io(
-                        std::io::Error::other(format!("axum ws send: {e}")),
-                    ))
+                s.send(axum_msg).await.map_err(|e| {
+                    tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(format!(
+                        "axum ws send: {e}"
+                    )))
+                })
             }
         }
     }
@@ -85,17 +89,20 @@ impl WsStream {
             #[cfg(feature = "axum")]
             WsStream::Axum(s) => {
                 let item = s.next().await?;
-                Some(item
-                    .map(|m| match m {
+                Some(
+                    item.map(|m| match m {
                         axum::extract::ws::Message::Binary(b) => Message::Binary(b),
                         axum::extract::ws::Message::Text(t) => Message::Text(t),
                         axum::extract::ws::Message::Ping(b) => Message::Ping(b),
                         axum::extract::ws::Message::Pong(b) => Message::Pong(b),
                         axum::extract::ws::Message::Close(_) => Message::Close(None),
                     })
-                    .map_err(|e| tokio_tungstenite::tungstenite::Error::Io(
-                        std::io::Error::other(format!("axum ws recv: {e}")),
-                    )))
+                    .map_err(|e| {
+                        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(format!(
+                            "axum ws recv: {e}"
+                        )))
+                    }),
+                )
             }
         }
     }
@@ -108,15 +115,21 @@ pub struct WebSocketRawTransport {
 
 enum TransportMode {
     DialOnly,
-    Listening { listener: Mutex<TcpListener> },
+    Listening {
+        listener: Mutex<TcpListener>,
+    },
     /// Accept pre-classified TcpStreams from an external dispatcher.
-    ExternalStreams { rx: Mutex<tokio::sync::mpsc::Receiver<TcpStream>> },
+    ExternalStreams {
+        rx: Mutex<tokio::sync::mpsc::Receiver<TcpStream>>,
+    },
     /// Drains a channel of *already-upgraded* axum WebSocket sockets.
     /// Populated by an upstream HTTP framework (axum) handler that did
     /// the WS upgrade. The transport is crypto-unaware; promotion to an
     /// authenticated connection happens above (e.g. sunset-noise).
     #[cfg(feature = "axum")]
-    Serving { rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<axum::extract::ws::WebSocket>> },
+    Serving {
+        rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<axum::extract::ws::WebSocket>>,
+    },
 }
 
 impl WebSocketRawTransport {
@@ -144,9 +157,7 @@ impl WebSocketRawTransport {
     /// as transport failure.
     pub fn external_streams(rx: tokio::sync::mpsc::Receiver<TcpStream>) -> Self {
         Self {
-            mode: TransportMode::ExternalStreams {
-                rx: Mutex::new(rx),
-            },
+            mode: TransportMode::ExternalStreams { rx: Mutex::new(rx) },
         }
     }
 
@@ -157,7 +168,10 @@ impl WebSocketRawTransport {
     /// Use the companion `axum_integration::ws_handler(tx)` to mount the
     /// upgrade handler on an axum router.
     #[cfg(feature = "axum")]
-    pub fn serving() -> (Self, tokio::sync::mpsc::UnboundedSender<axum::extract::ws::WebSocket>) {
+    pub fn serving() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedSender<axum::extract::ws::WebSocket>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<axum::extract::ws::WebSocket>();
         let transport = Self {
             mode: TransportMode::Serving { rx: Mutex::new(rx) },
