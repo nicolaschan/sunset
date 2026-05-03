@@ -14,6 +14,32 @@ pub type Mode {
   Dark
 }
 
+/// User-facing theme preference. `System` defers to the OS / browser
+/// `prefers-color-scheme` query at render time; `Light` / `Dark`
+/// override it explicitly. Persisted to localStorage as "" / "light" /
+/// "dark"; the `read_saved_pref` / `write_saved_pref` helpers in
+/// `storage.gleam` handle the round-trip.
+pub type Pref {
+  System
+  LightPref
+  DarkPref
+}
+
+/// Resolve a preference + the current OS dark-scheme signal into the
+/// concrete `Mode` we render with. `System` follows the OS; `LightPref`
+/// / `DarkPref` always force their respective mode.
+pub fn resolve_mode(pref: Pref, os_prefers_dark: Bool) -> Mode {
+  case pref {
+    System ->
+      case os_prefers_dark {
+        True -> Dark
+        False -> Light
+      }
+    LightPref -> Light
+    DarkPref -> Dark
+  }
+}
+
 pub type Palette {
   Palette(
     bg: String,

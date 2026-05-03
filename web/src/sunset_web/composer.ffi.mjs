@@ -53,6 +53,27 @@ export function applyTemplate(elementId, before, between, after, caretAtBetween)
   return el.value;
 }
 
+// Move focus to the textarea and place the caret at the end of its
+// current value. Used after channel / room switches so the user can
+// start typing immediately. No-op if the element is missing or not a
+// textarea (so the caller doesn't need to guard).
+export function focusTextarea(elementId) {
+  const el = document.getElementById(elementId);
+  if (!el || el.tagName !== "TEXTAREA") return;
+  const len = el.value.length;
+  // Defer to the next frame so any pending Lustre re-render (which can
+  // re-create the element) doesn't blow away the focus we just set.
+  requestAnimationFrame(() => {
+    try {
+      el.focus({ preventScroll: true });
+      el.selectionStart = len;
+      el.selectionEnd = len;
+    } catch {
+      // ignored: focus is best-effort.
+    }
+  });
+}
+
 export function attachShortcutPreventDefault(elementId) {
   const el = document.getElementById(elementId);
   if (!el) return;

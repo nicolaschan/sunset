@@ -250,12 +250,32 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
      }
      #app { height: 100%; background: " <> palette.bg <> "; }
      *, *::before, *::after { box-sizing: border-box; }
+     /* Hover highlight on every message row, full-bleed (no rounded
+        corners) so the user can see exactly where one message ends and
+        the next begins — matters for multi-line messages. The row
+        renders with negative horizontal margins (set inline by
+        message_view) so the background paints to the column edges. */
+     @media (hover: hover) {
+       .msg-row:hover {
+         background: " <> palette.surface_alt <> ";
+       }
+     }
+     /* `.is-active` pins the highlight while the row's reaction picker
+        or details panel is open — even after the cursor leaves the
+        row. Without this the highlight would flicker off as soon as
+        the user moved their mouse to the picker. */
+     .msg-row.is-active {
+       background: " <> palette.surface_alt <> ";
+     }
      /* Action toolbar visibility splits cleanly by input modality:
         pointer devices use :hover (the toolbar follows the cursor —
         always the most recently hovered row, never a stuck previous
         click), and touch devices use .is-selected (the model's
-        Option(String) selection, set by tap). At most one row matches
-        at a time on either side. */
+        Option(String) selection, set by tap). `.is-active` (set when
+        a per-message menu is open) keeps the toolbar visible on both
+        modalities so a user can re-click the React/Info button while
+        the picker / popover is up without having to re-enter the
+        row's hover area. */
      .msg-row .msg-actions {
        opacity: 0;
        pointer-events: none;
@@ -271,6 +291,10 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
          opacity: 1;
          pointer-events: auto;
        }
+     }
+     .msg-row.is-active .msg-actions {
+       opacity: 1;
+       pointer-events: auto;
      }
      .room-row .room-delete {
        opacity: 0;
