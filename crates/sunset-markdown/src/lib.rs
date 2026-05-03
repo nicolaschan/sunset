@@ -391,4 +391,66 @@ mod tests {
             }])])
         );
     }
+
+    #[test]
+    fn fenced_code_block_no_language() {
+        assert_eq!(
+            parse("```\nhello world\n```"),
+            Document(vec![Block::CodeBlock {
+                language: None,
+                source: "hello world".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_with_language() {
+        assert_eq!(
+            parse("```rust\nfn main() {}\n```"),
+            Document(vec![Block::CodeBlock {
+                language: Some("rust".to_owned()),
+                source: "fn main() {}".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_preserves_internal_blank_lines() {
+        assert_eq!(
+            parse("```\nline 1\n\nline 3\n```"),
+            Document(vec![Block::CodeBlock {
+                language: None,
+                source: "line 1\n\nline 3".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_does_not_parse_markdown_inside() {
+        assert_eq!(
+            parse("```\n**not bold**\n```"),
+            Document(vec![Block::CodeBlock {
+                language: None,
+                source: "**not bold**".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn unclosed_fenced_code_falls_back_to_paragraph() {
+        // Implementation choice: we treat the whole input as paragraphs
+        // when the closing fence is missing, rather than swallowing
+        // everything into an unterminated code block. This matches Discord.
+        let result = parse("```\nhello");
+        // The leading ``` line has no closer, so the block splitter
+        // emits it as a paragraph containing "```" then "hello".
+        assert_eq!(
+            result,
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("```".to_owned()),
+                Inline::LineBreak,
+                Inline::Text("hello".to_owned()),
+            ])])
+        );
+    }
 }
