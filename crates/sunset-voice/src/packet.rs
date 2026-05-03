@@ -57,7 +57,9 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub fn derive_voice_key(room: &Room, epoch_id: u64) -> Result<Zeroizing<[u8; 32]>> {
     use hkdf::Hkdf;
     use sha2::Sha256;
-    let epoch_root = room.epoch_root(epoch_id).ok_or(Error::EpochMissing(epoch_id))?;
+    let epoch_root = room
+        .epoch_root(epoch_id)
+        .ok_or(Error::EpochMissing(epoch_id))?;
     let mut info = Vec::with_capacity(VOICE_KEY_DOMAIN.len() + 8);
     info.extend_from_slice(VOICE_KEY_DOMAIN);
     info.extend_from_slice(&epoch_id.to_le_bytes());
@@ -110,8 +112,8 @@ pub fn decrypt(
 ) -> Result<VoicePacket> {
     let key = derive_voice_key(room, epoch_id)?;
     let aad = build_voice_aad(room, epoch_id, sender);
-    let pt = aead_decrypt(&key, &ev.nonce, &aad, &ev.ciphertext)
-        .map_err(|_| Error::AeadAuthFailed)?;
+    let pt =
+        aead_decrypt(&key, &ev.nonce, &aad, &ev.ciphertext).map_err(|_| Error::AeadAuthFailed)?;
     Ok(postcard::from_bytes(&pt)?)
 }
 
@@ -131,7 +133,9 @@ mod tests {
     }
 
     fn fixed_heartbeat() -> VoicePacket {
-        VoicePacket::Heartbeat { sent_at_ms: 1_700_000_000_000 }
+        VoicePacket::Heartbeat {
+            sent_at_ms: 1_700_000_000_000,
+        }
     }
 
     #[test]
