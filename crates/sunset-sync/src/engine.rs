@@ -435,6 +435,10 @@ where
     }
 
     async fn tick_anti_entropy(&self) {
+        // Snapshot peer ids under the lock, then drop it. `send_filter_digest`
+        // re-acquires the lock per fire and silently skips peers that have
+        // disconnected mid-tick, so a TOCTOU between this snapshot and the
+        // sends below is benign.
         let peers: Vec<PeerId> = {
             let state = self.state.lock().await;
             state.peer_outbound.keys().cloned().collect()
@@ -442,6 +446,10 @@ where
         if peers.is_empty() {
             return;
         }
+        // Belt-and-suspenders catch-up: PeerHello already fires these on
+        // every (re)connect, but the tick covers a peer that stayed
+        // connected through a lossy interval where push-side delivery
+        // dropped an entry on the floor.
         let bootstrap_filter = self.config.bootstrap_filter.clone();
         let own_filters = self.own_published_filters().await;
         for peer in &peers {
