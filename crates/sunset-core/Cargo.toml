@@ -40,8 +40,11 @@ zeroize.workspace = true
 wasmtimer.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
+postcard.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 sunset-store = { workspace = true, features = ["test-helpers"] }
 sunset-store-memory.workspace = true
 sunset-sync = { workspace = true, features = ["test-helpers"] }
+sunset-voice.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
