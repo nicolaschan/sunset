@@ -50,6 +50,17 @@
         connStateForAddr(addr) {
           return connState.get(addr) ?? null;
         },
+        async connectDirect(peerHex) {
+          const bytes = new Uint8Array(peerHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
+          await window.__voice.client.connect_direct(bytes);
+        },
+        peerMode(peerHex) {
+          const bytes = new Uint8Array(peerHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
+          return window.__voice.client.peer_connection_mode(bytes);
+        },
+        async startPresence() {
+          await window.__voice.client.start_presence(2000, 6000, 1500);
+        },
         sendFrame(samples) {
           window.__voice.client.voice_input(new Float32Array(samples));
         },
