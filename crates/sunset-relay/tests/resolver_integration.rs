@@ -60,7 +60,7 @@ async fn resolves_loopback_host_port_to_canonical_peeraddr() {
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let config = relay_config(dir.path(), "127.0.0.1:0");
-            let mut relay = Relay::new(config).await.expect("relay new");
+            let mut relay = Relay::start(config).await.expect("relay new");
             let canonical_expected = relay.dial_address(); // ws://127.0.0.1:<port>#x25519=<hex>
             let _engine = relay.run_for_test().await.expect("relay run");
 
