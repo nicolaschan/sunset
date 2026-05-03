@@ -354,6 +354,60 @@ impl Client {
         Ok(value_hash_hex)
     }
 
+    pub async fn send_reaction(
+        &self,
+        target_value_hash_hex: String,
+        emoji: String,
+        action: String,
+        sent_at_ms: f64,
+        nonce_seed: Vec<u8>,
+    ) -> Result<(), JsError> {
+        use sunset_store::Store as _;
+
+        let action = match action.as_str() {
+            "add" => ReactionAction::Add,
+            "remove" => ReactionAction::Remove,
+            other => {
+                return Err(JsError::new(&format!(
+                    "send_reaction: action must be \"add\" or \"remove\", got {other:?}"
+                )));
+            }
+        };
+        let target_bytes = hex::decode(&target_value_hash_hex)
+            .map_err(|e| JsError::new(&format!("send_reaction: bad target hex: {e}")))?;
+        if target_bytes.len() != 32 {
+            return Err(JsError::new("send_reaction: target hex must decode to 32 bytes"));
+        }
+        let mut target_arr = [0u8; 32];
+        target_arr.copy_from_slice(&target_bytes);
+        let target: sunset_store::Hash = target_arr.into();
+
+        let nonce_seed_arr: [u8; 32] = nonce_seed
+            .as_slice()
+            .try_into()
+            .map_err(|_| JsError::new("nonce_seed must be 32 bytes"))?;
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(nonce_seed_arr);
+
+        let composed = sunset_core::compose_reaction(
+            &self.identity,
+            &self.room,
+            0u64,
+            sent_at_ms as u64,
+            target,
+            &emoji,
+            action,
+            &mut rng,
+        )
+        .map_err(|e| JsError::new(&format!("compose_reaction: {e}")))?;
+
+        self.store
+            .insert(composed.entry, Some(composed.block))
+            .await
+            .map_err(|e| JsError::new(&format!("store insert: {e}")))?;
+
+        Ok(())
+    }
+
     pub fn on_message(&self, callback: js_sys::Function) {
         *self.on_message.borrow_mut() = Some(callback);
         self.spawn_message_subscription();
