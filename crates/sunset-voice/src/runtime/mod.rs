@@ -13,6 +13,7 @@
 //! for native).
 
 mod dyn_bus;
+pub mod dyn_bus_impl;
 mod state;
 mod traits;
 

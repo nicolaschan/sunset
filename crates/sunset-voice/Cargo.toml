@@ -24,6 +24,7 @@ rand_core.workspace = true
 serde.workspace = true
 sha2.workspace = true
 sunset-core.workspace = true
+sunset-store.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -43,4 +44,6 @@ rand_core = { workspace = true, features = ["getrandom"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 async-trait.workspace = true
 postcard.workspace = true
-sunset-store = { path = "../sunset-store" }
+sunset-store = { workspace = true, features = ["test-helpers"] }
+sunset-store-memory = { path = "../sunset-store-memory" }
+sunset-sync = { workspace = true, features = ["test-helpers"] }
