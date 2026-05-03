@@ -98,6 +98,11 @@
           manifest = ./web/manifest.toml;
           target = "javascript";
           lustre = true;
+          # `librsvg` provides `rsvg-convert` for the SVG→PNG bake step
+          # in installPhase (apple-touch-icon + manifest icon sizes).
+          # gleamLib's buildGleamPackage merges this list onto its own
+          # gleam/erlang/node toolchain.
+          nativeBuildInputs = [ pkgs.librsvg ];
           buildPhase = ''
             runHook preBuild
             # Link the Nix-built node_modules so Lustre's esbuild can
@@ -126,6 +131,15 @@
             if [ -d priv ]; then
               cp -r priv/. $out/
             fi
+            # Bake the apple-touch-icon and PWA manifest icons from the
+            # square SVG source. `apple-touch-icon.png` is the canonical
+            # iOS Add-to-Home-Screen icon (180×180); the 192/512 sizes
+            # are referenced from `manifest.webmanifest` for Android /
+            # PWA installs. iOS rounds the icon corners itself, so the
+            # source SVG is full-bleed (no rx) — see priv/apple-touch-icon.svg.
+            rsvg-convert -w 180 -h 180 priv/apple-touch-icon.svg -o $out/apple-touch-icon.png
+            rsvg-convert -w 192 -h 192 priv/apple-touch-icon.svg -o $out/icon-192.png
+            rsvg-convert -w 512 -h 512 priv/apple-touch-icon.svg -o $out/icon-512.png
             # Copy the sunset-web-wasm bundle alongside the Gleam JS so
             # sunset.ffi.mjs can `import` from a relative path.
             cp ${sunsetWebWasmPkg}/sunset_web_wasm.js $out/

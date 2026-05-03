@@ -22,6 +22,23 @@ rel = "icon"
 href = "favicon.svg"
 type = "image/svg+xml"
 
+# Apple home-screen icon (iOS Safari).
+# The PNG is baked from priv/apple-touch-icon.svg by the flake's
+# webDist installPhase via rsvg-convert. Apple touch icons must be
+# fully opaque PNGs — iOS applies its own rounded mask, so a
+# transparent background renders black at the corners.
+[[tools.lustre.html.links]]
+rel = "apple-touch-icon"
+href = "apple-touch-icon.png"
+sizes = "180x180"
+
+# PWA manifest. Drives Add-to-Home-Screen on Chrome/Android and the
+# install banner across browsers. Referenced icon files (180/192/512)
+# are baked from the same SVG source in installPhase.
+[[tools.lustre.html.links]]
+rel = "manifest"
+href = "manifest.webmanifest"
+
 [[tools.lustre.html.links]]
 rel = "preconnect"
 href = "https://fonts.googleapis.com"
@@ -34,3 +51,36 @@ crossorigin = ""
 [[tools.lustre.html.links]]
 rel = "stylesheet"
 href = "https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap"
+
+# theme-color paints the browser-chrome (URL bar, address bar) with
+# the sunset accent colour. Not split light/dark — the warm terracotta
+# reads correctly under either system theme.
+[[tools.lustre.html.meta]]
+name = "theme-color"
+content = "#bb5a3a"
+
+# Standalone display when the page is launched from the home screen
+# (PWA install). The `apple-mobile-web-app-*` variants are Apple's
+# legacy spelling, kept alongside the modern `mobile-web-app-capable`
+# for older iOS that still parses the `apple-` prefix.
+[[tools.lustre.html.meta]]
+name = "mobile-web-app-capable"
+content = "yes"
+
+[[tools.lustre.html.meta]]
+name = "apple-mobile-web-app-capable"
+content = "yes"
+
+# Status-bar theme on iOS Safari while the PWA is open. Translucent
+# lets the page bleed under the bar so the sunset gradient is what
+# the user sees behind the clock — instead of a hard black band.
+[[tools.lustre.html.meta]]
+name = "apple-mobile-web-app-status-bar-style"
+content = "black-translucent"
+
+# Short title that appears under the home-screen icon on iOS
+# (defaults to the page title otherwise; `sunset.chat` would render
+# truncated under the icon).
+[[tools.lustre.html.meta]]
+name = "apple-mobile-web-app-title"
+content = "sunset"
