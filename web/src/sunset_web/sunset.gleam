@@ -177,3 +177,40 @@ pub fn rec_for_value_hash_hex(r: IncomingReceipt) -> String
 /// Verifying key of the peer who authored this Receipt.
 @external(javascript, "./sunset.ffi.mjs", "recFromPubkey")
 pub fn rec_from_pubkey(r: IncomingReceipt) -> BitArray
+
+/// Snapshot payload delivered to `on_reactions_changed`. Opaque on the
+/// Gleam side; accessors below extract the concrete fields.
+pub type IncomingReactionsSnapshot
+
+@external(javascript, "./sunset.ffi.mjs", "reactionsSnapshotTargetHex")
+pub fn reactions_snapshot_target_hex(snapshot: IncomingReactionsSnapshot) -> String
+
+/// Returns the snapshot as a `List(#(emoji, List(author_pubkey_hex)))`.
+/// The FFI side flattens the JS Map<emoji, Set<author_hex>> into this
+/// shape so Gleam doesn't need to interop with Map/Set directly.
+@external(javascript, "./sunset.ffi.mjs", "reactionsSnapshotEntries")
+pub fn reactions_snapshot_entries(
+  snapshot: IncomingReactionsSnapshot,
+) -> List(#(String, List(String)))
+
+/// Register the per-target snapshot callback. Fires on initial replay
+/// and again whenever the target's reaction state changes.
+@external(javascript, "./sunset.ffi.mjs", "onReactionsChanged")
+pub fn on_reactions_changed(
+  client: ClientHandle,
+  callback: fn(IncomingReactionsSnapshot) -> Nil,
+) -> Nil
+
+/// Send a reaction event. `action` is "add" or "remove".
+@external(javascript, "./sunset.ffi.mjs", "sendReaction")
+pub fn send_reaction(
+  client: ClientHandle,
+  target_hex: String,
+  emoji: String,
+  action: String,
+  sent_at_ms: Int,
+  callback: fn(Result(Nil, String)) -> Nil,
+) -> Nil
+
+@external(javascript, "./sunset.ffi.mjs", "clientPublicKeyHex")
+pub fn client_public_key_hex(client: ClientHandle) -> String
