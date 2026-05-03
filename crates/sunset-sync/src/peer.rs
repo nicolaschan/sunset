@@ -53,6 +53,15 @@ pub(crate) enum InboundEvent {
         conn_id: crate::engine::ConnectionId,
         reason: String,
     },
+    /// A `Pong` was received from a peer; carries the round-trip time
+    /// measured against the most recent `Ping` send and the wall-clock
+    /// instant the Pong was observed. Engine re-emits as
+    /// `EngineEvent::PongObserved` for supervisor / UI consumption.
+    PongObserved {
+        peer_id: PeerId,
+        rtt_ms: u64,
+        observed_at_unix_ms: u64,
+    },
 }
 
 /// Engine-level context shared across all per-peer tasks. Bundling these

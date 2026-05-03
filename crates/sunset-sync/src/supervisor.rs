@@ -358,6 +358,8 @@ where
                     }
                 }
             }
+            // Placeholder: real handler wired in Task 5.
+            EngineEvent::PongObserved { .. } => {}
         }
     }
 

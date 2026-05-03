@@ -95,6 +95,16 @@ pub enum EngineEvent {
     PeerRemoved {
         peer_id: PeerId,
     },
+    /// A liveness `Pong` round-tripped from a connected peer. Carries
+    /// the measured RTT and the wall-clock time the Pong was observed.
+    /// Subscribers (e.g. `PeerSupervisor`) use this to surface live
+    /// per-peer health to applications. Fired once per heartbeat per
+    /// peer (default cadence: every `heartbeat_interval`, 15 s).
+    PongObserved {
+        peer_id: PeerId,
+        rtt_ms: u64,
+        observed_at_unix_ms: u64,
+    },
 }
 
 /// Sender + connection identity for one peer's currently-active connection.
@@ -563,6 +573,8 @@ where
                         .await;
                 }
             }
+            // Placeholder: real handler wired in Task 3.
+            InboundEvent::PongObserved { .. } => {}
         }
     }
 
