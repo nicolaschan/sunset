@@ -239,4 +239,27 @@ mod tests {
             )])])
         );
     }
+
+    #[test]
+    fn spoiler() {
+        assert_eq!(
+            parse("a ||secret|| c"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::Spoiler(vec![Inline::Text("secret".to_owned())]),
+                Inline::Text(" c".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn spoiler_wraps_bold() {
+        assert_eq!(
+            parse("||spoiler with **bold**||"),
+            Document(vec![Block::Paragraph(vec![Inline::Spoiler(vec![
+                Inline::Text("spoiler with ".to_owned()),
+                Inline::Bold(vec![Inline::Text("bold".to_owned())]),
+            ])])])
+        );
+    }
 }

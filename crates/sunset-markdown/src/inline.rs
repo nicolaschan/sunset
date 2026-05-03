@@ -45,6 +45,7 @@ enum Delim {
     Bold,          // **
     Underline,     // __
     Strikethrough, // ~~
+    Spoiler,       // ||
     ItalicStar,    // *
     ItalicUnder,   // _
 }
@@ -69,6 +70,12 @@ fn match_delimiter(bytes: &[u8], i: usize) -> Option<(Delim, usize)> {
             return None;
         }
         return Some((Delim::Strikethrough, 2));
+    }
+    if bytes.get(i..i + 2) == Some(b"||") {
+        if bytes.get(i + 2..i + 4) == Some(b"||") {
+            return None;
+        }
+        return Some((Delim::Spoiler, 2));
     }
     if bytes.get(i) == Some(&b'*') {
         return Some((Delim::ItalicStar, 1));
@@ -115,6 +122,7 @@ fn wrap(kind: Delim, inner: Vec<Inline>) -> Inline {
         Delim::Bold => Inline::Bold(inner),
         Delim::Underline => Inline::Underline(inner),
         Delim::Strikethrough => Inline::Strikethrough(inner),
+        Delim::Spoiler => Inline::Spoiler(inner),
         Delim::ItalicStar | Delim::ItalicUnder => Inline::Italic(inner),
     }
 }
