@@ -409,6 +409,34 @@ mod tests {
         }).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_members_changed_clears_last_signature() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let peer = helpers::mk_peer(ident(16)).await;
+            let room = peer.open_room("alpha").await.expect("open_room");
+
+            // Seed last_signature with something non-empty so we can verify
+            // the registration clears it. MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode)>
+            room.inner
+                .tracker_handles
+                .last_signature
+                .borrow_mut()
+                .push((
+                    vec![1, 2, 3],
+                    crate::membership::Presence::Online,
+                    crate::membership::ConnectionMode::Direct,
+                ));
+            assert!(!room.inner.tracker_handles.last_signature.borrow().is_empty());
+
+            room.on_members_changed(|_| {});
+            assert!(
+                room.inner.tracker_handles.last_signature.borrow().is_empty(),
+                "last_signature should be cleared after on_members_changed registration"
+            );
+        }).await;
+    }
+
     pub(super) mod helpers {
         use super::*;
         use async_trait::async_trait;

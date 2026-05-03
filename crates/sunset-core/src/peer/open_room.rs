@@ -249,6 +249,17 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             _ => "unknown",
         }
     }
+
+    pub fn on_members_changed<F: Fn(&[crate::membership::Member]) + 'static>(&self, cb: F) {
+        *self.inner.tracker_handles.on_members.borrow_mut() = Some(Box::new(cb));
+        // Match Client::on_members_changed: clear last_signature so the next
+        // refresh tick fires the callback with the current snapshot.
+        self.inner.tracker_handles.last_signature.borrow_mut().clear();
+    }
+
+    pub fn on_relay_status_changed<F: Fn(&str) + 'static>(&self, cb: F) {
+        *self.inner.tracker_handles.on_relay_status.borrow_mut() = Some(Box::new(cb));
+    }
 }
 
 impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
