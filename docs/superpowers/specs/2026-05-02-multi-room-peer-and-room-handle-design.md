@@ -10,7 +10,7 @@ Today the web client opens a single hardcoded room (`"sunset-demo"`, `sunset_web
 
 The user-visible goal: clicking a room in the rail makes the engine actually use that room. Joined rooms keep ticking in the background so unread counts can grow and switching back to an open room is instant.
 
-The architectural goal: `sunset-core::Peer` becomes the host-agnostic "running sunset peer" entity, parameterized over a transport stack and a `Spawner` for per-room background tasks. `sunset-core::OpenRoom` is the per-room handle, returned by `Peer::open_room`. The wasm crate's `Client` shrinks to identity-from-localStorage + voice + a `WasmSpawner`; everything else delegates to core. When the TUI plan starts, it gets multi-room "for free."
+The architectural goal: `sunset-core::Peer` becomes the host-agnostic "running sunset peer" entity, parameterized over a transport stack and a store. `sunset-core::OpenRoom` is the per-room handle, returned by `Peer::open_room`. Background tasks (subscription renewal, message decode, presence publisher) use the existing `sunset_sync::spawn::spawn_local` shim, which is already host-portable across native (tokio LocalSet) and wasm (wasm-bindgen-futures). The wasm crate's `Client` shrinks to identity-from-localStorage + voice + a thin `Peer` veneer; everything else delegates to core. When the TUI plan starts, it gets multi-room "for free."
 
 ## Non-goals (and why)
 
@@ -43,15 +43,9 @@ Gleam Lustre app
    Model.client: Option(ClientHandle)                [identity + relay only]
 ```
 
-The `Spawner` abstraction is the cross-host glue. Per-room background tasks (subscription renewal, message decode loop, presence publisher) need a runtime to live in. Today these all use `wasm_bindgen_futures::spawn_local` directly. After this change:
+**Spawning:** the cross-host concern is already solved — `sunset_sync::spawn::spawn_local` is a `cfg(target_arch = "wasm32")`-gated shim that uses `wasm_bindgen_futures::spawn_local` on browsers and `tokio::task::spawn_local` natively. Both `presence_publisher` and `RelaySignaler` already call it. Multi-room logic in `sunset-core` uses the same shim — no new abstraction needed. (`sunset-core` already depends on `sunset-sync`, so this introduces no new dependency.)
 
-```rust
-pub trait Spawner: 'static {
-    fn spawn_local(&self, fut: Pin<Box<dyn Future<Output = ()> + 'static>>);
-}
-```
-
-`sunset-web-wasm` provides `WasmSpawner`. The future TUI provides one wrapping `tokio::task::spawn_local`. The trait sits in `sunset-core` next to `Peer`. We introduce it now even though no other host exists yet — defining it later means rewriting every call site, and the trait is small.
+**Revision note (post-initial-spec):** an earlier draft of this design proposed a new `Spawner` trait in `sunset-core`. That was unnecessary — the existing `sunset_sync::spawn` shim covers native + wasm with no per-call configuration. Dropped to keep the surface minimal.
 
 ## Why move all of this to core
 
@@ -59,8 +53,8 @@ Three of the four upcoming hosts (TUI, Minecraft mod, native relay) will all wan
 
 Two existing wasm-only modules move to core as part of this:
 
-- `presence_publisher::spawn_publisher` → `sunset_core::membership::spawn_publisher` (sits next to the existing `spawn_tracker`). Today the only host-specific piece is the `wasm_bindgen_futures::spawn_local` call; after the `Spawner` trait, the function is fully host-agnostic.
-- `RelaySignaler` → `sunset_core::signaling::RelaySignaler`. The `web_sys::console` calls swap for `tracing` (already a workspace dep), and the spawn calls go through the `Spawner`.
+- `presence_publisher::spawn_publisher` → `sunset_core::membership::spawn_publisher` (sits next to the existing `spawn_tracker`). Already uses `sunset_sync::spawn::spawn_local`; only host-specific piece is the `web_sys::console::warn_1` log line, which swaps for `tracing::warn!`.
+- `RelaySignaler` → `sunset_core::signaling::RelaySignaler`. Already uses `sunset_sync::spawn::spawn_local`. The `web_sys::console::error_1` / `warn_1` calls swap for `tracing::error!` / `tracing::warn!`.
 
 ## Components
 
@@ -70,30 +64,32 @@ Two existing wasm-only modules move to core as part of this:
 pub struct Peer<T: Transport, St: Store> {
     identity: Identity,
     store: Arc<St>,
-    engine: Arc<SyncEngine<St, T>>,
-    supervisor: Arc<PeerSupervisor<St, T>>,
-    relay_status: Arc<RelayStatusCell>,
-    spawner: Box<dyn Spawner>,
-    open_rooms: Mutex<HashMap<RoomFingerprint, Weak<RoomState>>>,
-    rtc_signaler_dispatcher: Arc<MultiRoomSignaler>, // if rtc transport in use
+    engine: Rc<SyncEngine<St, T>>,
+    supervisor: Rc<PeerSupervisor<St, T>>,
+    relay_status: Rc<RefCell<String>>,
+    open_rooms: RefCell<HashMap<RoomFingerprint, Weak<RoomState<T, St>>>>,
+    rtc_signaler_dispatcher: Rc<MultiRoomSignaler>,
 }
 
 impl<T, St> Peer<T, St> {
     pub fn new(
         identity: Identity,
         store: Arc<St>,
-        transport: T,
-        rtc_signaler_dispatcher: Arc<MultiRoomSignaler>,
-        spawner: Box<dyn Spawner>,
-    ) -> Self;
+        engine: Rc<SyncEngine<St, T>>,
+        supervisor: Rc<PeerSupervisor<St, T>>,
+        rtc_signaler_dispatcher: Rc<MultiRoomSignaler>,
+    ) -> Rc<Self>;
 
     pub async fn add_relay(&self, addr: PeerAddr) -> Result<()>;
-    pub async fn open_room(self: &Arc<Self>, room_name: &str) -> Result<OpenRoom>;
-    pub fn close_room(&self, fp: RoomFingerprint);   // removes weak; OpenRoom drop does the actual cleanup
+    pub async fn open_room(self: &Rc<Self>, room_name: &str) -> Result<OpenRoom<T, St>>;
     pub fn relay_status(&self) -> String;
     pub fn public_key(&self) -> [u8; 32];
 }
 ```
+
+The caller constructs the engine, supervisor, and signaler dispatcher externally and passes them in; `Peer::new` does not own transport construction. This matches today's `Client::new` which already wires these together. The wasm bridge keeps that wiring and just delegates the room-management half to `Peer`.
+
+`Rc<RefCell<...>>` matches the existing wasm-side `?Send` posture. Native hosts that want `Send + Sync` can introduce a parallel `Peer` constructed with `Arc<Mutex<...>>` later; out of scope for this PR.
 
 `open_room` is idempotent on room fingerprint: if a strong `OpenRoom` already exists in the registry, return another reference to the same `RoomState` rather than constructing a duplicate. This is important because `JoinRoom(name)` for an already-joined room must not stand up a second engine task.
 
@@ -102,41 +98,52 @@ impl<T, St> Peer<T, St> {
 ### `sunset_core::OpenRoom` (new — same module)
 
 ```rust
-pub struct OpenRoom {
-    inner: Arc<RoomState>,
+pub struct OpenRoom<T: Transport, St: Store> {
+    inner: Rc<RoomState<T, St>>,
 }
 
-struct RoomState {
-    room: Arc<Room>,
-    peer_weak: Weak<Peer<T, St>>,         // for store/engine/identity access
-    subscription_id: SubscriptionId,
-    presence_started: AtomicBool,
-    tracker_handles: Arc<TrackerHandles>,
-    on_message: Mutex<Option<MessageCallback>>,
-    on_receipt: Mutex<Option<ReceiptCallback>>,
-    cancel: CancellationToken,             // fires on Drop; ends background tasks
+struct RoomState<T: Transport, St: Store> {
+    room: Rc<Room>,
+    peer_weak: Weak<Peer<T, St>>,                       // for store/engine/identity access
+    presence_started: Cell<bool>,
+    tracker_handles: Rc<sunset_core::membership::TrackerHandles>,
+    signaler: Rc<RelaySignaler>,
+    on_message: RefCell<Option<MessageCallback>>,
+    on_receipt: RefCell<Option<ReceiptCallback>>,
+    on_relay_status: RefCell<Option<RelayStatusCallback>>,
+    cancel_decode: Rc<Cell<bool>>,                      // background tasks check this and exit
 }
 
-impl OpenRoom {
-    pub async fn send_text(&self, body: String, sent_at_ms: u64) -> Result<Hash>;
-    pub fn start_presence(&self, interval_ms: u64, ttl_ms: u64, refresh_ms: u64);
+type MessageCallback = Box<dyn Fn(&DecodedMessage)>;
+type ReceiptCallback = Box<dyn Fn(sunset_store::Hash, &sunset_store::VerifyingKey)>;
+type RelayStatusCallback = Box<dyn Fn(&str)>;
+
+impl<T, St> OpenRoom<T, St> {
+    pub async fn send_text(&self, body: String, sent_at_ms: u64) -> Result<sunset_store::Hash>;
+    pub async fn start_presence(&self, interval_ms: u64, ttl_ms: u64, refresh_ms: u64);
     pub async fn connect_direct(&self, peer_pubkey: [u8; 32]) -> Result<()>;
     pub fn on_message<F: Fn(&DecodedMessage) + 'static>(&self, cb: F);
-    pub fn on_receipt<F: Fn(Hash, &VerifyingKey) + 'static>(&self, cb: F);
+    pub fn on_receipt<F: Fn(sunset_store::Hash, &sunset_store::VerifyingKey) + 'static>(&self, cb: F);
     pub fn on_members_changed<F: Fn(&[Member]) + 'static>(&self, cb: F);
     pub fn on_relay_status_changed<F: Fn(&str) + 'static>(&self, cb: F); // mirrors Peer's global
+    pub fn peer_connection_mode(&self, peer_pubkey: [u8; 32]) -> &'static str;
     pub fn fingerprint(&self) -> RoomFingerprint;
 }
 
-impl Drop for RoomState {
+impl<T, St> Drop for RoomState<T, St> {
     fn drop(&mut self) {
-        self.cancel.cancel();
-        // unregister signaler from MultiRoomSignaler (best-effort via peer_weak)
+        self.cancel_decode.set(true);
+        if let Some(peer) = self.peer_weak.upgrade() {
+            peer.rtc_signaler_dispatcher.unregister(self.room.fingerprint());
+        }
+        // Subscription expires naturally at the relay via TTL.
     }
 }
 ```
 
-`subscribe_messages` / `subscribe_members` could alternatively be `Stream`-returning — for the wasm bridge, callback-style is more convenient (matches `js_sys::Function`). For native hosts that prefer `Stream`, we can add stream-returning variants later without breaking the callback API.
+`cancel_decode: Rc<Cell<bool>>` over `tokio_util::CancellationToken`: keeps the data plane single-threaded (matches the existing `?Send` posture); decode/renewal loops poll the flag at each iteration boundary. No new dependency required.
+
+Callback-style chosen over `Stream`-returning because (a) the wasm bridge's `js_sys::Function` is naturally callback-shaped and (b) the existing tracker_handles already use `Box<dyn Fn(...)>`. Native hosts that want streams can add stream-returning variants later without breaking this API.
 
 ### `sunset_core::signaling::RelaySignaler` (moved — `crates/sunset-core/src/signaling/relay_signaler.rs`)
 
@@ -185,40 +192,14 @@ Caveat — if peers A and B both have rooms X and Y open, A's `MultiRoomSignaler
 
 ### `sunset_core::membership::spawn_publisher` (moved)
 
-Moved from `crates/sunset-web-wasm/src/presence_publisher.rs`. Same change set as `RelaySignaler`: `web_sys` → `tracing`, `spawn_local` → `Spawner`.
-
-### `sunset_core::Spawner` (new trait — `crates/sunset-core/src/spawner.rs`)
-
-```rust
-use std::future::Future;
-use std::pin::Pin;
-
-pub trait Spawner: Send + Sync + 'static {
-    fn spawn_local(&self, fut: Pin<Box<dyn Future<Output = ()> + 'static>>);
-}
-```
-
-For the wasm crate's `Send + Sync` constraint: the trait object is `Send + Sync` so a single spawner can be shared, but the futures it spawns are `?Send` (matching the existing `#[async_trait(?Send)]` posture of the data plane). This mirrors how `SignatureVerifier` is the one `Send + Sync` exception in `sunset-store`.
-
-`sunset-web-wasm::WasmSpawner`:
-
-```rust
-pub struct WasmSpawner;
-
-impl Spawner for WasmSpawner {
-    fn spawn_local(&self, fut: Pin<Box<dyn Future<Output = ()> + 'static>>) {
-        wasm_bindgen_futures::spawn_local(fut);
-    }
-}
-```
+Moved from `crates/sunset-web-wasm/src/presence_publisher.rs`. Already uses `sunset_sync::spawn::spawn_local`; only change is `web_sys::console::warn_1` → `tracing::warn!` for portability.
 
 ### `sunset-web-wasm::Client` (slimmed)
 
 ```rust
 #[wasm_bindgen]
 pub struct Client {
-    inner: Arc<Peer<MultiTransport<WsT, RtcT>, MemoryStore>>,
-    identity: Identity,                  // exposed for public_key getter
+    inner: Rc<Peer<MultiTransport<WsT, RtcT>, MemoryStore>>,
     voice: VoiceCell,                    // unchanged
 }
 
@@ -368,9 +349,8 @@ Persistent caching of `K_room` / `K_epoch_0` / `room_fingerprint` is the right l
 ## File layout summary
 
 New / moved in `sunset-core`:
-- `crates/sunset-core/src/spawner.rs` (new) — `Spawner` trait
 - `crates/sunset-core/src/peer/mod.rs` (new) — `Peer`, `OpenRoom`, `RoomState`
-- `crates/sunset-core/src/signaling/mod.rs` (new) — `RelaySignaler` (moved from wasm crate), `MultiRoomSignaler` (new)
+- `crates/sunset-core/src/signaling.rs` (new) — `RelaySignaler` (moved from wasm crate), `MultiRoomSignaler` (new)
 - `crates/sunset-core/src/membership.rs` — adds `spawn_publisher` (moved from wasm crate)
 - `crates/sunset-core/src/lib.rs` — re-exports
 
@@ -380,8 +360,7 @@ Deleted from `sunset-web-wasm`:
 
 Modified in `sunset-web-wasm`:
 - `crates/sunset-web-wasm/src/client.rs` — slimmed to thin `Peer` veneer
-- `crates/sunset-web-wasm/src/lib.rs` (new module: `room_handle.rs`, `spawner.rs`)
-- `crates/sunset-web-wasm/src/spawner.rs` (new) — `WasmSpawner`
+- `crates/sunset-web-wasm/src/lib.rs` — new module: `room_handle.rs`
 - `crates/sunset-web-wasm/src/room_handle.rs` (new) — `RoomHandle` wasm-bindgen veneer
 
 Modified in the Gleam web client:
