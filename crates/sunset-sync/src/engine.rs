@@ -399,10 +399,8 @@ where
     }
 
     async fn tick_anti_entropy(&self) {
-        // Snapshot peer ids under the lock, then drop it. `send_filter_digest`
-        // re-acquires the lock per fire and silently skips peers that have
-        // disconnected mid-tick, so a TOCTOU between this snapshot and the
-        // sends below is benign.
+        // Snapshot before per-peer fires; send_filter_digest re-acquires
+        // the lock and skips peers that disconnected mid-tick.
         let peers: Vec<PeerId> = {
             let state = self.state.lock().await;
             state.peer_outbound.keys().cloned().collect()
@@ -410,20 +408,9 @@ where
         if peers.is_empty() {
             return;
         }
-        // Belt-and-suspenders catch-up: PeerHello already fires these on
-        // every (re)connect, but the tick covers a peer that stayed
-        // connected through a lossy interval where push-side delivery
-        // dropped an entry on the floor.
-        let bootstrap_filter = self.config.bootstrap_filter.clone();
         let own_filters = self.own_published_filters().await;
         for peer in &peers {
-            self.send_filter_digest(peer, &bootstrap_filter).await;
-            for filter in &own_filters {
-                if *filter == bootstrap_filter {
-                    continue;
-                }
-                self.send_filter_digest(peer, filter).await;
-            }
+            self.fan_out_digests_to_peer(peer, &own_filters).await;
         }
     }
 
@@ -551,22 +538,8 @@ where
                 if let Some(s) = registered {
                     let _ = s.send(Ok(peer_id.clone()));
                 }
-                // Fire bootstrap digest exchange on the subscribe namespace,
-                // then a per-filter digest for each of our own published
-                // subscriptions. The latter is what makes a (re)connected
-                // client catch up on chat (and any other room-namespace)
-                // entries that landed at the relay while we were offline.
-                self.send_bootstrap_digest(&peer_id).await;
-                for filter in self.own_published_filters().await {
-                    // Skip when an own published filter exactly equals the
-                    // bootstrap one — `send_bootstrap_digest` above already
-                    // covered it, and re-firing would just spend wire
-                    // bandwidth on a redundant DigestExchange.
-                    if filter == self.config.bootstrap_filter {
-                        continue;
-                    }
-                    self.send_filter_digest(&peer_id, &filter).await;
-                }
+                let own_filters = self.own_published_filters().await;
+                self.fan_out_digests_to_peer(&peer_id, &own_filters).await;
             }
             InboundEvent::Message { from, message } => {
                 self.handle_peer_message(from, message).await;
@@ -649,7 +622,10 @@ where
     /// matching `replay_existing_subscriptions`.
     async fn own_published_filters(&self) -> Vec<Filter> {
         let mut out = Vec::new();
-        let filter = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
+        let filter = Filter::Specific(
+            self.local_peer.0.clone(),
+            Bytes::from_static(reserved::SUBSCRIBE_NAME),
+        );
         let mut entries = match self.store.iter(filter).await {
             Ok(s) => s,
             Err(e) => {
@@ -665,9 +641,6 @@ where
                     continue;
                 }
             };
-            if entry.verifying_key != self.local_peer.0 {
-                continue;
-            }
             let block = match self.store.get_content(&entry.value_hash).await {
                 Ok(Some(b)) => b,
                 Ok(None) => continue,
@@ -683,9 +656,18 @@ where
         out
     }
 
-    async fn send_bootstrap_digest(&self, to: &PeerId) {
-        let filter = self.config.bootstrap_filter.clone();
-        self.send_filter_digest(to, &filter).await;
+    /// Send the bootstrap digest plus a per-own-filter digest to `peer`,
+    /// skipping any own filter that equals `bootstrap_filter` so the
+    /// receiver doesn't see two `DigestExchange`s for the same filter.
+    async fn fan_out_digests_to_peer(&self, peer: &PeerId, own_filters: &[Filter]) {
+        let bootstrap = &self.config.bootstrap_filter;
+        self.send_filter_digest(peer, bootstrap).await;
+        for filter in own_filters {
+            if filter == bootstrap {
+                continue;
+            }
+            self.send_filter_digest(peer, filter).await;
+        }
     }
 
     /// Send a `DigestExchange` over `filter` to `to`. Builds a Bloom
@@ -1180,6 +1162,38 @@ mod tests {
             vk: local_peer.0.clone(),
         });
         SyncEngine::new(store, transport, SyncConfig::default(), local_peer, signer)
+    }
+
+    /// Register a fake connected peer on the engine and return the
+    /// receiver end of its outbound channel.
+    async fn add_test_peer(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        label: &[u8],
+        conn_id: ConnectionId,
+    ) -> (PeerId, mpsc::UnboundedReceiver<SyncMessage>) {
+        let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
+        let peer = PeerId(vk(label));
+        engine
+            .state
+            .lock()
+            .await
+            .peer_outbound
+            .insert(peer.clone(), PeerOutbound { conn_id, tx });
+        (peer, rx)
+    }
+
+    /// Drain `rx` (non-blocking), collecting `DigestExchange.filter`
+    /// values. Panics on any other queued message kind.
+    fn drain_digest_filters(rx: &mut mpsc::UnboundedReceiver<SyncMessage>) -> Vec<Filter> {
+        let mut out = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(SyncMessage::DigestExchange { filter, .. }) => out.push(filter),
+                Ok(other) => panic!("expected DigestExchange, got {other:?}"),
+                Err(_) => break,
+            }
+        }
+        out
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2045,10 +2059,6 @@ mod tests {
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
 
-                // Pre-publish one self-authored subscribe entry over a
-                // chat-like filter. Empty signature is fine because
-                // `make_engine` uses `MemoryStore::with_accept_all()`; this
-                // test exercises the PeerHello fan-out, not the publish path.
                 let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
                 let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
                 let block = ContentBlock {
@@ -2065,7 +2075,6 @@ mod tests {
                 };
                 engine.store.insert(entry, Some(block)).await.unwrap();
 
-                // Drive PeerHello with a captured outbound channel.
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
                 engine
                     .handle_inbound_event(InboundEvent::PeerHello {
@@ -2077,25 +2086,7 @@ mod tests {
                     })
                     .await;
 
-                // The engine sends both digests synchronously before
-                // `handle_inbound_event` returns (the per-peer fire path is
-                // async-but-in-memory: `send_filter_digest` awaits the
-                // state lock and then non-blocking-sends to an unbounded
-                // mpsc). By the time we get here, every digest the engine
-                // intends to fire is already queued — drain with try_recv
-                // so a missing fire produces an assertion failure, not a
-                // hang.
-                let mut filters: Vec<Filter> = Vec::new();
-                loop {
-                    match rx.try_recv() {
-                        Ok(SyncMessage::DigestExchange { filter, .. }) => {
-                            filters.push(filter);
-                        }
-                        Ok(other) => panic!("expected DigestExchange, got {other:?}"),
-                        Err(_) => break,
-                    }
-                }
-
+                let filters = drain_digest_filters(&mut rx);
                 let bootstrap = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
                 assert!(
                     filters.contains(&bootstrap),
@@ -2118,10 +2109,6 @@ mod tests {
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
 
-                // Pre-publish one self-authored subscribe entry. Empty
-                // signature is fine because `make_engine` uses
-                // `MemoryStore::with_accept_all()`; this test exercises
-                // the anti-entropy fan-out, not the publish path.
                 let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
                 let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
                 let block = ContentBlock {
@@ -2138,33 +2125,12 @@ mod tests {
                 };
                 engine.store.insert(entry, Some(block)).await.unwrap();
 
-                // Pre-register one connected peer with a captured outbound channel.
-                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                let peer = PeerId(vk(b"relay"));
-                engine.state.lock().await.peer_outbound.insert(
-                    peer.clone(),
-                    PeerOutbound {
-                        conn_id: ConnectionId::for_test(1),
-                        tx,
-                    },
-                );
+                let (_peer, mut rx) =
+                    add_test_peer(&engine, b"relay", ConnectionId::for_test(1)).await;
 
                 engine.tick_anti_entropy().await;
 
-                // Same drain pattern as the PeerHello test — both digests
-                // are queued by the time `tick_anti_entropy` returns.
-                // Filter doesn't impl Hash, so use Vec + contains.
-                let mut filters: Vec<Filter> = Vec::new();
-                loop {
-                    match rx.try_recv() {
-                        Ok(SyncMessage::DigestExchange { filter, .. }) => {
-                            filters.push(filter);
-                        }
-                        Ok(other) => panic!("expected DigestExchange, got {other:?}"),
-                        Err(_) => break,
-                    }
-                }
-
+                let filters = drain_digest_filters(&mut rx);
                 let bootstrap = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
                 assert!(
                     filters.contains(&bootstrap),
