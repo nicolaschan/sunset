@@ -831,9 +831,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     IdentityReady(seed) -> {
       let create_client_eff =
         effect.from(fn(dispatch) {
-          sunset.create_client(seed, sunset.heartbeat_interval_ms_from_url(), fn(client) {
-            dispatch(ClientReady(client))
-          })
+          sunset.create_client(
+            seed,
+            sunset.heartbeat_interval_ms_from_url(),
+            fn(client) { dispatch(ClientReady(client)) },
+          )
         })
       #(model, create_client_eff)
     }
@@ -1818,10 +1820,7 @@ fn peer_status_popover_overlay(
   }
 }
 
-fn relay_popover_overlay(
-  palette,
-  model: Model,
-) -> Element(Msg) {
+fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
   case model.viewport, model.relays_popover {
     domain.Desktop, Some(id) -> {
       let rs = relays_view.relays_for_view(model.intents)

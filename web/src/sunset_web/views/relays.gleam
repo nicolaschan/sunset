@@ -138,9 +138,7 @@ pub fn from_intent(snap: IntentSnapshot) -> Relay {
 
 /// Filter `intents` to relays only and project to view-models.
 /// Stable order: ascending by IntentId.
-pub fn relays_for_view(
-  intents: Dict(Float, IntentSnapshot),
-) -> List(Relay) {
+pub fn relays_for_view(intents: Dict(Float, IntentSnapshot)) -> List(Relay) {
   intents
   |> dict.values()
   |> list.filter(fn(s) { is_relay_label(s.label) })
@@ -199,11 +197,7 @@ pub fn rail_section(
   }
 }
 
-fn rail_row(
-  p: Palette,
-  r: Relay,
-  on_open: fn(Float) -> msg,
-) -> Element(msg) {
+fn rail_row(p: Palette, r: Relay, on_open: fn(Float) -> msg) -> Element(msg) {
   html.button(
     [
       attribute.attribute("data-testid", "relay-row"),

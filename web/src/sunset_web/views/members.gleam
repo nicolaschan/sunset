@@ -7,9 +7,7 @@ import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
-import sunset_web/domain.{
-  type Member, Away, MutedP, OfflineP, Online, Speaking,
-}
+import sunset_web/domain.{type Member, Away, MutedP, OfflineP, Online, Speaking}
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
@@ -213,4 +211,3 @@ fn member_id_str(id: domain.MemberId) -> String {
   let domain.MemberId(s) = id
   s
 }
-

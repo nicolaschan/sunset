@@ -29,7 +29,8 @@ pub fn parse_host_bare_hostname_test() {
 }
 
 pub fn parse_host_wss_test() {
-  relays.parse_host("wss://relay.sunset.chat") |> should.equal("relay.sunset.chat")
+  relays.parse_host("wss://relay.sunset.chat")
+  |> should.equal("relay.sunset.chat")
 }
 
 pub fn parse_host_with_port_test() {
