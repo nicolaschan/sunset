@@ -1299,6 +1299,104 @@ mod tests {
             .await;
     }
 
+    /// Two `add()` calls with the same `Resolving { input }` must
+    /// return the same `IntentId` — and only one dial is spawned, so
+    /// the resolver's HTTP fetch fires exactly once even though both
+    /// adds completed. The dedup check is synchronous inside the cmd
+    /// handler (under cmd-channel serialization), so the second add
+    /// can't race past it and spawn a parallel dial.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolving_dedup_returns_same_id_and_fetches_once() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+
+                let body = format!(
+                    "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"ws://bob\"}}",
+                    "00".repeat(32),
+                    "ab".repeat(32),
+                );
+
+                // Pre-compute the canonical so TestNetwork routes the
+                // resolved addr (it matches by exact PeerAddr bytes).
+                let probe_fetch: Rc<dyn sunset_relay_resolver::HttpFetch> =
+                    CountingFakeFetch::new(body.clone(), 0);
+                let probe_resolver = sunset_relay_resolver::Resolver::new(probe_fetch);
+                let canonical = probe_resolver
+                    .resolve("bob")
+                    .await
+                    .expect("probe resolve must succeed");
+
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", &canonical);
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+
+                // Single shared fetcher. Succeeds on first call. If
+                // dedup is broken and a second dial fires, this
+                // counter would advance past 1.
+                let fetch = CountingFakeFetch::new(body, 0);
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let id1 = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "bob".into(),
+                        fetch: fetch.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let id2 = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "bob".into(),
+                        fetch: fetch.clone(),
+                    })
+                    .await
+                    .unwrap();
+
+                assert_eq!(id1, id2, "same input must return the same IntentId");
+
+                // Wait for the (single) dial to land Connected.
+                let mut connected = false;
+                for _ in 0..50 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id1 && s.state == IntentState::Connected)
+                    {
+                        connected = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(connected, "intent did not reach Connected");
+
+                // Exactly one snapshot present — second add did not
+                // create a new intent.
+                assert_eq!(sup.snapshot().await.len(), 1);
+
+                // And exactly one HTTP fetch happened — second add
+                // did not spawn a parallel dial.
+                assert_eq!(
+                    fetch.seen.get(),
+                    1,
+                    "resolver fetch fired more than once; dedup didn't suppress the second dial"
+                );
+            })
+            .await;
+    }
+
     /// `subscribe_intents` replays the current snapshot of every
     /// existing intent on subscribe — late subscribers don't miss
     /// state. We register two intents (one that connects, one that
