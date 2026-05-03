@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod identity;
 pub mod relay;
+pub mod render;
 pub(crate) mod resolver_adapter;
 pub(crate) mod router;
 pub mod snapshot;
