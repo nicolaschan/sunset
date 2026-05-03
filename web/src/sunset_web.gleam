@@ -32,6 +32,7 @@ import sunset_web/fixture
 import sunset_web/scroll_anchor
 import sunset_web/storage
 import sunset_web/sunset.{type ClientHandle, type IncomingMessage}
+import sunset_web/composer
 import sunset_web/markdown
 import sunset_web/theme.{type Mode, Dark, Light}
 import sunset_web/ui
@@ -591,7 +592,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, rooms_collapsed: !model.rooms_collapsed),
       effect.none(),
     )
-    UpdateDraft(s) -> #(Model(..model, draft: s), effect.none())
+    UpdateDraft(s) -> #(
+      Model(..model, draft: s),
+      effect.from(fn(_dispatch) { composer.auto_grow("composer-textarea") }),
+    )
     IdentityReady(seed) -> {
       let create_client_eff =
         effect.from(fn(dispatch) {

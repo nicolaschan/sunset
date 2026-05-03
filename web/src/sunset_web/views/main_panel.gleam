@@ -813,28 +813,37 @@ fn composer(
         ],
         [
           attach_button(p),
-          html.input([
-            attribute.autofocus(True),
-            attribute.value(draft),
-            attribute.placeholder("Message #" <> channel_name),
-            event.on_input(on_draft),
-            event.on("keydown", {
-              use key <- decode.subfield(["key"], decode.string)
-              decode.success(case key {
-                "Enter" -> on_submit
-                _ -> noop
-              })
-            }),
-            ui.css([
-              #("flex", "1"),
-              #("border", "none"),
-              #("background", "transparent"),
-              #("font-family", "inherit"),
-              #("font-size", "16.25px"),
-              #("color", p.text),
-              #("outline", "none"),
-            ]),
-          ]),
+          html.textarea(
+            [
+              attribute.id("composer-textarea"),
+              attribute.autofocus(True),
+              attribute.placeholder("Message #" <> channel_name),
+              attribute.attribute("rows", "1"),
+              event.on_input(on_draft),
+              event.on("keydown", {
+                use key <- decode.subfield(["key"], decode.string)
+                use shift <- decode.subfield(["shiftKey"], decode.bool)
+                decode.success(case key, shift {
+                  "Enter", False -> on_submit
+                  _, _ -> noop
+                })
+              }),
+              ui.css([
+                #("flex", "1"),
+                #("border", "none"),
+                #("background", "transparent"),
+                #("font-family", "inherit"),
+                #("font-size", "16.25px"),
+                #("color", p.text),
+                #("outline", "none"),
+                #("resize", "none"),
+                #("overflow", "hidden"),
+                #("padding", "0"),
+                #("line-height", "1.4"),
+              ]),
+            ],
+            draft,
+          ),
           html.span(
             [
               ui.css([
