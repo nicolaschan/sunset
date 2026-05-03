@@ -42,6 +42,7 @@ pub fn view(
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
+  on_open_full_picker on_open_full_picker: fn(String) -> msg,
   on_open_detail on_open_detail: fn(String) -> msg,
   receipts receipts: Dict(String, Set(String)),
   selected_msg_id selected_msg_id: Option(String),
@@ -84,6 +85,7 @@ pub fn view(
         detail_msg_id,
         on_react_toggle,
         on_add_reaction,
+        on_open_full_picker,
         on_open_detail,
         receipts,
         selected_msg_id,
@@ -132,6 +134,7 @@ fn messages_list(
   detail_msg_id: Option(String),
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
+  on_open_full_picker: fn(String) -> msg,
   on_open_detail: fn(String) -> msg,
   receipts: Dict(String, Set(String)),
   selected_msg_id: Option(String),
@@ -174,6 +177,7 @@ fn messages_list(
         selected,
         on_react_toggle,
         on_add_reaction,
+        on_open_full_picker,
         on_open_detail,
         on_toggle_selected,
         receipts,
@@ -210,6 +214,7 @@ fn message_view(
   selected: Bool,
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
+  on_open_full_picker: fn(String) -> msg,
   on_open_detail: fn(String) -> msg,
   on_toggle_selected: fn(String) -> msg,
   receipts: Dict(String, Set(String)),
@@ -306,7 +311,8 @@ fn message_view(
           on_open_detail,
         ),
         case viewport, picker_open {
-          domain.Desktop, True -> reaction_picker(p, m.id, on_add_reaction)
+          domain.Desktop, True ->
+            reaction_picker(p, m.id, on_add_reaction, on_open_full_picker)
           _, _ -> element.fragment([])
         },
       ],
@@ -424,24 +430,9 @@ fn reaction_picker(
   p: Palette,
   msg_id: String,
   on_add_reaction: fn(String, String) -> msg,
+  on_open_full_picker: fn(String) -> msg,
 ) -> Element(msg) {
-  html.div(
-    [
-      attribute.attribute("data-testid", "reaction-picker"),
-      ui.css([
-        #("position", "absolute"),
-        #("top", "18px"),
-        #("right", "12px"),
-        #("display", "inline-flex"),
-        #("gap", "2px"),
-        #("padding", "4px"),
-        #("background", p.surface),
-        #("border", "1px solid " <> p.border),
-        #("border-radius", "999px"),
-        #("box-shadow", p.shadow_lg),
-        #("z-index", "5"),
-      ]),
-    ],
+  let quick_buttons =
     list.map(quick_reactions, fn(emoji) {
       html.button(
         [
@@ -464,7 +455,49 @@ fn reaction_picker(
         ],
         [html.text(emoji)],
       )
-    }),
+    })
+  let plus_button =
+    html.button(
+      [
+        attribute.title("More reactions"),
+        attribute.attribute("data-testid", "reaction-picker-more"),
+        event.on_click(on_open_full_picker(msg_id)),
+        ui.css([
+          #("width", "32px"),
+          #("height", "32px"),
+          #("display", "inline-flex"),
+          #("align-items", "center"),
+          #("justify-content", "center"),
+          #("padding", "0"),
+          #("border", "none"),
+          #("background", "transparent"),
+          #("border-radius", "999px"),
+          #("font-size", "18px"),
+          #("color", p.text_muted),
+          #("cursor", "pointer"),
+          #("font-family", "inherit"),
+        ]),
+      ],
+      [html.text("+")],
+    )
+  html.div(
+    [
+      attribute.attribute("data-testid", "reaction-picker"),
+      ui.css([
+        #("position", "absolute"),
+        #("top", "18px"),
+        #("right", "12px"),
+        #("display", "inline-flex"),
+        #("gap", "2px"),
+        #("padding", "4px"),
+        #("background", p.surface),
+        #("border", "1px solid " <> p.border),
+        #("border-radius", "999px"),
+        #("box-shadow", p.shadow_lg),
+        #("z-index", "5"),
+      ]),
+    ],
+    list.append(quick_buttons, [plus_button]),
   )
 }
 

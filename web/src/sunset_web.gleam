@@ -37,6 +37,7 @@ import sunset_web/ui
 import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
 import sunset_web/views/details_panel
+import sunset_web/views/emoji_picker
 import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
@@ -69,6 +70,8 @@ pub type Model {
     current_channel: ChannelId,
     draft: String,
     reacting_to: Option(String),
+    /// Target id whose full emoji picker is currently open, if any.
+    full_picker_for: Option(String),
     /// Per-target reaction state from the bridge tracker. Whole-snapshot
     /// replacement on each `ReactionsChanged` — never partially merged in
     /// the FE; the core tracker is the source of truth. Shape:
@@ -142,6 +145,8 @@ pub type Msg {
   ReactionsChanged(target: String, snapshot: Dict(String, Set(String)))
   ToggleReactionEmoji(target: String, emoji: String)
   ReactionSent(Result(Nil, String))
+  OpenFullEmojiPicker(String)
+  CloseFullEmojiPicker
   OpenDetail(String)
   CloseDetail
   OpenVoicePopover(String)
@@ -226,6 +231,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       current_channel: ChannelId(fixture.initial_channel_id),
       draft: "",
       reacting_to: None,
+      full_picker_for: None,
       reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
@@ -768,6 +774,23 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(Model(..model, reacting_to: next), effect.none())
     }
+    OpenFullEmojiPicker(target) -> {
+      // Trigger the lazy import so the web component is registered by the
+      // time we mount it.
+      sunset.register_emoji_picker()
+      #(
+        Model(
+          ..model,
+          full_picker_for: Some(target),
+          reacting_to: None,
+        ),
+        effect.none(),
+      )
+    }
+    CloseFullEmojiPicker -> #(
+      Model(..model, full_picker_for: None),
+      effect.none(),
+    )
     ReactionsChanged(target, snapshot) -> {
       #(
         Model(..model, reactions: dict.insert(model.reactions, target, snapshot)),
@@ -790,7 +813,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         Error(_) -> "add"
       }
-      let next_model = Model(..model, reacting_to: None)
+      let next_model =
+        Model(..model, reacting_to: None, full_picker_for: None)
       let send_effect = case model.client {
         Some(c) ->
           effect.from(fn(dispatch) {
@@ -978,6 +1002,48 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     _, _ -> element.fragment([])
   }
 
+  // Desktop: centered fixed-position overlay (goes in the shell's overlay slot).
+  let full_picker_overlay_el = case model.full_picker_for {
+    Some(target) ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "full-emoji-picker-overlay"),
+          ui.css([
+            #("position", "fixed"),
+            #("top", "50%"),
+            #("left", "50%"),
+            #("transform", "translate(-50%, -50%)"),
+            #("z-index", "100"),
+            #("background", palette.surface),
+            #("border", "1px solid " <> palette.border),
+            #("border-radius", "8px"),
+            #("box-shadow", palette.shadow_lg),
+          ]),
+        ],
+        [
+          emoji_picker.view(fn(emoji) {
+            ToggleReactionEmoji(target, emoji)
+          }),
+        ],
+      )
+    None -> element.fragment([])
+  }
+
+  // Phone: bottom sheet (merged into the reaction_sheet slot).
+  let full_picker_sheet_el = case model.full_picker_for {
+    Some(target) ->
+      bottom_sheet.view(
+        palette: palette,
+        open: True,
+        on_close: CloseFullEmojiPicker,
+        test_id: "full-emoji-picker-sheet",
+        content: emoji_picker.view(fn(emoji) {
+          ToggleReactionEmoji(target, emoji)
+        }),
+      )
+    None -> element.fragment([])
+  }
+
   let details_sheet_el = case model.viewport, model.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
       case find_message(messages_with_live_reactions, id) {
@@ -1135,6 +1201,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
       },
       on_toggle_reaction_picker: ToggleReactionPicker,
       on_add_reaction: ToggleReactionEmoji,
+      on_open_full_picker: OpenFullEmojiPicker,
       on_open_detail: OpenDetail,
       receipts: model.receipts,
       selected_msg_id: model.selected_msg_id,
@@ -1160,6 +1227,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     element.fragment([
       voice_popover_overlay(palette, model),
       peer_status_popover_overlay(palette, model),
+      full_picker_overlay_el,
     ]),
     phone_header.view(
       palette: palette,
@@ -1170,7 +1238,7 @@ fn room_view(model: Model, palette, current_name: String) -> Element(Msg) {
     details_sheet_el,
     voice_sheet_el,
     peer_status_sheet_el,
-    reaction_sheet_el,
+    element.fragment([reaction_sheet_el, full_picker_sheet_el]),
   )
 }
 
