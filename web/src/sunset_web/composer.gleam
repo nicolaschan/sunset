@@ -17,3 +17,6 @@ pub fn apply_template(
 
 @external(javascript, "./composer.ffi.mjs", "attachShortcutPreventDefault")
 pub fn attach_shortcut_prevent_default(element_id: String) -> Nil
+
+@external(javascript, "./composer.ffi.mjs", "focusTextarea")
+pub fn focus_textarea(element_id: String) -> Nil

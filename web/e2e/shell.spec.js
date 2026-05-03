@@ -503,14 +503,25 @@ test.describe("phone shell smoke", () => {
     );
   });
 
-  test("phone has theme toggle in rooms drawer footer (and not as a fixed pill)", async ({
+  test("phone exposes theme controls via the settings sheet (and not as a fixed pill)", async ({
     page,
   }) => {
+    // Theme controls live in the settings sheet, opened from the
+    // rooms-rail "you" row. The standalone phone-theme-toggle row
+    // (under the rooms list) was removed once the settings sheet
+    // landed — it was a redundant second entry point to the same
+    // preference.
     await page.getByTestId("phone-rooms-toggle").click();
     await page.getByTestId("channels-room-title").click();
-    await expect(page.getByTestId("phone-theme-toggle")).toBeVisible();
-    // Desktop fixed toggle isn't rendered on phone.
+    await page.getByTestId("you-row").click();
+    await expect(page.getByTestId("settings-sheet")).toBeVisible();
+    await expect(page.getByTestId("settings-theme-system")).toBeVisible();
+    await expect(page.getByTestId("settings-theme-light")).toBeVisible();
+    await expect(page.getByTestId("settings-theme-dark")).toBeVisible();
+    // Desktop fixed-pill toggle isn't rendered on phone.
     expect(await page.getByTestId("theme-toggle").count()).toBe(0);
+    // The deprecated standalone phone-theme-toggle row is gone.
+    expect(await page.getByTestId("phone-theme-toggle").count()).toBe(0);
   });
 });
 

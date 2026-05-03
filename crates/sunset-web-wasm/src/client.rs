@@ -35,15 +35,14 @@ impl NoiseIdentity for IdentityNoiseAdapter {
 #[wasm_bindgen]
 pub struct Client {
     /// Multi-room peer (identity + store + engine + supervisor +
-    /// per-room registry). Per-room ops route through `RoomHandle`.
+    /// per-room registry). Per-room ops route through `RoomHandle`;
+    /// supervisor-level ops (`add_relay`, `on_intent_changed`,
+    /// `intents`) route through `Peer`'s thin delegators.
     inner: Rc<sunset_core::Peer<MemoryStore, MultiTransport<WsT, RtcT>>>,
-    /// Local copies kept on the Client because (a) the voice subsystem
-    /// needs identity to start a per-room voice session, and (b) the
-    /// supervisor handle is needed for `on_intent_changed` /
-    /// `intents`. Identity could move into `Peer` accessors later;
-    /// for now the duplication is small and explicit.
+    /// Kept on the Client because the voice subsystem needs identity
+    /// to start a per-room voice session. Could move into a `Peer`
+    /// accessor later; for now the duplication is small and explicit.
     identity: Identity,
-    supervisor: Rc<sunset_sync::PeerSupervisor<MemoryStore, MultiTransport<WsT, RtcT>>>,
     /// Voice subsystem (single concurrent call per Client). See
     /// `voice_start` for the room-handle parameter that selects which
     /// room the call targets.
@@ -115,14 +114,13 @@ impl Client {
             identity.clone(),
             store.clone(),
             engine.clone(),
-            supervisor.clone(),
+            supervisor,
             dispatcher,
         );
 
         Ok(Client {
             inner: peer,
             identity,
-            supervisor,
             voice: crate::voice::new_voice_cell(),
             bus,
         })
@@ -154,9 +152,9 @@ impl Client {
     ///   * once per intent state transition thereafter.
     /// The callback receives an `IntentSnapshotJs`.
     pub fn on_intent_changed(&self, callback: js_sys::Function) {
-        let supervisor = self.supervisor.clone();
+        let inner = self.inner.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut rx = supervisor.subscribe_intents().await;
+            let mut rx = inner.subscribe_intents().await;
             while let Some(snap) = rx.recv().await {
                 let js_snap = crate::intent::IntentSnapshotJs::from(&snap);
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from(js_snap));
@@ -200,7 +198,7 @@ impl Client {
     /// requires `voice_stop` then `voice_start` against the new room.
     pub fn voice_start(
         &self,
-        room_name: String,
+        room_name: &str,
         on_frame: &js_sys::Function,
         on_voice_peer_state: &js_sys::Function,
     ) -> Result<(), JsError> {
@@ -208,7 +206,7 @@ impl Client {
         // already done by `open_room`, but voice is started rarely so
         // the cost is acceptable. A future API could take a RoomHandle
         // and pull the Room out of `OpenRoom` directly.
-        let room = sunset_core::Room::open(&room_name)
+        let room = sunset_core::Room::open(room_name)
             .map_err(|e| JsError::new(&format!("voice_start Room::open: {e}")))?;
         crate::voice::voice_start(
             &self.voice,

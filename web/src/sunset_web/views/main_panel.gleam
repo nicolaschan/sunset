@@ -21,7 +21,8 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, ChannelId,
+  type ChannelId, type Member, type Message, type Reaction, Away, ChannelId,
+  Direct, OfflineP, OneHop, Online, SelfRelay, Speaking,
 }
 import sunset_web/markdown
 import sunset_web/theme.{type Palette}
@@ -50,6 +51,9 @@ pub fn view(
   on_toggle_selected on_toggle_selected: fn(String) -> msg,
   is_spoiler_revealed is_revealed: fn(markdown.SpoilerKey) -> Bool,
   on_toggle_spoiler on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
+  // Live members list — used to color message author names by their
+  // current connection state.
+  members members: List(Member),
   // Slot rendered between the channel header and the message list.
   // Used by the phone shell for the in-call voice mini-bar — voice
   // chat is a per-channel concern, so the banner sits inside the
@@ -95,6 +99,7 @@ pub fn view(
         on_toggle_selected,
         is_revealed,
         on_toggle_spoiler,
+        members,
       ),
       composer(
         p,
@@ -155,6 +160,7 @@ fn messages_list(
   on_toggle_selected: fn(String) -> msg,
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
   on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
+  members: List(Member),
 ) -> Element(msg) {
   let last_seen_index = last_own_seen_index(ms)
   // Pair each message with its index AND its predecessor's author (for grouping).
@@ -199,6 +205,7 @@ fn messages_list(
         receipts,
         is_revealed,
         on_toggle_spoiler,
+        author_color(p, m, members),
       )
     })
 
@@ -238,6 +245,7 @@ fn message_view(
   receipts: Dict(String, Set(String)),
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
   on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
+  author_color: String,
 ) -> Element(msg) {
   let pending =
     m.you
@@ -258,20 +266,37 @@ fn message_view(
 
   let header = case grouped {
     True -> element.fragment([])
-    False -> message_header(p, m)
+    False -> message_header(p, m, author_color)
   }
 
-  let bg = case picker_open || detail_open {
-    True -> p.surface_alt
-    False -> "transparent"
+  // Row classes:
+  //   * `is-active` whenever a per-message menu is up (reaction picker
+  //     / details panel) — pins both the highlight backdrop and the
+  //     hover-only action toolbar visible while the user is interacting
+  //     with that menu, even after the cursor leaves the row.
+  //   * `is-selected` mirrors `selected_msg_id`. Used by the touch
+  //     stylesheet to keep the action toolbar visible on tap (since
+  //     :hover doesn't fire on touch devices).
+  // The hover background, edge-to-edge stretching, and active-state
+  // backdrop are all driven by CSS rules in `shell.global_reset` —
+  // inline styles can't express :hover, and keeping the rules in one
+  // place makes the layout easier to reason about.
+  let row_class = case picker_open || detail_open, selected {
+    True, True -> "msg-row is-active is-selected"
+    True, False -> "msg-row is-active"
+    False, True -> "msg-row is-selected"
+    False, False -> "msg-row"
   }
-  // Row class: `is-selected` whenever this row should pin its action
-  // toolbar visible. Opening the details panel sets selection too
-  // (see OpenDetail in sunset_web.gleam), so we don't need a separate
-  // `.is-active` marker for that case anymore.
-  let row_class = case selected {
-    True -> "msg-row is-selected"
-    False -> "msg-row"
+
+  // Stretch the row's inline-block-with-padding so its background can
+  // bleed to the edges of the messages container. The horizontal
+  // padding here mirrors the messages_list container's own horizontal
+  // padding (16/20px desktop, 12px phone), and the matching negative
+  // margin pulls the row outside that padding so the highlight reads
+  // as full-bleed.
+  let bleed_h = case viewport {
+    domain.Phone -> "12px"
+    domain.Desktop -> "20px"
   }
 
   // Wrap header + body + reactions in an inner clickable div so a
@@ -286,12 +311,12 @@ fn message_view(
         attribute.class(row_class),
         ui.css([
           #("position", "relative"),
-          #("padding", "2px 8px"),
-          #("border-radius", "6px"),
+          #("padding", "2px " <> bleed_h),
+          #("margin-left", "-" <> bleed_h),
+          #("margin-right", "-" <> bleed_h),
           #("opacity", opacity),
-          #("transition", "opacity 220ms ease"),
+          #("transition", "opacity 220ms ease, background-color 120ms ease"),
           #("margin-top", margin_top),
-          #("background", bg),
         ]),
       ],
       [
@@ -619,7 +644,7 @@ fn info_icon() -> Element(msg) {
   )
 }
 
-fn message_header(p: Palette, m: Message) -> Element(msg) {
+fn message_header(p: Palette, m: Message, author_color: String) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -633,10 +658,12 @@ fn message_header(p: Palette, m: Message) -> Element(msg) {
       [
         html.span(
           [
+            attribute.attribute("data-testid", "message-author"),
+            attribute.attribute("data-author", m.author),
             ui.css([
               #("font-weight", "600"),
               #("font-size", "16.25px"),
-              #("color", p.text),
+              #("color", author_color),
               #("cursor", "default"),
             ]),
           ],
@@ -1053,6 +1080,42 @@ fn you_tag(p: Palette) -> Element(msg) {
     ],
     [html.text("you")],
   )
+}
+
+/// Pick the color for a message author's name based on the matching
+/// member's connection state. Lookup is by `m.author == member.name`
+/// (both are derived from the first 4 bytes of the pubkey, so a single
+/// short-pubkey string identifies the peer).
+///
+/// Mapping:
+///   * own messages → palette accent (so "you" stands out)
+///   * online + direct WebRTC → palette ok (green; healthy mesh)
+///   * online + via-relay → palette warn (amber; not direct)
+///   * speaking → palette live (matches the voice-rail dot)
+///   * away → palette warn
+///   * offline → palette text_faint
+///   * fallback (no member match yet) → palette text
+fn author_color(p: Palette, m: Message, members: List(Member)) -> String {
+  case m.you {
+    True -> p.accent
+    False ->
+      case list.find(members, fn(mem) { mem.name == m.author }) {
+        Error(_) -> p.text
+        Ok(mem) -> color_for_member(p, mem)
+      }
+  }
+}
+
+fn color_for_member(p: Palette, mem: Member) -> String {
+  case mem.status, mem.relay {
+    OfflineP, _ -> p.text_faint
+    Away, _ -> p.warn
+    Speaking, _ -> p.live
+    Online, Direct -> p.ok
+    Online, OneHop -> p.warn
+    Online, SelfRelay -> p.text
+    _, _ -> p.text
+  }
 }
 
 /// Index of the last own message that's been seen by anyone — that's

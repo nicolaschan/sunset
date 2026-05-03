@@ -37,7 +37,9 @@ import sunset_web/storage
 import sunset_web/sunset.{
   type ClientHandle, type IncomingMessage, type RoomHandle,
 }
-import sunset_web/theme.{type Mode, Dark, Light}
+import sunset_web/theme.{
+  type Mode, type Pref, Dark, DarkPref, Light, LightPref, System,
+}
 import sunset_web/ui
 import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
@@ -50,6 +52,7 @@ import sunset_web/views/peer_status_popover
 import sunset_web/views/phone_header
 import sunset_web/views/relays as relays_view
 import sunset_web/views/rooms
+import sunset_web/views/settings_popover
 import sunset_web/views/shell
 import sunset_web/views/touch_drag
 import sunset_web/views/voice_minibar
@@ -115,6 +118,14 @@ fn empty_room_state() -> RoomState {
 pub type Model {
   Model(
     mode: Mode,
+    /// User-facing theme preference. `mode` is derived from this +
+    /// the OS `prefers-color-scheme` signal at init / on toggle. Two
+    /// fields rather than one because the System branch needs to
+    /// survive across reloads even though the rendered Mode flips
+    /// with the OS.
+    theme_pref: Pref,
+    /// True when the settings popover (theme + reset) is visible.
+    settings_open: Bool,
     view: View,
     joined_rooms: List(String),
     rooms_collapsed: Bool,
@@ -170,6 +181,10 @@ pub type Model {
 pub type Msg {
   NoOp
   ToggleMode
+  OpenSettings
+  CloseSettings
+  SetThemePref(Pref)
+  ResetLocalState
   HashChanged(String)
   UpdateLandingInput(String)
   UpdateSidebarSearch(String)
@@ -239,16 +254,12 @@ pub fn main() {
 fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   let stored_rooms = storage.read_joined_rooms()
   let initial_hash = storage.read_hash()
-  let initial_mode = case storage.read_saved_theme() {
-    "dark" -> Dark
-    "light" -> Light
-    // No explicit choice yet: follow the OS / browser preference.
-    _ ->
-      case storage.prefers_dark() {
-        True -> Dark
-        False -> Light
-      }
+  let initial_pref = case storage.read_saved_theme() {
+    "dark" -> DarkPref
+    "light" -> LightPref
+    _ -> System
   }
+  let initial_mode = theme.resolve_mode(initial_pref, storage.prefers_dark())
 
   // Resolve the initial view + rooms list:
   //   * URL fragment wins if present.
@@ -277,6 +288,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   let model =
     Model(
       mode: initial_mode,
+      theme_pref: initial_pref,
+      settings_open: False,
       view: initial_view,
       joined_rooms: joined,
       rooms_collapsed: False,
@@ -359,6 +372,14 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       composer.attach_shortcut_prevent_default("composer-textarea")
     })
 
+  // On first paint, force the composer textarea back to its single-row
+  // height. The autoGrow effect only fires on `input`, so without an
+  // explicit reset the textarea can render as a doubled-up 2-line
+  // height on mobile (where the iOS 16px font override changes the
+  // line metrics in a way that doesn't match the `rows="1"` default).
+  let initial_compose_reset_eff =
+    effect.from(fn(_dispatch) { composer.reset_textarea("composer-textarea") })
+
   #(
     model,
     effect.batch([
@@ -370,6 +391,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       subscribe_touch_drag,
       ticker_eff,
       attach_shortcuts_eff,
+      initial_compose_reset_eff,
     ]),
   )
 }
@@ -487,27 +509,60 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     NoOp -> #(model, effect.none())
     ToggleMode -> {
+      // The Light↔Dark toggle button writes a concrete preference (so
+      // the user gets the same theme on next load even if their OS
+      // preference flips). System preference is therefore retired by
+      // any toggle — that's the same behaviour the old code had,
+      // since it always wrote a concrete `light`/`dark` string.
       let next_mode = case model.mode {
         Light -> Dark
         Dark -> Light
+      }
+      let next_pref = case next_mode {
+        Light -> LightPref
+        Dark -> DarkPref
       }
       let label = case next_mode {
         Light -> "light"
         Dark -> "dark"
       }
       #(
-        Model(..model, mode: next_mode),
+        Model(..model, mode: next_mode, theme_pref: next_pref),
         effect.from(fn(_) {
           storage.write_saved_theme(label)
           Nil
         }),
       )
     }
+    OpenSettings -> #(Model(..model, settings_open: True), effect.none())
+    CloseSettings -> #(Model(..model, settings_open: False), effect.none())
+    SetThemePref(pref) -> {
+      let next_mode = theme.resolve_mode(pref, storage.prefers_dark())
+      let label = case pref {
+        System -> ""
+        LightPref -> "light"
+        DarkPref -> "dark"
+      }
+      #(
+        Model(..model, mode: next_mode, theme_pref: pref),
+        effect.from(fn(_) {
+          storage.write_saved_theme(label)
+          Nil
+        }),
+      )
+    }
+    ResetLocalState -> {
+      // The reset wipes localStorage and reloads, so any in-flight
+      // model state is discarded. We dispatch nothing else: the FFI
+      // call ends in `location.reload()`.
+      #(model, effect.from(fn(_) { storage.reset_local_state_and_reload() }))
+    }
     HashChanged(hash) -> {
       let new_view = case hash {
         "" -> LandingView
         name -> RoomView(name)
       }
+      let view_changed = new_view != model.view
       let new_rooms = case new_view {
         LandingView -> model.joined_rooms
         RoomView(name) -> ensure_joined(model.joined_rooms, name)
@@ -553,6 +608,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           })
         _, False, None -> effect.none()
       }
+      // Re-focus the composer when switching to a different room so the
+      // user can start typing immediately; reset the inline height so
+      // the textarea isn't stuck at a multi-line size carried over from
+      // another room's draft. Skipped when the view didn't actually
+      // change (e.g. spurious hashchange from setting the same hash).
+      let focus_eff = case view_changed, new_view {
+        True, RoomView(_) ->
+          effect.from(fn(_) {
+            composer.reset_textarea("composer-textarea")
+            composer.focus_textarea("composer-textarea")
+          })
+        _, _ -> effect.none()
+      }
       #(
         Model(
           ..model,
@@ -560,7 +628,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           joined_rooms: new_rooms,
           rooms: new_rooms_dict,
         ),
-        effect.batch([persisted, open_eff]),
+        effect.batch([persisted, open_eff, focus_eff]),
       )
     }
     UpdateLandingInput(s) -> #(Model(..model, landing_input: s), effect.none())
@@ -574,6 +642,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         "" -> #(model, effect.none())
         _ -> {
           let was_new = !list.contains(model.joined_rooms, name)
+          let active_changed = case model.view {
+            RoomView(active) -> active != name
+            LandingView -> True
+          }
           let new_room_list = ensure_joined(model.joined_rooms, name)
           // On phone, picking a room from the rooms drawer should land
           // the user in the channels drawer for the new room (so they
@@ -619,6 +691,20 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               })
             _, _ -> effect.none()
           }
+          // Reset + focus the composer when the active room actually
+          // changes (i.e. landing→room or room→other-room). The reset
+          // also fixes a stale inline `style.height` carried over from
+          // the previous room's multi-line draft (and the just-mounted
+          // textarea on phone, which can otherwise render as 2 lines
+          // depending on the rendered font metrics).
+          let focus_eff = case active_changed {
+            True ->
+              effect.from(fn(_) {
+                composer.reset_textarea("composer-textarea")
+                composer.focus_textarea("composer-textarea")
+              })
+            False -> effect.none()
+          }
           #(
             new_model,
             effect.batch([
@@ -628,6 +714,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                 Nil
               }),
               open_eff,
+              focus_eff,
             ]),
           )
         }
@@ -721,7 +808,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     )
     SelectChannel(id) ->
       with_active_room(model, fn(state) {
-        #(RoomState(..state, current_channel: id), effect.none())
+        // Switching channels should land focus on the composer so the
+        // user can start typing immediately. focus_textarea is a no-op
+        // if the textarea isn't mounted (e.g. mid-transition), so it's
+        // safe to dispatch unconditionally.
+        #(
+          RoomState(..state, current_channel: id),
+          effect.from(fn(_) { composer.focus_textarea("composer-textarea") }),
+        )
       })
     ToggleRoomsRail -> #(
       Model(..model, rooms_collapsed: !model.rooms_collapsed),
@@ -1389,6 +1483,38 @@ fn room_view_with_state(
     None -> element.fragment([])
   }
 
+  let settings_overlay_el = case model.viewport, model.settings_open {
+    domain.Desktop, True ->
+      settings_popover.view(
+        palette: palette,
+        pref: model.theme_pref,
+        placement: settings_popover.Floating,
+        on_select_pref: SetThemePref,
+        on_reset: ResetLocalState,
+        on_close: CloseSettings,
+      )
+    _, _ -> element.fragment([])
+  }
+
+  let settings_sheet_el = case model.viewport, model.settings_open {
+    domain.Phone, True ->
+      bottom_sheet.view(
+        palette: palette,
+        open: True,
+        on_close: CloseSettings,
+        test_id: "settings-sheet",
+        content: settings_popover.view(
+          palette: palette,
+          pref: model.theme_pref,
+          placement: settings_popover.InSheet,
+          on_select_pref: SetThemePref,
+          on_reset: ResetLocalState,
+          on_close: CloseSettings,
+        ),
+      )
+    _, _ -> element.fragment([])
+  }
+
   let full_picker_sheet_el = case model.full_picker_for {
     Some(target) ->
       bottom_sheet.view(
@@ -1549,8 +1675,7 @@ fn room_view_with_state(
       toggle: ToggleRoomsRail,
       viewport: model.viewport,
       members: state.members,
-      mode: model.mode,
-      on_toggle_mode: ToggleMode,
+      on_open_settings: OpenSettings,
     ),
     // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
     channels.view(
@@ -1598,6 +1723,7 @@ fn room_view_with_state(
       on_toggle_spoiler: fn(k: markdown.SpoilerKey) {
         ToggleSpoiler(k.message_id, k.path)
       },
+      members: state.members,
       voice_minibar: voice_minibar_el,
     ),
     case model.viewport, detail_msg {
@@ -1621,6 +1747,7 @@ fn room_view_with_state(
       peer_status_popover_overlay(palette, model, state),
       relay_popover_overlay(palette, model),
       full_picker_overlay_el,
+      settings_overlay_el,
     ]),
     phone_header.view(
       palette: palette,
@@ -1631,7 +1758,11 @@ fn room_view_with_state(
     details_sheet_el,
     voice_sheet_el,
     element.fragment([peer_status_sheet_el, relay_sheet_el]),
-    element.fragment([reaction_sheet_el, full_picker_sheet_el]),
+    element.fragment([
+      reaction_sheet_el,
+      full_picker_sheet_el,
+      settings_sheet_el,
+    ]),
   )
 }
 

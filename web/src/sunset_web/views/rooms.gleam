@@ -12,7 +12,7 @@ import lustre/event
 import sunset_web/domain.{
   type ConnStatus, type Room, type RoomId, Connected, Offline, Reconnecting,
 }
-import sunset_web/theme.{type Mode, type Palette}
+import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
 pub fn view(
@@ -36,8 +36,7 @@ pub fn view(
   toggle toggle: msg,
   viewport viewport: domain.Viewport,
   members members: List(domain.Member),
-  mode mode: Mode,
-  on_toggle_mode on_toggle_mode: msg,
+  on_open_settings on_open_settings: msg,
 ) -> Element(msg) {
   // On phone the rail lives inside a 320px-wide drawer, so it should
   // fill the drawer's width rather than the desktop 260px column.
@@ -100,11 +99,7 @@ pub fn view(
         on_drop,
         on_drag_end,
       ),
-      you_row(you, p, col),
-      case viewport {
-        domain.Phone -> phone_theme_toggle_row(p, mode, on_toggle_mode)
-        domain.Desktop -> element.fragment([])
-      },
+      you_row(you, p, col, on_open_settings),
     ],
   )
 }
@@ -324,12 +319,21 @@ fn on_enter_with_value(
   noop: msg,
   on_join: fn(String) -> msg,
 ) -> attribute.Attribute(msg) {
-  event.on("keydown", {
+  // Enter calls `preventDefault` on the keydown so the keystroke can't
+  // bleed through into a different focused element after Lustre's
+  // re-render replaces this input. See landing.on_enter_with_value for
+  // the full rationale — same bug, same fix.
+  event.advanced("keydown", {
     use key <- decode.subfield(["key"], decode.string)
     use value <- decode.subfield(["target", "value"], decode.string)
     decode.success(case key {
-      "Enter" -> on_join(value)
-      _ -> noop
+      "Enter" ->
+        event.handler(
+          on_join(value),
+          prevent_default: True,
+          stop_propagation: False,
+        )
+      _ -> event.handler(noop, prevent_default: False, stop_propagation: False)
     })
   })
 }
@@ -736,10 +740,13 @@ fn you_row(
   you: Option(domain.Member),
   p: Palette,
   collapsed: Bool,
+  on_open_settings: msg,
 ) -> Element(msg) {
   // Pinned at the bottom of the rooms rail. The fixed 64px height +
   // border-top is shared by the channels-rail self-bar and the main
   // panel composer so all three column-bottom rows visually align.
+  // The whole row is a button: clicking it opens the settings popover
+  // (theme + reset). Collapsed-rail variant centers a single dot.
   let padding = case collapsed {
     True -> "0"
     False -> "0 14px"
@@ -749,8 +756,12 @@ fn you_row(
     False -> "flex-start"
   }
   let your_name = you |> option.map(fn(a) { a.name }) |> option.unwrap("?")
-  html.div(
+  html.button(
     [
+      attribute.attribute("data-testid", "you-row"),
+      attribute.title("Settings"),
+      attribute.attribute("aria-label", "Open settings"),
+      event.on_click(on_open_settings),
       ui.css([
         #("box-sizing", "border-box"),
         #("height", "64px"),
@@ -760,7 +771,15 @@ fn you_row(
         #("justify-content", justify),
         #("gap", "8px"),
         #("padding", padding),
+        #("border", "none"),
         #("border-top", "1px solid " <> p.border_soft),
+        #("background", "transparent"),
+        #("color", p.text),
+        #("font-family", "inherit"),
+        #("font-size", "16.25px"),
+        #("text-align", "left"),
+        #("cursor", "pointer"),
+        #("width", "100%"),
       ]),
     ],
     [
@@ -874,41 +893,6 @@ fn logo(size: Int) -> Element(msg) {
         [],
       ),
     ],
-  )
-}
-
-fn phone_theme_toggle_row(
-  p: Palette,
-  mode: Mode,
-  on_toggle: msg,
-) -> Element(msg) {
-  let label = case mode {
-    theme.Light -> "Switch to dark mode"
-    theme.Dark -> "Switch to light mode"
-  }
-  html.button(
-    [
-      attribute.attribute("data-testid", "phone-theme-toggle"),
-      attribute.title(label),
-      attribute.attribute("aria-label", label),
-      event.on_click(on_toggle),
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("gap", "8px"),
-        #("padding", "12px 16px"),
-        #("border", "none"),
-        #("border-top", "1px solid " <> p.border_soft),
-        #("background", "transparent"),
-        #("color", p.text),
-        #("font-family", "inherit"),
-        #("font-size", "16.875px"),
-        #("cursor", "pointer"),
-        #("text-align", "left"),
-        #("width", "100%"),
-      ]),
-    ],
-    [html.text(label)],
   )
 }
 
