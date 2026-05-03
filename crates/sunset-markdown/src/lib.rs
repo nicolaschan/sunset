@@ -54,6 +54,7 @@ pub enum Inline {
 }
 
 mod blocks;
+mod inline;
 
 /// Parse a message body into a `Document`. Total: malformed input
 /// degrades to literal text rather than erroring.
@@ -113,6 +114,34 @@ mod tests {
         assert_eq!(
             parse("hello\n\n\n"),
             Document(vec![Block::Paragraph(vec![Inline::Text("hello".to_owned())])])
+        );
+    }
+
+    #[test]
+    fn bold_wraps_inner_text() {
+        assert_eq!(
+            parse("a **b** c"),
+            Document(vec![Block::Paragraph(vec![
+                Inline::Text("a ".to_owned()),
+                Inline::Bold(vec![Inline::Text("b".to_owned())]),
+                Inline::Text(" c".to_owned()),
+            ])])
+        );
+    }
+
+    #[test]
+    fn unclosed_bold_degrades_to_literal_text() {
+        assert_eq!(
+            parse("a **b c"),
+            Document(vec![Block::Paragraph(vec![Inline::Text("a **b c".to_owned())])])
+        );
+    }
+
+    #[test]
+    fn empty_bold_pair_collapses_to_literal_text() {
+        assert_eq!(
+            parse("a **** b"),
+            Document(vec![Block::Paragraph(vec![Inline::Text("a **** b".to_owned())])])
         );
     }
 }

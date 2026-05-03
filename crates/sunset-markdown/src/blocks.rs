@@ -26,14 +26,13 @@ pub(crate) fn split(input: &str) -> Vec<Block> {
 }
 
 fn paragraph_from_lines(lines: &[&str]) -> Block {
+    use crate::inline::parse_inlines;
     let mut content: Vec<Inline> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
             content.push(Inline::LineBreak);
         }
-        // Phase A2: each line is a single Text node. Tasks A3..A11
-        // replace this with the inline parser.
-        content.push(Inline::Text((*line).to_owned()));
+        content.extend(parse_inlines(line));
     }
     Block::Paragraph(content)
 }
