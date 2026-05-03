@@ -294,6 +294,18 @@ impl Client {
         *self.tracker_handles.on_relay_status.borrow_mut() = Some(Box::new(bridge));
     }
 
+    pub fn on_reactions_changed(&self, callback: js_sys::Function) {
+        let bridge = move |target: &sunset_store::Hash, snapshot: &sunset_core::ReactionSnapshot| {
+            let payload = crate::reactions::snapshot_to_js(target, snapshot);
+            let _ = callback.call1(&JsValue::NULL, &payload);
+        };
+        *self.reaction_handles.on_reactions_changed.borrow_mut() = Some(Box::new(bridge));
+        // Clear the per-target debounce signatures so the tracker's next
+        // applied event refires the snapshot. (Mirrors the on_members_changed
+        // last_signature.clear() pattern.)
+        self.reaction_handles.last_target_signatures.borrow_mut().clear();
+    }
+
     pub async fn publish_room_subscription(&self) -> Result<(), JsError> {
         use std::time::Duration;
         // Broader filter: covers <fp>/msg/ + <fp>/webrtc/ + future
