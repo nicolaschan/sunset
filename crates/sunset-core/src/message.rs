@@ -10,7 +10,9 @@ use sunset_store::{ContentBlock, Hash, SignedKvEntry};
 
 use crate::canonical::signing_payload;
 use crate::crypto::aead::{aead_decrypt, aead_encrypt, build_msg_aad, derive_msg_key, fresh_nonce};
-use crate::crypto::envelope::{EncryptedMessage, MessageBody, SignedMessage, inner_sig_payload_bytes};
+use crate::crypto::envelope::{
+    EncryptedMessage, MessageBody, ReactionAction, SignedMessage, inner_sig_payload_bytes,
+};
 use crate::crypto::room::{Room, RoomFingerprint};
 use crate::error::{Error, Result};
 use crate::identity::{Identity, IdentityKey};
@@ -123,6 +125,37 @@ pub fn compose_receipt<R: CryptoRngCore + ?Sized>(
         epoch_id,
         sent_at_ms,
         MessageBody::Receipt { for_value_hash },
+        rng,
+    )
+}
+
+/// Compose a reaction event. `for_value_hash` is the `value_hash` of
+/// the message being reacted to; `emoji` is a free-form unicode string
+/// (caller-validated; we only enforce the 64-byte length cap which
+/// covers all unicode emoji including ZWJ family sequences).
+pub fn compose_reaction<R: CryptoRngCore + ?Sized>(
+    identity: &Identity,
+    room: &Room,
+    epoch_id: u64,
+    sent_at_ms: u64,
+    for_value_hash: Hash,
+    emoji: &str,
+    action: ReactionAction,
+    rng: &mut R,
+) -> Result<ComposedMessage> {
+    if emoji.len() > 64 {
+        return Err(Error::EmojiTooLong { len: emoji.len() });
+    }
+    compose_message(
+        identity,
+        room,
+        epoch_id,
+        sent_at_ms,
+        MessageBody::Reaction {
+            for_value_hash,
+            emoji: emoji.to_owned(),
+            action,
+        },
         rng,
     )
 }
@@ -334,6 +367,96 @@ mod tests {
         let composed = compose_text(&id, &room, 0, 1_700_000_000_000, "hi", &mut OsRng).unwrap();
         let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
         assert_eq!(decoded.body, MessageBody::Text("hi".to_owned()));
+    }
+
+    #[test]
+    fn compose_reaction_roundtrips_add() {
+        let id = alice();
+        let room = general();
+        let target: Hash = blake3::hash(b"target message").into();
+        let composed = compose_reaction(
+            &id,
+            &room,
+            0,
+            1_700_000_000_000,
+            target,
+            "👍",
+            crate::crypto::envelope::ReactionAction::Add,
+            &mut OsRng,
+        )
+        .unwrap();
+        let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
+        assert_eq!(
+            decoded.body,
+            MessageBody::Reaction {
+                for_value_hash: target,
+                emoji: "👍".to_owned(),
+                action: crate::crypto::envelope::ReactionAction::Add,
+            }
+        );
+        assert_eq!(decoded.author_key, id.public());
+    }
+
+    #[test]
+    fn compose_reaction_roundtrips_remove() {
+        let id = alice();
+        let room = general();
+        let target: Hash = blake3::hash(b"target").into();
+        let composed = compose_reaction(
+            &id,
+            &room,
+            0,
+            2,
+            target,
+            "🎉",
+            crate::crypto::envelope::ReactionAction::Remove,
+            &mut OsRng,
+        )
+        .unwrap();
+        let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
+        assert!(matches!(
+            decoded.body,
+            MessageBody::Reaction { action: crate::crypto::envelope::ReactionAction::Remove, .. }
+        ));
+    }
+
+    #[test]
+    fn compose_reaction_rejects_oversized_emoji() {
+        let id = alice();
+        let room = general();
+        let target: Hash = blake3::hash(b"target").into();
+        let oversized = "a".repeat(65); // 65 bytes
+        let err = compose_reaction(
+            &id,
+            &room,
+            0,
+            1,
+            target,
+            &oversized,
+            crate::crypto::envelope::ReactionAction::Add,
+            &mut OsRng,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::EmojiTooLong { len: 65 }));
+    }
+
+    #[test]
+    fn compose_reaction_accepts_max_size_emoji() {
+        let id = alice();
+        let room = general();
+        let target: Hash = blake3::hash(b"target").into();
+        let max_size = "a".repeat(64); // exactly at the limit
+        let result = compose_reaction(
+            &id,
+            &room,
+            0,
+            1,
+            target,
+            &max_size,
+            crate::crypto::envelope::ReactionAction::Add,
+            &mut OsRng,
+        );
+        assert!(result.is_ok(), "64 bytes should be accepted (limit is inclusive)");
     }
 
     #[test]
