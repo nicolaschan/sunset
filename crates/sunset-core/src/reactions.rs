@@ -11,13 +11,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
-use crate::crypto::envelope::{MessageBody, ReactionAction};
+use crate::crypto::envelope::ReactionAction;
 use crate::identity::IdentityKey;
 use sunset_store::Hash;
-
-// MessageBody is imported here for use by spawn_reaction_tracker (B4).
-#[allow(unused_imports)]
-use self::MessageBody as _;
 
 /// Per-target snapshot: emoji → set of authors currently reacting with
 /// that emoji. Empty inner set means no live reactions for the emoji
@@ -255,9 +251,9 @@ mod apply_event_tests {
                 value_hash: h(20),
             },
         );
+        assert!(!changed, "stale event must not report a change");
         let snap = derive_snapshot(&state, &target);
         assert!(snap.get("👍").unwrap().contains(&alice), "stale Remove must not evict");
-        let _ = changed;
     }
 
     #[test]
