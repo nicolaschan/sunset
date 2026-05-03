@@ -2,22 +2,30 @@
 //! `<room_fp>/presence/<my_pk>` entry into the local store. The
 //! engine's existing room_filter subscription propagates these to
 //! peers automatically.
+//!
+//! Moved from `sunset-web-wasm::presence_publisher` so non-web hosts
+//! (TUI, Minecraft mod, native relay) can use the same logic.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+
+// Portable sleep: native uses tokio::time, wasm uses wasmtimer's
+// setTimeout-backed drop-in.
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time::sleep;
+#[cfg(target_arch = "wasm32")]
 use wasmtimer::tokio::sleep;
 
-use sunset_core::Identity;
+use crate::Identity;
 use sunset_store::{ContentBlock, SignedKvEntry, Store, canonical::signing_payload};
-use sunset_store_memory::MemoryStore;
 
-/// Spawn the heartbeat publisher. Runs forever (page lifetime).
-pub fn spawn_publisher(
+/// Spawn the heartbeat publisher. Runs forever (host-process / page lifetime).
+pub fn spawn_publisher<S: Store + 'static>(
     identity: Identity,
     room_fp_hex: String,
-    store: Arc<MemoryStore>,
+    store: Arc<S>,
     interval_ms: u64,
     ttl_ms: u64,
 ) {
@@ -25,18 +33,18 @@ pub fn spawn_publisher(
         let my_hex = hex::encode(identity.store_verifying_key().as_bytes());
         let name_str = format!("{room_fp_hex}/presence/{my_hex}");
         loop {
-            if let Err(e) = publish_once(&identity, &name_str, &store, ttl_ms).await {
-                tracing::warn!(error = %e, "presence publisher");
+            if let Err(e) = publish_once(&identity, &name_str, &*store, ttl_ms).await {
+                tracing::warn!("presence publisher: {e}");
             }
             sleep(Duration::from_millis(interval_ms)).await;
         }
     });
 }
 
-async fn publish_once(
+async fn publish_once<S: Store + 'static>(
     identity: &Identity,
     name_str: &str,
-    store: &MemoryStore,
+    store: &S,
     ttl_ms: u64,
 ) -> Result<(), String> {
     let block = ContentBlock {

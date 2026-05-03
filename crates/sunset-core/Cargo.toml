@@ -23,9 +23,11 @@ futures.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 postcard.workspace = true
-rand_core.workspace = true
+rand_chacha.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
 serde.workspace = true
 sha2.workspace = true
+sunset-noise.workspace = true
 sunset-store.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
@@ -37,13 +39,18 @@ zeroize.workspace = true
 
 # Wasm needs a setTimeout-backed `tokio::time::sleep` drop-in; the
 # `membership` module's refresh ticker uses it.
+#
+# getrandom 0.2 with the "js" feature is required for rand_core's
+# "getrandom" feature to work on wasm32-unknown-unknown. (rand_core 0.6
+# depends on getrandom 0.2, which needs "js" to use the browser RNG.)
+# Mirrors the same pattern in `sunset-web-wasm/Cargo.toml`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 wasmtimer.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
 postcard.workspace = true
-rand_core = { workspace = true, features = ["getrandom"] }
 sunset-store = { workspace = true, features = ["test-helpers"] }
 sunset-store-memory.workspace = true
 sunset-sync = { workspace = true, features = ["test-helpers"] }

@@ -100,6 +100,9 @@ test("two browsers see each other in the member rail", async ({ browser }) => {
   // Wait for window.sunsetClient to be exposed.
   await a.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
   await b.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
+  // Wait for window.sunsetRoom to be exposed (set when the room is opened).
+  await a.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
+  await b.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
 
   // We register an `on_members_changed` callback that stashes plain-JS
   // copies on `window.__sunsetLastMembers` so subsequent
@@ -112,7 +115,7 @@ test("two browsers see each other in the member rail", async ({ browser }) => {
     await p.evaluate(() => {
       // Stash members as plain JS objects (wasm-bindgen objects can
       // be freed between calls; freezing them avoids use-after-free).
-      window.sunsetClient.on_members_changed((members) => {
+      window.sunsetRoom.on_members_changed((members) => {
         window.__sunsetLastMembers = Array.from(members).map((m) => ({
           pubkey: Array.from(m.pubkey),
           presence: m.presence,
@@ -164,10 +167,13 @@ test("connect_direct flips connection_mode to direct", async ({ browser }) => {
 
   await a.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
   await b.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
+  // Wait for window.sunsetRoom to be exposed (set when the room is opened).
+  await a.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
+  await b.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
 
   for (const p of [a, b]) {
     await p.evaluate(() => {
-      window.sunsetClient.on_members_changed((members) => {
+      window.sunsetRoom.on_members_changed((members) => {
         window.__sunsetLastMembers = Array.from(members).map((m) => ({
           pubkey: Array.from(m.pubkey),
           presence: m.presence,
@@ -180,7 +186,7 @@ test("connect_direct flips connection_mode to direct", async ({ browser }) => {
 
   const bPub = await b.evaluate(() => Array.from(window.sunsetClient.public_key));
   await a.evaluate(async (pkArr) => {
-    await window.sunsetClient.connect_direct(new Uint8Array(pkArr));
+    await window.sunsetRoom.connect_direct(new Uint8Array(pkArr));
   }, bPub);
 
   await a.waitForFunction(
@@ -209,9 +215,12 @@ test("closing one tab makes the other side see away then drop", async ({ browser
 
   await a.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
   await b.waitForFunction(() => !!window.sunsetClient, null, { timeout: 15_000 });
+  // Wait for window.sunsetRoom to be exposed (set when the room is opened).
+  await a.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
+  await b.waitForFunction(() => !!window.sunsetRoom, null, { timeout: 15_000 });
 
   await b.evaluate(() => {
-    window.sunsetClient.on_members_changed((members) => {
+    window.sunsetRoom.on_members_changed((members) => {
       window.__sunsetLastMembers = Array.from(members).map((m) => ({
         pubkey: Array.from(m.pubkey),
         presence: m.presence,

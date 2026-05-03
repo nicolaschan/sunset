@@ -15,12 +15,14 @@ pub mod identity;
 pub mod liveness;
 pub mod membership;
 pub mod message;
+pub mod peer;
 pub mod reactions;
+pub mod signaling;
 pub mod verifier;
 
 pub use bus::{Bus, BusEvent, BusImpl};
 pub use crypto::envelope::{EncryptedMessage, MessageBody, ReactionAction, SignedMessage};
-pub use crypto::room::{Room, RoomFingerprint};
+pub use crypto::room::{Room, RoomFingerprint, V1_EPOCH_ID};
 pub use error::{Error, Result};
 pub use filters::{room_filter, room_messages_filter};
 pub use identity::{Identity, IdentityKey};
@@ -31,8 +33,10 @@ pub use message::{
     ComposedMessage, DecodedMessage, ReactionPayload, compose_message, compose_reaction,
     compose_receipt, compose_text, decode_message,
 };
+pub use peer::{OpenRoom, Peer};
 pub use reactions::{
     ReactionEvent, ReactionHandles, ReactionSnapshot, ReactionsCallback, ReactionsCallbackSlot,
     reactions_signature, spawn_reaction_tracker,
 };
+pub use signaling::{MultiRoomSignaler, RelaySignaler, signaling_filter};
 pub use verifier::Ed25519Verifier;
