@@ -183,9 +183,11 @@ test("chat resumes after relay restart without page reload", async ({ browser })
   // Typical total: ~17s. We wait 25s as a tight bound — anything slower
   // than this is a regression in the supervisor's reconnect path itself.
   //
-  // (Messages sent during the gap can be dropped because the engine has
-  // no per-peer message queue. Sending AFTER reconnect avoids that
-  // separate concern, which has its own anti-entropy story.)
+  // (Catch-up of messages sent during the gap is covered by
+  // catchup_after_disconnect.spec.js, which keeps the relay up so a
+  // live producer can actually publish during the gap. Killing the
+  // relay disconnects everyone, so this test asserts only that chat
+  // resumes for new traffic post-redial.)
   await new Promise((r) => setTimeout(r, 25_000));
 
   // Send a message — should arrive promptly on the freshly-redialed
