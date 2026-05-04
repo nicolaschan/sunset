@@ -29,6 +29,9 @@
 pub mod publisher;
 pub use publisher::spawn_publisher;
 
+pub mod body;
+pub use body::PresenceBody;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
