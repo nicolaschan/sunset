@@ -19,9 +19,11 @@ if (!dist) {
 }
 
 const port = Number(process.env.SUNSET_WEB_PORT ?? 4173);
+const testHooks = process.env.SUNSET_TEST_HOOKS === "1";
 
 export default defineConfig({
   testDir: "e2e",
+  testIgnore: testHooks ? [] : [/voice_.*\.spec\.js$/],
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   // No retries — flakes are bugs, not noise. A test that doesn't pass on

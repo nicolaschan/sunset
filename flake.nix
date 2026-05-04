@@ -246,6 +246,7 @@
           export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
           export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
           export SUNSET_WEB_DIST="${webVoiceUiTestDist}"
+          export SUNSET_TEST_HOOKS=1
 
           cd "$(${pkgs.git}/bin/git rev-parse --show-toplevel)/web"
           rm -f node_modules
@@ -268,6 +269,7 @@
           export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
           export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
           export SUNSET_WEB_DIST="${webDist}"
+          export SUNSET_TEST_HOOKS=0
 
           cd "$(${pkgs.git}/bin/git rev-parse --show-toplevel)/web"
           # Link the Nix-built node_modules in place if it isn't there or is
