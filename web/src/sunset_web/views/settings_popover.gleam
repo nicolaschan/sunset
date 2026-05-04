@@ -29,8 +29,15 @@ pub fn view(
   on_close on_close: msg,
 ) -> Element(msg) {
   let body =
-    body_view(p, pref, self_name, on_change_name, on_select_pref, on_reset,
-      on_close)
+    body_view(
+      p,
+      pref,
+      self_name,
+      on_change_name,
+      on_select_pref,
+      on_reset,
+      on_close,
+    )
   case placement {
     Floating ->
       html.div(

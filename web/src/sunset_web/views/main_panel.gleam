@@ -655,7 +655,11 @@ fn info_icon() -> Element(msg) {
   )
 }
 
-fn message_header(p: Palette, m: MessageView, author_color: String) -> Element(msg) {
+fn message_header(
+  p: Palette,
+  m: MessageView,
+  author_color: String,
+) -> Element(msg) {
   html.div(
     [
       ui.css([
