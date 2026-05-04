@@ -258,8 +258,9 @@ test("clicking the + button mounts the full emoji picker", async ({
 
   // The lazy-imported `emoji-picker-element` web component should mount
   // inside the overlay/sheet. Its container has a stable testid set by
-  // emoji_picker.view.
-  const pickerEl = page.locator('[data-testid="full-emoji-picker"]');
+  // emoji_picker.view. Scope to fullPicker so strict mode doesn't trip
+  // on the other viewport's (hidden) sibling container.
+  const pickerEl = fullPicker.locator('[data-testid="full-emoji-picker"]');
   await expect(pickerEl).toBeVisible({ timeout: 10_000 });
 
   await ctx.close();
