@@ -102,8 +102,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     inner.membership_liveness.observe(peer.clone(), st).await;
 
                     // Emit immediately on mute change.
-                    if inner.last_emitted_set_muted_seen(peer.clone(), is_muted) {
-                        let entry = *inner.last_emitted.borrow().get(&peer).unwrap();
+                    if let Some(entry) = inner.last_emitted_set_muted_seen(peer.clone(), is_muted) {
                         let state = VoicePeerState {
                             peer: peer.clone(),
                             in_call: entry.in_call,

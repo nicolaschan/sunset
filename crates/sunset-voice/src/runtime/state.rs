@@ -80,8 +80,17 @@ pub(crate) struct EmittedState {
 
 impl RuntimeInner {
     /// Record the `is_muted` flag from a heartbeat.
-    /// Returns true if is_muted differs from previously stored.
-    pub(crate) fn last_emitted_set_muted_seen(&self, peer: PeerId, is_muted: bool) -> bool {
+    ///
+    /// Returns `Some(state)` with the updated entry when `is_muted` changed
+    /// so the caller can emit it directly, or `None` when unchanged.
+    /// Returning the state avoids a second borrow of `last_emitted` at the
+    /// call site and eliminates the `unwrap()` that was previously needed
+    /// to re-fetch the just-inserted entry.
+    pub(crate) fn last_emitted_set_muted_seen(
+        &self,
+        peer: PeerId,
+        is_muted: bool,
+    ) -> Option<EmittedState> {
         let mut map = self.last_emitted.borrow_mut();
         let entry = map.entry(peer).or_insert(EmittedState {
             in_call: false,
@@ -92,9 +101,9 @@ impl RuntimeInner {
         });
         if entry.is_muted != is_muted {
             entry.is_muted = is_muted;
-            true
+            Some(*entry)
         } else {
-            false
+            None
         }
     }
 }
