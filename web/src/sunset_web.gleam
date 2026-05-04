@@ -1166,17 +1166,24 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, volume: value)
+      // Also forward to FFI so real peers (when name == peer_hex) get updated.
+      let gain = int.to_float(value) /. 100.0
+      let eff =
+        effect.from(fn(_) {
+          voice.set_peer_volume(name, gain)
+        })
       #(
         Model(
           ..model,
           voice_settings: dict.insert(model.voice_settings, name, next),
         ),
-        effect.none(),
+        eff,
       )
     }
     ToggleMemberDenoise(name) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, denoise: !settings.denoise)
+      // Denoise is cosmetic in C2c — no FFI wiring yet.
       #(
         Model(
           ..model,
@@ -1187,26 +1194,43 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     ToggleMemberDeafen(name) -> {
       let settings = member_voice_settings(model.voice_settings, name)
-      let next = domain.VoiceSettings(..settings, deafened: !settings.deafened)
+      let new_deafened = !settings.deafened
+      let next = domain.VoiceSettings(..settings, deafened: new_deafened)
+      // Mute-for-me: set GainNode to 0 or restore prior volume via FFI.
+      let gain = case new_deafened {
+        True -> 0.0
+        False -> int.to_float(settings.volume) /. 100.0
+      }
+      let eff =
+        effect.from(fn(_) {
+          voice.set_peer_volume(name, gain)
+        })
       #(
         Model(
           ..model,
           voice_settings: dict.insert(model.voice_settings, name, next),
         ),
-        effect.none(),
+        eff,
       )
     }
-    ResetMemberVoice(name) -> #(
-      Model(
-        ..model,
-        voice_settings: dict.insert(
-          model.voice_settings,
-          name,
-          domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
+    ResetMemberVoice(name) -> {
+      // Reset volume to 100% and restore GainNode via FFI.
+      let eff =
+        effect.from(fn(_) {
+          voice.set_peer_volume(name, 1.0)
+        })
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(
+            model.voice_settings,
+            name,
+            domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
+          ),
         ),
-      ),
-      effect.none(),
-    )
+        eff,
+      )
+    }
     ViewportChanged(v) -> {
       // Crossing the boundary in either direction closes any open drawer.
       // Sheets intentionally survive: DetailsSheet and VoiceSheet render
