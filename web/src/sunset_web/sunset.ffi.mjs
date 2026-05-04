@@ -85,6 +85,13 @@ export async function clientOpenRoom(client, name, callback) {
   callback(handle);
 }
 
+export function setSelfName(client, name, callback) {
+  // Empty string ⇒ clear the name (Rust normalizes whitespace + empty
+  // to None; passing "" through is fine).
+  client.set_self_name(name);
+  callback();
+}
+
 export async function clientConnectDirect(room, peerPubkey, callback) {
   try {
     const bytes = bitsToBytes(peerPubkey);
@@ -278,6 +285,13 @@ export function memLastHeartbeatMs(m) {
   // actual constructors, not bare values.
   const v = m.last_heartbeat_ms;
   if (v < 0) return new None();
+  return new Some(v);
+}
+export function memName(member) {
+  const v = member.name;
+  if (v === undefined || v === null || v === "") {
+    return new None();
+  }
   return new Some(v);
 }
 
