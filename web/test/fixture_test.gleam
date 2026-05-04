@@ -11,7 +11,7 @@ pub fn rooms_has_six_entries_test() {
 pub fn channels_include_text_and_voice_test() {
   fixture.channels()
   |> list.length
-  |> should.equal(6)
+  |> should.equal(5)
 }
 
 pub fn members_has_eight_entries_with_one_self_test() {

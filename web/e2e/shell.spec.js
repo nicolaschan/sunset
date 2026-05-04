@@ -68,55 +68,11 @@ test("all four columns render in light mode", async ({ page }) => {
   });
 });
 
-test("theme toggle flips light to dark", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
-  const toggle = page.getByTestId("theme-toggle");
-
-  // The icon-only button advertises its target mode via title.
-  await expect(toggle).toHaveAttribute("title", /dark/i);
-
-  // Capture the body bg before — light palette has #f7f5f1 (cream)
-  const bgLight = await page.evaluate(
-    () =>
-      getComputedStyle(
-        document.querySelector("#app > div"),
-      ).backgroundColor,
-  );
-
-  await toggle.click();
-  await expect(toggle).toHaveAttribute("title", /light/i);
-
-  const bgDark = await page.evaluate(
-    () =>
-      getComputedStyle(
-        document.querySelector("#app > div"),
-      ).backgroundColor,
-  );
-
-  expect(bgLight).not.toEqual(bgDark);
-
-  await page.screenshot({
-    path: "test-results/shell-dark.png",
-    fullPage: true,
-  });
-});
-
-test("theme choice persists across reloads", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
-  const toggle = page.getByTestId("theme-toggle");
-  // Start in light mode (the default for this beforeEach setup).
-  await expect(toggle).toHaveAttribute("title", /dark/i);
-
-  await toggle.click();
-  await expect(toggle).toHaveAttribute("title", /light/i);
-
-  // Reload — saved theme should be restored.
-  await page.reload();
-  await expect(page.getByTestId("theme-toggle")).toHaveAttribute(
-    "title",
-    /light/i,
-  );
-});
+// Theme palette flip (light↔dark) and persistence-across-reloads are
+// covered by the settings-popover tests in `ui_tweaks.spec.js` ("clicking
+// 'you' opens settings; theme buttons flip palette"). The legacy desktop-
+// only fixed pill at the bottom-right was removed; settings popover is
+// the only entry point now.
 
 test.describe("system theme default", () => {
   test.use({ colorScheme: "dark" });
@@ -134,9 +90,28 @@ test.describe("system theme default", () => {
     });
     await page.goto("/#dusk-collective");
     await expect(page.getByText("sunset", { exact: true })).toBeVisible();
-    await expect(page.getByTestId("theme-toggle")).toHaveAttribute(
-      "title",
-      /light/i,
+    // Settings popover's System button is the live reflection of the
+    // saved preference; with no saved choice the default is System and
+    // the dark colorScheme should be honoured. The body's bg paints
+    // `palette.bg` (set by global_reset) — the dark palette's bg is
+    // distinctly darker than the light palette's cream, so reading the
+    // computed colour and asserting it's not the light cream is a
+    // robust check that doesn't lock us to a specific hex.
+    const bodyBg = await page.evaluate(
+      () => getComputedStyle(document.body).backgroundColor,
+    );
+    // Light palette uses a cream (#f7f5f1 / rgb(247, 245, 241) family);
+    // dark palette is a deeply tinted near-black. Compute the average
+    // channel value — under 128 means the bg is dark.
+    const m = bodyBg.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+    expect(m, `unexpected bg shape: ${bodyBg}`).not.toBeNull();
+    const avg = (Number(m[1]) + Number(m[2]) + Number(m[3])) / 3;
+    expect(avg, `bg should be dark, got ${bodyBg}`).toBeLessThan(128);
+
+    await page.getByTestId("you-row").click();
+    await expect(page.getByTestId("settings-theme-system")).toHaveAttribute(
+      "aria-pressed",
+      "true",
     );
   });
 });
