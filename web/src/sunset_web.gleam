@@ -272,6 +272,8 @@ pub type Msg {
     after: String,
     caret_at_between: Bool,
   )
+  UpdateSelfName(String)
+  SelfNameCommit(String, Int)
 }
 
 pub fn main() {
@@ -503,6 +505,17 @@ fn sanitize(raw: String) -> String {
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "currentTimeMs")
 fn current_time_ms() -> Int
+
+@external(javascript, "./sunset_web/storage.ffi.mjs", "scheduleAfterMs")
+fn schedule_after_ms(delay_ms: Int, callback: fn() -> Nil) -> Nil
+
+fn schedule_self_name_commit(
+  value: String,
+  token: Int,
+  dispatch: fn(Msg) -> Nil,
+) -> Nil {
+  schedule_after_ms(300, fn() { dispatch(SelfNameCommit(value, token)) })
+}
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "hexEncode")
 fn hex_encode_ffi(bits: BitArray) -> String
@@ -1467,6 +1480,31 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, full_picker_for: None, full_picker_anchor: None),
       effect.none(),
     )
+    UpdateSelfName(value) -> {
+      let new_token = model.self_name_token + 1
+      let updated = Model(..model, self_name: value, self_name_token: new_token)
+      let commit_eff =
+        effect.from(fn(dispatch) {
+          schedule_self_name_commit(value, new_token, dispatch)
+        })
+      #(updated, commit_eff)
+    }
+    SelfNameCommit(value, token) -> {
+      case token == model.self_name_token {
+        False -> #(model, effect.none())
+        True -> {
+          storage.write_self_name(value)
+          let eff = case model.client {
+            Some(client) ->
+              effect.from(fn(_dispatch) {
+                sunset.set_self_name(client, value, fn() { Nil })
+              })
+            None -> effect.none()
+          }
+          #(model, eff)
+        }
+      }
+    }
   }
 }
 
@@ -1651,6 +1689,8 @@ fn room_view_with_state(
         palette: palette,
         pref: model.theme_pref,
         placement: settings_popover.Floating,
+        self_name: model.self_name,
+        on_change_name: UpdateSelfName,
         on_select_pref: SetThemePref,
         on_reset: ResetLocalState,
         on_close: CloseSettings,
@@ -1669,6 +1709,8 @@ fn room_view_with_state(
           palette: palette,
           pref: model.theme_pref,
           placement: settings_popover.InSheet,
+          self_name: model.self_name,
+          on_change_name: UpdateSelfName,
           on_select_pref: SetThemePref,
           on_reset: ResetLocalState,
           on_close: CloseSettings,

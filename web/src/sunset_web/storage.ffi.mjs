@@ -207,6 +207,12 @@ export function resetLocalStateAndReload() {
   location.reload();
 }
 
+/// Schedule a callback to fire after `delay_ms` ms. Used by Lustre
+/// effects to defer SelfNameCommit by 300ms.
+export function scheduleAfterMs(delay_ms, callback) {
+  setTimeout(callback, delay_ms);
+}
+
 // Override the default viewport meta tag with one that:
 //   * cover: enables env(safe-area-inset-*) under iOS notch / dynamic island.
 //   * interactive-widget=resizes-content: tells iOS/Android to resize the
