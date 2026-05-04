@@ -79,6 +79,15 @@ pub struct IntentSnapshot {
     /// Display label — `Connectable::label()` of the intent that
     /// created this snapshot. Stable across reconnect cycles.
     pub label: String,
+    /// Wall-clock ms of the most recent Pong observed from this peer.
+    /// `None` until the first Pong of the *first* connection lands.
+    /// Preserved across Backoff transitions (the popover should show
+    /// "heard from 12s ago" while reconnecting), cleared only when
+    /// the intent itself is removed (`SupervisorCommand::Remove`).
+    pub last_pong_at_unix_ms: Option<u64>,
+    /// Round-trip time of the most recent Pong, in milliseconds.
+    /// `None` under the same conditions as `last_pong_at_unix_ms`.
+    pub last_rtt_ms: Option<u64>,
 }
 
 /// Key used to clean up either dedup map without a second branch on the
@@ -104,6 +113,8 @@ pub(crate) struct IntentEntry {
     pub connectable: crate::connectable::Connectable,
     /// Cached `Connectable::label()` for snapshot construction.
     pub label: String,
+    pub last_pong_at_unix_ms: Option<u64>,
+    pub last_rtt_ms: Option<u64>,
 }
 
 pub(crate) struct SupervisorState {
@@ -144,6 +155,22 @@ pub struct PeerSupervisor<S: Store, T: Transport> {
     pub(crate) cmd_rx: RefCell<Option<mpsc::UnboundedReceiver<SupervisorCommand>>>,
     pub(crate) state: Rc<RefCell<SupervisorState>>,
     pub(crate) policy: BackoffPolicy,
+    /// Pinged whenever a *concurrent* task (currently only `spawn_dial`)
+    /// transitions an intent into `Backoff`. The run loop's `select!`
+    /// includes this as a wake-up source so it re-evaluates
+    /// `next_backoff_sleep()` instead of staying parked on a stale
+    /// `pending::<()>()` future.
+    ///
+    /// Why this is load-bearing: when `fire_due_backoffs` transitions an
+    /// intent `Backoff → Connecting` and spawns the dial, the run loop's
+    /// next iteration sees no `Backoff` intents, so it computes
+    /// `next_backoff_sleep() == None` and the sleep arm becomes
+    /// `pending::<()>()`. If `spawn_dial` then fails transiently and
+    /// schedules a fresh `Backoff` from its background task, the run
+    /// loop is still parked on the now-stale `pending` and would never
+    /// fire that backoff — the user observes "stuck reconnecting"
+    /// forever. Notifying here re-arms the timer.
+    pub(crate) wake: Rc<tokio::sync::Notify>,
 }
 
 impl<S, T> PeerSupervisor<S, T>
@@ -167,6 +194,7 @@ where
                 subscribers: Vec::new(),
             })),
             policy,
+            wake: Rc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -251,6 +279,8 @@ where
             kind: entry.kind,
             attempt: entry.attempt,
             label: entry.label.clone(),
+            last_pong_at_unix_ms: entry.last_pong_at_unix_ms,
+            last_rtt_ms: entry.last_rtt_ms,
         };
         state.subscribers.retain(|tx| tx.send(snap.clone()).is_ok());
     }
@@ -259,8 +289,12 @@ where
     pub async fn run(self: Rc<Self>) {
         let mut cmd_rx = match self.cmd_rx.borrow_mut().take() {
             Some(rx) => rx,
-            None => return, // run() called twice
+            None => {
+                tracing::error!("supervisor: run() called twice; second call is a no-op");
+                return;
+            }
         };
+        tracing::info!("supervisor: run loop starting");
         let mut events = self.engine.subscribe_engine_events().await;
 
         // Seed RNG. We use a simple counter-based seed so this works
@@ -302,6 +336,13 @@ where
                 _ = sleep_fut => {
                     self.clone().fire_due_backoffs(&mut rng).await;
                 }
+                _ = self.wake.notified() => {
+                    // Wake-up only — the loop iterates and recomputes
+                    // `next_backoff_sleep()` from the current state.
+                    // Sent by `spawn_dial` when its transient-err arm
+                    // schedules a fresh `Backoff` from a background task.
+                    tracing::debug!("supervisor: wake notified; re-evaluating sleep");
+                }
                 else => return,
             }
         }
@@ -331,11 +372,18 @@ where
                 let mut state = self.state.borrow_mut();
                 if let Some(id) = state.peer_to_intent.get(&peer_id).copied() {
                     if let Some(entry) = state.intents.get_mut(&id) {
+                        let prev = entry.state;
                         entry.state = IntentState::Connected;
                         entry.kind = Some(kind);
                         entry.attempt = 0;
                         entry.next_attempt_at = None;
                         Self::broadcast(&mut state, id);
+                        tracing::info!(
+                            intent_id = id,
+                            label = %state.intents[&id].label,
+                            prev = ?prev,
+                            "supervisor: PeerAdded → Connected",
+                        );
                     }
                 }
             }
@@ -353,10 +401,45 @@ where
                             );
                             let delay = self.policy.delay(entry.attempt, &mut rng);
                             entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
+                            let attempt = entry.attempt;
+                            let label = entry.label.clone();
                             Self::broadcast(&mut state, id);
+                            tracing::info!(
+                                intent_id = id,
+                                label = %label,
+                                attempt = attempt,
+                                next_attempt_in_ms = delay.as_millis() as u64,
+                                "supervisor: PeerRemoved → Backoff (will redial after delay)",
+                            );
+                        } else {
+                            tracing::debug!(
+                                intent_id = id,
+                                "supervisor: PeerRemoved on Cancelled intent (no-op)",
+                            );
                         }
                     }
+                } else {
+                    tracing::debug!(
+                        peer_id = ?peer_id,
+                        "supervisor: PeerRemoved for unknown peer (no intent owns this conn)",
+                    );
                 }
+            }
+            EngineEvent::PongObserved {
+                peer_id,
+                rtt_ms,
+                observed_at_unix_ms,
+            } => {
+                let mut state = self.state.borrow_mut();
+                let id = match state.peer_to_intent.get(&peer_id) {
+                    Some(i) => *i,
+                    None => return,
+                };
+                if let Some(entry) = state.intents.get_mut(&id) {
+                    entry.last_pong_at_unix_ms = Some(observed_at_unix_ms);
+                    entry.last_rtt_ms = Some(rtt_ms);
+                }
+                Self::broadcast(&mut state, id);
             }
         }
     }
@@ -420,6 +503,8 @@ where
                             next_attempt_at: None,
                             connectable: connectable.clone(),
                             label,
+                            last_pong_at_unix_ms: None,
+                            last_rtt_ms: None,
                         },
                     );
                     Self::broadcast(&mut state, id);
@@ -489,6 +574,8 @@ where
                         kind: e.kind,
                         attempt: e.attempt,
                         label: e.label.clone(),
+                        last_pong_at_unix_ms: e.last_pong_at_unix_ms,
+                        last_rtt_ms: e.last_rtt_ms,
                     })
                     .collect();
                 let _ = ack.send(snap);
@@ -512,6 +599,8 @@ where
                             kind: e.kind,
                             attempt: e.attempt,
                             label: e.label.clone(),
+                            last_pong_at_unix_ms: e.last_pong_at_unix_ms,
+                            last_rtt_ms: e.last_rtt_ms,
                         })
                         .collect();
                     for snap in snaps {
@@ -535,24 +624,84 @@ where
         let engine = self.engine.clone();
         let state = self.state.clone();
         let policy = self.policy.clone();
+        let wake = self.wake.clone();
         crate::spawn::spawn_local(async move {
             // Snapshot the connectable for this attempt.
-            let connectable = {
+            let (connectable, attempt, label) = {
                 let s = state.borrow();
                 match s.intents.get(&id) {
-                    Some(entry) if entry.state != IntentState::Cancelled => {
-                        entry.connectable.clone()
-                    }
+                    Some(entry) if entry.state != IntentState::Cancelled => (
+                        entry.connectable.clone(),
+                        entry.attempt,
+                        entry.label.clone(),
+                    ),
                     _ => return,
                 }
             };
 
+            tracing::info!(
+                intent_id = id,
+                label = %label,
+                attempt = attempt,
+                "supervisor: dial begin",
+            );
+            let resolve_started = web_time::SystemTime::now();
             let attempt_result = match connectable.resolve_addr().await {
-                Ok(addr) => engine
-                    .add_peer(addr)
-                    .await
-                    .map_err(crate::connectable::ResolveErr::from),
-                Err(e) => Err(e),
+                Ok(addr) => {
+                    let resolve_ms = resolve_started
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let addr_str = String::from_utf8_lossy(addr.as_bytes()).into_owned();
+                    tracing::info!(
+                        intent_id = id,
+                        attempt = attempt,
+                        resolve_ms,
+                        addr = %addr_str,
+                        "supervisor: resolved addr; calling engine.add_peer",
+                    );
+                    let connect_started = web_time::SystemTime::now();
+                    let r = engine
+                        .add_peer(addr)
+                        .await
+                        .map_err(crate::connectable::ResolveErr::from);
+                    let connect_ms = connect_started
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    match &r {
+                        Ok((pid, kind)) => tracing::info!(
+                            intent_id = id,
+                            attempt = attempt,
+                            connect_ms,
+                            peer_id = ?pid,
+                            kind = ?kind,
+                            "supervisor: engine.add_peer ok (Hello complete)",
+                        ),
+                        Err(e) => tracing::warn!(
+                            intent_id = id,
+                            attempt = attempt,
+                            connect_ms,
+                            error = %e,
+                            "supervisor: engine.add_peer failed",
+                        ),
+                    }
+                    r
+                }
+                Err(e) => {
+                    let resolve_ms = resolve_started
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    tracing::warn!(
+                        intent_id = id,
+                        attempt = attempt,
+                        resolve_ms,
+                        error = %e,
+                        "supervisor: resolve_addr failed",
+                    );
+                    Err(e)
+                }
             };
 
             // Compute next state. The borrow is split into two scopes so
@@ -617,8 +766,13 @@ where
                         entry.kind = Some(kind);
                         entry.attempt = 0;
                         entry.next_attempt_at = None;
-                        s.peer_to_intent.insert(peer_id, id);
+                        s.peer_to_intent.insert(peer_id.clone(), id);
                         Self::broadcast(&mut s, id);
+                        tracing::info!(
+                            intent_id = id,
+                            peer_id = ?peer_id,
+                            "supervisor: dial success → Connected",
+                        );
                     }
                     Err(crate::connectable::ResolveErr::Parse(_)) => {
                         // Permanent — cancel the intent and clean up
@@ -660,7 +814,21 @@ where
                         );
                         let delay = policy.delay(entry.attempt, &mut rng);
                         entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
+                        let attempt = entry.attempt;
                         Self::broadcast(&mut s, id);
+                        tracing::info!(
+                            intent_id = id,
+                            attempt,
+                            next_attempt_in_ms = delay.as_millis() as u64,
+                            "supervisor: transient dial err → Backoff (will redial)",
+                        );
+                        // Drop the borrow before notifying the run loop,
+                        // matching the codebase convention of never
+                        // holding a `RefCell` borrow across an await
+                        // (notify_one is sync but this keeps the
+                        // ordering crisp).
+                        drop(s);
+                        wake.notify_one();
                     }
                 }
             }
@@ -691,7 +859,15 @@ where
                     }
                     entry.state = IntentState::Connecting;
                     entry.next_attempt_at = None;
+                    let attempt = entry.attempt;
+                    let label = entry.label.clone();
                     Self::broadcast(&mut state, id);
+                    tracing::info!(
+                        intent_id = id,
+                        label = %label,
+                        attempt,
+                        "supervisor: backoff timer fired → Connecting",
+                    );
                 }
             }
             self.clone().spawn_dial(id);
@@ -791,6 +967,108 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 assert!(connected, "intent did not reach Connected");
+            })
+            .await;
+    }
+
+    /// Liveness regression: after a transient dial failure, the
+    /// supervisor must redial **without anyone poking it**. The
+    /// existing `first_dial_failure_enters_backoff_and_retries` test
+    /// hides this bug because it polls `sup.snapshot().await` every
+    /// 10 ms — every poll sends a `SupervisorCommand::Snapshot` which
+    /// wakes the run loop's `select!`, causing it to re-evaluate
+    /// `next_backoff_sleep()`. Production UI does NOT poll: it only
+    /// subscribes via `on_intent_changed`. So if the run loop parks
+    /// on `pending::<()>` between iterations and `spawn_dial`
+    /// schedules a fresh `Backoff` from its background task, nothing
+    /// pokes the loop and the timer never fires — user sees "stuck
+    /// reconnecting" indefinitely.
+    ///
+    /// This test reproduces the bug by reading state ONLY through
+    /// `subscribe_intents` (which uses the broadcast channel — no
+    /// command round-trip). Without the fix, the second wait below
+    /// times out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redial_fires_after_first_failure_without_external_poke() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+
+                // Tight backoff so the redial fires within the test's
+                // wait window without making the test slow.
+                let policy = BackoffPolicy {
+                    initial: std::time::Duration::from_millis(50),
+                    max: std::time::Duration::from_millis(50),
+                    multiplier: 1.0,
+                    jitter: 0.0,
+                };
+                let sup = PeerSupervisor::new(alice.clone(), policy);
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                // Subscribe BEFORE adding the intent so we observe every
+                // state transition without ever calling `snapshot()` /
+                // `intents()` (which would mask the bug by waking the
+                // run loop).
+                let mut sub = sup.subscribe_intents().await;
+
+                // No engine listening at "ghost". First dial fails fast.
+                let ghost = PeerAddr::new(Bytes::from_static(b"ghost"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(ghost))
+                    .await
+                    .expect("add must return Ok");
+
+                // Drain broadcasts until we see Backoff (proves
+                // spawn_dial transient-err arm fired AND broadcast).
+                async fn wait_for_state(
+                    sub: &mut mpsc::UnboundedReceiver<IntentSnapshot>,
+                    id: IntentId,
+                    target: IntentState,
+                ) -> bool {
+                    for _ in 0..50 {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            sub.recv(),
+                        )
+                        .await
+                        {
+                            Ok(Some(snap)) if snap.id == id && snap.state == target => {
+                                return true;
+                            }
+                            Ok(Some(_)) => continue,
+                            Ok(None) | Err(_) => return false,
+                        }
+                    }
+                    false
+                }
+
+                assert!(
+                    wait_for_state(&mut sub, id, IntentState::Backoff).await,
+                    "intent never reached Backoff after first dial failure",
+                );
+
+                // Bring "ghost" online. Critically: do NOT poll
+                // `sup.snapshot()` afterwards — the supervisor must
+                // redial on its own when its backoff timer fires.
+                let _ghost_engine = engine_with_addr(&net, b"ghost", "ghost");
+                crate::spawn::spawn_local({
+                    let g = _ghost_engine.clone();
+                    async move { g.run().await }
+                });
+
+                assert!(
+                    wait_for_state(&mut sub, id, IntentState::Connected).await,
+                    "supervisor did not redial on its own — run loop stuck on stale `pending` sleep_fut?",
+                );
             })
             .await;
     }
@@ -1166,6 +1444,189 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn pong_observed_updates_intent_snapshot() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", "bob");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
+                // Wait for Connected so peer_to_intent has bob_pid → id.
+                for _ in 0..200 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                // Inject PongObserved via the engine test shim.
+                let bob_pid = PeerId(vk(b"bob"));
+                alice
+                    .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+                        peer_id: bob_pid,
+                        rtt_ms: 17,
+                        observed_at_unix_ms: 1_700_000_000_500,
+                    })
+                    .await;
+                // Poll snapshot until the supervisor folds the new fields.
+                let mut found = false;
+                for _ in 0..200 {
+                    let snap = sup
+                        .snapshot()
+                        .await
+                        .into_iter()
+                        .find(|s| s.id == id)
+                        .expect("intent");
+                    if snap.last_rtt_ms == Some(17)
+                        && snap.last_pong_at_unix_ms == Some(1_700_000_000_500)
+                    {
+                        found = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(found, "PongObserved did not propagate to IntentSnapshot");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pong_observed_for_unknown_peer_is_dropped() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+                // Subscribe BEFORE injecting; no intents yet, so no replay.
+                let mut sub = sup.subscribe_intents().await;
+                // Inject for a peer the supervisor has never heard of.
+                let stranger = PeerId(vk(b"stranger"));
+                alice
+                    .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+                        peer_id: stranger,
+                        rtt_ms: 1,
+                        observed_at_unix_ms: 1,
+                    })
+                    .await;
+                // Within a short window, no broadcast should arrive.
+                let r =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv()).await;
+                assert!(r.is_err(), "expected no broadcast for unknown peer");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnect_preserves_last_pong_and_rtt() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob = engine_with_addr(&net, b"bob", "bob");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob.clone();
+                    async move { b.run().await }
+                });
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+                let bob_addr = PeerAddr::new(Bytes::from_static(b"bob"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(bob_addr))
+                    .await
+                    .unwrap();
+                // Wait for Connected.
+                for _ in 0..200 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id && s.state == IntentState::Connected)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let bob_pid = PeerId(vk(b"bob"));
+                alice
+                    .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+                        peer_id: bob_pid.clone(),
+                        rtt_ms: 11,
+                        observed_at_unix_ms: 5_000,
+                    })
+                    .await;
+                // Wait for the fold.
+                for _ in 0..200 {
+                    let snap = sup
+                        .snapshot()
+                        .await
+                        .into_iter()
+                        .find(|s| s.id == id)
+                        .expect("intent");
+                    if snap.last_rtt_ms == Some(11) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                // Force disconnect.
+                alice.remove_peer(bob_pid.clone()).await.ok();
+                // Wait for transition to Backoff and assert liveness preserved.
+                for _ in 0..200 {
+                    let snap = sup
+                        .snapshot()
+                        .await
+                        .into_iter()
+                        .find(|s| s.id == id)
+                        .expect("intent");
+                    if snap.state == IntentState::Backoff {
+                        assert_eq!(snap.last_rtt_ms, Some(11));
+                        assert_eq!(snap.last_pong_at_unix_ms, Some(5_000));
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("intent never transitioned to Backoff");
+            })
+            .await;
+    }
+
     struct NoopFetch;
 
     #[async_trait::async_trait(?Send)]
@@ -1205,6 +1666,180 @@ mod tests {
             }
             Ok(self.body.clone())
         }
+    }
+
+    /// Fake fetcher backed by an `Rc<Cell<String>>` so the test can
+    /// switch the response body between calls. Models a relay that
+    /// rotates its x25519 between deploys: `swap_body(new_body)` is the
+    /// test's "the relay just restarted with a new identity" lever.
+    struct SwitchableFakeFetch {
+        body: std::cell::RefCell<String>,
+        seen: std::cell::Cell<usize>,
+    }
+
+    impl SwitchableFakeFetch {
+        fn new(body: String) -> Rc<Self> {
+            Rc::new(Self {
+                body: std::cell::RefCell::new(body),
+                seen: std::cell::Cell::new(0),
+            })
+        }
+        fn swap_body(&self, new_body: String) {
+            *self.body.borrow_mut() = new_body;
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl sunset_relay_resolver::HttpFetch for SwitchableFakeFetch {
+        async fn get(&self, _url: &str) -> sunset_relay_resolver::Result<String> {
+            self.seen.set(self.seen.get() + 1);
+            Ok(self.body.borrow().clone())
+        }
+    }
+
+    /// Regression: a relay that restarts with a *new* x25519 identity
+    /// (e.g. the data dir wasn't persisted across deploys) must be
+    /// reconnected to with the new identity, not kept stuck dialing the
+    /// old one. The supervisor's `Resolving` connectable re-fetches the
+    /// relay's identity JSON on every attempt; this test exercises that
+    /// end-to-end through the engine + Hello round-trip.
+    ///
+    /// Sequence:
+    /// 1. Bob_v1 (peer_id = `b"bob_v1"`, canonical addr A) is online.
+    ///    Alice's supervisor connects via `Resolving { input: "bob" }`.
+    /// 2. Disconnect (modelled by `alice.remove_peer(bob_v1_pid)`).
+    /// 3. Switch the fetcher to return Bob_v2's body; bring Bob_v2 (peer_id
+    ///    = `b"bob_v2"`, canonical addr B) online.
+    /// 4. Within a bounded retry window, the intent must reach Connected
+    ///    with `peer_id == bob_v2_pid`. The OLD canonical addr must NOT
+    ///    be dialed once the resolver knows about the new identity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotated_relay_identity_picked_up_on_reconnect() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+
+                // Body for the OLD identity — x25519 key all-`00`. The
+                // resolver will append `#x25519=<hex>` to `wss://bob`.
+                let body_v1 = format!(
+                    "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"ws://bob\"}}",
+                    "00".repeat(32),
+                    "00".repeat(32),
+                );
+                let body_v2 = format!(
+                    "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"ws://bob\"}}",
+                    "11".repeat(32),
+                    "cd".repeat(32),
+                );
+
+                // Pre-compute canonical addresses so we can register
+                // each bob engine at exactly the addr the resolver will
+                // produce (TestNetwork routes by exact PeerAddr bytes).
+                let probe_v1: Rc<dyn sunset_relay_resolver::HttpFetch> =
+                    SwitchableFakeFetch::new(body_v1.clone());
+                let canonical_v1 = sunset_relay_resolver::Resolver::new(probe_v1)
+                    .resolve("bob")
+                    .await
+                    .expect("probe v1 resolve must succeed");
+                let probe_v2: Rc<dyn sunset_relay_resolver::HttpFetch> =
+                    SwitchableFakeFetch::new(body_v2.clone());
+                let canonical_v2 = sunset_relay_resolver::Resolver::new(probe_v2)
+                    .resolve("bob")
+                    .await
+                    .expect("probe v2 resolve must succeed");
+                assert_ne!(
+                    canonical_v1, canonical_v2,
+                    "test setup invariant: rotated identity must change the canonical addr"
+                );
+
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob_v1 = engine_with_addr(&net, b"bob_v1", &canonical_v1);
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob_v1.clone();
+                    async move { b.run().await }
+                });
+
+                // Tight backoff so the redial fires fast.
+                let policy = BackoffPolicy {
+                    initial: std::time::Duration::from_millis(50),
+                    max: std::time::Duration::from_millis(50),
+                    multiplier: 1.0,
+                    jitter: 0.0,
+                };
+                let sup = PeerSupervisor::new(alice.clone(), policy);
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let fetch = SwitchableFakeFetch::new(body_v1.clone());
+                let id = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "bob".into(),
+                        fetch: fetch.clone(),
+                    })
+                    .await
+                    .unwrap();
+
+                // Wait for the v1 connection to land.
+                let bob_v1_pid = PeerId(vk(b"bob_v1"));
+                let mut connected_v1 = false;
+                for _ in 0..200 {
+                    let snap = sup.snapshot().await;
+                    if let Some(s) = snap.iter().find(|s| s.id == id) {
+                        if s.state == IntentState::Connected
+                            && s.peer_id.as_ref() == Some(&bob_v1_pid)
+                        {
+                            connected_v1 = true;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(connected_v1, "intent never connected to bob_v1");
+
+                // Simulate the relay restarting:
+                //   - flip the resolver's response to Bob_v2's identity
+                //   - bring Bob_v2 online at the v2 canonical addr
+                //   - tear down the v1 connection at alice's engine
+                fetch.swap_body(body_v2.clone());
+                let bob_v2 = engine_with_addr(&net, b"bob_v2", &canonical_v2);
+                crate::spawn::spawn_local({
+                    let b = bob_v2.clone();
+                    async move { b.run().await }
+                });
+                alice.remove_peer(bob_v1_pid.clone()).await.ok();
+
+                // The supervisor must redial, re-resolve via the (now
+                // updated) fetcher, dial the v2 canonical addr, complete
+                // the handshake against Bob_v2 — and the intent must
+                // reflect peer_id = bob_v2_pid.
+                let bob_v2_pid = PeerId(vk(b"bob_v2"));
+                let mut connected_v2 = false;
+                for _ in 0..400 {
+                    let snap = sup.snapshot().await;
+                    if let Some(s) = snap.iter().find(|s| s.id == id) {
+                        if s.state == IntentState::Connected
+                            && s.peer_id.as_ref() == Some(&bob_v2_pid)
+                        {
+                            connected_v2 = true;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(
+                    connected_v2,
+                    "intent did not pick up the rotated relay identity; final snapshot: {:?}",
+                    sup.snapshot().await.into_iter().find(|s| s.id == id),
+                );
+            })
+            .await;
     }
 
     /// Resolver runs once per dial attempt — a rotated relay identity
@@ -1294,6 +1929,104 @@ mod tests {
                     fetch.seen.get(),
                     3,
                     "resolver should have been called once per attempt"
+                );
+            })
+            .await;
+    }
+
+    /// Two `add()` calls with the same `Resolving { input }` must
+    /// return the same `IntentId` — and only one dial is spawned, so
+    /// the resolver's HTTP fetch fires exactly once even though both
+    /// adds completed. The dedup check is synchronous inside the cmd
+    /// handler (under cmd-channel serialization), so the second add
+    /// can't race past it and spawn a parallel dial.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolving_dedup_returns_same_id_and_fetches_once() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+
+                let body = format!(
+                    "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"ws://bob\"}}",
+                    "00".repeat(32),
+                    "ab".repeat(32),
+                );
+
+                // Pre-compute the canonical so TestNetwork routes the
+                // resolved addr (it matches by exact PeerAddr bytes).
+                let probe_fetch: Rc<dyn sunset_relay_resolver::HttpFetch> =
+                    CountingFakeFetch::new(body.clone(), 0);
+                let probe_resolver = sunset_relay_resolver::Resolver::new(probe_fetch);
+                let canonical = probe_resolver
+                    .resolve("bob")
+                    .await
+                    .expect("probe resolve must succeed");
+
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let _bob = engine_with_addr(&net, b"bob", &canonical);
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = _bob.clone();
+                    async move { b.run().await }
+                });
+
+                // Single shared fetcher. Succeeds on first call. If
+                // dedup is broken and a second dial fires, this
+                // counter would advance past 1.
+                let fetch = CountingFakeFetch::new(body, 0);
+
+                let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let id1 = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "bob".into(),
+                        fetch: fetch.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let id2 = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "bob".into(),
+                        fetch: fetch.clone(),
+                    })
+                    .await
+                    .unwrap();
+
+                assert_eq!(id1, id2, "same input must return the same IntentId");
+
+                // Wait for the (single) dial to land Connected.
+                let mut connected = false;
+                for _ in 0..50 {
+                    let snap = sup.snapshot().await;
+                    if snap
+                        .iter()
+                        .any(|s| s.id == id1 && s.state == IntentState::Connected)
+                    {
+                        connected = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(connected, "intent did not reach Connected");
+
+                // Exactly one snapshot present — second add did not
+                // create a new intent.
+                assert_eq!(sup.snapshot().await.len(), 1);
+
+                // And exactly one HTTP fetch happened — second add
+                // did not spawn a parallel dial.
+                assert_eq!(
+                    fetch.seen.get(),
+                    1,
+                    "resolver fetch fired more than once; dedup didn't suppress the second dial"
                 );
             })
             .await;

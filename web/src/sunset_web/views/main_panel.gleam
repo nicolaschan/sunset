@@ -14,15 +14,14 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
-import gleam/set.{type Set}
 import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, ChannelId, HasBridge, Minecraft,
-  NoBridge,
+  type ChannelId, type Member, type MessageView, type Reaction, Away, ChannelId,
+  Direct, OfflineP, OneHop, Online, SelfRelay, Speaking,
 }
 import sunset_web/markdown
 import sunset_web/theme.{type Palette}
@@ -34,7 +33,7 @@ pub fn view(
   palette p: Palette,
   viewport viewport: domain.Viewport,
   current_channel cur: ChannelId,
-  messages ms: List(Message),
+  messages ms: List(MessageView),
   draft draft: String,
   on_draft on_draft: fn(String) -> msg,
   on_submit on_submit: msg,
@@ -44,13 +43,17 @@ pub fn view(
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker on_open_full_picker: fn(String, Option(#(Float, Float))) ->
+    msg,
   on_open_detail on_open_detail: fn(String) -> msg,
-  receipts receipts: Dict(String, Set(String)),
+  receipts receipts: Dict(String, Dict(String, Int)),
   selected_msg_id selected_msg_id: Option(String),
   on_toggle_selected on_toggle_selected: fn(String) -> msg,
   is_spoiler_revealed is_revealed: fn(markdown.SpoilerKey) -> Bool,
   on_toggle_spoiler on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
+  // Live members list — used to color message author names by their
+  // current connection state.
+  members members: List(Member),
   // Slot rendered between the channel header and the message list.
   // Used by the phone shell for the in-call voice mini-bar — voice
   // chat is a per-channel concern, so the banner sits inside the
@@ -96,6 +99,7 @@ pub fn view(
         on_toggle_selected,
         is_revealed,
         on_toggle_spoiler,
+        members,
       ),
       composer(
         p,
@@ -144,18 +148,19 @@ fn channel_header(p: Palette, name: String) -> Element(msg) {
 fn messages_list(
   p: Palette,
   viewport: domain.Viewport,
-  ms: List(Message),
+  ms: List(MessageView),
   reacting_to: Option(String),
   detail_msg_id: Option(String),
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
   on_open_detail: fn(String) -> msg,
-  receipts: Dict(String, Set(String)),
+  receipts: Dict(String, Dict(String, Int)),
   selected_msg_id: Option(String),
   on_toggle_selected: fn(String) -> msg,
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
   on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
+  members: List(Member),
 ) -> Element(msg) {
   let last_seen_index = last_own_seen_index(ms)
   // Pair each message with its index AND its predecessor's author (for grouping).
@@ -200,6 +205,7 @@ fn messages_list(
         receipts,
         is_revealed,
         on_toggle_spoiler,
+        author_color(p, m, members),
       )
     })
 
@@ -225,7 +231,7 @@ fn messages_list(
 fn message_view(
   p: Palette,
   viewport: domain.Viewport,
-  m: Message,
+  m: MessageView,
   grouped: Bool,
   show_read_marker: Bool,
   picker_open: Bool,
@@ -233,18 +239,19 @@ fn message_view(
   selected: Bool,
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
   on_open_detail: fn(String) -> msg,
   on_toggle_selected: fn(String) -> msg,
-  receipts: Dict(String, Set(String)),
+  receipts: Dict(String, Dict(String, Int)),
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
   on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
+  author_color: String,
 ) -> Element(msg) {
   let pending =
     m.you
     && {
       case dict.get(receipts, m.id) {
-        Ok(s) -> set.size(s) == 0
+        Ok(d) -> dict.size(d) == 0
         Error(_) -> True
       }
     }
@@ -259,20 +266,37 @@ fn message_view(
 
   let header = case grouped {
     True -> element.fragment([])
-    False -> message_header(p, m)
+    False -> message_header(p, m, author_color)
   }
 
-  let bg = case picker_open || detail_open {
-    True -> p.surface_alt
-    False -> "transparent"
+  // Row classes:
+  //   * `is-active` whenever a per-message menu is up (reaction picker
+  //     / details panel) — pins both the highlight backdrop and the
+  //     hover-only action toolbar visible while the user is interacting
+  //     with that menu, even after the cursor leaves the row.
+  //   * `is-selected` mirrors `selected_msg_id`. Used by the touch
+  //     stylesheet to keep the action toolbar visible on tap (since
+  //     :hover doesn't fire on touch devices).
+  // The hover background, edge-to-edge stretching, and active-state
+  // backdrop are all driven by CSS rules in `shell.global_reset` —
+  // inline styles can't express :hover, and keeping the rules in one
+  // place makes the layout easier to reason about.
+  let row_class = case picker_open || detail_open, selected {
+    True, True -> "msg-row is-active is-selected"
+    True, False -> "msg-row is-active"
+    False, True -> "msg-row is-selected"
+    False, False -> "msg-row"
   }
-  // Row class: `is-selected` whenever this row should pin its action
-  // toolbar visible. Opening the details panel sets selection too
-  // (see OpenDetail in sunset_web.gleam), so we don't need a separate
-  // `.is-active` marker for that case anymore.
-  let row_class = case selected {
-    True -> "msg-row is-selected"
-    False -> "msg-row"
+
+  // Stretch the row's inline-block-with-padding so its background can
+  // bleed to the edges of the messages container. The horizontal
+  // padding here mirrors the messages_list container's own horizontal
+  // padding (16/20px desktop, 12px phone), and the matching negative
+  // margin pulls the row outside that padding so the highlight reads
+  // as full-bleed.
+  let bleed_h = case viewport {
+    domain.Phone -> "12px"
+    domain.Desktop -> "20px"
   }
 
   // Wrap header + body + reactions in an inner clickable div so a
@@ -287,12 +311,12 @@ fn message_view(
         attribute.class(row_class),
         ui.css([
           #("position", "relative"),
-          #("padding", "2px 8px"),
-          #("border-radius", "6px"),
+          #("padding", "2px " <> bleed_h),
+          #("margin-left", "-" <> bleed_h),
+          #("margin-right", "-" <> bleed_h),
           #("opacity", opacity),
-          #("transition", "opacity 220ms ease"),
+          #("transition", "opacity 220ms ease, background-color 120ms ease"),
           #("margin-top", margin_top),
-          #("background", bg),
         ]),
       ],
       [
@@ -351,7 +375,7 @@ fn message_view(
 /// hover via the .msg-row CSS rule in shell.gleam.
 fn actions_toolbar(
   p: Palette,
-  m: Message,
+  m: MessageView,
   picker_open: Bool,
   on_react_toggle: fn(String) -> msg,
   _on_add_reaction: fn(String, String) -> msg,
@@ -451,7 +475,7 @@ fn reaction_picker(
   p: Palette,
   msg_id: String,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
 ) -> Element(msg) {
   let quick_buttons =
     list.map(quick_reactions, fn(emoji) {
@@ -482,7 +506,18 @@ fn reaction_picker(
       [
         attribute.title("More reactions"),
         attribute.attribute("data-testid", "reaction-picker-more"),
-        event.on_click(on_open_full_picker(msg_id)),
+        // Capture the click's `clientY` and the live viewport height
+        // (`view.innerHeight`) so the desktop overlay can decide
+        // whether there's more room above or below the trigger before
+        // it positions itself. Both fields are read directly off the
+        // MouseEvent — the `view` accessor is the WindowProxy that
+        // owns the document, which is non-null for any UIEvent fired
+        // from a click.
+        event.on("click", {
+          use cy <- decode.subfield(["clientY"], decode.float)
+          use vh <- decode.subfield(["view", "innerHeight"], decode.float)
+          decode.success(on_open_full_picker(msg_id, option.Some(#(cy, vh))))
+        }),
         ui.css([
           #("width", "32px"),
           #("height", "32px"),
@@ -620,7 +655,11 @@ fn info_icon() -> Element(msg) {
   )
 }
 
-fn message_header(p: Palette, m: Message) -> Element(msg) {
+fn message_header(
+  p: Palette,
+  m: MessageView,
+  author_color: String,
+) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -634,20 +673,19 @@ fn message_header(p: Palette, m: Message) -> Element(msg) {
       [
         html.span(
           [
+            attribute.attribute("data-testid", "message-author"),
+            attribute.attribute("data-author", m.author),
             ui.css([
               #("font-weight", "600"),
               #("font-size", "16.25px"),
-              #("color", p.text),
+              #("color", author_color),
               #("cursor", "default"),
             ]),
           ],
           [html.text(m.author)],
         ),
       ],
-      case m.bridge {
-        HasBridge(Minecraft) -> [bridge_tag(p, "⛏ minecraft")]
-        NoBridge -> []
-      },
+      [],
       case m.you {
         True -> [you_tag(p)]
         False -> []
@@ -1041,22 +1079,6 @@ fn attach_button(p: Palette) -> Element(msg) {
   )
 }
 
-fn bridge_tag(p: Palette, label: String) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("padding", "1px 5px"),
-        #("border-radius", "3px"),
-        #("background", p.accent_soft),
-        #("color", p.accent_deep),
-        #("font-size", "13.125px"),
-        #("font-weight", "500"),
-      ]),
-    ],
-    [html.text(label)],
-  )
-}
-
 fn you_tag(p: Palette) -> Element(msg) {
   html.span(
     [
@@ -1075,13 +1097,49 @@ fn you_tag(p: Palette) -> Element(msg) {
   )
 }
 
+/// Pick the color for a message author's name based on the matching
+/// member's connection state. Lookup is by `m.author == member.name`
+/// (both hold the resolved display name, or the short-pubkey fallback
+/// when no name has been set).
+///
+/// Mapping:
+///   * own messages → palette accent (so "you" stands out)
+///   * online + direct WebRTC → palette ok (green; healthy mesh)
+///   * online + via-relay → palette warn (amber; not direct)
+///   * speaking → palette live (matches the voice-rail dot)
+///   * away → palette warn
+///   * offline → palette text_faint
+///   * fallback (no member match yet) → palette text
+fn author_color(p: Palette, m: MessageView, members: List(Member)) -> String {
+  case m.you {
+    True -> p.accent
+    False ->
+      case list.find(members, fn(mem) { mem.name == m.author }) {
+        Error(_) -> p.text
+        Ok(mem) -> color_for_member(p, mem)
+      }
+  }
+}
+
+fn color_for_member(p: Palette, mem: Member) -> String {
+  case mem.status, mem.relay {
+    OfflineP, _ -> p.text_faint
+    Away, _ -> p.warn
+    Speaking, _ -> p.live
+    Online, Direct -> p.ok
+    Online, OneHop -> p.warn
+    Online, SelfRelay -> p.text
+    _, _ -> p.text
+  }
+}
+
 /// Index of the last own message that's been seen by anyone — that's
 /// where the "read up to here" marker goes.
-fn last_own_seen_index(ms: List(Message)) -> Int {
+fn last_own_seen_index(ms: List(MessageView)) -> Int {
   do_last_own_seen(ms, 0, -1)
 }
 
-fn do_last_own_seen(ms: List(Message), i: Int, best: Int) -> Int {
+fn do_last_own_seen(ms: List(MessageView), i: Int, best: Int) -> Int {
   case ms {
     [] -> best
     [m, ..rest] -> {

@@ -99,6 +99,28 @@ export function writeSavedTheme(value) {
   }
 }
 
+const SELF_NAME_KEY = "sunset/self-name";
+
+/// Returns the user's chosen display name as a string. "" when unset.
+export function readSelfName() {
+  try {
+    return window.localStorage.getItem(SELF_NAME_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/// Persists the user's chosen display name. Empty string clears.
+export function writeSelfName(value) {
+  try {
+    if (value === "") {
+      window.localStorage.removeItem(SELF_NAME_KEY);
+    } else {
+      window.localStorage.setItem(SELF_NAME_KEY, value);
+    }
+  } catch {}
+}
+
 // True if the OS / browser is currently advertising a dark colour
 // scheme via the prefers-color-scheme media query. Used as the
 // fallback when the user hasn't picked a theme yet.
@@ -144,6 +166,51 @@ export function onViewportChange(callback) {
   } catch {
     // best-effort: viewport tracking is non-critical.
   }
+}
+
+// Wipe all `sunset-web/` localStorage keys (and any other state
+// the app stores in local persistence) and reload the page so the
+// caller gets a clean slate. Triggered by the "reset local state"
+// settings action — equivalent to "log out + clear identity"
+// because the keypair is stored in localStorage too.
+export function resetLocalStateAndReload() {
+  try {
+    // Iterate forward then remove — calling removeItem inside a
+    // forward iteration mutates the indices, so collect keys first.
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const k = localStorage.key(i);
+      if (k !== null) keys.push(k);
+    }
+    for (const k of keys) {
+      localStorage.removeItem(k);
+    }
+  } catch {
+    // ignored: storage is best-effort.
+  }
+  try {
+    sessionStorage.clear();
+  } catch {
+    // ignored.
+  }
+  // Drop the URL fragment so the reload doesn't immediately re-enter
+  // the same room.
+  try {
+    history.replaceState(
+      "",
+      document.title,
+      location.pathname + location.search,
+    );
+  } catch {
+    // ignored.
+  }
+  location.reload();
+}
+
+/// Schedule a callback to fire after `delay_ms` ms. Used by Lustre
+/// effects to defer SelfNameCommit by 300ms.
+export function scheduleAfterMs(delay_ms, callback) {
+  setTimeout(callback, delay_ms);
 }
 
 // Override the default viewport meta tag with one that:

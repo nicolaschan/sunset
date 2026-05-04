@@ -1,36 +1,47 @@
 //// Right-column message-details panel — replaces the members rail
 //// when a message's info button is clicked.
 ////
-//// Renders up to four sections:
+//// Renders up to five sections:
 ////   • the quoted message body (always)
 ////   • sender / cryptographic provenance (when full details are known)
 ////   • delivery path (when full details are known)
-////   • read receipts (always; sourced from the live receipts dict so
-////     even messages without crypto provenance show acks as they
-////     arrive)
+////   • delivery acknowledgements — peers whose delivery receipt for
+////     this message has landed locally, each stamped with the unix-ms
+////     when that peer composed the receipt
+////   • reactions — per-emoji breakdown of who reacted and when
+////
+//// "Delivered" rather than "Read" because what we surface is a
+//// best-effort, automatic ack the recipient writes when the encrypted
+//// payload decodes locally; it doesn't claim the user has actually
+//// looked at the message yet.
 ////
 //// Closes via the X button in the top-right.
 
+import gleam/dict.{type Dict}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import gleam/set.{type Set}
+import gleam/order
+import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Member, type Message, type MessageDetails, type RelayStatus, BridgeRelay,
-  Direct, HasDetails, MemberId, NoDetails, NoRelay, OneHop, SelfRelay, TwoHop,
-  ViaPeer,
+  type Member, type MessageDetails, type MessageView, type RelayStatus, Direct,
+  HasDetails, MemberId, NoDetails, NoRelay, OneHop, SelfRelay, TwoHop, ViaPeer,
 }
+import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
 pub fn view(
   palette p: Palette,
-  message m: Message,
-  receipts r: Set(String),
+  message m: MessageView,
+  receipts r: Dict(String, Int),
+  reactions reactions: Dict(String, Dict(String, Int)),
   members ms: List(Member),
+  name_map nm: Dict(String, String),
   on_close on_close: msg,
 ) -> Element(msg) {
   let detail_section = case m.details {
@@ -69,7 +80,8 @@ pub fn view(
         [
           message_quote(p, m),
           detail_section,
-          receipts_section(p, m, r, ms),
+          receipts_section(p, m, r, ms, nm),
+          reactions_section(p, reactions, nm),
         ],
       ),
     ],
@@ -165,7 +177,7 @@ fn close_button(p: Palette, on_close: msg) -> Element(msg) {
   )
 }
 
-fn message_quote(p: Palette, m: Message) -> Element(msg) {
+fn message_quote(p: Palette, m: MessageView) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -287,29 +299,55 @@ fn arrow(p: Palette) -> Element(msg) {
 
 fn receipts_section(
   p: Palette,
-  m: Message,
-  r: Set(String),
+  m: MessageView,
+  r: Dict(String, Int),
   ms: List(Member),
+  nm: Dict(String, String),
 ) -> Element(msg) {
   // Order: matches member-rail order so receipts read consistently
   // across panels. Pubkeys not in the member list (peer left, never
   // seen, etc.) get appended at the end.
+  //
+  // Receipts are keyed by full-hex pubkey. Member ids are short-pubkey
+  // (8 hex chars). Match by comparing the first 8 chars of the receipt
+  // key against the member's short id.
   let from_members =
     list.filter_map(ms, fn(member) {
-      let MemberId(pk) = member.id
-      case set.contains(r, pk) {
-        True -> Ok(#(pk, member.name, member.relay))
-        False -> Error(Nil)
+      let MemberId(short) = member.id
+      case
+        list.find_map(dict.to_list(r), fn(pair) {
+          let #(full_hex, ts) = pair
+          case string.slice(full_hex, 0, 8) == short {
+            True -> Ok(#(full_hex, ts))
+            False -> Error(Nil)
+          }
+        })
+      {
+        Ok(#(full_hex, ts)) -> {
+          let name = case dict.get(nm, full_hex) {
+            Ok(n) -> n
+            Error(_) -> member.name
+          }
+          Ok(#(full_hex, name, member.relay, ts))
+        }
+        Error(_) -> Error(Nil)
       }
     })
-  let known_pks =
-    list.fold(from_members, set.new(), fn(acc, t) { set.insert(acc, t.0) })
+  let known_hexes = list.map(from_members, fn(t) { t.0 })
   let stragglers =
-    set.to_list(set.difference(r, known_pks))
-    |> list.map(fn(pk) { #(pk, pk, NoRelay) })
+    dict.to_list(r)
+    |> list.filter(fn(pair) { !list.contains(known_hexes, pair.0) })
+    |> list.map(fn(pair) {
+      let #(full_hex, ts) = pair
+      let name = case dict.get(nm, full_hex) {
+        Ok(n) -> n
+        Error(_) -> short_pubkey_from_hex(full_hex)
+      }
+      #(full_hex, name, NoRelay, ts)
+    })
   let rows = list.append(from_members, stragglers)
 
-  section(p, "Read by", [
+  section(p, "Delivered to", [
     case rows {
       [] ->
         html.div(
@@ -332,8 +370,8 @@ fn receipts_section(
             ]),
           ],
           list.map(rows, fn(row) {
-            let #(pk, name, relay) = row
-            receipt_row(p, pk, name, relay)
+            let #(pk, name, relay, ts) = row
+            receipt_row(p, pk, name, relay, ts)
           }),
         )
     },
@@ -342,10 +380,10 @@ fn receipts_section(
 
 /// Receipts only flow back for our own outgoing messages — peers don't
 /// emit acks for messages they sent. Tell the reader which case applies
-/// instead of just "no reads yet" everywhere.
-fn empty_state_text(m: Message) -> String {
+/// instead of just "no acks yet" everywhere.
+fn empty_state_text(m: MessageView) -> String {
   case m.you {
-    True -> "No reads yet."
+    True -> "No deliveries yet."
     False -> "Receipts are only tracked for messages you sent."
   }
 }
@@ -355,6 +393,7 @@ fn receipt_row(
   _pk: String,
   name: String,
   relay: RelayStatus,
+  delivered_at_ms: Int,
 ) -> Element(msg) {
   html.div(
     [
@@ -384,18 +423,221 @@ fn receipt_row(
         ],
         [html.text(name)],
       ),
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("align-items", "baseline"),
+            #("gap", "10px"),
+            #("white-space", "nowrap"),
+          ]),
+        ],
+        [
+          html.span(
+            [
+              ui.css([
+                #("font-size", "12.5px"),
+                #("color", p.text),
+                #("font-variant-numeric", "tabular-nums"),
+              ]),
+            ],
+            [html.text(sunset.format_time_ms_exact(delivered_at_ms))],
+          ),
+          html.span(
+            [
+              ui.css([
+                #("font-size", "12.5px"),
+                #("color", p.text_muted),
+              ]),
+            ],
+            [html.text(relay_label(relay))],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+fn reactions_section(
+  p: Palette,
+  reactions: Dict(String, Dict(String, Int)),
+  nm: Dict(String, String),
+) -> Element(msg) {
+  let entries =
+    dict.to_list(reactions)
+    |> list.filter(fn(pair) { dict.size(pair.1) > 0 })
+    // Stable-ish ordering: emoji asc. The engine uses LWW by
+    // `(sent_at_ms, value_hash)`, but at the panel level we just want a
+    // deterministic listing.
+    |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
+
+  section(p, "Reactions", [
+    case entries {
+      [] ->
+        html.div(
+          [
+            ui.css([
+              #("color", p.text_faint),
+              #("font-size", "13.75px"),
+              #("font-style", "italic"),
+            ]),
+          ],
+          [html.text("No reactions yet.")],
+        )
+      _ ->
+        html.div(
+          [
+            ui.css([
+              #("display", "flex"),
+              #("flex-direction", "column"),
+              #("gap", "10px"),
+            ]),
+          ],
+          list.map(entries, fn(pair) {
+            let #(emoji, authors) = pair
+            reaction_group(p, emoji, authors, nm)
+          }),
+        )
+    },
+  ])
+}
+
+fn reaction_group(
+  p: Palette,
+  emoji: String,
+  authors: Dict(String, Int),
+  nm: Dict(String, String),
+) -> Element(msg) {
+  // Sort reactors oldest-first so the list reads as a chronological
+  // story of who reacted when. Within equal timestamps fall back to
+  // pubkey for determinism.
+  let sorted =
+    dict.to_list(authors)
+    |> list.sort(fn(a, b) {
+      case int.compare(a.1, b.1) {
+        order.Eq -> string.compare(a.0, b.0)
+        other -> other
+      }
+    })
+  html.div(
+    [
+      attribute.attribute("data-testid", "reaction-group"),
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("gap", "4px"),
+        #("padding", "8px 10px"),
+        #("border", "1px solid " <> p.border_soft),
+        #("border-radius", "8px"),
+        #("background", p.surface_alt),
+      ]),
+    ],
+    [
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("align-items", "baseline"),
+            #("gap", "8px"),
+          ]),
+        ],
+        [
+          html.span(
+            [ui.css([#("font-size", "18.75px"), #("line-height", "1")])],
+            [html.text(emoji)],
+          ),
+          html.span(
+            [
+              ui.css([
+                #("font-size", "12.5px"),
+                #("color", p.text_faint),
+                #("font-variant-numeric", "tabular-nums"),
+              ]),
+            ],
+            [html.text(reactor_count_label(list.length(sorted)))],
+          ),
+        ],
+      ),
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "2px"),
+          ]),
+        ],
+        list.map(sorted, fn(pair) {
+          let #(author_hex, ts) = pair
+          reactor_row(p, author_hex, ts, nm)
+        }),
+      ),
+    ],
+  )
+}
+
+fn reactor_row(
+  p: Palette,
+  author_hex: String,
+  sent_at_ms: Int,
+  nm: Dict(String, String),
+) -> Element(msg) {
+  // Look up the reactor's chosen display name from name_map (keyed by
+  // full hex). Fall back to the 8-char hex prefix when no name has been
+  // observed — covers offline reactors and peers who haven't set a name.
+  let display_name = case dict.get(nm, author_hex) {
+    Ok(name) -> name
+    Error(_) -> short_pubkey_from_hex(author_hex)
+  }
+  html.div(
+    [
+      attribute.attribute("data-testid", "reactor-row"),
+      ui.css([
+        #("display", "flex"),
+        #("align-items", "baseline"),
+        #("justify-content", "space-between"),
+        #("gap", "8px"),
+      ]),
+    ],
+    [
+      html.span(
+        [
+          ui.css([
+            #("font-family", theme.font_mono),
+            #("font-size", "13.75px"),
+            #("color", p.text),
+            #("overflow", "hidden"),
+            #("text-overflow", "ellipsis"),
+          ]),
+        ],
+        [html.text(display_name)],
+      ),
       html.span(
         [
           ui.css([
             #("font-size", "12.5px"),
             #("color", p.text_muted),
             #("white-space", "nowrap"),
+            #("font-variant-numeric", "tabular-nums"),
           ]),
         ],
-        [html.text(relay_label(relay))],
+        [html.text(sunset.format_time_ms_exact(sent_at_ms))],
       ),
     ],
   )
+}
+
+/// Returns the first 8 hex characters of a full-hex pubkey string.
+/// Used as a fallback display name when no chosen name is in the map.
+/// Matches what short_pubkey() returns for the first 4 bytes of a key.
+fn short_pubkey_from_hex(hex: String) -> String {
+  string.slice(hex, 0, 8)
+}
+
+fn reactor_count_label(n: Int) -> String {
+  case n {
+    1 -> "1 reactor"
+    _ -> int.to_string(n) <> " reactors"
+  }
 }
 
 fn relay_label(r: RelayStatus) -> String {
@@ -404,7 +646,6 @@ fn relay_label(r: RelayStatus) -> String {
     OneHop -> "1-hop"
     TwoHop -> "2-hop"
     ViaPeer(name) -> "via " <> name
-    BridgeRelay -> "bridge"
     SelfRelay -> "self"
     NoRelay -> "—"
   }

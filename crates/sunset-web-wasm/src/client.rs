@@ -35,15 +35,14 @@ impl NoiseIdentity for IdentityNoiseAdapter {
 #[wasm_bindgen]
 pub struct Client {
     /// Multi-room peer (identity + store + engine + supervisor +
-    /// per-room registry). Per-room ops route through `RoomHandle`.
+    /// per-room registry). Per-room ops route through `RoomHandle`;
+    /// supervisor-level ops (`add_relay`, `on_intent_changed`,
+    /// `intents`) route through `Peer`'s thin delegators.
     inner: Rc<sunset_core::Peer<MemoryStore, MultiTransport<WsT, RtcT>>>,
-    /// Local copies kept on the Client because (a) the voice subsystem
-    /// needs identity to start a per-room voice session, and (b) the
-    /// supervisor handle is needed for `on_intent_changed` /
-    /// `intents`. Identity could move into `Peer` accessors later;
-    /// for now the duplication is small and explicit.
+    /// Kept on the Client because the voice subsystem needs identity
+    /// to start a per-room voice session. Could move into a `Peer`
+    /// accessor later; for now the duplication is small and explicit.
     identity: Identity,
-    supervisor: Rc<sunset_sync::PeerSupervisor<MemoryStore, MultiTransport<WsT, RtcT>>>,
     /// Voice subsystem (single concurrent call per Client). See
     /// `voice_start` for the room-handle parameter that selects which
     /// room the call targets.
@@ -56,7 +55,7 @@ pub struct Client {
 #[wasm_bindgen]
 impl Client {
     #[wasm_bindgen(constructor)]
-    pub fn new(seed: &[u8]) -> Result<Client, JsError> {
+    pub fn new(seed: &[u8], heartbeat_interval_ms: u32) -> Result<Client, JsError> {
         let identity = identity_from_seed(seed).map_err(|e| JsError::new(&e))?;
         let store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
 
@@ -77,10 +76,19 @@ impl Client {
 
         let multi = MultiTransport::new(ws_noise, rtc_noise);
         let signer: Arc<dyn Signer> = Arc::new(identity.clone());
+
+        let mut config = SyncConfig::default();
+        if heartbeat_interval_ms > 0 {
+            let interval = std::time::Duration::from_millis(heartbeat_interval_ms as u64);
+            config.heartbeat_interval = interval;
+            // Match default 3× ratio between interval and timeout.
+            config.heartbeat_timeout = interval * 3;
+        }
+
         let engine = Rc::new(SyncEngine::new(
             store.clone(),
             multi,
-            SyncConfig::default(),
+            config,
             local_peer,
             signer,
         ));
@@ -109,14 +117,13 @@ impl Client {
             identity.clone(),
             store.clone(),
             engine.clone(),
-            supervisor.clone(),
+            supervisor,
             dispatcher,
         );
 
         Ok(Client {
             inner: peer,
             identity,
-            supervisor,
             voice: crate::voice::new_voice_cell(),
             bus,
         })
@@ -148,9 +155,9 @@ impl Client {
     ///   * once per intent state transition thereafter.
     /// The callback receives an `IntentSnapshotJs`.
     pub fn on_intent_changed(&self, callback: js_sys::Function) {
-        let supervisor = self.supervisor.clone();
+        let inner = self.inner.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut rx = supervisor.subscribe_intents().await;
+            let mut rx = inner.subscribe_intents().await;
             while let Some(snap) = rx.recv().await {
                 let js_snap = crate::intent::IntentSnapshotJs::from(&snap);
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from(js_snap));
@@ -178,6 +185,13 @@ impl Client {
             .await
             .map_err(|e| JsError::new(&format!("open_room: {e}")))?;
         Ok(crate::room_handle::RoomHandle::new(open))
+    }
+
+    /// Update the display name carried in every open room's presence
+    /// heartbeats. Persists for the lifetime of the Client (the Gleam
+    /// layer is responsible for localStorage). Idempotent.
+    pub fn set_self_name(&self, name: String) {
+        self.inner.set_self_name(&name);
     }
 
     /// Start voice in the given room. The `room_handle` must have been

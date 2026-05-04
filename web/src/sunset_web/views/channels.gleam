@@ -10,12 +10,13 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Channel, type ChannelId, type ConnStatus, type Member, type Room,
-  type Viewport, Bridge, Connected, Desktop, MemberId, Minecraft, MutedP,
-  Offline, Phone, Reconnecting, Speaking, TextChannel, Voice,
+  type Channel, type ChannelId, type ConnStatus, type Member, type Relay,
+  type Room, type Viewport, Connected, Desktop, MemberId, MutedP, Offline, Phone,
+  Reconnecting, Speaking, TextChannel, Voice,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
+import sunset_web/views/relays as relays_view
 
 pub fn view(
   palette p: Palette,
@@ -35,26 +36,26 @@ pub fn view(
   self_in_call self_in_call: Bool,
   self_muted self_muted: Bool,
   self_deafened self_deafened: Bool,
+  relays relays: List(Relay),
+  on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
-  let bridge_channels =
-    list.filter(cs, fn(c) {
-      case c.kind {
-        Bridge(_) -> True
-        _ -> False
-      }
-    })
   let in_call = list.filter(ms, fn(m) { m.in_call })
 
   let active_voice =
     list.find(voice_channels, fn(c) { c.in_call > 0 })
     |> result_to_option
+  // `height: 100%` resolves correctly for both layouts: the drawer's
+  // safe-area-padded content box on phone, and the desktop grid row
+  // (which is sized to 100dvh by shell.desktop_view's
+  // `grid-template-rows`). A bare 100dvh would overflow the drawer's
+  // clipping box on phone PWA mode and cover the iOS home indicator.
   html.aside(
     [
       ui.css([
-        #("height", "100vh"),
-        #("height", "100dvh"),
+        #("height", "100%"),
+        #("min-height", "0"),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("background", p.surface_alt),
@@ -101,15 +102,11 @@ pub fn view(
               }),
             ]),
           ),
-          case bridge_channels {
-            [] -> element.fragment([])
-            _ ->
-              section(
-                p,
-                "Bridges",
-                list.map(bridge_channels, fn(c) { bridge_channel_row(p, c) }),
-              )
-          },
+          relays_view.rail_section(
+            palette: p,
+            relays: relays,
+            on_open: on_open_relay,
+          ),
         ],
       ),
       case viewport, active_voice {
@@ -961,31 +958,6 @@ fn phone_hangup_icon() -> Element(msg) {
         ],
         [],
       ),
-    ],
-  )
-}
-
-fn bridge_channel_row(p: Palette, c: Channel) -> Element(msg) {
-  let icon = case c.kind {
-    Bridge(Minecraft) -> "⛏"
-    _ -> "↗"
-  }
-  html.div(
-    [
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("gap", "8px"),
-        #("padding", "6px 12px"),
-        #("font-size", "16.25px"),
-        #("color", p.text_muted),
-      ]),
-    ],
-    [
-      html.span([ui.css([#("color", p.accent), #("opacity", "0.7")])], [
-        html.text(icon),
-      ]),
-      html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
     ],
   )
 }

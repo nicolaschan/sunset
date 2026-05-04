@@ -73,7 +73,11 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
             let (fired_target, fired_snapshot) = observed.borrow()[0].clone();
             assert_eq!(fired_target, target);
             let alice_set = fired_snapshot.get("👍").unwrap();
-            assert!(alice_set.contains(&alice.public()));
+            assert_eq!(
+                alice_set.get(&alice.public()),
+                Some(&100),
+                "snapshot should expose the Add's sent_at_ms so the info panel can stamp the reaction"
+            );
 
             // Alice removes the reaction.
             let composed_remove = compose_reaction(

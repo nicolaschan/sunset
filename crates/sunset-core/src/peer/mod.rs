@@ -7,6 +7,7 @@ mod open_room;
 
 pub use open_room::OpenRoom;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -30,6 +31,11 @@ pub struct Peer<St: Store + 'static, T: Transport + 'static> {
     /// overwriting the first in the dispatcher).
     open_rooms: tokio::sync::Mutex<HashMap<RoomFingerprint, Weak<open_room::RoomState<St, T>>>>,
     pub(crate) rtc_signaler_dispatcher: Rc<MultiRoomSignaler>,
+    /// Last name set via `set_self_name`. Applied to newly-opened
+    /// rooms' publishers in `start_presence` so that a web client
+    /// calling `set_self_name` from `ClientReady` (before any room is
+    /// open) doesn't silently no-op. Empty string is stored as `None`.
+    pending_self_name: RefCell<Option<String>>,
 }
 
 impl<St, T> Peer<St, T>
@@ -52,6 +58,7 @@ where
             supervisor,
             open_rooms: tokio::sync::Mutex::new(HashMap::new()),
             rtc_signaler_dispatcher,
+            pending_self_name: RefCell::new(None),
         })
     }
 
@@ -151,6 +158,7 @@ where
             room,
             peer_weak: Rc::downgrade(self),
             presence_started: std::cell::Cell::new(false),
+            publisher: std::cell::RefCell::new(None),
             tracker_handles: Rc::new(crate::membership::TrackerHandles::new()),
             reaction_handles,
             cancel_decode: cancel,
@@ -191,6 +199,46 @@ where
     /// change after that.
     pub async fn subscribe_intents(&self) -> tokio::sync::mpsc::UnboundedReceiver<IntentSnapshot> {
         self.supervisor.subscribe_intents().await
+    }
+
+    /// Update the display name carried in every open room's presence
+    /// heartbeats. Caches the name so rooms opened after this call
+    /// also pick it up via `start_presence`. Silently skips rooms
+    /// whose `OpenRoom` has been dropped (the corresponding
+    /// `Weak<RoomState>` upgrade fails). Silently skips rooms that
+    /// have not called `start_presence` yet.
+    pub fn set_self_name(&self, name: &str) {
+        // Cache unconditionally — this is the whole point: a web client
+        // calls set_self_name from ClientReady before any room is open,
+        // and start_presence must pick it up later.
+        *self.pending_self_name.borrow_mut() = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_owned())
+        };
+
+        let rooms = match self.open_rooms.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                // Lock is held by an in-flight open_room; the new room
+                // will inherit the cached name via start_presence.
+                tracing::debug!("set_self_name: open_rooms lock contended; cache written");
+                return;
+            }
+        };
+        for weak in rooms.values() {
+            if let Some(state) = weak.upgrade() {
+                if let Some(p) = state.publisher.borrow().as_ref() {
+                    p.update_name(name);
+                }
+            }
+        }
+    }
+
+    /// Returns the last name set via `set_self_name`, or `None` if
+    /// no name has been set (or the last name was empty).
+    pub(crate) fn cached_self_name(&self) -> Option<String> {
+        self.pending_self_name.borrow().clone()
     }
 
     // Accessor methods consumed by Phase 5+ (open_room, send_text, etc.).
@@ -479,15 +527,15 @@ mod tests {
                 let peer = helpers::mk_peer(ident(12)).await;
                 let room = peer.open_room("alpha").await.expect("open_room");
 
-                let received: Rc<RefCell<Vec<sunset_store::Hash>>> =
+                let received: Rc<RefCell<Vec<(sunset_store::Hash, u64)>>> =
                     Rc::new(RefCell::new(Vec::new()));
                 let received_clone = received.clone();
                 // Register a no-op on_message so the decode loop spawns even
                 // though we only care about receipts here. (The loop spawns on
                 // first on_message OR on_receipt registration — either works.)
                 room.on_message(|_, _| {});
-                room.on_receipt(move |for_hash, _from: &crate::IdentityKey| {
-                    received_clone.borrow_mut().push(for_hash);
+                room.on_receipt(move |for_hash, _from: &crate::IdentityKey, sent_at_ms| {
+                    received_clone.borrow_mut().push((for_hash, sent_at_ms));
                 });
 
                 // Compose+insert a Receipt referencing some target hash.
@@ -511,7 +559,7 @@ mod tests {
                 for _ in 0..50 {
                     tokio::task::yield_now().await;
                 }
-                assert_eq!(received.borrow().clone(), vec![target]);
+                assert_eq!(received.borrow().clone(), vec![(target, 1_700_000_000_000)]);
             })
             .await;
     }
@@ -547,6 +595,79 @@ mod tests {
                     .expect("no presence entry within 500ms")
                     .expect("subscription closed");
                 assert!(matches!(ev, Ok(sunset_store::Event::Inserted(_))));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_self_name_updates_every_open_room() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(40)).await;
+                let alpha = peer.open_room("alpha").await.expect("open_room alpha");
+                let beta = peer.open_room("beta").await.expect("open_room beta");
+                alpha.start_presence(50, 1000, 100).await;
+                beta.start_presence(50, 1000, 100).await;
+
+                peer.set_self_name("alice");
+
+                // After the immediate republish, both rooms' presence bodies
+                // should decode to name = Some("alice").
+                let pk_hex = hex::encode(peer.public_key());
+                for (room_fp_hex, label) in [
+                    (alpha.fingerprint().to_hex(), "alpha"),
+                    (beta.fingerprint().to_hex(), "beta"),
+                ] {
+                    let key = format!("{room_fp_hex}/presence/{pk_hex}");
+                    let store = peer.store().clone();
+                    // Wait up to 1s for the body name to flip to Some("alice").
+                    let mut found = false;
+                    for _ in 0..100 {
+                        if let Some(body) = read_presence_body(&store, &key).await {
+                            if body.name == Some("alice".to_owned()) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    assert!(found, "body name never became Some(alice) for room {label}");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_self_name_before_open_room_persists_via_pending_cache() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let peer = helpers::mk_peer(ident(41)).await;
+                // CRITICAL ORDER: set the name BEFORE opening the room.
+                peer.set_self_name("alice");
+                let alpha = peer.open_room("alpha").await.expect("open_room alpha");
+                alpha.start_presence(50, 1000, 100).await;
+
+                let room_fp_hex = alpha.fingerprint().to_hex();
+                let pk_hex = hex::encode(peer.public_key());
+                let key = format!("{room_fp_hex}/presence/{pk_hex}");
+                let store = peer.store().clone();
+
+                let mut found = false;
+                for _ in 0..100 {
+                    if let Some(body) = read_presence_body(&store, &key).await {
+                        if body.name == Some("alice".to_owned()) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(
+                    found,
+                    "presence body never picked up alice from pending cache"
+                );
             })
             .await;
     }
@@ -610,7 +731,7 @@ mod tests {
                 let room = peer.open_room("alpha").await.expect("open_room");
 
                 // Seed last_signature with something non-empty so we can verify
-                // the registration clears it. MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode)>
+                // the registration clears it. MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode, Option<String>)>
                 room.inner
                     .tracker_handles
                     .last_signature
@@ -619,6 +740,7 @@ mod tests {
                         vec![1, 2, 3],
                         crate::membership::Presence::Online,
                         crate::membership::ConnectionMode::Direct,
+                        None,
                     ));
                 assert!(
                     !room
@@ -640,6 +762,29 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// Read the current `PresenceBody` for an exact store key.
+    /// Returns `None` if no entry is present yet.
+    async fn read_presence_body(
+        store: &std::sync::Arc<MemoryStore>,
+        name: &str,
+    ) -> Option<crate::membership::PresenceBody> {
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use sunset_store::{Filter, Replay, Store as _};
+        let mut sub = store
+            .subscribe(Filter::Namespace(Bytes::from(name.to_owned())), Replay::All)
+            .await
+            .ok()?;
+        let ev = sub.next().await?.ok()?;
+        let entry = match ev {
+            sunset_store::Event::Inserted(e) => e,
+            sunset_store::Event::Replaced { new, .. } => new,
+            _ => return None,
+        };
+        let block = store.get_content(&entry.value_hash).await.ok()??;
+        postcard::from_bytes(&block.data).ok()
     }
 
     pub(super) mod helpers {

@@ -126,18 +126,18 @@ async fn pump_loop<R, F, Fut, C>(
                     match with_timeout(handshake_timeout, promote(rc)).await {
                         Some(Ok(conn)) => {
                             if auth_tx.send(conn).is_err() {
-                                eprintln!(
-                                    "sunset-sync: accepted connection arrived after acceptor was dropped; discarding"
+                                tracing::debug!(
+                                    "accepted connection arrived after acceptor was dropped; discarding"
                                 );
                             }
                         }
                         Some(Err(e)) => {
-                            eprintln!("sunset-sync: promote failed: {e}");
+                            tracing::warn!(error = %e, "promote failed");
                         }
                         None => {
-                            eprintln!(
-                                "sunset-sync: promote timed out after {:?}; dropping",
-                                handshake_timeout,
+                            tracing::warn!(
+                                timeout_secs = handshake_timeout.as_secs_f64(),
+                                "promote timed out; dropping",
                             );
                         }
                     }
@@ -145,11 +145,16 @@ async fn pump_loop<R, F, Fut, C>(
             }
             Err(e) => {
                 consecutive_errors += 1;
-                eprintln!(
-                    "sunset-sync: raw accept failed: {e} (consecutive: {consecutive_errors}); continuing"
+                tracing::warn!(
+                    error = %e,
+                    consecutive = consecutive_errors,
+                    "raw accept failed; continuing",
                 );
                 if consecutive_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
-                    eprintln!("sunset-sync: too many consecutive accept errors; pump exiting");
+                    tracing::error!(
+                        consecutive = consecutive_errors,
+                        "too many consecutive accept errors; pump exiting",
+                    );
                     return;
                 }
                 with_sleep(Duration::from_millis(100)).await;

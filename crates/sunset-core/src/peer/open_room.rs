@@ -14,7 +14,7 @@ use crate::membership::TrackerHandles;
 use crate::message::DecodedMessage;
 
 pub(crate) type MessageCallback = Box<dyn Fn(&DecodedMessage, bool /* is_self */)>;
-pub(crate) type ReceiptCallback = Box<dyn Fn(sunset_store::Hash, &crate::IdentityKey)>;
+pub(crate) type ReceiptCallback = Box<dyn Fn(sunset_store::Hash, &crate::IdentityKey, u64)>;
 
 #[derive(Default)]
 pub(crate) struct RoomCallbacks {
@@ -26,6 +26,7 @@ pub(crate) struct RoomState<St: Store + 'static, T: Transport + 'static> {
     pub(crate) room: Rc<Room>,
     pub(crate) peer_weak: Weak<super::Peer<St, T>>,
     pub(crate) presence_started: Cell<bool>,
+    pub(crate) publisher: RefCell<Option<crate::membership::PublisherHandle>>,
     pub(crate) tracker_handles: Rc<TrackerHandles>,
     pub(crate) reaction_handles: crate::reactions::ReactionHandles,
     pub(crate) cancel_decode: Rc<Cell<bool>>,
@@ -92,7 +93,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         }
     }
 
-    pub fn on_receipt<F: Fn(sunset_store::Hash, &crate::IdentityKey) + 'static>(&self, cb: F) {
+    pub fn on_receipt<F: Fn(sunset_store::Hash, &crate::IdentityKey, u64) + 'static>(&self, cb: F) {
         let mut cbs = self.inner.callbacks.borrow_mut();
         let was_unregistered = cbs.on_message.is_none() && cbs.on_receipt.is_none();
         cbs.on_receipt = Some(Box::new(cb));
@@ -178,7 +179,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                         }
                         crate::MessageBody::Receipt { for_value_hash } => {
                             if let Some(cb) = cbs.on_receipt.as_ref() {
-                                cb(*for_value_hash, &decoded.author_key);
+                                cb(*for_value_hash, &decoded.author_key, decoded.sent_at_ms);
                             }
                         }
                         // Reactions are handled by ReactionTracker
@@ -212,13 +213,22 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         let room_fp_hex = self.inner.room.fingerprint().to_hex();
         let local_peer = sunset_sync::PeerId(peer.identity().store_verifying_key());
 
-        crate::membership::spawn_publisher(
+        let publisher = crate::membership::spawn_publisher(
             peer.identity().clone(),
             room_fp_hex.clone(),
             peer.store().clone(),
             interval_ms,
             ttl_ms,
         );
+        *self.inner.publisher.borrow_mut() = Some(publisher);
+
+        // Apply any name cached before this room was opened (e.g. set
+        // via Peer::set_self_name in ClientReady before RoomOpened).
+        if let Some(name) = peer.cached_self_name() {
+            if let Some(p) = self.inner.publisher.borrow().as_ref() {
+                p.update_name(&name);
+            }
+        }
 
         let engine_events = peer.engine().subscribe_engine_events().await;
         let snapshot = peer.engine().current_peers().await;
@@ -241,6 +251,14 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             },
             (*self.inner.tracker_handles).clone(),
         );
+    }
+
+    /// Update the display name carried in this room's presence
+    /// heartbeats. No-op until `start_presence` has been called.
+    pub fn set_self_name(&self, name: &str) {
+        if let Some(p) = self.inner.publisher.borrow().as_ref() {
+            p.update_name(name);
+        }
     }
 
     pub async fn connect_direct(&self, peer_pubkey: [u8; 32]) -> crate::Result<()> {

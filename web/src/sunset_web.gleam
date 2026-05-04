@@ -13,6 +13,7 @@
 //// so a refresh restores the user's state.
 
 import gleam/dict.{type Dict}
+import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -27,8 +28,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, type Room, ChannelId, MemberId,
-  NoBridge, Reaction, Room, RoomId, VoiceModel, VoicePeerStateUI,
+  type ChannelId, type Reaction, type Room, ChannelId, MemberId, Reaction, Room,
+  RoomId, VoiceModel, VoicePeerStateUI,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -37,7 +38,9 @@ import sunset_web/storage
 import sunset_web/sunset.{
   type ClientHandle, type IncomingMessage, type RoomHandle,
 }
-import sunset_web/theme.{type Mode, Dark, Light}
+import sunset_web/theme.{
+  type Mode, type Pref, Dark, DarkPref, Light, LightPref, System,
+}
 import sunset_web/ui
 import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
@@ -48,7 +51,9 @@ import sunset_web/views/main_panel
 import sunset_web/views/members
 import sunset_web/views/peer_status_popover
 import sunset_web/views/phone_header
+import sunset_web/views/relays as relays_view
 import sunset_web/views/rooms
+import sunset_web/views/settings_popover
 import sunset_web/views/shell
 import sunset_web/views/touch_drag
 import sunset_web/views/voice_error_toast
@@ -80,7 +85,11 @@ pub type RoomState {
     handle: Option(RoomHandle),
     messages: List(domain.Message),
     members: List(domain.Member),
-    receipts: Dict(String, Set(String)),
+    /// Per-message delivery acks: msg_id → from_pubkey (full hex) →
+    /// unix-ms when the acknowledging peer composed the receipt. The
+    /// timestamp is surfaced in the message-details panel as the
+    /// per-recipient delivered-at stamp.
+    receipts: Dict(String, Dict(String, Int)),
     reactions: Dict(String, List(Reaction)),
     current_channel: ChannelId,
     draft: String,
@@ -116,6 +125,14 @@ fn empty_room_state() -> RoomState {
 pub type Model {
   Model(
     mode: Mode,
+    /// User-facing theme preference. `mode` is derived from this +
+    /// the OS `prefers-color-scheme` signal at init / on toggle. Two
+    /// fields rather than one because the System branch needs to
+    /// survive across reloads even though the rendered Mode flips
+    /// with the OS.
+    theme_pref: Pref,
+    /// True when the settings popover (theme + reset) is visible.
+    settings_open: Bool,
     view: View,
     joined_rooms: List(String),
     rooms_collapsed: Bool,
@@ -125,14 +142,23 @@ pub type Model {
     /// (not per-room) because only one picker is open at a time and it
     /// dismisses if you switch rooms anyway.
     full_picker_for: Option(String),
+    /// Click-relative position of the trigger that opened the desktop
+    /// full emoji picker, plus the viewport height at the time of the
+    /// click. `None` for sheet-mode (mobile) opens; for desktop opens
+    /// it lets the overlay anchor itself near the trigger and decide
+    /// whether there's space to render below or above. Cleared on
+    /// `CloseFullEmojiPicker`.
+    full_picker_anchor: Option(#(Float, Float)),
     /// Per-target reaction state from the bridge tracker. TEMPORARILY
     /// global on the merged branch — the reactions tracker in
     /// sunset-core::reactions is currently per-Client (not per-room).
     /// Migrating reactions to per-OpenRoom (so each room has its own
-    /// `Dict(target_hex, Dict(emoji, Set(author_pubkey_hex)))`) is
+    /// `Dict(target_hex, Dict(emoji, Dict(author_pubkey_hex, sent_at_ms)))`) is
     /// tracked as a follow-up; ReactionsChanged from any room will
-    /// merge into this single dict for now.
-    reactions: Dict(String, Dict(String, Set(String))),
+    /// merge into this single dict for now. The inner-most `Int` is the
+    /// LWW-winning Add entry's unix-ms — the timestamp the message-details
+    /// panel renders next to each reactor.
+    reactions: Dict(String, Dict(String, Dict(String, Int))),
     /// Name of the room currently being dragged in the rooms rail.
     /// `None` between drag operations.
     dragging_room: Option(String),
@@ -164,12 +190,29 @@ pub type Model {
     rooms: Dict(String, RoomState),
     /// Voice subsystem state: self_in_call, mute, deafen, per-peer live state.
     voice: domain.VoiceModel,
+    /// IntentId of the relay whose popover is currently open. Client-wide
+    /// (not per-room) because relays are a client-level concept.
+    relays_popover: option.Option(Float),
+    /// Peer display-name map, keyed by full hex pubkey. Rebuilt from each
+    /// room's member list on MembersUpdated. Used by display_name() to
+    /// resolve a peer's chosen name with short_pubkey fallback.
+    name_map: Dict(String, String),
+    /// The local user's own display name (read from localStorage on init;
+    /// updated when the user submits the settings name field).
+    self_name: String,
+    /// Monotonically-incrementing token used to debounce/sequence
+    /// set_self_name calls so stale callbacks don't clobber the UI.
+    self_name_token: Int,
   )
 }
 
 pub type Msg {
   NoOp
   ToggleMode
+  OpenSettings
+  CloseSettings
+  SetThemePref(Pref)
+  ResetLocalState
   HashChanged(String)
   UpdateLandingInput(String)
   UpdateSidebarSearch(String)
@@ -187,10 +230,14 @@ pub type Msg {
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
   AddReaction(String, String)
-  ReactionsChanged(target: String, snapshot: Dict(String, Set(String)))
+  ReactionsChanged(target: String, snapshot: Dict(String, Dict(String, Int)))
   ToggleReactionEmoji(target: String, emoji: String)
   ReactionSent(Result(Nil, String))
-  OpenFullEmojiPicker(String)
+  /// Open the full emoji picker. The optional `#(client_y, viewport_h)`
+  /// is captured by the trigger's click decoder on desktop so the
+  /// overlay can anchor itself to the click; mobile uses a bottom
+  /// sheet and passes `None`.
+  OpenFullEmojiPicker(target: String, anchor: Option(#(Float, Float)))
   CloseFullEmojiPicker
   OpenDetail(String)
   CloseDetail
@@ -198,6 +245,8 @@ pub type Msg {
   CloseVoicePopover
   OpenPeerStatusPopover(domain.MemberId)
   ClosePeerStatusPopover
+  OpenRelayPopover(Float)
+  CloseRelayPopover
   Tick(Int)
   SetMemberVolume(String, Int)
   ToggleMemberDenoise(String)
@@ -210,7 +259,12 @@ pub type Msg {
   /// A room's wasm-side handle is ready; register callbacks + start presence.
   RoomOpened(name: String, handle: RoomHandle)
   IncomingMsg(room: String, im: IncomingMessage)
-  IncomingReceipt(room: String, message_id: String, from_pubkey: String)
+  IncomingReceipt(
+    room: String,
+    message_id: String,
+    from_pubkey: String,
+    delivered_at_ms: Int,
+  )
   SubmitDraft
   MessageSent(Result(String, String))
   MembersUpdated(room: String, members: List(domain.Member))
@@ -244,6 +298,8 @@ pub type Msg {
   ToggleMuteForPeer(peer_hex: String)
   VoicePermissionDenied(message: String)
   ResetVoiceError
+  UpdateSelfName(String)
+  SelfNameCommit(String, Int)
 }
 
 pub fn main() {
@@ -257,16 +313,12 @@ pub fn main() {
 fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   let stored_rooms = storage.read_joined_rooms()
   let initial_hash = storage.read_hash()
-  let initial_mode = case storage.read_saved_theme() {
-    "dark" -> Dark
-    "light" -> Light
-    // No explicit choice yet: follow the OS / browser preference.
-    _ ->
-      case storage.prefers_dark() {
-        True -> Dark
-        False -> Light
-      }
+  let initial_pref = case storage.read_saved_theme() {
+    "dark" -> DarkPref
+    "light" -> LightPref
+    _ -> System
   }
+  let initial_mode = theme.resolve_mode(initial_pref, storage.prefers_dark())
 
   // Resolve the initial view + rooms list:
   //   * URL fragment wins if present.
@@ -295,12 +347,15 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   let model =
     Model(
       mode: initial_mode,
+      theme_pref: initial_pref,
+      settings_open: False,
       view: initial_view,
       joined_rooms: joined,
       rooms_collapsed: False,
       landing_input: "",
       sidebar_search: "",
       full_picker_for: None,
+      full_picker_anchor: None,
       reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
@@ -318,6 +373,10 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         peers: dict.new(),
         permission_error: None,
       ),
+      relays_popover: None,
+      name_map: dict.new(),
+      self_name: storage.read_self_name(),
+      self_name_token: 0,
     )
 
   let subscribe_hash =
@@ -390,6 +449,14 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       })
     })
 
+  // On first paint, force the composer textarea back to its single-row
+  // height. The autoGrow effect only fires on `input`, so without an
+  // explicit reset the textarea can render as a doubled-up 2-line
+  // height on mobile (where the iOS 16px font override changes the
+  // line metrics in a way that doesn't match the `rows="1"` default).
+  let initial_compose_reset_eff =
+    effect.from(fn(_dispatch) { composer.reset_textarea("composer-textarea") })
+
   #(
     model,
     effect.batch([
@@ -402,6 +469,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       ticker_eff,
       attach_shortcuts_eff,
       install_voice_handler_eff,
+      initial_compose_reset_eff,
     ]),
   )
 }
@@ -498,8 +566,60 @@ fn sanitize(raw: String) -> String {
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "currentTimeMs")
 fn current_time_ms() -> Int
 
+@external(javascript, "./sunset_web/storage.ffi.mjs", "scheduleAfterMs")
+fn schedule_after_ms(delay_ms: Int, callback: fn() -> Nil) -> Nil
+
+fn schedule_self_name_commit(
+  value: String,
+  token: Int,
+  dispatch: fn(Msg) -> Nil,
+) -> Nil {
+  schedule_after_ms(300, fn() { dispatch(SelfNameCommit(value, token)) })
+}
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "hexEncode")
+fn hex_encode_ffi(bits: BitArray) -> String
+
+/// Hex-encode a BitArray as a lowercase string for use as a name_map dict key.
+/// Matches the format the Rust membership tracker uses to key its names map
+/// (full hex of the verifying key bytes — NOT truncated short_pubkey).
+pub fn hex_encode(bits: BitArray) -> String {
+  hex_encode_ffi(bits)
+}
+
+/// Look up a peer's chosen display name from the name_map, falling back to
+/// `short_pubkey(pk)` when no name has been observed (or the peer cleared theirs).
+pub fn display_name(name_map: Dict(String, String), pk: BitArray) -> String {
+  case dict.get(name_map, hex_encode(pk)) {
+    Ok(name) -> name
+    Error(_) -> short_pubkey(pk)
+  }
+}
+
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortPubkey")
 fn short_pubkey(bits: BitArray) -> String
+
+/// Resolve a list of domain.Message into domain.MessageView, baking in the
+/// author display name (from name_map, falling back to short_pubkey).
+pub fn resolve_messages(
+  name_map: Dict(String, String),
+  messages: List(domain.Message),
+) -> List(domain.MessageView) {
+  list.map(messages, fn(m) {
+    domain.MessageView(
+      id: m.id,
+      author: display_name(name_map, m.author_pubkey),
+      initials: m.initials,
+      time: m.time,
+      body: m.body,
+      seen_by: m.seen_by,
+      you: m.you,
+      pending: m.pending,
+      reactions: m.reactions,
+      details: m.details,
+    )
+  })
+}
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortInitials")
 fn short_initials(bits: BitArray) -> String
@@ -538,27 +658,60 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     NoOp -> #(model, effect.none())
     ToggleMode -> {
+      // The Light↔Dark toggle button writes a concrete preference (so
+      // the user gets the same theme on next load even if their OS
+      // preference flips). System preference is therefore retired by
+      // any toggle — that's the same behaviour the old code had,
+      // since it always wrote a concrete `light`/`dark` string.
       let next_mode = case model.mode {
         Light -> Dark
         Dark -> Light
+      }
+      let next_pref = case next_mode {
+        Light -> LightPref
+        Dark -> DarkPref
       }
       let label = case next_mode {
         Light -> "light"
         Dark -> "dark"
       }
       #(
-        Model(..model, mode: next_mode),
+        Model(..model, mode: next_mode, theme_pref: next_pref),
         effect.from(fn(_) {
           storage.write_saved_theme(label)
           Nil
         }),
       )
     }
+    OpenSettings -> #(Model(..model, settings_open: True), effect.none())
+    CloseSettings -> #(Model(..model, settings_open: False), effect.none())
+    SetThemePref(pref) -> {
+      let next_mode = theme.resolve_mode(pref, storage.prefers_dark())
+      let label = case pref {
+        System -> ""
+        LightPref -> "light"
+        DarkPref -> "dark"
+      }
+      #(
+        Model(..model, mode: next_mode, theme_pref: pref),
+        effect.from(fn(_) {
+          storage.write_saved_theme(label)
+          Nil
+        }),
+      )
+    }
+    ResetLocalState -> {
+      // The reset wipes localStorage and reloads, so any in-flight
+      // model state is discarded. We dispatch nothing else: the FFI
+      // call ends in `location.reload()`.
+      #(model, effect.from(fn(_) { storage.reset_local_state_and_reload() }))
+    }
     HashChanged(hash) -> {
       let new_view = case hash {
         "" -> LandingView
         name -> RoomView(name)
       }
+      let view_changed = new_view != model.view
       let new_rooms = case new_view {
         LandingView -> model.joined_rooms
         RoomView(name) -> ensure_joined(model.joined_rooms, name)
@@ -604,6 +757,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           })
         _, False, None -> effect.none()
       }
+      // Re-focus the composer when switching to a different room so the
+      // user can start typing immediately; reset the inline height so
+      // the textarea isn't stuck at a multi-line size carried over from
+      // another room's draft. Skipped when the view didn't actually
+      // change (e.g. spurious hashchange from setting the same hash).
+      let focus_eff = case view_changed, new_view {
+        True, RoomView(_) ->
+          effect.from(fn(_) {
+            composer.reset_textarea("composer-textarea")
+            composer.focus_textarea("composer-textarea")
+          })
+        _, _ -> effect.none()
+      }
       #(
         Model(
           ..model,
@@ -611,7 +777,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           joined_rooms: new_rooms,
           rooms: new_rooms_dict,
         ),
-        effect.batch([persisted, open_eff]),
+        effect.batch([persisted, open_eff, focus_eff]),
       )
     }
     UpdateLandingInput(s) -> #(Model(..model, landing_input: s), effect.none())
@@ -625,6 +791,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         "" -> #(model, effect.none())
         _ -> {
           let was_new = !list.contains(model.joined_rooms, name)
+          let active_changed = case model.view {
+            RoomView(active) -> active != name
+            LandingView -> True
+          }
           let new_room_list = ensure_joined(model.joined_rooms, name)
           // On phone, picking a room from the rooms drawer should land
           // the user in the channels drawer for the new room (so they
@@ -670,6 +840,20 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               })
             _, _ -> effect.none()
           }
+          // Reset + focus the composer when the active room actually
+          // changes (i.e. landing→room or room→other-room). The reset
+          // also fixes a stale inline `style.height` carried over from
+          // the previous room's multi-line draft (and the just-mounted
+          // textarea on phone, which can otherwise render as 2 lines
+          // depending on the rendered font metrics).
+          let focus_eff = case active_changed {
+            True ->
+              effect.from(fn(_) {
+                composer.reset_textarea("composer-textarea")
+                composer.focus_textarea("composer-textarea")
+              })
+            False -> effect.none()
+          }
           #(
             new_model,
             effect.batch([
@@ -679,6 +863,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                 Nil
               }),
               open_eff,
+              focus_eff,
             ]),
           )
         }
@@ -772,7 +957,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     )
     SelectChannel(id) ->
       with_active_room(model, fn(state) {
-        #(RoomState(..state, current_channel: id), effect.none())
+        // Switching channels should land focus on the composer so the
+        // user can start typing immediately. focus_textarea is a no-op
+        // if the textarea isn't mounted (e.g. mid-transition), so it's
+        // safe to dispatch unconditionally.
+        #(
+          RoomState(..state, current_channel: id),
+          effect.from(fn(_) { composer.focus_textarea("composer-textarea") }),
+        )
       })
     ToggleRoomsRail -> #(
       Model(..model, rooms_collapsed: !model.rooms_collapsed),
@@ -788,9 +980,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     IdentityReady(seed) -> {
       let create_client_eff =
         effect.from(fn(dispatch) {
-          sunset.create_client(seed, fn(client) {
-            dispatch(ClientReady(client))
-          })
+          sunset.create_client(
+            seed,
+            sunset.heartbeat_interval_ms_from_url(),
+            fn(client) { dispatch(ClientReady(client)) },
+          )
         })
       #(model, create_client_eff)
     }
@@ -862,6 +1056,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // wiring fires them yet — re-wire as part of the per-room
       // reactions follow-up.
 
+      // Bootstrap self-name from localStorage: restore the persisted name
+      // so the first presence heartbeat carries it.
+      let bootstrap_eff = case model.self_name {
+        "" -> effect.none()
+        name ->
+          effect.from(fn(_dispatch) {
+            sunset.set_self_name(client, name, fn() { Nil })
+          })
+      }
+
       // Insert placeholder RoomState for every joined room so the
       // shell renders fully even before the first RoomOpened lands.
       let rooms_with_placeholders =
@@ -878,6 +1082,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           connect_eff,
           open_active_eff,
           open_others_eff,
+          bootstrap_eff,
         ]),
       )
     }
@@ -908,7 +1113,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             dispatch(IncomingReceipt(
               name,
               sunset.rec_for_value_hash_hex(r),
-              short_pubkey(sunset.rec_from_pubkey(r)),
+              hex_encode(sunset.rec_from_pubkey(r)),
+              sunset.rec_sent_at_ms(r),
             ))
           })
           sunset.on_members_changed(handle, fn(ms) {
@@ -920,7 +1126,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             let inner_dict =
               list.fold(entries, dict.new(), fn(d, pair) {
                 let #(emoji, authors) = pair
-                dict.insert(d, emoji, set.from_list(authors))
+                dict.insert(d, emoji, dict.from_list(authors))
               })
             dispatch(ReactionsChanged(target, inner_dict))
           })
@@ -935,7 +1141,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let new_msg =
             domain.Message(
               id: sunset.inc_value_hash_hex(im),
-              author: short_pubkey(sunset.inc_author_pubkey(im)),
+              author_pubkey: sunset.inc_author_pubkey(im),
               initials: short_initials(sunset.inc_author_pubkey(im)),
               time: format_time_ms(sunset.inc_sent_at_ms(im)),
               body: sunset.inc_body(im),
@@ -943,7 +1149,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               you: sunset.inc_is_self(im),
               pending: False,
               reactions: [],
-              bridge: NoBridge,
               details: domain.NoDetails,
             )
           // Append; dedupe by id to handle Replay::All re-emits.
@@ -1013,15 +1218,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     }
     MessageSent(_) -> #(model, effect.none())
-    IncomingReceipt(name, message_id, from_pubkey) -> {
+    IncomingReceipt(name, message_id, from_pubkey, delivered_at_ms) -> {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
           let existing = case dict.get(state.receipts, message_id) {
-            Ok(s) -> s
-            Error(_) -> set.new()
+            Ok(d) -> d
+            Error(_) -> dict.new()
           }
-          let updated = set.insert(existing, from_pubkey)
+          let updated = dict.insert(existing, from_pubkey, delivered_at_ms)
           let new_state =
             RoomState(
               ..state,
@@ -1038,6 +1243,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
+          // Rebuild name_map: insert when raw_name is Some, delete when None.
+          let new_map =
+            list.fold(ms, model.name_map, fn(acc, m) {
+              let key = hex_encode(m.pubkey)
+              case m.raw_name {
+                option.Some(n) -> dict.insert(acc, key, n)
+                option.None -> dict.delete(acc, key)
+              }
+            })
           // If the open popover's target left, close it.
           let next_popover = case state.peer_status_popover {
             None -> None
@@ -1050,7 +1264,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let new_state =
             RoomState(..state, members: ms, peer_status_popover: next_popover)
           #(
-            Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
+            Model(
+              ..model,
+              rooms: dict.insert(model.rooms, name, new_state),
+              name_map: new_map,
+            ),
             effect.none(),
           )
         }
@@ -1168,6 +1386,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       with_active_room(model, fn(state) {
         #(RoomState(..state, peer_status_popover: None), effect.none())
       })
+    OpenRelayPopover(id) -> #(
+      Model(..model, relays_popover: option.Some(id)),
+      effect.none(),
+    )
+    CloseRelayPopover -> #(
+      Model(..model, relays_popover: option.None),
+      effect.none(),
+    )
     Tick(now) -> #(Model(..model, now_ms: now), effect.none())
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
@@ -1273,7 +1499,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Ok(snap) ->
           case dict.get(snap, emoji), self_pubkey_hex_opt {
             Ok(authors), Some(me) ->
-              case set.contains(authors, me) {
+              case dict.has_key(authors, me) {
                 True -> "remove"
                 False -> "add"
               }
@@ -1281,7 +1507,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         Error(_) -> "add"
       }
-      let next_model = Model(..model, full_picker_for: None)
+      let next_model =
+        Model(..model, full_picker_for: None, full_picker_anchor: None)
       let send_eff = case dict.get(model.rooms, active_name) {
         Ok(state) ->
           case state.handle {
@@ -1471,7 +1698,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(Model(..model, voice: new_voice), effect.none())
     }
 
-    OpenFullEmojiPicker(target) -> {
+    OpenFullEmojiPicker(target, anchor) -> {
       // Closing the per-room quick-picker prevents both pickers from
       // rendering at once; full picker takes over.
       let active_name = active_room_name(model)
@@ -1489,14 +1716,44 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let register_eff =
         effect.from(fn(_dispatch) { sunset.register_emoji_picker() })
       #(
-        Model(..model, rooms: rooms, full_picker_for: Some(target)),
+        Model(
+          ..model,
+          rooms: rooms,
+          full_picker_for: Some(target),
+          full_picker_anchor: anchor,
+        ),
         register_eff,
       )
     }
     CloseFullEmojiPicker -> #(
-      Model(..model, full_picker_for: None),
+      Model(..model, full_picker_for: None, full_picker_anchor: None),
       effect.none(),
     )
+    UpdateSelfName(value) -> {
+      let new_token = model.self_name_token + 1
+      let updated = Model(..model, self_name: value, self_name_token: new_token)
+      let commit_eff =
+        effect.from(fn(dispatch) {
+          schedule_self_name_commit(value, new_token, dispatch)
+        })
+      #(updated, commit_eff)
+    }
+    SelfNameCommit(value, token) -> {
+      case token == model.self_name_token {
+        False -> #(model, effect.none())
+        True -> {
+          storage.write_self_name(value)
+          let eff = case model.client {
+            Some(client) ->
+              effect.from(fn(_dispatch) {
+                sunset.set_self_name(client, value, fn() { Nil })
+              })
+            None -> effect.none()
+          }
+          #(model, eff)
+        }
+      }
+    }
   }
 }
 
@@ -1565,9 +1822,12 @@ fn room_view_with_state(
       }
     })
 
+  let resolved_messages =
+    resolve_messages(model.name_map, messages_with_live_reactions)
+
   let detail_msg = case state.sheet {
     Some(domain.DetailsSheet(message_id: id)) ->
-      find_message(messages_with_live_reactions, id)
+      find_message(resolved_messages, id)
     _ -> None
   }
 
@@ -1583,12 +1843,69 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
-  // Full emoji picker. Desktop renders a centered overlay; phone
-  // renders a bottom sheet. Each goes into its viewport's slot in
-  // `shell.view` (overlay / reaction_sheet) so only the right one is
-  // visible at a time.
-  let full_picker_overlay_el = case model.full_picker_for {
-    Some(target) ->
+  // Full emoji picker. Desktop renders a click-anchored overlay
+  // (placed above or below the trigger depending on viewport space);
+  // phone renders a bottom sheet. Each goes into its viewport's slot
+  // in `shell.view` so only the right one is visible at a time.
+  //
+  // Two desktop pieces:
+  //   * `full_picker_backdrop_el` — transparent, full-viewport, sits
+  //     just under the picker. Its only job is to dispatch
+  //     `CloseFullEmojiPicker` on click, giving the picker a normal
+  //     "click outside to dismiss" affordance.
+  //   * `full_picker_overlay_el` — the picker itself, positioned
+  //     against the click anchor stored in `full_picker_anchor`.
+  let full_picker_backdrop_el = case model.viewport, model.full_picker_for {
+    domain.Desktop, Some(_) ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "full-emoji-picker-backdrop"),
+          event.on_click(CloseFullEmojiPicker),
+          ui.css([
+            #("position", "fixed"),
+            #("inset", "0"),
+            #("background", "transparent"),
+            #("z-index", "99"),
+          ]),
+        ],
+        [],
+      )
+    _, _ -> element.fragment([])
+  }
+
+  let full_picker_overlay_el = case
+    model.viewport,
+    model.full_picker_for,
+    model.full_picker_anchor
+  {
+    domain.Desktop, Some(target), Some(#(anchor_y, viewport_h)) ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "full-emoji-picker-overlay"),
+          // Position the picker against the click anchor:
+          //   * `top` is clamped via CSS to keep the picker fully on-
+          //     screen even at the viewport edges.
+          //   * `left` is centered horizontally — the picker is
+          //     ~360px wide, so we offset by 180px and clamp to keep
+          //     a small gutter from the edges.
+          // Vertical placement flips above the trigger when there
+          // isn't ~`PICKER_HEIGHT + 16px` of room below the click,
+          // so the picker doesn't visually fall off the bottom of
+          // the viewport.
+          ui.css(picker_anchor_styles(palette, anchor_y, viewport_h)),
+        ],
+        [
+          emoji_picker.view(
+            palette: palette,
+            mode: model.mode,
+            on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+          ),
+        ],
+      )
+    domain.Desktop, Some(target), None ->
+      // Anchor data is missing (e.g. the picker was opened by some
+      // path other than the on-row "+" button). Fall back to the
+      // viewport-centered overlay so the picker is still reachable.
       html.div(
         [
           attribute.attribute("data-testid", "full-emoji-picker-overlay"),
@@ -1605,10 +1922,50 @@ fn room_view_with_state(
           ]),
         ],
         [
-          emoji_picker.view(fn(emoji) { ToggleReactionEmoji(target, emoji) }),
+          emoji_picker.view(
+            palette: palette,
+            mode: model.mode,
+            on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+          ),
         ],
       )
-    None -> element.fragment([])
+    _, _, _ -> element.fragment([])
+  }
+
+  let settings_overlay_el = case model.viewport, model.settings_open {
+    domain.Desktop, True ->
+      settings_popover.view(
+        palette: palette,
+        pref: model.theme_pref,
+        placement: settings_popover.Floating,
+        self_name: model.self_name,
+        on_change_name: UpdateSelfName,
+        on_select_pref: SetThemePref,
+        on_reset: ResetLocalState,
+        on_close: CloseSettings,
+      )
+    _, _ -> element.fragment([])
+  }
+
+  let settings_sheet_el = case model.viewport, model.settings_open {
+    domain.Phone, True ->
+      bottom_sheet.view(
+        palette: palette,
+        open: True,
+        on_close: CloseSettings,
+        test_id: "settings-sheet",
+        content: settings_popover.view(
+          palette: palette,
+          pref: model.theme_pref,
+          placement: settings_popover.InSheet,
+          self_name: model.self_name,
+          on_change_name: UpdateSelfName,
+          on_select_pref: SetThemePref,
+          on_reset: ResetLocalState,
+          on_close: CloseSettings,
+        ),
+      )
+    _, _ -> element.fragment([])
   }
 
   let full_picker_sheet_el = case model.full_picker_for {
@@ -1618,9 +1975,11 @@ fn room_view_with_state(
         open: True,
         on_close: CloseFullEmojiPicker,
         test_id: "full-emoji-picker-sheet",
-        content: emoji_picker.view(fn(emoji) {
-          ToggleReactionEmoji(target, emoji)
-        }),
+        content: emoji_picker.view(
+          palette: palette,
+          mode: model.mode,
+          on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+        ),
       )
     None -> element.fragment([])
   }
@@ -1648,7 +2007,7 @@ fn room_view_with_state(
 
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
-      case find_message(messages_with_live_reactions, id) {
+      case find_message(resolved_messages, id) {
         Some(m) ->
           bottom_sheet.view(
             palette: palette,
@@ -1659,7 +2018,9 @@ fn room_view_with_state(
               palette: palette,
               message: m,
               receipts: receipts_for(state.receipts, m.id),
+              reactions: reactions_for(model.reactions, m.id),
               members: state.members,
+              name_map: model.name_map,
               on_close: CloseDetail,
             ),
           )
@@ -1718,6 +2079,30 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
+  let relay_sheet_el = case model.viewport, model.relays_popover {
+    domain.Phone, Some(id) -> {
+      let rs = relays_view.relays_for_view(model.intents)
+      case list.find(rs, fn(r) { r.id == id }) {
+        Ok(r) ->
+          bottom_sheet.view(
+            palette: palette,
+            open: True,
+            on_close: CloseRelayPopover,
+            test_id: "relay-sheet",
+            content: relays_view.popover(
+              palette: palette,
+              relay: r,
+              now_ms: model.now_ms,
+              placement: relays_view.InSheet,
+              on_close: CloseRelayPopover,
+            ),
+          )
+        Error(_) -> element.fragment([])
+      }
+    }
+    _, _ -> element.fragment([])
+  }
+
   // Use real voice model state: show minibar when user is in call.
   let user_in_call = option.is_some(model.voice.self_in_call)
 
@@ -1750,7 +2135,6 @@ fn room_view_with_state(
     model.rooms_collapsed,
     detail_msg != None,
     model.drawer,
-    ToggleMode,
     CloseDrawer,
     rooms.view(
       palette: palette,
@@ -1776,8 +2160,7 @@ fn room_view_with_state(
       toggle: ToggleRoomsRail,
       viewport: model.viewport,
       members: state.members,
-      mode: model.mode,
-      on_toggle_mode: ToggleMode,
+      on_open_settings: OpenSettings,
     ),
     channels.view(
       palette: palette,
@@ -1800,12 +2183,14 @@ fn room_view_with_state(
       self_in_call: option.is_some(model.voice.self_in_call),
       self_muted: model.voice.self_muted,
       self_deafened: model.voice.self_deafened,
+      relays: relays_view.relays_for_view(model.intents),
+      on_open_relay: OpenRelayPopover,
     ),
     main_panel.view(
       palette: palette,
       viewport: model.viewport,
       current_channel: state.current_channel,
-      messages: messages_with_live_reactions,
+      messages: resolved_messages,
       draft: state.draft,
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
@@ -1829,6 +2214,7 @@ fn room_view_with_state(
       on_toggle_spoiler: fn(k: markdown.SpoilerKey) {
         ToggleSpoiler(k.message_id, k.path)
       },
+      members: state.members,
       voice_minibar: voice_minibar_el,
     ),
     case model.viewport, detail_msg {
@@ -1837,7 +2223,9 @@ fn room_view_with_state(
           palette: palette,
           message: m,
           receipts: receipts_for(state.receipts, m.id),
+          reactions: reactions_for(model.reactions, m.id),
           members: state.members,
+          name_map: model.name_map,
           on_close: CloseDetail,
         )
       _, _ ->
@@ -1850,6 +2238,8 @@ fn room_view_with_state(
     element.fragment([
       voice_popover_overlay(palette, model, state, members_for_channels),
       peer_status_popover_overlay(palette, model, state),
+      relay_popover_overlay(palette, model),
+      full_picker_backdrop_el,
       full_picker_overlay_el,
       case model.voice.permission_error {
         Some(msg) ->
@@ -1860,6 +2250,7 @@ fn room_view_with_state(
           )
         None -> element.fragment([])
       },
+      settings_overlay_el,
     ]),
     phone_header.view(
       palette: palette,
@@ -1869,8 +2260,12 @@ fn room_view_with_state(
     ),
     details_sheet_el,
     voice_sheet_el,
-    peer_status_sheet_el,
-    element.fragment([reaction_sheet_el, full_picker_sheet_el]),
+    element.fragment([peer_status_sheet_el, relay_sheet_el]),
+    element.fragment([
+      reaction_sheet_el,
+      full_picker_sheet_el,
+      settings_sheet_el,
+    ]),
   )
 }
 
@@ -1928,6 +2323,45 @@ fn peer_status_popover_overlay(
   }
 }
 
+fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
+  case model.viewport, model.relays_popover {
+    domain.Desktop, Some(id) -> {
+      let rs = relays_view.relays_for_view(model.intents)
+      case list.find(rs, fn(r) { r.id == id }) {
+        Ok(r) ->
+          relays_view.popover(
+            palette: palette,
+            relay: r,
+            now_ms: model.now_ms,
+            placement: relays_view.Floating(
+              anchor_left_px: rooms_rail_width_px(model.rooms_collapsed)
+              + channels_rail_width_px
+              + 8,
+            ),
+            on_close: CloseRelayPopover,
+          )
+        Error(_) -> element.fragment([])
+      }
+    }
+    _, _ -> element.fragment([])
+  }
+}
+
+/// Mirrors `shell.desktop_view`'s grid-template-columns rooms slot.
+/// Kept here (and not threaded as a constant from `shell`) because the
+/// only desktop overlay that needs the channels-rail right edge is the
+/// relay popover, and Lustre doesn't measure layout from the inside —
+/// the popover's `left` has to come from the layout's source of truth.
+fn rooms_rail_width_px(collapsed: Bool) -> Int {
+  case collapsed {
+    True -> 54
+    False -> 260
+  }
+}
+
+/// Mirrors `shell.desktop_view`'s grid-template-columns channels slot.
+const channels_rail_width_px: Int = 230
+
 fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
   let needle = string.lowercase(string.trim(search))
   case needle {
@@ -1982,7 +2416,6 @@ fn synthetic_room(
     status: relay_status_pill(intents),
     last_active: "now",
     unread: 0,
-    bridge: NoBridge,
   )
 }
 
@@ -2007,7 +2440,68 @@ pub fn relay_status_pill(
   }
 }
 
-fn find_message(ms: List(Message), id: String) -> Option(Message) {
+/// Compute inline styles for the desktop full-emoji-picker overlay
+/// based on the click anchor (`anchor_y` is the click's `clientY`,
+/// `viewport_h` is the live `view.innerHeight`).
+///
+/// Placement rule: open below the trigger when there's at least one
+/// picker height + 16px of room; otherwise flip above. Horizontal
+/// position is centered on the right side of the chat (the trigger
+/// always sits in the message-row toolbar at the right edge), with a
+/// `clamp` to keep the picker fully on-screen. The picker is sized
+/// at ~360×400px by emoji-picker-element's defaults.
+fn picker_anchor_styles(
+  palette: theme.Palette,
+  anchor_y: Float,
+  viewport_h: Float,
+) -> List(#(String, String)) {
+  let picker_h = 410.0
+  let gap = 8.0
+  let space_below = viewport_h -. anchor_y
+  // Vertical placement:
+  //   * room below → place picker just below the trigger
+  //   * not enough room below → flip above the trigger
+  let top_css = case space_below >. picker_h +. gap {
+    True ->
+      "clamp(8px, "
+      <> float_px(anchor_y +. gap)
+      <> ", calc(100dvh - "
+      <> float_px(picker_h +. 8.0)
+      <> "))"
+    False ->
+      "clamp(8px, "
+      <> float_px(anchor_y -. picker_h -. gap)
+      <> ", calc(100dvh - "
+      <> float_px(picker_h +. 8.0)
+      <> "))"
+  }
+  // Horizontal: keep the picker right-anchored in the chat column —
+  // the trigger sits at the right edge of the message row, so
+  // pinning the picker's right edge a small gutter inside the
+  // viewport's right edge feels natural.
+  let right_css = "clamp(8px, 16px, calc(100dvw - 372px))"
+  [
+    #("position", "fixed"),
+    #("top", top_css),
+    #("right", right_css),
+    #("z-index", "100"),
+    #("background", palette.surface),
+    #("border", "1px solid " <> palette.border),
+    #("border-radius", "8px"),
+    #("box-shadow", palette.shadow_lg),
+  ]
+}
+
+fn float_px(n: Float) -> String {
+  // Round-down formatting that keeps CSS happy without printing a
+  // trailing decimal for whole-pixel values.
+  float.to_string(n) <> "px"
+}
+
+fn find_message(
+  ms: List(domain.MessageView),
+  id: String,
+) -> Option(domain.MessageView) {
   list.find(ms, fn(m) { m.id == id })
   |> option.from_result
 }
@@ -2058,17 +2552,17 @@ fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
 /// `by_you` flag; `None` (no client yet) treats every reaction as
 /// not-by-you so the UI doesn't lie.
 fn snapshot_to_reactions(
-  snapshot: Dict(String, Set(String)),
+  snapshot: Dict(String, Dict(String, Int)),
   self_pubkey_hex: Option(String),
 ) -> List(domain.Reaction) {
   dict.to_list(snapshot)
   |> list.filter_map(fn(pair) {
     let #(emoji, authors) = pair
-    case set.size(authors) {
+    case dict.size(authors) {
       0 -> Error(Nil)
       n -> {
         let by_you = case self_pubkey_hex {
-          Some(me) -> set.contains(authors, me)
+          Some(me) -> dict.has_key(authors, me)
           None -> False
         }
         Ok(domain.Reaction(emoji: emoji, count: n, by_you: by_you))
@@ -2081,27 +2575,50 @@ fn client_pubkey_hex(c: ClientHandle) -> String {
   sunset.client_public_key_hex(c)
 }
 
-fn receipts_for(receipts: Dict(String, Set(String)), id: String) -> Set(String) {
+fn receipts_for(
+  receipts: Dict(String, Dict(String, Int)),
+  id: String,
+) -> Dict(String, Int) {
   case dict.get(receipts, id) {
-    Ok(s) -> s
-    Error(_) -> set.new()
+    Ok(d) -> d
+    Error(_) -> dict.new()
+  }
+}
+
+/// Reactions for a single message id, keyed by `model.reactions[message_id]`.
+/// Returns the empty dict when the engine hasn't surfaced any reactions for
+/// that message yet so the details panel can render an empty section
+/// instead of branching at the call site.
+fn reactions_for(
+  reactions: Dict(String, Dict(String, Dict(String, Int))),
+  id: String,
+) -> Dict(String, Dict(String, Int)) {
+  case dict.get(reactions, id) {
+    Ok(d) -> d
+    Error(_) -> dict.new()
   }
 }
 
 fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
   list.map(ms, fn(m) {
     let pk = sunset.mem_pubkey(m)
+    let raw = sunset.mem_name(m)
+    let name = case raw {
+      option.Some(n) -> n
+      option.None -> short_pubkey(pk)
+    }
     domain.Member(
       id: domain.MemberId(short_pubkey(pk)),
-      name: short_pubkey(pk),
+      name: name,
       initials: short_initials(pk),
       status: presence_to_status(sunset.mem_presence(m)),
       relay: connection_mode_to_relay(sunset.mem_connection_mode(m)),
       you: sunset.mem_is_self(m),
       in_call: False,
-      bridge: domain.NoBridge,
       role: domain.NoRole,
       last_heartbeat_ms: sunset.mem_last_heartbeat_ms(m),
+      raw_name: raw,
+      pubkey: pk,
     )
   })
 }
@@ -2153,7 +2670,9 @@ fn phone_reaction_grid(
         attribute.title("More reactions"),
         attribute.attribute("aria-label", "More reactions"),
         attribute.attribute("data-testid", "reaction-picker-more"),
-        event.on_click(OpenFullEmojiPicker(message_id)),
+        // Mobile uses the bottom-sheet variant of the full picker; no
+        // anchor is needed (the sheet is its own placement).
+        event.on_click(OpenFullEmojiPicker(message_id, None)),
         ui.css([
           #("padding", "12px"),
           #("font-size", "26px"),

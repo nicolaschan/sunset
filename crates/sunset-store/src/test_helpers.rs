@@ -109,6 +109,8 @@ where
     subscribe_emits_expired_event(&store_factory().await).await;
     subscribe_emits_blob_added_event(&store_factory().await).await;
     subscribe_emits_blob_removed_event(&store_factory().await).await;
+    put_content_emits_blob_added(&store_factory().await).await;
+    put_content_idempotent_does_not_re_emit_blob_added(&store_factory().await).await;
 }
 
 /// Test: insert + get_entry roundtrip.
@@ -481,6 +483,70 @@ pub async fn subscribe_emits_blob_added_event<S: Store>(store: &S) {
     } else {
         unreachable!()
     }
+}
+
+/// Test: `put_content` with a new blob emits `Event::BlobAdded` to all subscribers.
+///
+/// Necessary contract because sync's `handle_blob_response` path uses
+/// `put_content` to deliver late blocks, and downstream subscribers
+/// (e.g. the membership tracker's BlobAdded retry) depend on the event firing.
+///
+/// The subscriber filter intentionally does NOT match any writer key;
+/// BlobAdded must be delivered regardless of subscription filter.
+pub async fn put_content_emits_blob_added<S: Store>(store: &S) {
+    let b = ContentBlock {
+        data: bytes::Bytes::from_static(b"put-content-blob-added test"),
+        references: vec![],
+    };
+    let hash = b.hash();
+    let mut s = store
+        .subscribe(Filter::Keyspace(vk(b"unrelated-watcher")), Replay::None)
+        .await
+        .unwrap();
+    let put_hash = store.put_content(b).await.unwrap();
+    assert_eq!(put_hash, hash);
+    let evt = next_matching(&mut s, |e| matches!(e, Event::BlobAdded(_))).await;
+    if let Event::BlobAdded(h) = evt {
+        assert_eq!(h, hash);
+    } else {
+        unreachable!()
+    }
+}
+
+/// Test: `put_content` of an already-present blob does NOT re-emit `Event::BlobAdded`.
+pub async fn put_content_idempotent_does_not_re_emit_blob_added<S: Store>(store: &S) {
+    let b = ContentBlock {
+        data: bytes::Bytes::from_static(b"put-content-idempotent test"),
+        references: vec![],
+    };
+    let hash = b.hash();
+    // First put: fires BlobAdded (we don't care about it here).
+    store.put_content(b.clone()).await.unwrap();
+
+    // Subscribe after the first put so we only see events from the second put.
+    let mut s = store
+        .subscribe(Filter::Keyspace(vk(b"unrelated-watcher")), Replay::None)
+        .await
+        .unwrap();
+    // Second put of the same content: should NOT fire BlobAdded.
+    store.put_content(b).await.unwrap();
+    let timeout = std::time::Duration::from_millis(100);
+    let result = tokio::time::timeout(timeout, async {
+        use futures::StreamExt;
+        loop {
+            match s.next().await {
+                Some(Ok(Event::BlobAdded(h))) if h == hash => return Some(h),
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => panic!("stream error: {:?}", err),
+                None => return None,
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_err() || matches!(result, Ok(None)),
+        "second put_content of same blob should not re-emit BlobAdded"
+    );
 }
 
 /// Test: `gc_blobs()` emits `Event::BlobRemoved` to all subscribers for each reclaimed blob.

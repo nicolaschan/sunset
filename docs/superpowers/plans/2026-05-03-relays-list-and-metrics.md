@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the dummy "minecraft bridge" channels-rail entry with a real "Relays" list driven by the supervisor's per-intent snapshot stream, including live last-pong-at and round-trip-time per relay. Click-through opens a popover (floating on desktop, bottom sheet on phone) with full metrics.
+**Goal:** Replace the dummy "minecraft bridge" channels-rail entry with a real "Relays" list driven by the supervisor's existing `IntentSnapshot` stream, including live last-pong-at and round-trip-time per relay. Click-through opens a popover (floating on desktop, bottom sheet on phone) with full metrics.
 
-**Architecture:** Three layers change; the wire format does not. (1) `sunset-sync` measures RTT in the existing per-peer liveness loop and emits `EngineEvent::PongObserved`, which the supervisor folds into `IntentSnapshot.{last_pong_at_unix_ms, last_rtt_ms}`. (2) The wasm bridge enriches `intent_snapshot_to_js` with the new fields and accepts a `heartbeat_interval_ms` constructor parameter (e2e-only). (3) The Gleam app subscribes to `on_peer_connection_state` at Client construction, filters relay-scheme intents, and renders a "Relays" rail section + popover that mirrors `peer_status_popover`'s desktop/phone-sheet placement.
+**Architecture:** PR #23 already landed the `Connectable + IntentId` supervisor refactor and the `intents: Dict(Float, IntentSnapshot)` model in Gleam. This plan adds (a) liveness measurement: `EngineEvent::PongObserved` from the per-peer task → supervisor folds into new `IntentSnapshot.{last_pong_at_unix_ms, last_rtt_ms}` fields, (b) wasm-bridge enrichment of `IntentSnapshotJs` with the new fields and a `heartbeat_interval_ms` constructor arg, and (c) the Gleam `Relay` view-model + `views/relays.gleam` (rail section + popover) on top of the already-live `IntentChanged` stream. Direct WebRTC peers are filtered out by inspecting the `label` field's scheme (`webrtc://...`).
 
-**Tech Stack:** Rust workspace (stable), tokio (current_thread), `web_time::SystemTime` for cross-platform wall-clock, wasm-bindgen, Gleam (lustre), Playwright.
+**Tech Stack:** Rust workspace (stable), tokio (current_thread), `web_time::SystemTime` for cross-platform wall-clock, wasm-bindgen, Gleam (lustre, gleam/uri), Playwright.
 
 **Spec:** [`docs/superpowers/specs/2026-05-03-relays-list-and-metrics-design.md`](../specs/2026-05-03-relays-list-and-metrics-design.md)
 
@@ -15,41 +15,42 @@
 ## File structure
 
 **Modify (Rust — sunset-sync):**
-- `crates/sunset-sync/src/peer.rs` — change `pong_tx`/`pong_rx` carry to `web_time::Instant` send-time; in the liveness loop, on Pong receipt compute `rtt_ms = now − send_time` and emit `InboundEvent::PongObserved`.
-- `crates/sunset-sync/src/engine.rs` — new `InboundEvent::PongObserved` variant; new `EngineEvent::PongObserved`; `handle_inbound_event` re-emits to engine subscribers.
-- `crates/sunset-sync/src/supervisor.rs` — add `last_pong_at_unix_ms` / `last_rtt_ms` to `IntentEntry` and `IntentSnapshot`; new `EngineEvent::PongObserved` arm in `handle_engine_event`; update `Snapshot` command and `broadcast` to include new fields; preserve fields across Backoff transitions; clear on `Remove`.
+- `crates/sunset-sync/src/peer.rs` — change the `pong_tx`/`pong_rx` channel to carry the Pong's nonce; in the liveness loop, stamp `last_ping_sent_at` on each send and on Pong receipt compute `rtt_ms` and emit `InboundEvent::PongObserved`.
+- `crates/sunset-sync/src/engine.rs` — add `InboundEvent::PongObserved` and `EngineEvent::PongObserved` variants; `handle_inbound_event` re-emits.
+- `crates/sunset-sync/src/supervisor.rs` — add `last_pong_at_unix_ms` / `last_rtt_ms` to `IntentEntry` + `IntentSnapshot`; add a `PongObserved` arm to `handle_engine_event`; update `broadcast` and the `Snapshot` builder to emit the new fields; preserve them across `Backoff` transitions.
 
 **Modify (Rust — sunset-web-wasm):**
-- `crates/sunset-web-wasm/src/client.rs` — `Client::new` accepts a `heartbeat_interval_ms: u32` (0 = use default) and writes through to `SyncConfig`; `intent_snapshot_to_js` writes `last_pong_at_unix_ms` and `last_rtt_ms` when `Some`.
+- `crates/sunset-web-wasm/src/intent.rs` — add `last_pong_at_unix_ms: Option<f64>` and `last_rtt_ms: Option<f64>` to `IntentSnapshotJs`; update the `From<&IntentSnapshot>` impl.
+- `crates/sunset-web-wasm/src/client.rs` — `Client::new` gains a `heartbeat_interval_ms: u32` (0 = use SyncConfig default of 15 s); when non-zero, sets `SyncConfig.heartbeat_interval = Duration::from_millis(n)` and `heartbeat_timeout = 3 × interval`.
 
 **Modify (Gleam):**
-- `web/src/sunset_web/domain.gleam` — add `Relay`, `RelayConnState`; remove `Bridge(_)` from `ChannelKind`, remove the `BridgeOpt`/`HasBridge`/`NoBridge`/`BridgeKind`/`Minecraft` types and the `bridge:` field from `Room`/`Member`/`Message`.
-- `web/src/sunset_web/fixture.gleam` — drop `minecraft-bridge` channel and all `bridge:` field usage.
-- `web/src/sunset_web/views/main_panel.gleam` — drop `bridge_tag` rendering and the `case m.bridge` branch.
-- `web/src/sunset_web/views/channels.gleam` — replace the `bridge_channels` filter and "Bridges" `section(...)` with a call to `relays.rail_section(...)`. Add `relays` parameter to `view`.
-- `web/src/sunset_web/sunset.gleam` — declare new externals: `subscribe_peer_connections`, `peer_connection_snapshot`, `heartbeat_interval_ms_from_url`, plus a record type for the JS-side intent snapshot accessors.
-- `web/src/sunset_web/sunset.ffi.mjs` — add `subscribePeerConnections`, `peerConnectionSnapshot`, `heartbeatIntervalMsFromUrl` JS shims; pass the URL-param value as second arg to `new Client(seed, heartbeatIntervalMs)`.
-- `web/src/sunset_web.gleam` — Model gains `relays: List(Relay)` and `relays_popover: Option(String)`; new Msgs `PeerConnectionSnapshotSeed`, `PeerConnectionStateUpdated`, `OpenRelayPopover(String)`, `CloseRelayPopover`; init effect seeds + subscribes; channels.view gets `relays` and `OpenRelayPopover` callback; popover overlay branches mounted alongside `peer_status_popover_overlay` (Floating desktop, in-bottom_sheet phone).
+- `web/src/sunset_web/sunset.ffi.mjs` — `createClient` shim grows `heartbeatIntervalMs` arg and forwards to `new Client(seed, hb)`; `onIntentChanged` shim's `new IntentSnapshot(...)` constructor call grows two args reading `snap.last_pong_at_unix_ms` / `snap.last_rtt_ms`; new `heartbeatIntervalMsFromUrl()` shim.
+- `web/src/sunset_web/sunset.gleam` — `IntentSnapshot` record gains two `Option(Int)` fields; `create_client` external grows the heartbeat arg; new `heartbeat_interval_ms_from_url` external.
+- `web/src/sunset_web/domain.gleam` — drop `Bridge(BridgeKind)` from `ChannelKind`; drop `BridgeKind`, `BridgeOpt`, `HasBridge`, `NoBridge`, `BridgeRelay`; drop `bridge:` from `Room` / `Member` / `Message`; add `RelayConnState` and `Relay` view-model types.
+- `web/src/sunset_web/fixture.gleam` — drop the `minecraft-bridge` channel and every `bridge:` field; update imports.
+- `web/src/sunset_web/views/main_panel.gleam` — drop `bridge_tag` and the `case m.bridge` branch.
+- `web/src/sunset_web/views/channels.gleam` — replace the `bridge_channels` filter and "Bridges" section with `relays_view.rail_section(...)`; add `relays` and `on_open_relay` parameters.
+- `web/src/sunset_web.gleam` — Model gains `relays_popover: Option(Float)`; new Msgs `OpenRelayPopover(Float)` / `CloseRelayPopover`; pass heartbeat URL param to `create_client`; add `relays_for_view(model.intents)` view-helper; mount popover overlays alongside `peer_status_popover_overlay` (Floating on desktop, in-bottom_sheet on phone).
+- `web/test/relay_status_pill_test.gleam` — fix `IntentSnapshot` constructor calls to pass `option.None, option.None` for the two new fields. No assertion changes.
 
-**Create (Rust):**
-- New unit tests inline in `crates/sunset-sync/src/peer.rs`, `engine.rs`, and `supervisor.rs`.
+**Create (Rust unit tests):** appended into `peer.rs`, `engine.rs`, `supervisor.rs` `#[cfg(test)]` blocks.
 
 **Create (Gleam):**
-- `web/src/sunset_web/views/relays.gleam` — `rail_section` + `popover` (with `Placement = Floating | InSheet`), plus pure helpers `parse_host`, `is_relay_addr`, `format_status`, `format_rtt`, `humanize_age` (the last copied — kept duplicated per the spec rather than pre-extracting a shared helper).
+- `web/src/sunset_web/views/relays.gleam` — `rail_section`, `popover` (with `Placement = Floating | InSheet`), pure helpers (`is_relay_label`, `parse_host`, `parse_state`, `format_status`, `format_rtt`, `humanize_age`, `short_peer_id`, `from_intent`, `relays_for_view`).
 - `web/test/sunset_web/views/relays_test.gleam` — pure-function tests.
-- `web/e2e/relays.spec.js` — Playwright e2e covering desktop + phone bottom-sheet placement.
+- `web/e2e/relays.spec.js` — Playwright covering desktop + phone bottom sheet.
 
 ---
 
-## Task 1 — Add `EngineEvent::PongObserved` and `InboundEvent::PongObserved`
+## Task 1 — Add `EngineEvent::PongObserved` + `InboundEvent::PongObserved`
 
 **Files:**
-- Modify: `crates/sunset-sync/src/engine.rs:90-98` (add EngineEvent variant)
-- Modify: `crates/sunset-sync/src/peer.rs:15-52` (add InboundEvent variant)
+- Modify: `crates/sunset-sync/src/engine.rs:90-98` (EngineEvent variants)
+- Modify: `crates/sunset-sync/src/peer.rs:15-52` (InboundEvent variants)
 
 - [ ] **Step 1.1: Add `InboundEvent::PongObserved` variant**
 
-In `crates/sunset-sync/src/peer.rs`, append a variant to the `InboundEvent` enum:
+In `crates/sunset-sync/src/peer.rs`, append a variant to `InboundEvent`:
 
 ```rust
     /// A `Pong` was received from a peer; carries the round-trip time
@@ -80,10 +81,10 @@ In `crates/sunset-sync/src/engine.rs:90-98`, append:
     },
 ```
 
-- [ ] **Step 1.3: Verify the workspace still builds (no handlers yet)**
+- [ ] **Step 1.3: Verify the workspace still builds**
 
 Run: `nix develop --command cargo build -p sunset-sync 2>&1 | tail -10`
-Expected: builds cleanly. The `match`es over `InboundEvent` are non-exhaustive at all current call sites except `handle_inbound_event`; add it there in Task 3.
+Expected: builds. If a `match event` over `InboundEvent` errors with "non-exhaustive patterns: `PongObserved { .. }` not covered", add a temporary `InboundEvent::PongObserved { .. } => {}` arm in `handle_inbound_event` so the build is green; Task 3 replaces it with the real handler.
 
 - [ ] **Step 1.4: Commit**
 
@@ -94,7 +95,7 @@ sunset-sync: add InboundEvent and EngineEvent PongObserved variants
 
 Carries per-peer liveness (RTT and wall-clock observed-at) so the
 supervisor can surface it to applications via IntentSnapshot. No
-producer or consumer yet — wired in subsequent tasks.
+producer or consumer wired yet — populated in subsequent tasks.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -106,16 +107,16 @@ EOF
 ## Task 2 — Liveness loop measures RTT and emits `InboundEvent::PongObserved`
 
 **Files:**
-- Modify: `crates/sunset-sync/src/peer.rs` (`recv_reliable_task` and `liveness_task` — change pong channel payload, send PongObserved)
+- Modify: `crates/sunset-sync/src/peer.rs` (`recv_reliable_task` Pong arm, `liveness_task`)
 
-- [ ] **Step 2.1: Change `pong_tx`/`pong_rx` to carry the receive instant + nonce**
+- [ ] **Step 2.1: Change `pong_tx`/`pong_rx` to carry the Pong's nonce**
 
 In `crates/sunset-sync/src/peer.rs:186`, replace the `pong_tx` channel definition:
 
 ```rust
     // Pong delivery channel: recv_reliable_task forwards every observed
-    // Pong here so the liveness_task can update last_pong_at AND emit
-    // PongObserved with measured RTT, without sharing mutable state
+    // Pong's nonce here so the liveness_task can update last_pong_at AND
+    // emit PongObserved with measured RTT, without sharing mutable state
     // across tasks. The `nonce` is the Pong's echoed nonce — informational
     // for logs; RTT is measured against `last_ping_sent_at` in the
     // liveness loop, which is correct because at most one Ping is in
@@ -134,7 +135,7 @@ In `recv_reliable_task` (around line 216-219), change the Pong handler:
 
 - [ ] **Step 2.2: Track ping send time and emit PongObserved on receipt**
 
-Replace the entire `liveness_task` block in `crates/sunset-sync/src/peer.rs:305-359` with:
+Replace the entire `liveness_task` block in `crates/sunset-sync/src/peer.rs` (currently lines 305-359) with:
 
 ```rust
     let liveness_task = {
@@ -215,25 +216,22 @@ Replace the entire `liveness_task` block in `crates/sunset-sync/src/peer.rs:305-
 - [ ] **Step 2.3: Compile-check**
 
 Run: `nix develop --command cargo build -p sunset-sync 2>&1 | tail -10`
-Expected: builds. (The new `InboundEvent` variant still hits a non-exhaustive `match` in `handle_inbound_event`; we wire that in the next task.)
-
-If it errors with "non-exhaustive patterns: `PongObserved { .. }` not covered", add a temporary `InboundEvent::PongObserved { .. } => {}` arm in `handle_inbound_event` so this task compiles independently. Task 3 replaces it with the real handler.
+Expected: builds. If the `handle_inbound_event` placeholder from Step 1.3 isn't yet in place, add it now (`InboundEvent::PongObserved { .. } => {}`).
 
 - [ ] **Step 2.4: Add a peer-task unit test**
 
-Append to the `#[cfg(test)] mod tests` block in `crates/sunset-sync/src/peer.rs`. (If no such block exists, create it at the file's end.) The test drives the per-peer task with the existing `test_transport` fixtures and asserts a `PongObserved` event lands on `inbound_rx` after the peer task receives a Pong:
+Inspect `crates/sunset-sync/src/test_transport.rs` to learn the actual fixture API (struct names, `feed`/`drain_one`-style methods). Append to the existing `#[cfg(test)] mod tests` block in `crates/sunset-sync/src/peer.rs` (or create one). The test drives the per-peer task, responds Hello + Pong, and asserts an `InboundEvent::PongObserved` lands on `inbound_rx`:
 
 ```rust
 #[cfg(test)]
-mod liveness_tests {
+mod liveness_pong_observed_tests {
     use super::*;
     use crate::engine::ConnectionId;
-    use crate::test_transport::{InMemoryConn, InMemoryPair};
     use crate::transport::TransportKind;
     use std::time::Duration;
     use sunset_store::VerifyingKey;
 
-    fn peer(b: &[u8]) -> PeerId {
+    fn peer(b: &[u8; 32]) -> PeerId {
         PeerId(VerifyingKey::new(Bytes::copy_from_slice(b)))
     }
 
@@ -242,12 +240,20 @@ mod liveness_tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let pair = InMemoryPair::new(TransportKind::Secondary);
-                let local_id = peer(b"local-aaaaaaaaaaaaaaaaaaaaaaaaaa");
-                let remote_id = peer(b"remote-aaaaaaaaaaaaaaaaaaaaaaaa");
+                // Adapt to the actual TestTransport / InMemoryPair API
+                // exposed by `crate::test_transport`. Concretely we need:
+                //   * a connection that the per-peer task drives, and
+                //   * a "remote" handle to inject Hello + Pong and to
+                //     drain whatever the local side sends.
+                let pair = crate::test_transport::InMemoryPair::new(
+                    TransportKind::Secondary,
+                );
+                let local_id = peer(&[1u8; 32]);
+                let remote_id = peer(&[2u8; 32]);
                 let env = PeerEnv {
                     local_peer: local_id.clone(),
-                    protocol_version: crate::types::SyncConfig::default().protocol_version,
+                    protocol_version: crate::types::SyncConfig::default()
+                        .protocol_version,
                     heartbeat_interval: Duration::from_millis(20),
                     heartbeat_timeout: Duration::from_secs(5),
                 };
@@ -264,33 +270,30 @@ mod liveness_tests {
                     inbound_tx,
                     None,
                 ));
-                // Peer-side: respond to Hello with Hello, then echo Ping → Pong.
                 pair.remote
-                    .feed(crate::message::SyncMessage::Hello {
-                        protocol_version: crate::types::SyncConfig::default().protocol_version,
+                    .feed(SyncMessage::Hello {
+                        protocol_version: crate::types::SyncConfig::default()
+                            .protocol_version,
                         peer_id: remote_id.clone(),
                     })
                     .await;
-                // Drain Hello from local outbound side.
-                let _hello_out = pair.remote.drain_one().await.expect("hello");
-                // Wait for first Ping; respond with Pong of the same nonce.
+                let _hello_out = pair.remote.drain_one().await.expect("hello out");
                 tokio::time::advance(Duration::from_millis(25)).await;
-                let ping = pair.remote.drain_one().await.expect("ping");
+                let ping = pair.remote.drain_one().await.expect("ping out");
                 let nonce = match ping {
-                    crate::message::SyncMessage::Ping { nonce } => nonce,
+                    SyncMessage::Ping { nonce } => nonce,
                     other => panic!("expected Ping, got {other:?}"),
                 };
-                pair.remote
-                    .feed(crate::message::SyncMessage::Pong { nonce })
-                    .await;
-                // Drain inbound until we see a PongObserved.
+                pair.remote.feed(SyncMessage::Pong { nonce }).await;
                 let mut found = None;
                 for _ in 0..32 {
                     if let Ok(Some(ev)) = tokio::time::timeout(
                         Duration::from_millis(50),
                         inbound_rx.recv(),
-                    ).await {
-                        if let InboundEvent::PongObserved { rtt_ms, peer_id, .. } = &ev {
+                    )
+                    .await
+                    {
+                        if let InboundEvent::PongObserved { peer_id, rtt_ms, .. } = &ev {
                             assert_eq!(peer_id, &remote_id);
                             found = Some(*rtt_ms);
                             break;
@@ -298,7 +301,6 @@ mod liveness_tests {
                     }
                 }
                 let rtt = found.expect("no PongObserved seen");
-                // RTT is non-negative by type; assertion documents the contract.
                 assert!(rtt < 5_000, "RTT should be small under paused time");
             })
             .await;
@@ -306,12 +308,12 @@ mod liveness_tests {
 }
 ```
 
-If `test_transport`'s `InMemoryPair`/`feed`/`drain_one` shape differs from what's used here, adjust to the fixture's actual API (read `crates/sunset-sync/src/test_transport.rs`). The test's contract — drive Hello → expect Ping → respond Pong → assert PongObserved with non-zero `rtt_ms` — does not change.
+If the `InMemoryPair` / `feed` / `drain_one` shape differs in `test_transport.rs`, adapt to whatever exists. The test's contract — drive Hello → expect Ping → respond Pong → assert `InboundEvent::PongObserved` — does not change. If no per-peer-task test infra exists at all, write a minimal `Conn` mock inline that satisfies `TransportConnection`; do not give up on the test.
 
 - [ ] **Step 2.5: Run the test**
 
-Run: `nix develop --command cargo test -p sunset-sync liveness_tests::liveness_emits_pong_observed_with_rtt -- --nocapture 2>&1 | tail -25`
-Expected: PASS. If the assertion `assert!(rtt < 5_000, ...)` fails because `tokio::time::advance` skipped past the heartbeat, that's still a meaningful PongObserved — relax the upper bound or remove if needed, but DO NOT relax the "non-negative" property.
+Run: `nix develop --command cargo test -p sunset-sync liveness_pong_observed -- --nocapture 2>&1 | tail -30`
+Expected: PASS.
 
 - [ ] **Step 2.6: Commit**
 
@@ -339,11 +341,11 @@ EOF
 ## Task 3 — Engine re-emits `InboundEvent::PongObserved` as `EngineEvent::PongObserved`
 
 **Files:**
-- Modify: `crates/sunset-sync/src/engine.rs:481-` (`handle_inbound_event`)
+- Modify: `crates/sunset-sync/src/engine.rs` (`handle_inbound_event`)
 
-- [ ] **Step 3.1: Add the handler arm**
+- [ ] **Step 3.1: Replace the placeholder arm with the real handler**
 
-In `crates/sunset-sync/src/engine.rs`, locate the `match event` block in `handle_inbound_event`. Add (or replace the placeholder from Task 2.3):
+In `crates/sunset-sync/src/engine.rs`, find the placeholder added in Step 1.3 (or 2.3) inside `handle_inbound_event`, and replace it with:
 
 ```rust
             InboundEvent::PongObserved { peer_id, rtt_ms, observed_at_unix_ms } => {
@@ -358,15 +360,19 @@ In `crates/sunset-sync/src/engine.rs`, locate the `match event` block in `handle
 
 - [ ] **Step 3.2: Add an engine-level test that PongObserved propagates**
 
-Append to the existing tests module in `crates/sunset-sync/src/engine.rs`:
+Append to the existing tests module in `crates/sunset-sync/src/engine.rs` (locate any current `#[tokio::test]` to mirror its setup helpers):
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
 async fn pong_observed_inbound_event_propagates_as_engine_event() {
+    use crate::peer::InboundEvent;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (engine, _store) = test_helpers::make_engine().await;
+            // Build a minimal SyncEngine using the same constructor the
+            // existing tests use. (Mirror the helper that test files like
+            // crates/sunset-sync/tests/two_peer_sync.rs reach for.)
+            let (engine, _store) = crate::engine::tests::make_engine().await;
             let mut subs = engine.subscribe_engine_events().await;
             let pid = PeerId(sunset_store::VerifyingKey::new(
                 bytes::Bytes::from_static(&[7u8; 32]),
@@ -395,9 +401,9 @@ async fn pong_observed_inbound_event_propagates_as_engine_event() {
 }
 ```
 
-If `test_helpers::make_engine()` does not exist, locate the equivalent helper used by other tests in the module (e.g., one of the `tests::helpers` constructions) and adapt the call.
+If `tests::make_engine` doesn't exist, locate an analogous helper in the engine tests module (or in `tests/`) and adapt the call. If there is genuinely no helper, build a minimal engine inline using `MemoryStore` + `NopTransport` (as `peer/mod.rs::tests::helpers` does).
 
-- [ ] **Step 3.3: Run the test**
+- [ ] **Step 3.3: Run**
 
 Run: `nix develop --command cargo test -p sunset-sync pong_observed_inbound_event_propagates -- --nocapture 2>&1 | tail -20`
 Expected: PASS.
@@ -410,8 +416,8 @@ git commit -m "$(cat <<'EOF'
 sunset-sync: engine re-emits PongObserved as EngineEvent
 
 Per-peer task → InboundEvent::PongObserved → handle_inbound_event
-forwards to all engine-event subscribers (PeerSupervisor consumes
-it in the next change).
+forwards to all engine-event subscribers (PeerSupervisor consumes it
+in the next change).
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -423,86 +429,48 @@ EOF
 ## Task 4 — Supervisor `IntentEntry` and `IntentSnapshot` gain liveness fields
 
 **Files:**
-- Modify: `crates/sunset-sync/src/supervisor.rs` (struct defs around lines 67-92, `broadcast` around 186, `Snapshot` builder around 407)
+- Modify: `crates/sunset-sync/src/supervisor.rs`
 
 - [ ] **Step 4.1: Add fields to `IntentEntry` and `IntentSnapshot`**
 
-In `crates/sunset-sync/src/supervisor.rs`, replace the `IntentSnapshot` and `IntentEntry` structs:
+In `crates/sunset-sync/src/supervisor.rs`, add the two fields. Add to `IntentSnapshot` (currently around lines 72-82) — after `pub label: String,`:
 
 ```rust
-#[derive(Clone, Debug)]
-pub struct IntentSnapshot {
-    pub addr: PeerAddr,
-    pub state: IntentState,
-    pub peer_id: Option<PeerId>,
-    pub attempt: u32,
     /// Wall-clock ms of the most recent Pong observed from this peer.
     /// `None` until the first Pong of the *first* connection lands.
     /// Preserved across Backoff transitions (the popover should show
-    /// "heard from 12s ago" while reconnecting), cleared only on
-    /// `SupervisorCommand::Remove`.
+    /// "heard from 12s ago" while reconnecting), cleared only when
+    /// the intent itself is removed (`SupervisorCommand::Remove`).
     pub last_pong_at_unix_ms: Option<u64>,
     /// Round-trip time of the most recent Pong, in milliseconds.
     /// `None` under the same conditions as `last_pong_at_unix_ms`.
     pub last_rtt_ms: Option<u64>,
-}
-
-pub(crate) struct IntentEntry {
-    pub state: IntentState,
-    pub attempt: u32,
-    pub peer_id: Option<PeerId>,
-    /// Earliest moment the next dial attempt may run. None when not in Backoff.
-    pub next_attempt_at: Option<web_time::SystemTime>,
-    pub last_pong_at_unix_ms: Option<u64>,
-    pub last_rtt_ms: Option<u64>,
-}
 ```
 
-- [ ] **Step 4.2: Update every `IntentEntry { ... }` literal to include the new fields**
+Add the same two fields to `IntentEntry` (around lines 93-107) — after `pub label: String,`.
 
-Two construction sites: the `SupervisorCommand::Add` handler (around line 327) and any test fixtures that build entries by hand. Add `last_pong_at_unix_ms: None, last_rtt_ms: None` to each. Search:
+- [ ] **Step 4.2: Update every `IntentEntry { ... }` literal**
 
-```
+Find every site that builds an `IntentEntry`:
+
+```bash
 nix develop --command rg -n 'IntentEntry \{' crates/sunset-sync/src/supervisor.rs
 ```
 
-Update every match.
+Add `last_pong_at_unix_ms: None, last_rtt_ms: None,` to each.
 
 - [ ] **Step 4.3: Update `broadcast` to emit the new fields**
 
-Replace the body of `broadcast` (around line 186-197):
+Find the `fn broadcast(...)` (currently around lines 186-197) and update the `IntentSnapshot { ... }` literal it constructs to include:
 
 ```rust
-    fn broadcast(state: &mut SupervisorState, addr: &PeerAddr) {
-        let Some(entry) = state.intents.get(addr) else {
-            return;
-        };
-        let snap = IntentSnapshot {
-            addr: addr.clone(),
-            state: entry.state,
-            peer_id: entry.peer_id.clone(),
-            attempt: entry.attempt,
             last_pong_at_unix_ms: entry.last_pong_at_unix_ms,
             last_rtt_ms: entry.last_rtt_ms,
-        };
-        state.subscribers.retain(|tx| tx.send(snap.clone()).is_ok());
-    }
 ```
 
 - [ ] **Step 4.4: Update the `Snapshot` command builder**
 
-Replace the `.map(...)` closure in the `SupervisorCommand::Snapshot` arm (around line 412):
-
-```rust
-                    .map(|(addr, e)| IntentSnapshot {
-                        addr: addr.clone(),
-                        state: e.state,
-                        peer_id: e.peer_id.clone(),
-                        attempt: e.attempt,
-                        last_pong_at_unix_ms: e.last_pong_at_unix_ms,
-                        last_rtt_ms: e.last_rtt_ms,
-                    })
-```
+Find `SupervisorCommand::Snapshot` (currently around line 407) and the `.map(|(id, e)| IntentSnapshot { ... })` closure. Add the same two fields.
 
 - [ ] **Step 4.5: Compile-check**
 
@@ -532,9 +500,13 @@ EOF
 **Files:**
 - Modify: `crates/sunset-sync/src/supervisor.rs` (`handle_engine_event`)
 
-- [ ] **Step 5.1: Write a failing supervisor unit test**
+- [ ] **Step 5.1: Inspect the current supervisor test setup**
 
-Append to the `#[cfg(test)] mod tests` block in `crates/sunset-sync/src/supervisor.rs`:
+Read `crates/sunset-sync/src/supervisor.rs` lines around 580-790 to find the test fixture used by `subscribe_emits_state_transitions`, `subscribe_observes_connecting_during_redial`, etc. Identify the helper for two-peer setup and the way EngineEvents are injected. (We need to mirror its idioms; the new tests below shouldn't reinvent that wheel.)
+
+- [ ] **Step 5.2: Write three failing supervisor unit tests**
+
+Append to the `#[cfg(test)] mod tests` block in `crates/sunset-sync/src/supervisor.rs`. The exact helper names below (`make_two_peer_setup`, `inject_engine_event`) are placeholders — substitute the real ones discovered in 5.1:
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -542,32 +514,56 @@ async fn pong_observed_updates_intent_snapshot() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // Stand up alice ↔ bob through TestTransport, add bob via
-            // supervisor, wait for Connected, then drive a synthetic
-            // PongObserved engine event and assert it lands on the
-            // IntentSnapshot subscriber.
-            let (alice, bob, bob_addr) = test_helpers::two_peer_setup().await;
+            // Two-peer setup from the existing test fixtures.
+            let (alice, bob, bob_addr) = make_two_peer_setup().await;
             let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
             crate::spawn::spawn_local({
                 let s = sup.clone();
                 async move { s.run().await }
             });
-            sup.add(bob_addr.clone()).await.expect("add bob");
-            // Drive a PongObserved on the engine; supervisor must fold
-            // it into IntentEntry and broadcast.
+            let id = sup
+                .add(crate::connectable::Connectable::Direct(bob_addr.clone()))
+                .await
+                .expect("add bob");
+            // Wait for Connected. Subscribers replay current state, so
+            // we can poll snapshot() rather than draining the channel.
+            for _ in 0..200 {
+                if sup
+                    .snapshot()
+                    .await
+                    .iter()
+                    .any(|s| s.id == id && s.state == IntentState::Connected)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
             let bob_pid = bob.local_peer_id();
-            alice
-                .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+            inject_engine_event(
+                &alice,
+                EngineEvent::PongObserved {
                     peer_id: bob_pid.clone(),
                     rtt_ms: 17,
                     observed_at_unix_ms: 1_700_000_000_500,
-                })
-                .await;
-            // Snapshot must show the new fields.
-            let snaps = sup.snapshot().await;
-            let snap = snaps.iter().find(|s| s.addr == bob_addr).expect("intent");
-            assert_eq!(snap.last_rtt_ms, Some(17));
-            assert_eq!(snap.last_pong_at_unix_ms, Some(1_700_000_000_500));
+                },
+            )
+            .await;
+            // Snapshot reflects the new fields.
+            for _ in 0..200 {
+                let snap = sup
+                    .snapshot()
+                    .await
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .expect("intent");
+                if snap.last_rtt_ms == Some(17)
+                    && snap.last_pong_at_unix_ms == Some(1_700_000_000_500)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("PongObserved did not propagate to IntentSnapshot");
         })
         .await;
 }
@@ -577,27 +573,32 @@ async fn pong_observed_for_unknown_peer_is_dropped() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (alice, _bob, _bob_addr) = test_helpers::two_peer_setup().await;
+            let (alice, _bob, _bob_addr) = make_two_peer_setup().await;
             let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
             crate::spawn::spawn_local({
                 let s = sup.clone();
                 async move { s.run().await }
             });
-            // Subscribe so we can observe (or not observe) broadcasts.
-            let mut sub = sup.subscribe();
+            let mut sub = sup.subscribe_intents().await;
+            // Drain any startup snapshots (none here — no intents yet).
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                sub.recv(),
+            )
+            .await;
             let stranger = PeerId(sunset_store::VerifyingKey::new(
                 bytes::Bytes::from_static(&[99u8; 32]),
             ));
-            alice
-                .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+            inject_engine_event(
+                &alice,
+                EngineEvent::PongObserved {
                     peer_id: stranger,
                     rtt_ms: 1,
                     observed_at_unix_ms: 1,
-                })
-                .await;
-            // No broadcast expected within a short window.
-            use futures::StreamExt as _;
-            let r = tokio::time::timeout(std::time::Duration::from_millis(100), sub.next()).await;
+                },
+            )
+            .await;
+            let r = tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv()).await;
             assert!(r.is_err(), "expected no broadcast for unknown peer");
         })
         .await;
@@ -608,94 +609,128 @@ async fn disconnect_preserves_last_pong_and_rtt() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (alice, bob, bob_addr) = test_helpers::two_peer_setup().await;
+            let (alice, bob, bob_addr) = make_two_peer_setup().await;
             let sup = PeerSupervisor::new(alice.clone(), BackoffPolicy::default());
             crate::spawn::spawn_local({
                 let s = sup.clone();
                 async move { s.run().await }
             });
-            sup.add(bob_addr.clone()).await.expect("add");
+            let id = sup
+                .add(crate::connectable::Connectable::Direct(bob_addr.clone()))
+                .await
+                .expect("add");
+            // Wait for Connected.
+            for _ in 0..200 {
+                if sup
+                    .snapshot()
+                    .await
+                    .iter()
+                    .any(|s| s.id == id && s.state == IntentState::Connected)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
             let bob_pid = bob.local_peer_id();
-            alice
-                .emit_engine_event_for_test(crate::engine::EngineEvent::PongObserved {
+            inject_engine_event(
+                &alice,
+                EngineEvent::PongObserved {
                     peer_id: bob_pid.clone(),
                     rtt_ms: 11,
                     observed_at_unix_ms: 5_000,
-                })
-                .await;
-            // Force a disconnect (simulates network blip).
-            alice.remove_peer(bob_pid.clone()).await.ok();
-            // Wait for the PeerRemoved engine event to fold into Backoff.
-            for _ in 0..50 {
+                },
+            )
+            .await;
+            // Wait for fold.
+            for _ in 0..200 {
+                let snap = sup
+                    .snapshot()
+                    .await
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .expect("intent");
+                if snap.last_rtt_ms == Some(11) {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-            let snap = sup.snapshot().await
-                .into_iter()
-                .find(|s| s.addr == bob_addr)
-                .expect("intent");
-            assert_eq!(snap.state, IntentState::Backoff);
-            assert_eq!(snap.last_rtt_ms, Some(11));
-            assert_eq!(snap.last_pong_at_unix_ms, Some(5_000));
+            // Force a disconnect.
+            alice.remove_peer(bob_pid.clone()).await.ok();
+            for _ in 0..200 {
+                let snap = sup
+                    .snapshot()
+                    .await
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .expect("intent");
+                if snap.state == IntentState::Backoff {
+                    assert_eq!(snap.last_rtt_ms, Some(11));
+                    assert_eq!(snap.last_pong_at_unix_ms, Some(5_000));
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("intent never transitioned to Backoff");
         })
         .await;
 }
 ```
 
-The helpers `test_helpers::two_peer_setup`, `Engine::emit_engine_event_for_test`, and `Engine::local_peer_id` may not exist verbatim. Locate the closest existing test fixture in `supervisor.rs` (e.g., `subscribe_emits_state_transitions` around line 670) and adapt names. If `emit_engine_event_for_test` is missing, add a `pub(crate) async fn emit_engine_event_for_test(...)` shim that calls the existing private `emit_engine_event` — gated `#[cfg(test)]`.
+If `make_two_peer_setup` and `inject_engine_event` don't exist verbatim, adapt to the real helpers found in Step 5.1. If `inject_engine_event` requires a public test-only entry point (e.g., the engine has only a private `emit_engine_event`), add a `#[cfg(test)] pub(crate) async fn emit_engine_event_for_test(...)` shim on `SyncEngine` that wraps the private call. Do not call private methods from tests via reflection — add the test-only public shim.
 
-- [ ] **Step 5.2: Run tests — expect failures**
+- [ ] **Step 5.3: Run — expect failures**
 
-Run: `nix develop --command cargo test -p sunset-sync supervisor::tests::pong_observed -- --nocapture 2>&1 | tail -20`
-Expected: the first two FAIL ("expected no broadcast" passes trivially today because PongObserved is never handled; `pong_observed_updates_intent_snapshot` FAILs because last_rtt_ms is still None). `disconnect_preserves_last_pong_and_rtt` FAILs for the same reason.
+Run: `nix develop --command cargo test -p sunset-sync supervisor::tests::pong_observed -- --nocapture 2>&1 | tail -30`
+Run: `nix develop --command cargo test -p sunset-sync supervisor::tests::disconnect_preserves -- --nocapture 2>&1 | tail -30`
+Expected: `pong_observed_updates_intent_snapshot` and `disconnect_preserves_last_pong_and_rtt` FAIL (last_rtt_ms is None). `pong_observed_for_unknown_peer_is_dropped` may pass trivially today since there's no handler at all.
 
-- [ ] **Step 5.3: Add the PongObserved arm in `handle_engine_event`**
+- [ ] **Step 5.4: Add the PongObserved arm in `handle_engine_event`**
 
-In `crates/sunset-sync/src/supervisor.rs`, within `handle_engine_event` (around line 265), add a third arm:
+In `crates/sunset-sync/src/supervisor.rs`, locate `handle_engine_event` and add a third arm:
 
 ```rust
             EngineEvent::PongObserved { peer_id, rtt_ms, observed_at_unix_ms } => {
                 let mut state = self.state.borrow_mut();
-                let addr = match state.peer_to_addr.get(&peer_id) {
-                    Some(a) => a.clone(),
+                let id = match state.peer_to_intent.get(&peer_id) {
+                    Some(i) => *i,
                     None => return,
                 };
-                if let Some(entry) = state.intents.get_mut(&addr) {
+                if let Some(entry) = state.intents.get_mut(&id) {
                     entry.last_pong_at_unix_ms = Some(observed_at_unix_ms);
                     entry.last_rtt_ms = Some(rtt_ms);
                 }
-                Self::broadcast(&mut state, &addr);
+                Self::broadcast(&mut state, id);
             }
 ```
 
-- [ ] **Step 5.4: Verify `PeerRemoved` does NOT clear the liveness fields**
+If `Self::broadcast` takes `&PeerAddr` instead of `IntentId`, adapt — read the existing `broadcast` signature and call it with whatever key it expects.
 
-Re-read the `EngineEvent::PeerRemoved` arm (around lines 286-306). It must mutate `state` and `peer_id` only; it must NOT touch `last_pong_at_unix_ms` or `last_rtt_ms`. If it does, fix it.
+- [ ] **Step 5.5: Verify `PeerRemoved` does NOT clear the liveness fields**
 
-- [ ] **Step 5.5: Verify `SupervisorCommand::Remove` DOES clear the fields (cleanup-on-remove semantics)**
-
-The handler removes the entry entirely (`state.intents.remove(&addr)`), so the fields go away with it. No code change required, but confirm by re-reading lines 384-405.
+Re-read the `EngineEvent::PeerRemoved` arm. It must mutate `state` and `peer_id` only; it must NOT touch `last_pong_at_unix_ms` or `last_rtt_ms`. If it does, fix it.
 
 - [ ] **Step 5.6: Run the tests — expect PASS**
 
-Run: `nix develop --command cargo test -p sunset-sync supervisor::tests:: -- --nocapture 2>&1 | tail -30`
+Run: `nix develop --command cargo test -p sunset-sync supervisor:: -- --nocapture 2>&1 | tail -40`
 Expected: all three new tests PASS, no regressions in existing supervisor tests.
 
 - [ ] **Step 5.7: Run the full sunset-sync test suite**
 
 Run: `nix develop --command cargo test -p sunset-sync 2>&1 | tail -10`
-Expected: all tests PASS.
+Expected: clean.
 
 - [ ] **Step 5.8: Commit**
 
 ```bash
-git add crates/sunset-sync/src/supervisor.rs
+git add crates/sunset-sync/src/supervisor.rs crates/sunset-sync/src/engine.rs
 git commit -m "$(cat <<'EOF'
 sunset-sync: supervisor folds PongObserved into IntentSnapshot
 
 handle_engine_event grows a PongObserved arm that updates the
 IntentEntry's last_pong_at_unix_ms / last_rtt_ms and broadcasts the
-new snapshot. Stale events (peer not in peer_to_addr) are dropped
-silently. Disconnect preserves the fields; only Remove clears them.
+new snapshot. Stale events (peer not in peer_to_intent) are dropped
+silently. Disconnect preserves the fields; only Remove clears them
+(by removing the entry entirely).
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -704,21 +739,40 @@ EOF
 
 ---
 
-## Task 6 — wasm bridge: `intent_snapshot_to_js` includes liveness, `Client::new` accepts heartbeat override
+## Task 6 — wasm bridge: `IntentSnapshotJs` liveness, `Client::new` heartbeat override
 
 **Files:**
-- Modify: `crates/sunset-web-wasm/src/client.rs:62-130` (constructor) and `:243-270` (intent_snapshot_to_js)
+- Modify: `crates/sunset-web-wasm/src/intent.rs`
+- Modify: `crates/sunset-web-wasm/src/client.rs`
 
-- [ ] **Step 6.1: Update `Client::new` to accept `heartbeat_interval_ms`**
+- [ ] **Step 6.1: Add fields and mapping in `intent.rs`**
 
-In `crates/sunset-web-wasm/src/client.rs:62-64`, change the signature:
+In `crates/sunset-web-wasm/src/intent.rs`, append two fields to `IntentSnapshotJs`:
+
+```rust
+    pub last_pong_at_unix_ms: Option<f64>,
+    pub last_rtt_ms: Option<f64>,
+```
+
+Update the `From<&IntentSnapshot> for IntentSnapshotJs` impl to add:
+
+```rust
+            last_pong_at_unix_ms: s.last_pong_at_unix_ms.map(|n| n as f64),
+            last_rtt_ms: s.last_rtt_ms.map(|n| n as f64),
+```
+
+(`u64 → f64` is safe for ms values in any plausible range.)
+
+- [ ] **Step 6.2: Update `Client::new` to accept `heartbeat_interval_ms`**
+
+In `crates/sunset-web-wasm/src/client.rs:57`, change the constructor signature:
 
 ```rust
     #[wasm_bindgen(constructor)]
     pub fn new(seed: &[u8], heartbeat_interval_ms: u32) -> Result<Client, JsError> {
 ```
 
-Inside the body, after `Ed25519Verifier` is wired and before `SyncEngine::new`, build the config:
+Inside, after the existing `let multi = ...;` line and before the `SyncEngine::new(...)` call (currently around line 78), build the config:
 
 ```rust
         let mut config = SyncConfig::default();
@@ -728,68 +782,38 @@ Inside the body, after `Ed25519Verifier` is wired and before `SyncEngine::new`, 
             // Match default 3× ratio between interval and timeout.
             config.heartbeat_timeout = interval * 3;
         }
-        let engine = Rc::new(SyncEngine::new(
-            store.clone(),
-            multi,
-            config,
-            local_peer,
-            signer,
-        ));
 ```
 
-(Replace the existing `SyncConfig::default()` argument inline.)
-
-- [ ] **Step 6.2: Enrich `intent_snapshot_to_js`**
-
-In `crates/sunset-web-wasm/src/client.rs:243-270`, append two `Reflect::set` blocks before the final `Ok(obj.into())`:
-
-```rust
-    if let Some(t) = snap.last_pong_at_unix_ms {
-        js_sys::Reflect::set(
-            &obj,
-            &JsValue::from_str("last_pong_at_unix_ms"),
-            &JsValue::from_f64(t as f64),
-        )
-        .map_err(|_| JsError::new("Reflect::set last_pong_at_unix_ms failed"))?;
-    }
-    if let Some(r) = snap.last_rtt_ms {
-        js_sys::Reflect::set(
-            &obj,
-            &JsValue::from_str("last_rtt_ms"),
-            &JsValue::from_f64(r as f64),
-        )
-        .map_err(|_| JsError::new("Reflect::set last_rtt_ms failed"))?;
-    }
-```
-
-(`u64 → f64` is safe for ms values in any plausible range; ms-since-1970 fits easily.)
+Replace the `SyncConfig::default()` argument in the `SyncEngine::new(...)` call with `config`.
 
 - [ ] **Step 6.3: Build the wasm crate**
 
-Run: `nix develop --command cargo build -p sunset-web-wasm --target wasm32-unknown-unknown 2>&1 | tail -10`
-Expected: builds. If `cargo build` warns/errors about wasm-bindgen u32 ABI, double-check the constructor uses `u32` (not `u64` — `u64` requires bigint which the JS shim would have to format).
+Run: `nix develop --command cargo build -p sunset-web-wasm --target wasm32-unknown-unknown 2>&1 | tail -15`
+Expected: builds.
 
-- [ ] **Step 6.4: Update the dev/build harness if needed**
+- [ ] **Step 6.4: Build the rest of the workspace (catches downstream callers of `Client::new`)**
 
-Run the existing project bundler script and confirm it still produces `web/build/sunset_web_wasm.js` and `_bg.wasm`. Look for any helper script:
+Run: `nix develop --command cargo build --workspace --all-features 2>&1 | tail -15`
+Expected: any tests that build a `Client` directly (e.g., `crates/sunset-web-wasm/tests/construct.rs`) need a `0` arg added. Find them with:
 
+```bash
+nix develop --command rg -n 'Client::new\b|new Client\(' crates/ web/
 ```
-nix develop --command rg -n 'wasm-pack|cargo build.*wasm32|sunset_web_wasm' --type-not target | head -20
-```
 
-If `wasm-pack` is invoked from a script, run that script to refresh artefacts. Do not edit JS shims yet — Task 7 does that.
+Update each.
 
 - [ ] **Step 6.5: Commit**
 
 ```bash
-git add crates/sunset-web-wasm/src/client.rs
+git add crates/sunset-web-wasm/src/intent.rs crates/sunset-web-wasm/src/client.rs crates/sunset-web-wasm/tests/
 git commit -m "$(cat <<'EOF'
-sunset-web-wasm: optional heartbeat override + liveness on intent JS
+sunset-web-wasm: optional heartbeat override + liveness on IntentSnapshotJs
 
 Client::new gains a u32 heartbeat_interval_ms (0 = use the SyncConfig
-default of 15 s), mirroring presence_interval-style URL-tunability.
-intent_snapshot_to_js writes last_pong_at_unix_ms and last_rtt_ms
-when the supervisor has them.
+default of 15 s), mirroring presence_interval-style URL-tunability for
+e2e tests. IntentSnapshotJs gains last_pong_at_unix_ms / last_rtt_ms
+optional fields; the From<&IntentSnapshot> impl picks them up
+automatically.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -798,23 +822,25 @@ EOF
 
 ---
 
-## Task 7 — Add Gleam FFI shims for relay subscription and URL param
+## Task 7 — Gleam FFI: heartbeat URL param + `IntentSnapshot` extension
 
 **Files:**
-- Modify: `web/src/sunset_web/sunset.ffi.mjs` (add functions)
-- Modify: `web/src/sunset_web/sunset.gleam` (add externals)
+- Modify: `web/src/sunset_web/sunset.ffi.mjs`
+- Modify: `web/src/sunset_web/sunset.gleam`
+- Modify: `web/test/relay_status_pill_test.gleam`
 
 - [ ] **Step 7.1: Update `createClient` shim to pass heartbeat**
 
-In `web/src/sunset_web/sunset.ffi.mjs:47-57`, modify:
+In `web/src/sunset_web/sunset.ffi.mjs`, find the existing `createClient` export and replace with:
 
 ```javascript
 export async function createClient(seed, heartbeatIntervalMs, callback) {
   await ensureLoaded();
   const seedBytes = bitsToBytes(seed);
-  const hb = Number.isFinite(heartbeatIntervalMs) && heartbeatIntervalMs > 0
-    ? heartbeatIntervalMs
-    : 0;
+  const hb =
+    Number.isFinite(heartbeatIntervalMs) && heartbeatIntervalMs > 0
+      ? heartbeatIntervalMs
+      : 0;
   const client = new Client(seedBytes, hb);
   if (typeof window !== "undefined" && window.SUNSET_TEST) {
     window.sunsetClient = client;
@@ -823,14 +849,40 @@ export async function createClient(seed, heartbeatIntervalMs, callback) {
 }
 ```
 
-- [ ] **Step 7.2: Add `heartbeatIntervalMsFromUrl` shim**
+- [ ] **Step 7.2: Update `onIntentChanged` to wrap the new fields**
+
+In the `onIntentChanged` shim (currently around lines 108-128), update the `new IntentSnapshot(...)` call to include two more args:
+
+```javascript
+    const lastPongMs = snap.last_pong_at_unix_ms;
+    const lastRttMs = snap.last_rtt_ms;
+    const record = new IntentSnapshot(
+      snap.id,
+      snap.state,
+      snap.label,
+      peerPubkey === undefined || peerPubkey === null
+        ? new None()
+        : new Some(new BitArray(peerPubkey)),
+      kind === undefined || kind === null ? new None() : new Some(kind),
+      snap.attempt,
+      lastPongMs === undefined || lastPongMs === null
+        ? new None()
+        : new Some(lastPongMs),
+      lastRttMs === undefined || lastRttMs === null
+        ? new None()
+        : new Some(lastRttMs),
+    );
+    callback(record);
+```
+
+- [ ] **Step 7.3: Add `heartbeatIntervalMsFromUrl` shim**
 
 Append to `web/src/sunset_web/sunset.ffi.mjs`:
 
 ```javascript
 /// Read `?heartbeat_interval_ms=NNN` from the current URL. Returns 0
 /// when absent or unparseable, signalling Client::new to use the
-/// SyncConfig default (15 s).
+/// SyncConfig default (15 s). e2e-only knob.
 export function heartbeatIntervalMsFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const raw = params.get("heartbeat_interval_ms");
@@ -840,108 +892,11 @@ export function heartbeatIntervalMsFromUrl() {
 }
 ```
 
-- [ ] **Step 7.3: Add `peerConnectionSnapshot` and `subscribePeerConnections` shims**
+- [ ] **Step 7.4: Update Gleam externals + `IntentSnapshot` record**
 
-Append to `web/src/sunset_web/sunset.ffi.mjs`:
+In `web/src/sunset_web/sunset.gleam`:
 
-```javascript
-/// Snapshot every current peer-connection intent (relays AND direct
-/// peers — caller filters by addr scheme). Returns a Promise of an
-/// Array of plain JS objects:
-///   { addr, state, attempt, peer_id?, last_pong_at_unix_ms?, last_rtt_ms? }
-export function peerConnectionSnapshot(client, callback) {
-  client
-    .peer_connection_snapshot()
-    .then((arr) => callback(toList(Array.from(arr))))
-    .catch((e) => {
-      console.warn("peerConnectionSnapshot failed", e);
-      callback(toList([]));
-    });
-}
-
-/// Register a callback for live peer-connection state transitions.
-/// Replaces any previous callback. Each invocation receives one
-/// snapshot object (same shape as peerConnectionSnapshot's elements).
-export function subscribePeerConnections(client, callback) {
-  client.on_peer_connection_state((snap) => {
-    try {
-      callback(snap);
-    } catch (e) {
-      console.warn("subscribePeerConnections callback threw", e);
-    }
-  });
-}
-
-// Per-snapshot accessors. `snap` is the plain object emitted by the
-// wasm side via Reflect::set; presence/absence is meaningful.
-export function snapAddr(snap) { return snap.addr; }
-export function snapState(snap) { return snap.state; }
-export function snapAttempt(snap) { return snap.attempt; }
-export function snapPeerIdHex(snap) {
-  const pk = snap.peer_id;
-  if (!pk) return new GError(undefined);
-  return new Ok(
-    Array.from(pk, (b) => b.toString(16).padStart(2, "0")).join(""),
-  );
-}
-export function snapLastPongAtMs(snap) {
-  const v = snap.last_pong_at_unix_ms;
-  return typeof v === "number" ? new Some(v) : new None();
-}
-export function snapLastRttMs(snap) {
-  const v = snap.last_rtt_ms;
-  return typeof v === "number" ? new Some(v) : new None();
-}
-```
-
-- [ ] **Step 7.4: Add Gleam externals**
-
-In `web/src/sunset_web/sunset.gleam`, add (place near other client-level externals):
-
-```gleam
-import gleam/option
-
-@external(javascript, "./sunset.ffi.mjs", "heartbeatIntervalMsFromUrl")
-pub fn heartbeat_interval_ms_from_url() -> Int
-
-/// Opaque handle to a single JS-side intent snapshot. Always read via
-/// the snap_* accessors below — never carry the raw value across an
-/// async boundary, since the underlying wasm-bindgen wrapper may be
-/// freed.
-pub type IntentSnapshotJs
-
-@external(javascript, "./sunset.ffi.mjs", "peerConnectionSnapshot")
-pub fn peer_connection_snapshot(
-  client: ClientHandle,
-  callback: fn(List(IntentSnapshotJs)) -> Nil,
-) -> Nil
-
-@external(javascript, "./sunset.ffi.mjs", "subscribePeerConnections")
-pub fn subscribe_peer_connections(
-  client: ClientHandle,
-  callback: fn(IntentSnapshotJs) -> Nil,
-) -> Nil
-
-@external(javascript, "./sunset.ffi.mjs", "snapAddr")
-pub fn snap_addr(snap: IntentSnapshotJs) -> String
-
-@external(javascript, "./sunset.ffi.mjs", "snapState")
-pub fn snap_state(snap: IntentSnapshotJs) -> String
-
-@external(javascript, "./sunset.ffi.mjs", "snapAttempt")
-pub fn snap_attempt(snap: IntentSnapshotJs) -> Int
-
-@external(javascript, "./sunset.ffi.mjs", "snapPeerIdHex")
-pub fn snap_peer_id_hex(snap: IntentSnapshotJs) -> Result(String, Nil)
-
-@external(javascript, "./sunset.ffi.mjs", "snapLastPongAtMs")
-pub fn snap_last_pong_at_ms(snap: IntentSnapshotJs) -> option.Option(Int)
-
-@external(javascript, "./sunset.ffi.mjs", "snapLastRttMs")
-pub fn snap_last_rtt_ms(snap: IntentSnapshotJs) -> option.Option(Int)
-```
-
-Update the `create_client` external to include the heartbeat parameter:
+Change `create_client`:
 
 ```gleam
 @external(javascript, "./sunset.ffi.mjs", "createClient")
@@ -952,23 +907,74 @@ pub fn create_client(
 ) -> Nil
 ```
 
-- [ ] **Step 7.5: Compile-check**
+Add the URL helper near the bottom (alongside `presence_params_from_url`):
+
+```gleam
+/// Read `?heartbeat_interval_ms=NNN` from the URL. Returns 0 when
+/// absent or unparseable. e2e-only knob.
+@external(javascript, "./sunset.ffi.mjs", "heartbeatIntervalMsFromUrl")
+pub fn heartbeat_interval_ms_from_url() -> Int
+```
+
+Extend `IntentSnapshot`:
+
+```gleam
+pub type IntentSnapshot {
+  IntentSnapshot(
+    id: Float,
+    state: String,
+    label: String,
+    peer_pubkey: option.Option(BitArray),
+    kind: option.Option(String),
+    attempt: Int,
+    /// Wall-clock ms of the most recent Pong. None until the first
+    /// Pong of the first connection lands; preserved across Backoff.
+    last_pong_at_ms: option.Option(Int),
+    /// Round-trip time of the most recent Pong, in milliseconds.
+    last_rtt_ms: option.Option(Int),
+  )
+}
+```
+
+- [ ] **Step 7.5: Fix `relay_status_pill_test.gleam`**
+
+In `web/test/relay_status_pill_test.gleam`, update the `snap` helper:
+
+```gleam
+fn snap(id: Float, state: String) -> IntentSnapshot {
+  IntentSnapshot(
+    id: id,
+    state: state,
+    label: "test",
+    peer_pubkey: None,
+    kind: None,
+    attempt: 0,
+    last_pong_at_ms: None,
+    last_rtt_ms: None,
+  )
+}
+```
+
+- [ ] **Step 7.6: Compile-check**
 
 Run: `cd web && nix develop --command gleam build 2>&1 | tail -15`
 Expected: build fails because `sunset_web.gleam` still calls `sunset.create_client(seed, callback)` without the new arg. We fix that in Task 9.
 
-- [ ] **Step 7.6: Commit**
+Run: `cd web && nix develop --command gleam test 2>&1 | tail -20`
+Expected: `relay_status_pill_test` passes (the constructor extension is the only relevant change). Other test failures may exist due to pending Bridge cleanup; those land in Task 8.
+
+- [ ] **Step 7.7: Commit**
 
 ```bash
-git add web/src/sunset_web/sunset.ffi.mjs web/src/sunset_web/sunset.gleam
+git add web/src/sunset_web/sunset.ffi.mjs web/src/sunset_web/sunset.gleam web/test/relay_status_pill_test.gleam
 git commit -m "$(cat <<'EOF'
-web: FFI shims for relay subscription and heartbeat URL param
+web: extend IntentSnapshot with last_pong_at_ms / last_rtt_ms
 
-Adds peerConnectionSnapshot, subscribePeerConnections, and per-snap
-accessors (addr/state/attempt/peer_id_hex/last_pong_at_ms/last_rtt_ms)
-plus a heartbeatIntervalMsFromUrl reader and an extra createClient
-parameter. No callers wired yet; the model + view land in the next
-changes.
+The FFI shim wraps the new IntentSnapshotJs fields; the Gleam record
+gains two Option(Int) fields. createClient grows a heartbeat-interval
+arg sourced from a new ?heartbeat_interval_ms URL param (e2e-only;
+default 0 means use the SyncConfig 15 s default). relay_status_pill_test
+constructor calls updated mechanically.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -977,38 +983,19 @@ EOF
 
 ---
 
-## Task 8 — Domain types, fixture cleanup, and removal of Bridge
+## Task 8 — Domain types + remove Bridge / Minecraft fixture types
 
 **Files:**
 - Modify: `web/src/sunset_web/domain.gleam`
 - Modify: `web/src/sunset_web/fixture.gleam`
 - Modify: `web/src/sunset_web/views/main_panel.gleam`
 - Modify: `web/src/sunset_web/views/channels.gleam`
+- Modify: `web/test/fixture_test.gleam` (if it constructs domain types directly)
 
-- [ ] **Step 8.1: Add new domain types and remove Bridge**
+- [ ] **Step 8.1: Drop Bridge from domain.gleam, add Relay types**
 
-In `web/src/sunset_web/domain.gleam`, replace the `ChannelKind`, `BridgeKind`, and `BridgeOpt` definitions plus the `bridge:` field on `Room`/`Member`/`Message`:
+In `web/src/sunset_web/domain.gleam`, delete `BridgeKind`, `BridgeOpt`, change `ChannelKind` to:
 
-Delete:
-```gleam
-pub type BridgeKind {
-  Minecraft
-}
-pub type BridgeOpt {
-  HasBridge(BridgeKind)
-  NoBridge
-}
-```
-
-Change `ChannelKind` from:
-```gleam
-pub type ChannelKind {
-  TextChannel
-  Voice
-  Bridge(BridgeKind)
-}
-```
-to:
 ```gleam
 pub type ChannelKind {
   TextChannel
@@ -1016,9 +1003,9 @@ pub type ChannelKind {
 }
 ```
 
-Remove `bridge: BridgeOpt,` from `Room`, `Member`, and `Message`.
+Remove `bridge: BridgeOpt,` from `Room`, `Member`, `Message`. Drop `BridgeRelay` from the `RelayStatus` enum.
 
-Append the new types:
+Append:
 
 ```gleam
 pub type RelayConnState {
@@ -1028,20 +1015,23 @@ pub type RelayConnState {
   RelayCancelled
 }
 
+/// View-model for a relay row + popover. Derived per render from
+/// `Model.intents` via `relays_view.relays_for_view`. Not a source
+/// of truth — `intents` remains so.
 pub type Relay {
   Relay(
-    /// Raw addr URL (the supervisor's identity for an intent).
-    addr: String,
-    /// Display label parsed from `addr`. Best-effort — falls back
-    /// to `addr` when the URL is unparseable.
+    /// IntentId — popover key.
+    id: Float,
+    /// Parsed hostname for display, e.g. "relay.sunset.chat".
     host: String,
+    /// Full Connectable label (raw user input or canonical URL).
+    raw_label: String,
     state: RelayConnState,
     attempt: Int,
-    /// Short pubkey (first 4 + last 4 hex bytes) once the Noise
-    /// handshake completes. `None` while connecting.
+    /// First 4 + last 4 hex bytes of the relay's peer_id. None
+    /// while the Noise handshake is still pending.
     peer_id_short: option.Option(String),
     /// Wall-clock ms of the most recent Pong from this relay.
-    /// `None` until the first Pong of the first connection lands.
     last_pong_at_ms: option.Option(Int),
     /// Round-trip time of the most recent Pong, in milliseconds.
     last_rtt_ms: option.Option(Int),
@@ -1049,58 +1039,47 @@ pub type Relay {
 }
 ```
 
-- [ ] **Step 8.2: Strip Bridge usage from `fixture.gleam`**
+- [ ] **Step 8.2: Strip Bridge from fixture.gleam**
 
-In `web/src/sunset_web/fixture.gleam`, remove (a) the `Channel(... kind: Bridge(Minecraft) ...)` row whose name is `"minecraft-bridge"`; (b) every occurrence of `bridge: NoBridge,` on Room/Member/Message constructors; (c) every `bridge: HasBridge(Minecraft),` (member rows that "came from the bridge"); (d) update the import line to drop `Bridge`, `BridgeRelay`, `HasBridge`, `Minecraft`, `NoBridge`. The `Receipt(name: "elena", time: "5:49:18 pm", relay: BridgeRelay)` row also goes — substitute `relay: NoRelay` (Receipt's relay field is the `RelayStatus` enum, unrelated to the new `Relay` type, but `BridgeRelay` is being removed below).
+In `web/src/sunset_web/fixture.gleam`:
+- Update the `import sunset_web/domain.{...}` line to drop `Bridge`, `BridgeRelay`, `HasBridge`, `Minecraft`, `NoBridge`.
+- Remove the channel whose name is `"minecraft-bridge"` (currently around line 130-134).
+- Remove every `bridge: NoBridge,`, `bridge: HasBridge(Minecraft),` field from constructors.
+- For `Receipt(name: ..., relay: BridgeRelay)` rows, change `BridgeRelay` to `NoRelay` (only fixture data; nothing real).
 
-- [ ] **Step 8.3: Drop `BridgeRelay` from `RelayStatus`**
-
-In `web/src/sunset_web/domain.gleam`, change `RelayStatus`:
-
-```gleam
-pub type RelayStatus {
-  Direct
-  OneHop
-  TwoHop
-  ViaPeer(String)
-  SelfRelay
-  NoRelay
-}
-```
-
-(Removed `BridgeRelay` because the Bridge concept is gone; `Receipt`'s `relay` field falls back to `NoRelay` for fixture rows that previously used it. If any non-fixture code constructs `BridgeRelay`, find and fix.)
-
-- [ ] **Step 8.4: Remove `bridge_tag` and bridge handling from `main_panel.gleam`**
+- [ ] **Step 8.3: Strip Bridge from main_panel.gleam**
 
 In `web/src/sunset_web/views/main_panel.gleam`:
-- Remove the `HasBridge`, `Minecraft`, `NoBridge` items from the `domain.{...}` import on line 24-26.
-- Remove the `case m.bridge { HasBridge(Minecraft) -> ... NoBridge -> ... }` block at line 647-649; replace with `[]`.
-- Delete the `fn bridge_tag` definition at line 1025+.
+- Remove `HasBridge`, `Minecraft`, `NoBridge` from the `domain.{...}` import.
+- Delete the `case m.bridge { HasBridge(Minecraft) -> [bridge_tag(...)] NoBridge -> [] }` block (currently around lines 647-649); replace with `[]`.
+- Delete `fn bridge_tag(...)` (currently around line 1025).
 
-- [ ] **Step 8.5: Remove bridge handling from `channels.gleam`**
+- [ ] **Step 8.4: Strip Bridge from channels.gleam**
 
 In `web/src/sunset_web/views/channels.gleam`:
-- Remove `Bridge`, `Minecraft` from the `domain.{...}` import on line 12-16.
-- Remove the `bridge_channels` filter (lines 34-40) and the `case bridge_channels { ... } -> section(p, "Bridges", ...)` block (lines 94-102). Leave a placeholder `element.fragment([])` where the section was; Task 11 replaces it with the real Relays section.
-- Delete `fn bridge_channel_row` (lines 871-894).
+- Remove `Bridge`, `Minecraft` from the `domain.{...}` import.
+- Delete the `bridge_channels` filter (currently lines 34-40) and the `case bridge_channels { ... } -> section(p, "Bridges", ...)` block (currently lines 94-102). Leave `element.fragment([])` where the section was — Task 10 replaces it with the real Relays section.
+- Delete `fn bridge_channel_row(...)` (currently around line 871).
 
-- [ ] **Step 8.6: Build Gleam code**
+- [ ] **Step 8.5: Build and fix any remaining fallout**
 
 Run: `cd web && nix develop --command gleam build 2>&1 | tail -25`
-Expected: still fails on `create_client` arity (Task 9 fixes), but no other errors should remain. Read each error and fix any missed `bridge:` occurrence or stale import.
+Expected: errors only around `create_client` arity (Task 9 fixes). Read each error and fix any missed `bridge:` occurrence or stale import.
 
-- [ ] **Step 8.7: Commit**
+Run: `cd web && nix develop --command gleam test 2>&1 | tail -20`
+Expected: any test that constructed `Channel` / `Member` / `Message` / `Room` with `bridge:` needs that field dropped. The most likely culprit is `web/test/fixture_test.gleam`. Update.
+
+- [ ] **Step 8.6: Commit**
 
 ```bash
-git add web/src/sunset_web/domain.gleam web/src/sunset_web/fixture.gleam web/src/sunset_web/views/main_panel.gleam web/src/sunset_web/views/channels.gleam
+git add web/src/sunset_web/domain.gleam web/src/sunset_web/fixture.gleam web/src/sunset_web/views/main_panel.gleam web/src/sunset_web/views/channels.gleam web/test/
 git commit -m "$(cat <<'EOF'
-web: remove Bridge / Minecraft fixture types; add Relay domain
+web: remove Bridge / Minecraft fixture types; add Relay view-model
 
-The dummy minecraft-bridge channel and bridge: fields on Room /
+The dummy minecraft-bridge channel and the bridge: fields on Room /
 Member / Message had no real producers; nothing in the runtime read
-them. Replaced by a real Relay { addr, host, state, attempt,
-peer_id_short, last_pong_at_ms, last_rtt_ms } type that the next
-change will populate from the supervisor.
+them. Replaced by a domain.Relay view-model derived per render from
+Model.intents (added in the next change).
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1109,52 +1088,95 @@ EOF
 
 ---
 
-## Task 9 — Pure helpers + Gleam unit tests
+## Task 9 — `relays.gleam` pure helpers + Gleam unit tests
 
 **Files:**
 - Create: `web/src/sunset_web/views/relays.gleam` (helpers only — view comes in Task 10)
 - Create: `web/test/sunset_web/views/relays_test.gleam`
 
-- [ ] **Step 9.1: Create `relays.gleam` with the pure helpers only**
+- [ ] **Step 9.1a: Add a `bitsToHex` FFI shim**
+
+Append to `web/src/sunset_web/sunset.ffi.mjs`:
+
+```javascript
+/// Encode a BitArray (Uint8Array internally) as lowercase hex.
+/// Used by the relays popover to render the relay's peer_id.
+export function bitsToHex(bits) {
+  const bytes = bitsToBytes(bits);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+```
+
+Add the Gleam external in `web/src/sunset_web/sunset.gleam` (near `client_public_key_hex`):
+
+```gleam
+@external(javascript, "./sunset.ffi.mjs", "bitsToHex")
+pub fn bits_to_hex(bits: BitArray) -> String
+```
+
+- [ ] **Step 9.1b: Create `relays.gleam` with the pure helpers**
 
 ```gleam
 //// Relays UI: rail-section list + click-through popover (desktop
-//// floating / phone bottom sheet). This file currently exposes only
-//// the pure helpers so they can be unit-tested. The view functions
-//// land in the next change.
+//// floating / phone bottom sheet). This file currently exposes the
+//// pure helpers and a from_intent / relays_for_view derivation. The
+//// view functions land in the next change.
 
+import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option}
+import gleam/order
 import gleam/string
 import gleam/uri
 import sunset_web/domain.{
-  type Relay, type RelayConnState, RelayBackoff, RelayCancelled, RelayConnected,
-  RelayConnecting,
+  type Relay, type RelayConnState, Relay, RelayBackoff, RelayCancelled,
+  RelayConnected, RelayConnecting,
+}
+import sunset_web/sunset.{type IntentSnapshot}
+
+/// True when `label` is a relay (not a direct WebRTC peer).
+/// Connectable::Direct(webrtc://…) carries that scheme on its label;
+/// every other shape (Resolving inputs like "relay.sunset.chat" or
+/// Direct(wss://…) URLs from ?relay=) is a relay.
+pub fn is_relay_label(label: String) -> Bool {
+  !string.starts_with(label, "webrtc://")
 }
 
-/// True for ws:// and wss:// addrs. Direct WebRTC peers (`webrtc://`)
-/// are NOT relays and must be excluded from the rail.
-pub fn is_relay_addr(addr: String) -> Bool {
-  string.starts_with(addr, "ws://") || string.starts_with(addr, "wss://")
-}
-
-/// Best-effort hostname extraction. Returns `addr` unchanged when the
-/// URL fails to parse — defensive fallback so a malformed addr never
-/// crashes the rail. Includes the port when non-default
-/// ("127.0.0.1:8080" → "127.0.0.1:8080").
-pub fn parse_host(addr: String) -> String {
-  case uri.parse(addr) {
-    Ok(u) ->
-      case u.host {
-        option.Some(h) ->
-          case u.port {
-            option.Some(p) -> h <> ":" <> int.to_string(p)
-            option.None -> h
+/// Best-effort hostname extraction. When `label` looks like a URL
+/// (contains `://`), use gleam/uri to extract host[:port]. When it's
+/// a bare hostname (typical for Resolving inputs), return it
+/// unchanged. Returns `label` on parse failure — defensive fallback so
+/// a malformed label never crashes the rail.
+pub fn parse_host(label: String) -> String {
+  case string.contains(label, "://") {
+    False -> label
+    True ->
+      case uri.parse(label) {
+        Ok(u) ->
+          case u.host {
+            option.Some(h) ->
+              case u.port {
+                option.Some(p) -> h <> ":" <> int.to_string(p)
+                option.None -> h
+              }
+            option.None -> label
           }
-        option.None -> addr
+        Error(_) -> label
       }
-    Error(_) -> addr
+  }
+}
+
+/// Map JS-side intent state string to the typed enum. Unknown
+/// strings fall back to `RelayBackoff` so the row stays visible in
+/// some recoverable state rather than being silently dropped.
+pub fn parse_state(s: String) -> RelayConnState {
+  case s {
+    "connected" -> RelayConnected
+    "connecting" -> RelayConnecting
+    "backoff" -> RelayBackoff
+    "cancelled" -> RelayCancelled
+    _ -> RelayBackoff
   }
 }
 
@@ -1201,19 +1223,6 @@ pub fn humanize_age(now_ms: Int, last_ms: Option(Int)) -> String {
   }
 }
 
-/// Map a JS-side intent state string to the typed enum. Unknown
-/// strings fall back to `RelayBackoff` so the row stays visible in
-/// some recoverable state rather than being silently dropped.
-pub fn parse_state(s: String) -> RelayConnState {
-  case s {
-    "connected" -> RelayConnected
-    "connecting" -> RelayConnecting
-    "backoff" -> RelayBackoff
-    "cancelled" -> RelayCancelled
-    _ -> RelayBackoff
-  }
-}
-
 /// Format a hex pubkey as "first8…last8" (8 chars on each side).
 /// Strings of length ≤ 16 are returned unchanged.
 pub fn short_peer_id(hex: String) -> String {
@@ -1223,120 +1232,85 @@ pub fn short_peer_id(hex: String) -> String {
   }
 }
 
-/// Upsert a snapshot into a list of relays keyed by `addr`. Preserves
-/// existing insertion order; appends new addrs at the end.
-pub fn upsert(existing: List(Relay), updated: Relay) -> List(Relay) {
-  case list.find(existing, fn(r) { r.addr == updated.addr }) {
-    Ok(_) ->
-      list.map(existing, fn(r) {
-        case r.addr == updated.addr {
-          True -> updated
-          False -> r
-        }
-      })
-    Error(_) -> list.append(existing, [updated])
-  }
+/// Build a domain.Relay from a sunset.IntentSnapshot. Pure projection.
+pub fn from_intent(snap: IntentSnapshot) -> Relay {
+  let peer_id_short =
+    snap.peer_pubkey
+    |> option.map(fn(bits) { short_peer_id(sunset.bits_to_hex(bits)) })
+  Relay(
+    id: snap.id,
+    host: parse_host(snap.label),
+    raw_label: snap.label,
+    state: parse_state(snap.state),
+    attempt: snap.attempt,
+    peer_id_short: peer_id_short,
+    last_pong_at_ms: snap.last_pong_at_ms,
+    last_rtt_ms: snap.last_rtt_ms,
+  )
+}
+
+/// Filter `intents` to relays only and project to view-models.
+/// Stable order: ascending by IntentId.
+pub fn relays_for_view(
+  intents: Dict(Float, IntentSnapshot),
+) -> List(Relay) {
+  intents
+  |> dict.values()
+  |> list.filter(fn(s) { is_relay_label(s.label) })
+  |> list.sort(fn(a, b) {
+    case a.id <. b.id, a.id >. b.id {
+      True, _ -> order.Lt
+      _, True -> order.Gt
+      _, _ -> order.Eq
+    }
+  })
+  |> list.map(from_intent)
 }
 ```
 
 - [ ] **Step 9.2: Create the test file**
 
 ```gleam
+import gleam/dict
 import gleam/option
 import gleeunit/should
 import sunset_web/domain.{
   Relay, RelayBackoff, RelayCancelled, RelayConnected, RelayConnecting,
 }
+import sunset_web/sunset.{IntentSnapshot}
 import sunset_web/views/relays
 
-pub fn is_relay_addr_wss_test() {
-  relays.is_relay_addr("wss://relay.sunset.chat?x=1#x25519=abc")
-  |> should.be_true()
+pub fn is_relay_label_bare_hostname_test() {
+  relays.is_relay_label("relay.sunset.chat") |> should.be_true()
 }
 
-pub fn is_relay_addr_ws_test() {
-  relays.is_relay_addr("ws://127.0.0.1:8080")
-  |> should.be_true()
+pub fn is_relay_label_wss_test() {
+  relays.is_relay_label("wss://relay.sunset.chat#x25519=ab") |> should.be_true()
 }
 
-pub fn is_relay_addr_webrtc_test() {
-  relays.is_relay_addr("webrtc://abc#x25519=def")
-  |> should.be_false()
+pub fn is_relay_label_ws_test() {
+  relays.is_relay_label("ws://127.0.0.1:8080") |> should.be_true()
 }
 
-pub fn is_relay_addr_https_test() {
-  relays.is_relay_addr("https://example.com")
-  |> should.be_false()
+pub fn is_relay_label_webrtc_test() {
+  relays.is_relay_label("webrtc://abcdef#x25519=11") |> should.be_false()
 }
 
-pub fn parse_host_simple_test() {
-  relays.parse_host("wss://relay.sunset.chat")
-  |> should.equal("relay.sunset.chat")
+pub fn parse_host_bare_hostname_test() {
+  relays.parse_host("relay.sunset.chat") |> should.equal("relay.sunset.chat")
+}
+
+pub fn parse_host_wss_test() {
+  relays.parse_host("wss://relay.sunset.chat") |> should.equal("relay.sunset.chat")
 }
 
 pub fn parse_host_with_port_test() {
-  relays.parse_host("ws://127.0.0.1:8080")
-  |> should.equal("127.0.0.1:8080")
+  relays.parse_host("ws://127.0.0.1:8080") |> should.equal("127.0.0.1:8080")
 }
 
-pub fn parse_host_with_path_query_fragment_test() {
+pub fn parse_host_full_url_test() {
   relays.parse_host("wss://relay.sunset.chat:443/api?token=foo#x25519=abc")
   |> should.equal("relay.sunset.chat:443")
-}
-
-pub fn parse_host_unparseable_falls_back_test() {
-  relays.parse_host("not a url at all")
-  |> should.equal("not a url at all")
-}
-
-pub fn format_status_connected_test() {
-  relays.format_status(RelayConnected, 0)
-  |> should.equal("Connected")
-}
-
-pub fn format_status_connecting_test() {
-  relays.format_status(RelayConnecting, 0)
-  |> should.equal("Connecting")
-}
-
-pub fn format_status_backoff_zero_test() {
-  relays.format_status(RelayBackoff, 0)
-  |> should.equal("Backoff")
-}
-
-pub fn format_status_backoff_with_attempt_test() {
-  relays.format_status(RelayBackoff, 3)
-  |> should.equal("Backoff (attempt 3)")
-}
-
-pub fn format_status_cancelled_test() {
-  relays.format_status(RelayCancelled, 7)
-  |> should.equal("Cancelled")
-}
-
-pub fn format_rtt_present_test() {
-  relays.format_rtt(option.Some(42))
-  |> should.equal("RTT 42 ms")
-}
-
-pub fn format_rtt_absent_test() {
-  relays.format_rtt(option.None)
-  |> should.equal("RTT —")
-}
-
-pub fn humanize_age_just_now_test() {
-  relays.humanize_age(1000, option.Some(800))
-  |> should.equal("just now")
-}
-
-pub fn humanize_age_seconds_test() {
-  relays.humanize_age(5500, option.Some(500))
-  |> should.equal("5s ago")
-}
-
-pub fn humanize_age_never_test() {
-  relays.humanize_age(0, option.None)
-  |> should.equal("never")
 }
 
 pub fn parse_state_known_test() {
@@ -1347,13 +1321,51 @@ pub fn parse_state_known_test() {
 }
 
 pub fn parse_state_unknown_falls_back_to_backoff_test() {
-  relays.parse_state("eldritch_state")
-  |> should.equal(RelayBackoff)
+  relays.parse_state("eldritch_state") |> should.equal(RelayBackoff)
+}
+
+pub fn format_status_connected_test() {
+  relays.format_status(RelayConnected, 0) |> should.equal("Connected")
+}
+
+pub fn format_status_connecting_test() {
+  relays.format_status(RelayConnecting, 0) |> should.equal("Connecting")
+}
+
+pub fn format_status_backoff_zero_test() {
+  relays.format_status(RelayBackoff, 0) |> should.equal("Backoff")
+}
+
+pub fn format_status_backoff_with_attempt_test() {
+  relays.format_status(RelayBackoff, 3) |> should.equal("Backoff (attempt 3)")
+}
+
+pub fn format_status_cancelled_test() {
+  relays.format_status(RelayCancelled, 7) |> should.equal("Cancelled")
+}
+
+pub fn format_rtt_present_test() {
+  relays.format_rtt(option.Some(42)) |> should.equal("RTT 42 ms")
+}
+
+pub fn format_rtt_absent_test() {
+  relays.format_rtt(option.None) |> should.equal("RTT —")
+}
+
+pub fn humanize_age_just_now_test() {
+  relays.humanize_age(1000, option.Some(800)) |> should.equal("just now")
+}
+
+pub fn humanize_age_seconds_test() {
+  relays.humanize_age(5500, option.Some(500)) |> should.equal("5s ago")
+}
+
+pub fn humanize_age_never_test() {
+  relays.humanize_age(0, option.None) |> should.equal("never")
 }
 
 pub fn short_peer_id_short_unchanged_test() {
-  relays.short_peer_id("abcdef")
-  |> should.equal("abcdef")
+  relays.short_peer_id("abcdef") |> should.equal("abcdef")
 }
 
 pub fn short_peer_id_truncates_test() {
@@ -1361,43 +1373,57 @@ pub fn short_peer_id_truncates_test() {
   |> should.equal("01234567…89abcdef")
 }
 
-pub fn upsert_inserts_new_at_end_test() {
-  let r =
-    Relay(
-      addr: "wss://a",
-      host: "a",
-      state: RelayConnecting,
-      attempt: 0,
-      peer_id_short: option.None,
-      last_pong_at_ms: option.None,
-      last_rtt_ms: option.None,
-    )
-  relays.upsert([], r)
-  |> should.equal([r])
+fn snap(id: Float, label: String, state: String) -> IntentSnapshot {
+  IntentSnapshot(
+    id: id,
+    state: state,
+    label: label,
+    peer_pubkey: option.None,
+    kind: option.None,
+    attempt: 0,
+    last_pong_at_ms: option.None,
+    last_rtt_ms: option.None,
+  )
 }
 
-pub fn upsert_replaces_existing_test() {
-  let r1 =
-    Relay(
-      addr: "wss://a",
-      host: "a",
-      state: RelayConnecting,
-      attempt: 0,
-      peer_id_short: option.None,
-      last_pong_at_ms: option.None,
-      last_rtt_ms: option.None,
-    )
-  let r2 = Relay(..r1, state: RelayConnected, last_rtt_ms: option.Some(42))
-  let r3 = Relay(..r1, addr: "wss://b", host: "b")
-  relays.upsert([r1, r3], r2)
-  |> should.equal([r2, r3])
+pub fn from_intent_basic_test() {
+  let s = snap(7.0, "relay.sunset.chat", "connected")
+  let r = relays.from_intent(s)
+  r.id |> should.equal(7.0)
+  r.host |> should.equal("relay.sunset.chat")
+  r.raw_label |> should.equal("relay.sunset.chat")
+  r.state |> should.equal(RelayConnected)
+  r.attempt |> should.equal(0)
+  r.peer_id_short |> should.equal(option.None)
+  r.last_pong_at_ms |> should.equal(option.None)
+  r.last_rtt_ms |> should.equal(option.None)
+}
+
+pub fn relays_for_view_filters_webrtc_test() {
+  let intents =
+    dict.new()
+    |> dict.insert(1.0, snap(1.0, "relay.sunset.chat", "connected"))
+    |> dict.insert(2.0, snap(2.0, "webrtc://abc#x25519=11", "connected"))
+    |> dict.insert(3.0, snap(3.0, "wss://other.example", "connecting"))
+  let out = relays.relays_for_view(intents)
+  // Two relays, sorted by id ascending.
+  out |> list.length() |> should.equal(2)
+  case out {
+    [a, b] -> {
+      a.id |> should.equal(1.0)
+      b.id |> should.equal(3.0)
+    }
+    _ -> should.fail()
+  }
 }
 ```
 
+Add `import gleam/list` at the top if missing.
+
 - [ ] **Step 9.3: Run the Gleam tests**
 
-Run: `cd web && nix develop --command gleam test 2>&1 | tail -25`
-Expected: tests pass. (The full app `gleam build` may still fail at this point because `sunset_web.gleam`'s `create_client` call is stale; `gleam test` runs the test target separately and should still build the unit-test code paths if they don't transitively pull in the broken main module. If `gleam test` *also* fails on main module compile, complete Task 10 first and circle back.)
+Run: `cd web && nix develop --command gleam test 2>&1 | tail -30`
+Expected: all `relays_test` cases pass. Existing `relay_status_pill_test` continues to pass. Other tests' state depends on Task 8 cleanup having landed cleanly.
 
 - [ ] **Step 9.4: Commit**
 
@@ -1406,11 +1432,12 @@ git add web/src/sunset_web/views/relays.gleam web/test/sunset_web/views/relays_t
 git commit -m "$(cat <<'EOF'
 web: relays.gleam pure helpers + unit tests
 
-is_relay_addr / parse_host (gleam/uri-backed, with addr fallback) /
-format_status (with attempt-N rendering for Backoff) / format_rtt /
-humanize_age (mirrors peer_status_popover; kept duplicated per spec) /
-parse_state / short_peer_id / upsert. View entry points come in the
-next change.
+is_relay_label (filters webrtc:// direct peers) / parse_host
+(gleam/uri-backed with bare-hostname fallback) / parse_state
+(unknown → RelayBackoff defensive fallback) / format_status (with
+attempt-N rendering for Backoff) / format_rtt / humanize_age (mirrors
+peer_status_popover) / short_peer_id / from_intent + relays_for_view
+(filter + sort + project). View entry points come in the next change.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1419,122 +1446,43 @@ EOF
 
 ---
 
-## Task 10 — Wire model + subscription + popover state in `sunset_web.gleam`
+## Task 10 — Render the Relays section in the channels rail (no popover yet)
 
 **Files:**
-- Modify: `web/src/sunset_web.gleam` (Model, Msg, init effect, update branches, view wiring)
+- Modify: `web/src/sunset_web/views/relays.gleam` (add `rail_section` view)
+- Modify: `web/src/sunset_web/views/channels.gleam` (replace placeholder with rail_section call)
+- Modify: `web/src/sunset_web.gleam` (pass `relays` and `OpenRelayPopover` callback into `channels.view`; pass heartbeat URL param to `create_client`; add Msgs + Model field)
 
-- [ ] **Step 10.1: Add `relays` and `relays_popover` to the Model**
+- [ ] **Step 10.1: Add Model + Msg + bootstrap wiring**
 
-In `web/src/sunset_web.gleam`, locate the `Model(...)` record (around line 145) and add:
+In `web/src/sunset_web.gleam`:
+
+Add to `Model` (right after the `intents:` field or wherever popover state lives):
 
 ```gleam
-    /// All relay intents currently registered with the supervisor.
-    /// Updated from on_peer_connection_state. Direct WebRTC peers are
-    /// excluded by `relays.is_relay_addr` before insertion.
-    relays: List(domain.Relay),
-    /// Address of the relay whose popover is open, if any. Phone +
-    /// desktop share this state — placement is decided by `viewport`.
-    relays_popover: option.Option(String),
+    /// The IntentId of the relay whose popover is open, if any.
+    /// Phone + desktop share this; placement is decided by `viewport`.
+    relays_popover: option.Option(Float),
 ```
 
-In the `Model(..., relay_status: "disconnected")` initialiser (around line 284), add:
+Initialise in the `Model(...)` constructor (where other defaults live):
 
 ```gleam
-      relays: [],
       relays_popover: option.None,
 ```
 
-- [ ] **Step 10.2: Add new Msg variants**
-
-In the `pub type Msg { ... }` block (around line 200-220), add:
+Add to `pub type Msg`:
 
 ```gleam
-  PeerConnectionSnapshotSeed(List(sunset.IntentSnapshotJs))
-  PeerConnectionStateUpdated(sunset.IntentSnapshotJs)
-  OpenRelayPopover(String)
+  OpenRelayPopover(Float)
   CloseRelayPopover
 ```
 
-- [ ] **Step 10.3: Pass the heartbeat URL param into `create_client`**
-
-Locate the `sunset.create_client(seed, fn(client) { ... })` call site (the only one — search `rg -n 'create_client' web/src/`). Change to:
+Update the `update` arm list:
 
 ```gleam
-let hb = sunset.heartbeat_interval_ms_from_url()
-sunset.create_client(seed, hb, fn(client) {
-  ...
-})
-```
-
-- [ ] **Step 10.4: Subscribe at Client creation time**
-
-Inside the `create_client` callback (right after the `ClientHandle` is captured, before any `add_relay` is fired — search for where `add_relay` is called from the bootstrap effect, around line 740-748), add:
-
-```gleam
-sunset.peer_connection_snapshot(client, fn(snaps) {
-  dispatch(PeerConnectionSnapshotSeed(snaps))
-})
-sunset.subscribe_peer_connections(client, fn(snap) {
-  dispatch(PeerConnectionStateUpdated(snap))
-})
-```
-
-- [ ] **Step 10.5: Add a helper that maps a JS snapshot to a `domain.Relay`**
-
-Above the `update` function (or near the bottom of the file with other helpers), add:
-
-```gleam
-fn snap_to_relay(snap: sunset.IntentSnapshotJs) -> domain.Relay {
-  let addr = sunset.snap_addr(snap)
-  let state = relays_view.parse_state(sunset.snap_state(snap))
-  let peer_id_short =
-    case sunset.snap_peer_id_hex(snap) {
-      Ok(hex) -> option.Some(relays_view.short_peer_id(hex))
-      Error(_) -> option.None
-    }
-  domain.Relay(
-    addr: addr,
-    host: relays_view.parse_host(addr),
-    state: state,
-    attempt: sunset.snap_attempt(snap),
-    peer_id_short: peer_id_short,
-    last_pong_at_ms: sunset.snap_last_pong_at_ms(snap),
-    last_rtt_ms: sunset.snap_last_rtt_ms(snap),
-  )
-}
-```
-
-Add a corresponding alias near the imports:
-
-```gleam
-import sunset_web/views/relays as relays_view
-```
-
-- [ ] **Step 10.6: Handle the new Msgs in `update`**
-
-In the `pub fn update` arms, add:
-
-```gleam
-    PeerConnectionSnapshotSeed(snaps) -> {
-      let new_relays =
-        snaps
-        |> list.filter(fn(s) { relays_view.is_relay_addr(sunset.snap_addr(s)) })
-        |> list.map(snap_to_relay)
-      #(Model(..model, relays: new_relays), effect.none())
-    }
-    PeerConnectionStateUpdated(snap) -> {
-      let addr = sunset.snap_addr(snap)
-      case relays_view.is_relay_addr(addr) {
-        False -> #(model, effect.none())
-        True -> {
-          let r = snap_to_relay(snap)
-          #(Model(..model, relays: relays_view.upsert(model.relays, r)), effect.none())
-        }
-      }
-    }
-    OpenRelayPopover(addr) -> #(
-      Model(..model, relays_popover: option.Some(addr)),
+    OpenRelayPopover(id) -> #(
+      Model(..model, relays_popover: option.Some(id)),
       effect.none(),
     )
     CloseRelayPopover -> #(
@@ -1543,40 +1491,22 @@ In the `pub fn update` arms, add:
     )
 ```
 
-- [ ] **Step 10.7: Compile-check**
+Update the bootstrap effect that calls `sunset.create_client`. Find:
 
-Run: `cd web && nix develop --command gleam build 2>&1 | tail -25`
-Expected: builds, but the channels rail still doesn't render relays (Task 11) and the popover overlay still isn't mounted (Task 12).
-
-- [ ] **Step 10.8: Commit**
-
-```bash
-git add web/src/sunset_web.gleam
-git commit -m "$(cat <<'EOF'
-web: subscribe to peer-connection state and seed Relays in Model
-
-create_client now passes the URL-tunable heartbeat_interval_ms and
-immediately wires peer_connection_snapshot + subscribe_peer_connections
-so the supervisor's IntentSnapshot stream populates Model.relays.
-Direct peers (webrtc://) are filtered out.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-EOF
-)"
+```gleam
+sunset.create_client(seed, fn(client) { ... })
 ```
 
----
+Replace with:
 
-## Task 11 — Render the Relays section in the channels rail
+```gleam
+let hb = sunset.heartbeat_interval_ms_from_url()
+sunset.create_client(seed, hb, fn(client) { ... })
+```
 
-**Files:**
-- Modify: `web/src/sunset_web/views/relays.gleam` (add `rail_section` view)
-- Modify: `web/src/sunset_web/views/channels.gleam` (replace the placeholder slot from Task 8.5)
-- Modify: `web/src/sunset_web.gleam` (pass `relays` and `OpenRelayPopover` into `channels.view`)
+- [ ] **Step 10.2: Add `rail_section` to `relays.gleam`**
 
-- [ ] **Step 11.1: Add `rail_section` to `relays.gleam`**
-
-Add the following imports at the top of `web/src/sunset_web/views/relays.gleam` (Gleam requires imports at the top — append the function definitions at the bottom but the imports go up with the existing `import` block):
+Add the lustre / theme / ui imports at the top of `web/src/sunset_web/views/relays.gleam` (Gleam imports go at the file top):
 
 ```gleam
 import lustre/attribute
@@ -1587,14 +1517,13 @@ import sunset_web/theme.{type Palette}
 import sunset_web/ui
 ```
 
-Then append the function definitions to the end of the file:
+Then append the view functions to the file's end:
 
 ```gleam
-
 pub fn rail_section(
   palette p: Palette,
-  relays rs: List(domain.Relay),
-  on_open on_open: fn(String) -> msg,
+  relays rs: List(Relay),
+  on_open on_open: fn(Float) -> msg,
 ) -> Element(msg) {
   case rs {
     [] -> element.fragment([])
@@ -1638,15 +1567,15 @@ pub fn rail_section(
 
 fn rail_row(
   p: Palette,
-  r: domain.Relay,
-  on_open: fn(String) -> msg,
+  r: Relay,
+  on_open: fn(Float) -> msg,
 ) -> Element(msg) {
   html.button(
     [
       attribute.attribute("data-testid", "relay-row"),
       attribute.attribute("data-relay-host", r.host),
       attribute.attribute("data-relay-state", state_attr(r.state)),
-      event.on_click(on_open(r.addr)),
+      event.on_click(on_open(r.id)),
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),
@@ -1664,19 +1593,28 @@ fn rail_row(
     ],
     [
       conn_dot(p, r.state),
-      html.span([ui.css([#("flex", "1"), #("min-width", "0"),
-        #("white-space", "nowrap"), #("overflow", "hidden"),
-        #("text-overflow", "ellipsis")])], [html.text(r.host)]),
+      html.span(
+        [
+          ui.css([
+            #("flex", "1"),
+            #("min-width", "0"),
+            #("white-space", "nowrap"),
+            #("overflow", "hidden"),
+            #("text-overflow", "ellipsis"),
+          ]),
+        ],
+        [html.text(r.host)],
+      ),
     ],
   )
 }
 
-fn conn_dot(p: Palette, s: domain.RelayConnState) -> Element(msg) {
+fn conn_dot(p: Palette, s: RelayConnState) -> Element(msg) {
   let c = case s {
-    domain.RelayConnected -> p.live
-    domain.RelayConnecting -> p.warn
-    domain.RelayBackoff -> p.warn
-    domain.RelayCancelled -> p.text_faint
+    RelayConnected -> p.live
+    RelayConnecting -> p.warn
+    RelayBackoff -> p.warn
+    RelayCancelled -> p.text_faint
   }
   html.span(
     [
@@ -1693,29 +1631,29 @@ fn conn_dot(p: Palette, s: domain.RelayConnState) -> Element(msg) {
   )
 }
 
-fn state_attr(s: domain.RelayConnState) -> String {
+fn state_attr(s: RelayConnState) -> String {
   case s {
-    domain.RelayConnected -> "connected"
-    domain.RelayConnecting -> "connecting"
-    domain.RelayBackoff -> "backoff"
-    domain.RelayCancelled -> "cancelled"
+    RelayConnected -> "connected"
+    RelayConnecting -> "connecting"
+    RelayBackoff -> "backoff"
+    RelayCancelled -> "cancelled"
   }
 }
 ```
 
-- [ ] **Step 11.2: Wire `rail_section` into `channels.gleam`**
+- [ ] **Step 10.3: Wire `rail_section` into `channels.gleam`**
 
-In `web/src/sunset_web/views/channels.gleam`, add to the `view` signature (alongside `voice_popover_open`, etc.):
-
-```gleam
-  relays relays: List(domain.Relay),
-  on_open_relay on_open_relay: fn(String) -> msg,
-```
-
-Add the import:
+In `web/src/sunset_web/views/channels.gleam`, add the import:
 
 ```gleam
 import sunset_web/views/relays as relays_view
+```
+
+Add to the `view` function's labeled-arg list (alongside `voice_popover_open`):
+
+```gleam
+  relays relays: List(domain.Relay),
+  on_open_relay on_open_relay: fn(Float) -> msg,
 ```
 
 Replace the placeholder fragment that previously sat where the Bridges section was, with:
@@ -1728,35 +1666,44 @@ Replace the placeholder fragment that previously sat where the Bridges section w
           ),
 ```
 
-- [ ] **Step 11.3: Pass relays from the shell**
+- [ ] **Step 10.4: Pass `relays` from the shell**
 
-In `web/src/sunset_web.gleam`, locate the `channels.view(...)` call site (around line 1308 area where channels rail mounts) and add:
+In `web/src/sunset_web.gleam`, locate every `channels.view(...)` call site (search `rg -n 'channels.view(' web/src/sunset_web.gleam`). Add to each call:
 
 ```gleam
-        relays: model.relays,
+        relays: relays_view.relays_for_view(model.intents),
         on_open_relay: OpenRelayPopover,
 ```
 
-If `channels.view` is invoked from multiple branches (desktop / phone drawer), update each.
+Add the import at the top (mirrors the existing `views/...` imports):
 
-- [ ] **Step 11.4: Build and visually verify locally (no popover yet)**
+```gleam
+import sunset_web/views/relays as relays_view
+```
+
+- [ ] **Step 10.5: Build and verify in a browser**
 
 Run: `cd web && nix develop --command gleam build 2>&1 | tail -10`
 Expected: clean.
 
-Run the dev server: `cd web && nix develop --command npm run dev` (or whatever is in `web/package.json`'s scripts). Open in a browser, confirm the "Relays" section appears under the channels rail when a relay is configured. Click does nothing yet — popover lands in Task 12. (For UI changes, the CLAUDE.md rule says to verify in a browser before claiming complete; do this here even though the popover is not finished.)
+Per CLAUDE.md, verify UI changes in a browser before claiming complete. Start the dev server (find the script via `cat web/package.json | grep -A1 scripts`); open the page with a relay configured (e.g. `?relay=ws://127.0.0.1:PORT#x25519=...` against a local relay you spawn out-of-band, or just rely on the default `relay.sunset.chat` resolution if internet is available). Confirm the "Relays" section appears under the channels rail. Click does nothing yet — popover lands in Task 11.
 
-- [ ] **Step 11.5: Commit**
+If no browser verification is possible from your shell, say so explicitly and proceed to Task 11.
+
+- [ ] **Step 10.6: Commit**
 
 ```bash
 git add web/src/sunset_web/views/relays.gleam web/src/sunset_web/views/channels.gleam web/src/sunset_web.gleam
 git commit -m "$(cat <<'EOF'
-web: render Relays section in the channels rail
+web: render Relays section in channels rail
 
-Replaces the dummy "Bridges" slot with a live list of relays sourced
-from the supervisor's IntentSnapshot stream. Status dot colours mirror
-ConnStatus (live / warn / faint). Click handler dispatches
-OpenRelayPopover; popover wiring lands next.
+Replaces the dummy Bridges slot with a live list of relays sourced
+from the supervisor's IntentSnapshot stream (filtered to non-webrtc
+labels). Status dot colours mirror ConnStatus (live / warn / faint).
+Click handler dispatches OpenRelayPopover; popover wiring lands next.
+
+Bootstrap also threads the new ?heartbeat_interval_ms URL param into
+Client::new for e2e use.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1765,13 +1712,13 @@ EOF
 
 ---
 
-## Task 12 — Popover view + desktop floating / phone bottom-sheet wiring
+## Task 11 — Popover view + desktop floating / phone bottom-sheet wiring
 
 **Files:**
-- Modify: `web/src/sunset_web/views/relays.gleam` (add `popover` view + Placement)
-- Modify: `web/src/sunset_web.gleam` (mount the overlay alongside `peer_status_popover_overlay`)
+- Modify: `web/src/sunset_web/views/relays.gleam` (add `popover` view + `Placement`)
+- Modify: `web/src/sunset_web.gleam` (mount overlays alongside `peer_status_popover_overlay`)
 
-- [ ] **Step 12.1: Add the popover view**
+- [ ] **Step 11.1: Add the popover view**
 
 Append to `web/src/sunset_web/views/relays.gleam`:
 
@@ -1783,7 +1730,7 @@ pub type Placement {
 
 pub fn popover(
   palette p: Palette,
-  relay r: domain.Relay,
+  relay r: Relay,
   now_ms now: Int,
   placement placement: Placement,
   on_close on_close: msg,
@@ -1801,10 +1748,13 @@ pub fn popover(
       [
         header(p, r.host, on_close),
         status_pill(p, r.state, format_status(r.state, r.attempt)),
-        info_row(p, "relay-popover-heard-from",
-          "heard from " <> humanize_age(now, r.last_pong_at_ms)),
+        info_row(
+          p,
+          "relay-popover-heard-from",
+          "heard from " <> humanize_age(now, r.last_pong_at_ms),
+        ),
         info_row(p, "relay-popover-rtt", format_rtt(r.last_rtt_ms)),
-        mono_row(p, "relay-popover-addr", r.addr),
+        mono_row(p, "relay-popover-label", r.raw_label),
         case r.peer_id_short {
           option.Some(s) -> mono_row(p, "relay-popover-peer-id", s)
           option.None -> element.fragment([])
@@ -1891,12 +1841,12 @@ fn header(p: Palette, host: String, on_close: msg) -> Element(msg) {
   )
 }
 
-fn status_pill(p: Palette, state: domain.RelayConnState, label: String) -> Element(msg) {
+fn status_pill(p: Palette, state: RelayConnState, label: String) -> Element(msg) {
   let bg = case state {
-    domain.RelayConnected -> p.live
-    domain.RelayConnecting -> p.warn
-    domain.RelayBackoff -> p.warn
-    domain.RelayCancelled -> p.text_faint
+    RelayConnected -> p.live
+    RelayConnecting -> p.warn
+    RelayBackoff -> p.warn
+    RelayCancelled -> p.text_faint
   }
   html.span(
     [
@@ -1944,22 +1894,50 @@ fn mono_row(p: Palette, testid: String, text: String) -> Element(msg) {
 }
 ```
 
-- [ ] **Step 12.2: Mount the overlay in `sunset_web.gleam`**
+- [ ] **Step 11.2: Mount overlays in `sunset_web.gleam`**
 
-Locate `peer_status_popover_overlay` (around line 1516) and the matching `peer_status_sheet_el` (around line 1375). Add a sibling for relays.
+Locate `peer_status_popover_overlay` (search `rg -n 'peer_status_popover_overlay\|peer_status_sheet_el' web/src/sunset_web.gleam`).
 
-For the desktop overlay (search for `peer_status_popover_overlay(palette, model, state)` mount and add immediately after):
+For desktop, add a sibling function:
+
+```gleam
+fn relay_popover_overlay(
+  palette: theme.Palette,
+  model: Model,
+) -> Element(Msg) {
+  case model.viewport, model.relays_popover {
+    domain.Desktop, option.Some(id) -> {
+      let rs = relays_view.relays_for_view(model.intents)
+      case list.find(rs, fn(r) { r.id == id }) {
+        Ok(r) ->
+          relays_view.popover(
+            palette: palette,
+            relay: r,
+            now_ms: model.now_ms,
+            placement: relays_view.Floating,
+            on_close: CloseRelayPopover,
+          )
+        Error(_) -> element.fragment([])
+      }
+    }
+    _, _ -> element.fragment([])
+  }
+}
+```
+
+Mount it where `peer_status_popover_overlay(palette, model, state)` is called — add immediately after:
 
 ```gleam
 relay_popover_overlay(palette, model),
 ```
 
-For the phone bottom sheet (search for `peer_status_sheet_el` definition and add a `relay_sheet_el`):
+For phone, define a sibling sheet element next to `peer_status_sheet_el`:
 
 ```gleam
 let relay_sheet_el = case model.viewport, model.relays_popover {
-  domain.Phone, option.Some(addr) ->
-    case list.find(model.relays, fn(r) { r.addr == addr }) {
+  domain.Phone, option.Some(id) -> {
+    let rs = relays_view.relays_for_view(model.intents)
+    case list.find(rs, fn(r) { r.id == id }) {
       Ok(r) ->
         bottom_sheet.view(
           palette: palette,
@@ -1974,44 +1952,23 @@ let relay_sheet_el = case model.viewport, model.relays_popover {
         )
       Error(_) -> element.fragment([])
     }
+  }
   _, _ -> element.fragment([])
 }
 ```
 
-And mount `relay_sheet_el` in the same `case` arm where `peer_status_sheet_el` is mounted (under the `Phone` branch of the shell render).
+Mount `relay_sheet_el` in the same render block as `peer_status_sheet_el`.
 
-Define the desktop overlay function near `peer_status_popover_overlay`:
+If `model.now_ms` is named differently, search `rg -n 'now_ms\|NowTick' web/src/sunset_web.gleam` and substitute.
 
-```gleam
-fn relay_popover_overlay(palette: theme.Palette, model: Model) -> Element(Msg) {
-  case model.viewport, model.relays_popover {
-    domain.Desktop, option.Some(addr) ->
-      case list.find(model.relays, fn(r) { r.addr == addr }) {
-        Ok(r) ->
-          relays_view.popover(
-            palette: palette,
-            relay: r,
-            now_ms: model.now_ms,
-            placement: relays_view.Floating,
-            on_close: CloseRelayPopover,
-          )
-        Error(_) -> element.fragment([])
-      }
-    _, _ -> element.fragment([])
-  }
-}
-```
-
-If the model field for the live "now" tick is named differently (search `rg -n 'now_ms\|NowTick\|setIntervalMs' web/src/`), substitute the actual field name.
-
-- [ ] **Step 12.3: Build and verify in the browser**
+- [ ] **Step 11.3: Build and verify**
 
 Run: `cd web && nix develop --command gleam build 2>&1 | tail -10`
 Expected: clean.
 
-Open the dev server, click a Relays row. Desktop: a floating card opens top-right with hostname / status pill / "heard from" / RTT / addr. Phone (DevTools 390×844): the same content slides up as a bottom sheet. Close via × works in both.
+Browser smoke (per CLAUDE.md): open the dev server, click a Relays row. Desktop: a floating card opens top-right with hostname / status / "heard from" / RTT / label. Phone (DevTools 390×844): the same content slides up as a bottom sheet. Close via × works in both. If no browser is available, skip and rely on the e2e test in Task 12.
 
-- [ ] **Step 12.4: Commit**
+- [ ] **Step 11.4: Commit**
 
 ```bash
 git add web/src/sunset_web/views/relays.gleam web/src/sunset_web.gleam
@@ -2020,7 +1977,7 @@ web: relay popover (desktop floating + phone bottom sheet)
 
 Click a Relays row to see hostname header, status pill, last
 heartbeat (live-ticking via the existing now_ms ticker), RTT, full
-addr URL (mono, selectable), and short peer id (when known).
+label (mono, selectable), and short peer id (when known).
 Placement mirrors peer_status_popover (Floating | InSheet) and
 mounts inside the existing bottom_sheet host on phone.
 
@@ -2031,12 +1988,14 @@ EOF
 
 ---
 
-## Task 13 — Playwright e2e
+## Task 12 — Playwright e2e
 
 **Files:**
 - Create: `web/e2e/relays.spec.js`
 
-- [ ] **Step 13.1: Author the spec**
+- [ ] **Step 12.1: Author the spec**
+
+Mirror the spawn-relay pattern from `web/e2e/peer_status_popover.spec.js`:
 
 ```javascript
 // Acceptance test for the Relays rail and popover.
@@ -2044,7 +2003,7 @@ EOF
 // Spawns a real sunset-relay, points one browser at it, and asserts:
 //   * Relays section + row appear with the correct hostname.
 //   * Row state attribute reaches "connected".
-//   * Click opens the popover (hostname, status, heard-from, RTT, addr).
+//   * Click opens the popover (hostname, status, heard-from, RTT, label).
 //   * Live age + RTT update once a Pong round-trips
 //     (heartbeat_interval_ms=2000 keeps the test under 15 s).
 //   * On phone viewport, the popover renders inside the bottom sheet.
@@ -2121,8 +2080,6 @@ const buildUrl = () =>
   `&heartbeat_interval_ms=2000` +
   `#sunset-relays`;
 
-// Compute the host/port string we expect rendered, matching parse_host's
-// behaviour on `ws://127.0.0.1:NNN`.
 function expectedHost() {
   const u = new URL(relayAddress);
   return u.port ? `${u.hostname}:${u.port}` : u.hostname;
@@ -2135,7 +2092,6 @@ test("desktop: relay row appears and popover shows live metrics", async ({ page 
     process.stderr.write(`[pageerror] ${err.stack || err}\n`),
   );
   await page.goto(buildUrl());
-  // The Relays section is hidden when empty; wait for it to materialise.
   await expect(page.locator('[data-testid="relays-section"]')).toBeVisible({
     timeout: 10_000,
   });
@@ -2154,11 +2110,10 @@ test("desktop: relay row appears and popover shows live metrics", async ({ page 
     popover.locator('[data-testid="relay-popover-status"]'),
   ).toHaveText("Connected");
   await expect(
-    popover.locator('[data-testid="relay-popover-addr"]'),
+    popover.locator('[data-testid="relay-popover-label"]'),
   ).toContainText(relayAddress);
 
-  // Within ~6 s (3 × heartbeat_interval_ms=2000) we should see a
-  // measured RTT and a humanised heartbeat age.
+  // Within ~6 s (3 × heartbeat_interval_ms=2000) we should see RTT.
   const rtt = popover.locator('[data-testid="relay-popover-rtt"]');
   await expect(rtt).toHaveText(/^RTT \d+ ms$/, { timeout: 8_000 });
   const heard = popover.locator('[data-testid="relay-popover-heard-from"]');
@@ -2178,11 +2133,10 @@ test("phone: popover renders inside the bottom sheet", async ({ browser }) => {
   );
   await page.goto(buildUrl());
 
-  // On phone the channels rail is inside the channels drawer; open it.
-  // (The brand button at the top opens the rooms drawer; the channels
-  // drawer is opened by a chevron / hamburger on the room header.)
-  // If the relays section is reachable directly (e.g. when the channels
-  // drawer is mounted but slid in), this becomes a no-op.
+  // On phone the channels rail may live inside a drawer; open it
+  // through whatever opener the existing UI uses. The selector below
+  // is a guess — search the codebase for the actual phone-side
+  // channels-drawer testid before assuming the if-block always runs.
   const channelsDrawerOpener = page.locator(
     '[data-testid="phone-open-channels"]',
   );
@@ -2201,10 +2155,8 @@ test("phone: popover renders inside the bottom sheet", async ({ browser }) => {
 
   const popover = page.locator('[data-testid="relay-popover"]');
   await expect(popover).toBeVisible();
-  // Assert the popover lives inside the bottom-sheet host. The host's
-  // testid is `bottom-sheet`; a sibling `data-testid="bottom-sheet"`
-  // ancestor proves this is the InSheet placement, not the Floating
-  // desktop card mistakenly mounted.
+  // The popover's `data-testid="bottom-sheet"` ancestor proves we're
+  // in the InSheet placement, not the Floating desktop card.
   const sheetAncestor = popover.locator(
     'xpath=ancestor::*[@data-testid="bottom-sheet"]',
   );
@@ -2214,19 +2166,25 @@ test("phone: popover renders inside the bottom sheet", async ({ browser }) => {
 });
 ```
 
-If the phone-channels-drawer testid is named differently (search `rg -n 'phone-open\|ChannelsDrawer\|drawer.*open' web/src/`), substitute the real selector. If the channels rail is *always* reachable on phone without an explicit opener, the `if (await channelsDrawerOpener.count())` block becomes a harmless no-op.
+If the phone-channels-drawer test-id is named differently, search:
 
-- [ ] **Step 13.2: Run the new spec**
+```bash
+nix develop --command rg -n 'phone-open\|ChannelsDrawer\|channels-drawer\|drawer.*open' web/src/
+```
+
+and substitute. If the channels rail is always reachable on phone without an explicit opener, the `if (await ...count())` block becomes a harmless no-op.
+
+- [ ] **Step 12.2: Run the new spec**
 
 Run: `cd web && nix develop --command npx playwright test relays.spec.js 2>&1 | tail -40`
-Expected: both tests PASS. If the desktop test fails on the RTT assertion within 8 s, double-check the heartbeat URL param made it through (Task 7 + Task 10) and that Client::new actually applies it (Task 6).
+Expected: both tests PASS. If the desktop test fails on the RTT assertion within 8 s, double-check (a) the heartbeat URL param made it through (Task 7 + Task 10), (b) `Client::new` actually applies it (Task 6), and (c) the supervisor's `handle_engine_event` fires `PongObserved` and propagates to the snapshot (Task 5). Use the systematic-debugging skill — never paper over a real bug with a longer timeout. The test asserts a contract a real user would notice.
 
-- [ ] **Step 13.3: Run the full e2e suite to catch regressions**
+- [ ] **Step 12.3: Run the full e2e suite to catch regressions**
 
-Run: `cd web && nix develop --command npx playwright test 2>&1 | tail -20`
-Expected: no regressions. If `peer_status_popover.spec.js` or other tests fail because they relied on the now-removed Bridge fixture data, fix them.
+Run: `cd web && nix develop --command npx playwright test 2>&1 | tail -30`
+Expected: no regressions. If any spec fails because it relied on the now-removed Bridge fixture data, fix it. If `relay_deploy.spec.js` fails on a timing issue introduced by the heartbeat change, investigate root cause — don't loosen the test.
 
-- [ ] **Step 13.4: Commit**
+- [ ] **Step 12.4: Commit**
 
 ```bash
 git add web/e2e/relays.spec.js
@@ -2236,7 +2194,7 @@ web: e2e for Relays rail + popover (desktop + phone bottom sheet)
 Spawns a real sunset-relay, asserts:
   * Relays section + row materialise with the right hostname.
   * Row state reaches "connected".
-  * Popover opens with status pill, full addr, live RTT and
+  * Popover opens with status pill, full label, live RTT and
     heard-from age (the latter two driven by the new
     heartbeat_interval_ms=2000 URL param so the test fits under 15 s).
   * On phone viewport the popover lives inside the bottom-sheet host.
@@ -2248,46 +2206,44 @@ EOF
 
 ---
 
-## Task 14 — Cross-cutting verification
+## Task 13 — Cross-cutting verification
 
 **Files:** none modified — verification only.
 
-- [ ] **Step 14.1: Run the full Rust workspace test suite**
+- [ ] **Step 13.1: Full Rust workspace test suite**
 
 Run: `nix develop --command cargo test --workspace --all-features 2>&1 | tail -20`
 Expected: all PASS.
 
-- [ ] **Step 14.2: Run clippy with workspace policy (no suppressions allowed)**
+- [ ] **Step 13.2: Workspace clippy with no-suppressions policy**
 
 Run: `nix develop --command cargo clippy --workspace --all-features --all-targets -- -D warnings 2>&1 | tail -30`
-Expected: clean. If clippy flags anything new from this change, fix at source — `#[allow]` / `#[expect]` are forbidden.
+Expected: clean. If clippy flags anything new from this change, fix at source — `#[allow]` / `#[expect]` are forbidden per CLAUDE.md.
 
 Run: `nix develop --command bash scripts/check-no-clippy-allow.sh 2>&1 | tail`
-Expected: empty (no suppressions added).
+Expected: empty.
 
-- [ ] **Step 14.3: Format check**
+- [ ] **Step 13.3: Format check**
 
 Run: `nix develop --command cargo fmt --all --check 2>&1 | tail`
-Expected: clean. If it diffs, run `cargo fmt --all` and fold into Task 14's verification commit.
+Expected: clean. If diffs, run `cargo fmt --all` and fold into a small "chore: cargo fmt" commit.
 
-- [ ] **Step 14.4: Gleam build + tests**
+- [ ] **Step 13.4: Gleam build + tests**
 
 Run: `cd web && nix develop --command gleam build 2>&1 | tail -10`
 Run: `cd web && nix develop --command gleam test 2>&1 | tail -20`
 Expected: both clean.
 
-- [ ] **Step 14.5: Full Playwright suite (one more time, after all the Rust changes have been baked in)**
+- [ ] **Step 13.5: Full Playwright suite**
 
-Run: `cd web && nix develop --command npx playwright test 2>&1 | tail -20`
+Run: `cd web && nix develop --command npx playwright test 2>&1 | tail -30`
 Expected: all PASS.
 
-- [ ] **Step 14.6: Mobile + desktop visual smoke**
+- [ ] **Step 13.6: Mobile + desktop visual smoke**
 
-CLAUDE.md requires browser verification for UI changes. Open the dev server, with a relay configured, exercise the golden path on both desktop and DevTools mobile (390×844): the Relays section is visible, click opens a popover with live metrics, close works, the desktop popover floats top-right while the phone version is the bottom sheet.
+CLAUDE.md requires browser verification for UI changes. With a relay configured, exercise the golden path on both desktop and DevTools mobile (390×844): the Relays section is visible, click opens a popover with live metrics, close works, the desktop popover floats top-right while the phone version is the bottom sheet. If no browser is available from your shell, say so explicitly and lean on the e2e tests as the verification.
 
-- [ ] **Step 14.7: No-op commit if everything passed; otherwise loop back**
-
-If any check produced changes, commit them with `chore: post-implementation verification fixes`. Otherwise nothing to commit — the implementation is complete.
+- [ ] **Step 13.7: Wrap-up commit if any verification work produced changes; otherwise nothing to commit.**
 
 ---
 
@@ -2296,17 +2252,18 @@ If any check produced changes, commit them with `chore: post-implementation veri
 | Spec section | Tasks |
 |---|---|
 | §1 PongObserved + IntentSnapshot fields | T1, T2, T3, T4, T5 |
-| §1 disconnect-preserves-liveness semantics | T5.4 + T5.1 (`disconnect_preserves_last_pong_and_rtt`) |
+| §1 disconnect-preserves-liveness | T5 (`disconnect_preserves_last_pong_and_rtt`) |
 | §1 wire format unchanged | (no protocol change; only InboundEvent/EngineEvent) |
-| §2 wasm bridge enrichment | T6 |
-| §3 Domain types `Relay` + `RelayConnState`; remove Bridge/Minecraft | T8 |
-| §3 View `rail_section` + `popover` (Floating/InSheet) | T11, T12 |
-| §3 Wiring at Client construction | T7, T10 |
-| §3 Channels-rail integration | T11 |
-| §3 Mobile bottom sheet | T12, T13 (phone test) |
-| §3 `data-testid` hooks | T11 (`relays-section`, `relay-row`, `data-relay-host/state`), T12 (`relay-popover*`) |
+| §2 wasm bridge enrichment + heartbeat constructor | T6 |
+| §3 FFI: heartbeat URL param + IntentSnapshot extension | T7 |
+| §3 Domain `Relay` + `RelayConnState`; remove Bridge/Minecraft | T8 |
+| §3 Pure helpers (`is_relay_label`, `parse_host`, …) | T9 |
+| §3 View `rail_section` + `popover` (Floating/InSheet) | T10, T11 |
+| §3 Channels-rail integration | T10 |
+| §3 Mobile bottom sheet | T11, T12 (phone test) |
+| §3 `data-testid` hooks | T10 (`relays-section`, `relay-row`, `data-relay-host/state`), T11 (`relay-popover*`) |
 | §4 Fixture cleanup | T8 |
-| Tests — Rust unit | T2.4, T3.2, T5.1 |
+| Tests — Rust unit | T2, T3, T5 |
 | Tests — Gleam pure | T9 |
-| Tests — Playwright e2e | T13 |
+| Tests — Playwright e2e | T12 |
 | Out-of-scope items NOT implemented | (per spec — confirmed not in any task) |

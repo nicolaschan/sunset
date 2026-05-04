@@ -31,11 +31,6 @@ pub type ConnStatus {
 pub type ChannelKind {
   TextChannel
   Voice
-  Bridge(BridgeKind)
-}
-
-pub type BridgeKind {
-  Minecraft
 }
 
 pub type Presence {
@@ -53,7 +48,6 @@ pub type RelayStatus {
   OneHop
   TwoHop
   ViaPeer(String)
-  BridgeRelay
   SelfRelay
   NoRelay
 }
@@ -68,7 +62,6 @@ pub type Room {
     status: ConnStatus,
     last_active: String,
     unread: Int,
-    bridge: BridgeOpt,
   )
 }
 
@@ -91,12 +84,18 @@ pub type Member {
     relay: RelayStatus,
     you: Bool,
     in_call: Bool,
-    bridge: BridgeOpt,
     role: RoleOpt,
     /// Unix-ms timestamp of the last app-level presence heartbeat we
     /// received from this peer. `None` for self or peers we have not
     /// heard from. The popover renders age as `now_ms - this`.
     last_heartbeat_ms: option.Option(Int),
+    /// Raw display name from the wasm side. `None` ⇒ peer hasn't set
+    /// one (the rendered `name` field above falls back to short_pubkey
+    /// in that case).
+    raw_name: option.Option(String),
+    /// Raw pubkey bytes — kept here so MembersUpdated can map raw
+    /// names by pubkey without re-deriving from MemberId.
+    pubkey: BitArray,
   )
 }
 
@@ -151,6 +150,24 @@ pub type VoiceSettings {
 pub type Message {
   Message(
     id: String,
+    author_pubkey: BitArray,
+    initials: String,
+    time: String,
+    body: String,
+    seen_by: Int,
+    you: Bool,
+    pending: Bool,
+    reactions: List(Reaction),
+    details: DetailsOpt,
+  )
+}
+
+/// Pre-resolved view of a Message with the author display name baked in.
+/// Built once per render from the live name_map; view functions consume
+/// these instead of raw Message so they don't have to thread the dict around.
+pub type MessageView {
+  MessageView(
+    id: String,
     author: String,
     initials: String,
     time: String,
@@ -159,16 +176,8 @@ pub type Message {
     you: Bool,
     pending: Bool,
     reactions: List(Reaction),
-    bridge: BridgeOpt,
     details: DetailsOpt,
   )
-}
-
-/// Tiny Option-substitutes — Gleam's `option.Option` works, but in
-/// patterns and view code these read more naturally as plain ADTs.
-pub type BridgeOpt {
-  HasBridge(BridgeKind)
-  NoBridge
 }
 
 pub type RoleOpt {
@@ -221,5 +230,35 @@ pub type VoiceModel {
     peers: Dict(String, VoicePeerStateUI),
     /// Set when mic permission is denied; cleared by `ResetVoiceError`.
     permission_error: option.Option(String),
+  )
+}
+
+pub type RelayConnState {
+  RelayConnecting
+  RelayConnected
+  RelayBackoff
+  RelayCancelled
+}
+
+/// View-model for a relay row + popover. Derived per render from
+/// `Model.intents` via `relays_view.relays_for_view`. Not a source
+/// of truth — `intents` remains so.
+pub type Relay {
+  Relay(
+    /// IntentId — popover key.
+    id: Float,
+    /// Parsed hostname for display, e.g. "relay.sunset.chat".
+    host: String,
+    /// Full Connectable label (raw user input or canonical URL).
+    raw_label: String,
+    state: RelayConnState,
+    attempt: Int,
+    /// First 4 + last 4 hex bytes of the relay's peer_id. None
+    /// while the Noise handshake is still pending.
+    peer_id_short: option.Option(String),
+    /// Wall-clock ms of the most recent Pong from this relay.
+    last_pong_at_ms: option.Option(Int),
+    /// Round-trip time of the most recent Pong, in milliseconds.
+    last_rtt_ms: option.Option(Int),
   )
 }

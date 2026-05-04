@@ -63,10 +63,12 @@ impl RoomHandle {
     }
 
     pub fn on_receipt(&self, callback: js_sys::Function) {
-        self.inner.on_receipt(move |for_hash, from_pubkey| {
-            let incoming = crate::messages::receipt_to_js(for_hash.to_hex(), from_pubkey);
-            let _ = callback.call1(&JsValue::NULL, &JsValue::from(incoming));
-        });
+        self.inner
+            .on_receipt(move |for_hash, from_pubkey, sent_at_ms| {
+                let incoming =
+                    crate::messages::receipt_to_js(for_hash.to_hex(), from_pubkey, sent_at_ms);
+                let _ = callback.call1(&JsValue::NULL, &JsValue::from(incoming));
+            });
     }
 
     pub fn on_members_changed(&self, callback: js_sys::Function) {

@@ -60,7 +60,7 @@ fn desktop_view(
       ]),
     ],
     [
-      reset_style(),
+      reset_style(p),
       card(p, input, noop, on_input, on_join),
       mode_toggle_button(p, mode, on_toggle_mode),
     ],
@@ -94,6 +94,7 @@ fn phone_view(
       ]),
     ],
     [
+      reset_style(p),
       html.h1(
         [
           ui.css([
@@ -395,28 +396,51 @@ fn mode_toggle_button(p: Palette, mode: Mode, on_toggle: msg) -> Element(msg) {
 /// `on_join(value)` only on Enter (other keys yield `noop`). Reading
 /// the value out of the event itself avoids any staleness from the
 /// closure being captured against an older render's state.
+///
+/// Enter calls `preventDefault` on the keydown so the keystroke can't
+/// bleed through into a different focused element after Lustre's
+/// re-render replaces this input. Without this, pressing Enter on the
+/// landing input on phone navigates to the room AND inserts a newline
+/// into the (newly-mounted, autofocus'd) composer textarea, because
+/// the browser's default keydown action runs after the DOM mutation
+/// has moved focus.
 fn on_enter_with_value(
   noop: msg,
   on_join: fn(String) -> msg,
 ) -> attribute.Attribute(msg) {
-  event.on("keydown", {
+  event.advanced("keydown", {
     use key <- decode.subfield(["key"], decode.string)
     use value <- decode.subfield(["target", "value"], decode.string)
     decode.success(case key {
-      "Enter" -> on_join(value)
-      _ -> noop
+      "Enter" ->
+        event.handler(
+          on_join(value),
+          prevent_default: True,
+          stop_propagation: False,
+        )
+      _ -> event.handler(noop, prevent_default: False, stop_propagation: False)
     })
   })
 }
 
-fn reset_style() -> Element(msg) {
+fn reset_style(p: Palette) -> Element(msg) {
   // Same body reset as the room view, duplicated here so the landing
   // screen renders without margins/scrollbars even when the chat shell
-  // isn't mounted.
+  // isn't mounted. The background paint on html/body/#app matters on
+  // iOS PWA standalone mode: with `viewport-fit=cover` the page sits
+  // under the status bar and home indicator, and the inner fixed
+  // wrapper's background only paints what the wrapper itself covers.
+  // Without an html/body bg, the safe-area regions and any rubber-
+  // band overscroll show the OS default (white in light mode, near-
+  // black in dark) instead of the palette's `bg` colour.
   html.style(
     [],
-    "html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
-     #app { height: 100%; }
+    "html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: "
+      <> p.bg
+      <> "; }
+     #app { height: 100%; background: "
+      <> p.bg
+      <> "; }
      *, *::before, *::after { box-sizing: border-box; }",
   )
 }

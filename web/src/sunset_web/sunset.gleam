@@ -19,7 +19,11 @@ pub fn load_or_create_identity(callback: fn(BitArray) -> Nil) -> Nil
 /// Construct a Client. Seed must be 32 bytes. `callback` is called with
 /// the opaque ClientHandle once the wasm bundle is loaded + initialised.
 @external(javascript, "./sunset.ffi.mjs", "createClient")
-pub fn create_client(seed: BitArray, callback: fn(ClientHandle) -> Nil) -> Nil
+pub fn create_client(
+  seed: BitArray,
+  heartbeat_interval_ms: Int,
+  callback: fn(ClientHandle) -> Nil,
+) -> Nil
 
 /// Open a room by name. Returns a RoomHandle via `callback` once the room
 /// subscription is published and the wasm-side state is initialised.
@@ -28,6 +32,15 @@ pub fn open_room(
   client: ClientHandle,
   name: String,
   callback: fn(RoomHandle) -> Nil,
+) -> Nil
+
+/// Set the self-advertised name. Empty string clears the name; the
+/// Rust side normalizes whitespace + empty to None.
+@external(javascript, "./sunset.ffi.mjs", "setSelfName")
+pub fn set_self_name(
+  client: ClientHandle,
+  name: String,
+  callback: fn() -> Nil,
 ) -> Nil
 
 /// Register a durable intent to keep connected to `url`. The
@@ -51,6 +64,11 @@ pub type IntentSnapshot {
     peer_pubkey: option.Option(BitArray),
     kind: option.Option(String),
     attempt: Int,
+    /// Wall-clock ms of the most recent Pong. None until the first
+    /// Pong of the first connection lands; preserved across Backoff.
+    last_pong_at_ms: option.Option(Int),
+    /// Round-trip time of the most recent Pong, in milliseconds.
+    last_rtt_ms: option.Option(Int),
   )
 }
 
@@ -153,10 +171,18 @@ pub fn mem_is_self(m: MemberJs) -> Bool
 @external(javascript, "./sunset.ffi.mjs", "memLastHeartbeatMs")
 pub fn mem_last_heartbeat_ms(m: MemberJs) -> option.Option(Int)
 
+@external(javascript, "./sunset.ffi.mjs", "memName")
+pub fn mem_name(member: MemberJs) -> option.Option(String)
+
 /// Read presence-cadence params from `?presence_interval=&presence_ttl=&presence_refresh=`.
 /// Returns `#(interval_ms, ttl_ms, refresh_ms)`. Defaults: 30000/60000/5000.
 @external(javascript, "./sunset.ffi.mjs", "presenceParamsFromUrl")
 pub fn presence_params_from_url() -> #(Int, Int, Int)
+
+/// Read `?heartbeat_interval_ms=NNN` from the URL. Returns 0 when
+/// absent or unparseable. e2e-only knob.
+@external(javascript, "./sunset.ffi.mjs", "heartbeatIntervalMsFromUrl")
+pub fn heartbeat_interval_ms_from_url() -> Int
 
 /// Schedule a recurring callback every `ms` milliseconds. Used by the
 /// popover ticker; runs for the page lifetime, no cancel handle in v1.
@@ -189,6 +215,12 @@ pub fn rec_for_value_hash_hex(r: IncomingReceipt) -> String
 @external(javascript, "./sunset.ffi.mjs", "recFromPubkey")
 pub fn rec_from_pubkey(r: IncomingReceipt) -> BitArray
 
+/// Wall-clock unix-ms when the acknowledging peer composed this Receipt.
+/// Surfaced in the message-details panel as the per-recipient delivered-at
+/// stamp.
+@external(javascript, "./sunset.ffi.mjs", "recSentAtMs")
+pub fn rec_sent_at_ms(r: IncomingReceipt) -> Int
+
 /// Snapshot payload delivered to `on_reactions_changed`. Opaque on the
 /// Gleam side; accessors below extract the concrete fields.
 pub type IncomingReactionsSnapshot
@@ -198,13 +230,15 @@ pub fn reactions_snapshot_target_hex(
   snapshot: IncomingReactionsSnapshot,
 ) -> String
 
-/// Returns the snapshot as a `List(#(emoji, List(author_pubkey_hex)))`.
-/// The FFI side flattens the JS Map<emoji, Set<author_hex>> into this
-/// shape so Gleam doesn't need to interop with Map/Set directly.
+/// Returns the snapshot as a `List(#(emoji, List(#(author_pubkey_hex, sent_at_ms))))`.
+/// The FFI side flattens the JS Map<emoji, Map<author_hex, sent_at_ms>> into
+/// this shape so Gleam doesn't need to interop with Map/Set directly. The
+/// `sent_at_ms` is the unix-ms timestamp of the LWW-winning Add entry — it's
+/// what the message-details panel renders next to each reactor.
 @external(javascript, "./sunset.ffi.mjs", "reactionsSnapshotEntries")
 pub fn reactions_snapshot_entries(
   snapshot: IncomingReactionsSnapshot,
-) -> List(#(String, List(String)))
+) -> List(#(String, List(#(String, Int))))
 
 /// Register the per-target snapshot callback. Fires on initial replay
 /// and again whenever the target's reaction state changes.
@@ -228,8 +262,24 @@ pub fn send_reaction(
 @external(javascript, "./sunset.ffi.mjs", "clientPublicKeyHex")
 pub fn client_public_key_hex(client: ClientHandle) -> String
 
+/// Encode a BitArray as lowercase hex. Used by the Relays popover
+/// to render the relay's peer_id.
+@external(javascript, "./sunset.ffi.mjs", "bitsToHex")
+pub fn bits_to_hex(bits: BitArray) -> String
+
+/// HH:MM:SS local time of a unix-ms timestamp. The exact-seconds form
+/// is what the message-details panel renders for delivery acks and
+/// reaction timestamps.
+@external(javascript, "./sunset.ffi.mjs", "formatTimeMsExact")
+pub fn format_time_ms_exact(ms: Int) -> String
+
 /// Lazily registers the `emoji-picker-element` web component. Idempotent;
 /// safe to call on every picker open. Resolves the dynamic import on
 /// first call, caches the promise on subsequent calls.
 @external(javascript, "./sunset.ffi.mjs", "registerEmojiPicker")
 pub fn register_emoji_picker() -> Nil
+
+/// First 4 hex chars of the pubkey (2 raw bytes). Used as a compact
+/// fallback display name until a real self-name is resolved.
+@external(javascript, "./sunset.ffi.mjs", "shortPubkey")
+pub fn short_pubkey(bits: BitArray) -> String

@@ -68,55 +68,11 @@ test("all four columns render in light mode", async ({ page }) => {
   });
 });
 
-test("theme toggle flips light to dark", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
-  const toggle = page.getByTestId("theme-toggle");
-
-  // The icon-only button advertises its target mode via title.
-  await expect(toggle).toHaveAttribute("title", /dark/i);
-
-  // Capture the body bg before — light palette has #f7f5f1 (cream)
-  const bgLight = await page.evaluate(
-    () =>
-      getComputedStyle(
-        document.querySelector("#app > div"),
-      ).backgroundColor,
-  );
-
-  await toggle.click();
-  await expect(toggle).toHaveAttribute("title", /light/i);
-
-  const bgDark = await page.evaluate(
-    () =>
-      getComputedStyle(
-        document.querySelector("#app > div"),
-      ).backgroundColor,
-  );
-
-  expect(bgLight).not.toEqual(bgDark);
-
-  await page.screenshot({
-    path: "test-results/shell-dark.png",
-    fullPage: true,
-  });
-});
-
-test("theme choice persists across reloads", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
-  const toggle = page.getByTestId("theme-toggle");
-  // Start in light mode (the default for this beforeEach setup).
-  await expect(toggle).toHaveAttribute("title", /dark/i);
-
-  await toggle.click();
-  await expect(toggle).toHaveAttribute("title", /light/i);
-
-  // Reload — saved theme should be restored.
-  await page.reload();
-  await expect(page.getByTestId("theme-toggle")).toHaveAttribute(
-    "title",
-    /light/i,
-  );
-});
+// Theme palette flip (light↔dark) and persistence-across-reloads are
+// covered by the settings-popover tests in `ui_tweaks.spec.js` ("clicking
+// 'you' opens settings; theme buttons flip palette"). The legacy desktop-
+// only fixed pill at the bottom-right was removed; settings popover is
+// the only entry point now.
 
 test.describe("system theme default", () => {
   test.use({ colorScheme: "dark" });
@@ -134,9 +90,28 @@ test.describe("system theme default", () => {
     });
     await page.goto("/#dusk-collective");
     await expect(page.getByText("sunset", { exact: true })).toBeVisible();
-    await expect(page.getByTestId("theme-toggle")).toHaveAttribute(
-      "title",
-      /light/i,
+    // Settings popover's System button is the live reflection of the
+    // saved preference; with no saved choice the default is System and
+    // the dark colorScheme should be honoured. The body's bg paints
+    // `palette.bg` (set by global_reset) — the dark palette's bg is
+    // distinctly darker than the light palette's cream, so reading the
+    // computed colour and asserting it's not the light cream is a
+    // robust check that doesn't lock us to a specific hex.
+    const bodyBg = await page.evaluate(
+      () => getComputedStyle(document.body).backgroundColor,
+    );
+    // Light palette uses a cream (#f7f5f1 / rgb(247, 245, 241) family);
+    // dark palette is a deeply tinted near-black. Compute the average
+    // channel value — under 128 means the bg is dark.
+    const m = bodyBg.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+    expect(m, `unexpected bg shape: ${bodyBg}`).not.toBeNull();
+    const avg = (Number(m[1]) + Number(m[2]) + Number(m[3])) / 3;
+    expect(avg, `bg should be dark, got ${bodyBg}`).toBeLessThan(128);
+
+    await page.getByTestId("you-row").click();
+    await expect(page.getByTestId("settings-theme-system")).toHaveAttribute(
+      "aria-pressed",
+      "true",
     );
   });
 });
@@ -234,6 +209,98 @@ test("favicon link points at favicon.svg", async ({ page }) => {
     () => document.querySelector('link[rel="icon"]')?.getAttribute("href"),
   );
   expect(href).toMatch(/favicon\.svg$/);
+});
+
+test("apple-touch-icon link points at a 180x180 PNG that exists", async ({
+  page,
+}) => {
+  // Apple home-screen icons must be a full-bleed opaque PNG; iOS
+  // applies its own corner mask, so any rounding in the source PNG
+  // shows up as a doubled edge. The PNG is baked from
+  // priv/apple-touch-icon.svg by the flake's webDist installPhase.
+  const link = await page.evaluate(() => {
+    const el = document.querySelector('link[rel="apple-touch-icon"]');
+    return el
+      ? { href: el.getAttribute("href"), sizes: el.getAttribute("sizes") }
+      : null;
+  });
+  expect(link).not.toBeNull();
+  expect(link.href).toMatch(/apple-touch-icon\.png$/);
+  expect(link.sizes).toBe("180x180");
+
+  // The icon must actually be served alongside the build artefact.
+  const resolved = new URL(link.href, page.url()).toString();
+  const response = await page.request.get(resolved);
+  expect(response.ok()).toBe(true);
+  expect(response.headers()["content-type"]).toContain("image/png");
+
+  // Decode the PNG to verify the dimensions match the link's sizes
+  // attribute. We use createImageBitmap rather than Buffer-parsing so
+  // the test stays portable across Playwright environments.
+  const dims = await page.evaluate(async (url) => {
+    const r = await fetch(url);
+    const blob = await r.blob();
+    const bm = await createImageBitmap(blob);
+    return { width: bm.width, height: bm.height };
+  }, resolved);
+  expect(dims).toEqual({ width: 180, height: 180 });
+});
+
+test("manifest link points at a valid web app manifest", async ({ page }) => {
+  // Add-to-Home-Screen on Chrome/Android reads `<link rel="manifest">`
+  // for the icon set, name, and display mode.
+  const href = await page.evaluate(
+    () => document.querySelector('link[rel="manifest"]')?.getAttribute("href"),
+  );
+  expect(href).toMatch(/manifest\.webmanifest$/);
+
+  const resolved = new URL(href, page.url()).toString();
+  const response = await page.request.get(resolved);
+  expect(response.ok()).toBe(true);
+  // Some servers serve .webmanifest as text/plain; accept either as
+  // long as the body is valid JSON with the required fields.
+  const manifest = await response.json();
+  expect(manifest.name).toBe("sunset.chat");
+  expect(manifest.short_name).toBeTruthy();
+  expect(manifest.display).toBe("standalone");
+  // At minimum the iOS-sized icon and one square PWA icon must be
+  // declared, and each must reference a fetchable PNG.
+  const sizes = manifest.icons.map((i) => i.sizes);
+  expect(sizes).toContain("180x180");
+  expect(sizes.some((s) => s === "192x192" || s === "512x512")).toBe(true);
+
+  for (const icon of manifest.icons) {
+    if (icon.type !== "image/png") continue;
+    const iconUrl = new URL(icon.src, resolved).toString();
+    const iconResp = await page.request.get(iconUrl);
+    expect(iconResp.ok()).toBe(true);
+    expect(iconResp.headers()["content-type"]).toContain("image/png");
+  }
+});
+
+test("PWA / Apple home-screen meta tags are present", async ({ page }) => {
+  // theme-color paints the browser chrome; the `apple-mobile-web-app-*`
+  // metas are what iOS reads when the page is launched as a standalone
+  // home-screen app — without them the title bar shows the truncated
+  // page title and the status bar reverts to the system default.
+  const metas = await page.evaluate(() => {
+    const get = (name) =>
+      document
+        .querySelector(`meta[name="${name}"]`)
+        ?.getAttribute("content") ?? null;
+    return {
+      themeColor: get("theme-color"),
+      appleCapable: get("apple-mobile-web-app-capable"),
+      mobileCapable: get("mobile-web-app-capable"),
+      statusBar: get("apple-mobile-web-app-status-bar-style"),
+      title: get("apple-mobile-web-app-title"),
+    };
+  });
+  expect(metas.themeColor).toMatch(/^#[0-9a-fA-F]{3,8}$/);
+  expect(metas.appleCapable).toBe("yes");
+  expect(metas.mobileCapable).toBe("yes");
+  expect(metas.statusBar).toBe("black-translucent");
+  expect(metas.title).toBeTruthy();
 });
 
 test("viewport meta is mobile-friendly (safe-area + keyboard resize)", async ({
@@ -503,14 +570,25 @@ test.describe("phone shell smoke", () => {
     );
   });
 
-  test("phone has theme toggle in rooms drawer footer (and not as a fixed pill)", async ({
+  test("phone exposes theme controls via the settings sheet (and not as a fixed pill)", async ({
     page,
   }) => {
+    // Theme controls live in the settings sheet, opened from the
+    // rooms-rail "you" row. The standalone phone-theme-toggle row
+    // (under the rooms list) was removed once the settings sheet
+    // landed — it was a redundant second entry point to the same
+    // preference.
     await page.getByTestId("phone-rooms-toggle").click();
     await page.getByTestId("channels-room-title").click();
-    await expect(page.getByTestId("phone-theme-toggle")).toBeVisible();
-    // Desktop fixed toggle isn't rendered on phone.
+    await page.getByTestId("you-row").click();
+    await expect(page.getByTestId("settings-sheet")).toBeVisible();
+    await expect(page.getByTestId("settings-theme-system")).toBeVisible();
+    await expect(page.getByTestId("settings-theme-light")).toBeVisible();
+    await expect(page.getByTestId("settings-theme-dark")).toBeVisible();
+    // Desktop fixed-pill toggle isn't rendered on phone.
     expect(await page.getByTestId("theme-toggle").count()).toBe(0);
+    // The deprecated standalone phone-theme-toggle row is gone.
+    expect(await page.getByTestId("phone-theme-toggle").count()).toBe(0);
   });
 });
 

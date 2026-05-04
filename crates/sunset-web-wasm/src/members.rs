@@ -22,6 +22,7 @@ pub struct MemberJs {
     /// presence) and for any peer we've heard nothing from. The Gleam
     /// popover computes age = now_ms - last_heartbeat_ms.
     pub(crate) last_heartbeat_ms: Option<u64>,
+    pub(crate) name: Option<String>,
 }
 
 impl From<&Member> for MemberJs {
@@ -32,6 +33,7 @@ impl From<&Member> for MemberJs {
             connection_mode: m.connection_mode.as_str().to_owned(),
             is_self: m.is_self,
             last_heartbeat_ms: m.last_heartbeat_ms,
+            name: m.name.clone(),
         }
     }
 }
@@ -67,5 +69,13 @@ impl MemberJs {
             Some(ms) => ms as f64,
             None => -1.0,
         }
+    }
+    /// Display name claimed by this peer in their most recent presence
+    /// heartbeat. wasm-bindgen exposes Option<String> as `string |
+    /// undefined` on the JS side. `undefined` ⇒ peer hasn't set a
+    /// name; UI falls back to short_pubkey rendering.
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> Option<String> {
+        self.name.clone()
     }
 }

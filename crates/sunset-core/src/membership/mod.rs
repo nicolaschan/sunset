@@ -27,7 +27,10 @@
 //! `sunset-web-wasm`) and native client-surface callbacks (TUI, mod).
 
 pub mod publisher;
-pub use publisher::spawn_publisher;
+pub use publisher::{PublisherHandle, spawn_publisher};
+
+pub mod body;
+pub use body::PresenceBody;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -105,13 +108,18 @@ pub struct Member {
     /// peer we've heard nothing from. UI surfaces compute
     /// `now_ms - last_heartbeat_ms` for the "heard from N ago" string.
     pub last_heartbeat_ms: Option<u64>,
+    /// Display name claimed by this peer in their most recent
+    /// `PresenceBody`. `None` ⇒ peer has not set a name (or their
+    /// presence body is not local yet — see tracker block-fetch
+    /// notes). UI surfaces fall back to `short_pubkey` rendering.
+    pub name: Option<String>,
 }
 
 /// Stable per-member signature row used for debounce:
-/// `(pubkey, presence, connection_mode)`. Excludes
+/// `(pubkey, presence, connection_mode, name)`. Excludes
 /// `last_heartbeat_ms` so the tracker doesn't re-emit on every
 /// heartbeat tick.
-pub type MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode)>;
+pub type MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode, Option<String>)>;
 
 /// Callback fired with the current rendered member list whenever it
 /// changes (per `members_signature` debounce).
@@ -137,6 +145,14 @@ pub fn presence_bucket(age_ms: u64, interval_ms: u64, ttl_ms: u64) -> Presence {
     }
 }
 
+/// Inputs derived from the tracker's maps. Bundled so derive_members
+/// stays under the clippy `too_many_arguments` threshold (default 7).
+pub struct MemberInputs<'a> {
+    pub presence_map: &'a HashMap<PeerId, u64>,
+    pub peer_kinds: &'a HashMap<PeerId, TransportKind>,
+    pub names: &'a HashMap<PeerId, Option<String>>,
+}
+
 /// Pure derivation: given the current state, return the rendered
 /// member list. Self is always present and always Online. Others
 /// whose age exceeds `ttl_ms` are filtered out.
@@ -145,9 +161,13 @@ pub fn derive_members(
     interval_ms: u64,
     ttl_ms: u64,
     self_peer: &PeerId,
-    presence_map: &HashMap<PeerId, u64>,
-    peer_kinds: &HashMap<PeerId, TransportKind>,
+    inputs: &MemberInputs<'_>,
 ) -> Vec<Member> {
+    let MemberInputs {
+        presence_map,
+        peer_kinds,
+        names,
+    } = inputs;
     let mut out = Vec::new();
     out.push(Member {
         pubkey: self_peer.verifying_key().as_bytes().to_vec(),
@@ -155,6 +175,7 @@ pub fn derive_members(
         connection_mode: ConnectionMode::Self_,
         is_self: true,
         last_heartbeat_ms: None,
+        name: names.get(self_peer).cloned().unwrap_or(None),
     });
     let mut others: Vec<(&PeerId, &u64)> = presence_map
         .iter()
@@ -193,6 +214,7 @@ pub fn derive_members(
             connection_mode,
             is_self: false,
             last_heartbeat_ms: Some(*last_ms),
+            name: names.get(pk).cloned().unwrap_or(None),
         });
     }
     out
@@ -204,7 +226,14 @@ pub fn derive_members(
 pub fn members_signature(members: &[Member]) -> MemberSig {
     members
         .iter()
-        .map(|m| (m.pubkey.clone(), m.presence, m.connection_mode))
+        .map(|m| {
+            (
+                m.pubkey.clone(),
+                m.presence,
+                m.connection_mode,
+                m.name.clone(),
+            )
+        })
         .collect()
 }
 
@@ -297,31 +326,61 @@ pub fn spawn_tracker<S: Store + 'static>(
         let mut presence_sub = presence_sub.fuse();
         let mut refresh_rx = refresh_rx.fuse();
         let presence_map: Rc<RefCell<HashMap<PeerId, u64>>> = Rc::new(RefCell::new(HashMap::new()));
+        let names_map: Rc<RefCell<HashMap<PeerId, Option<String>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let pending_blocks: Rc<RefCell<HashMap<PeerId, sunset_store::Hash>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         let prefix = format!("{room_fp_hex}/presence/");
 
         loop {
             futures::select! {
                 ev = presence_sub.next() => {
                     let Some(ev) = ev else { break };
-                    let entry = match ev {
-                        Ok(sunset_store::Event::Inserted(e)) => e,
-                        Ok(sunset_store::Event::Replaced { new, .. }) => new,
-                        Ok(_) => continue,
+                    match ev {
+                        Ok(sunset_store::Event::Inserted(entry))
+                        | Ok(sunset_store::Event::Replaced { new: entry, .. }) => {
+                            let Some(pk) = parse_presence_pk(&entry.name, &prefix) else { continue };
+                            presence_map.borrow_mut().insert(pk.clone(), entry.priority);
+                            fetch_and_set_name(&store, &pk, entry.value_hash, &names_map, &pending_blocks).await;
+                            maybe_fire_members(
+                                now_ms(),
+                                interval_ms,
+                                ttl_ms,
+                                &self_peer,
+                                &presence_map.borrow(),
+                                &names_map.borrow(),
+                                &handles,
+                            );
+                        }
+                        Ok(sunset_store::Event::BlobAdded(hash)) => {
+                            let candidates: Vec<PeerId> = pending_blocks
+                                .borrow()
+                                .iter()
+                                .filter(|(_, h)| **h == hash)
+                                .map(|(pk, _)| pk.clone())
+                                .collect();
+                            let mut changed = false;
+                            for pk in candidates {
+                                fetch_and_set_name(&store, &pk, hash, &names_map, &pending_blocks).await;
+                                changed = true;
+                            }
+                            if changed {
+                                maybe_fire_members(
+                                    now_ms(),
+                                    interval_ms,
+                                    ttl_ms,
+                                    &self_peer,
+                                    &presence_map.borrow(),
+                                    &names_map.borrow(),
+                                    &handles,
+                                );
+                            }
+                        }
+                        Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "presence event error");
-                            continue;
                         }
-                    };
-                    let Some(pk) = parse_presence_pk(&entry.name, &prefix) else { continue };
-                    presence_map.borrow_mut().insert(pk, entry.priority);
-                    maybe_fire_members(
-                        now_ms(),
-                        interval_ms,
-                        ttl_ms,
-                        &self_peer,
-                        &presence_map.borrow(),
-                        &handles,
-                    );
+                    }
                 }
                 ev = recv_engine(&mut engine_events).fuse() => {
                     let Some(ev) = ev else { break };
@@ -332,6 +391,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         ttl_ms,
                         &self_peer,
                         &presence_map.borrow(),
+                        &names_map.borrow(),
                         &handles,
                     );
                 }
@@ -345,6 +405,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         ttl_ms,
                         &self_peer,
                         &presence_map.borrow(),
+                        &names_map.borrow(),
                         &handles,
                     );
                 }
@@ -384,6 +445,45 @@ fn handle_engine_event(handles: &TrackerHandles, ev: &EngineEvent) {
         EngineEvent::PeerRemoved { peer_id } => {
             handles.peer_kinds.borrow_mut().remove(peer_id);
         }
+        EngineEvent::PongObserved { .. } => {
+            // Membership tracker is identity-only; per-peer liveness
+            // (last_pong/RTT) is consumed by the supervisor for
+            // IntentSnapshot, not here.
+        }
+    }
+}
+
+async fn fetch_and_set_name<S: Store + 'static>(
+    store: &std::sync::Arc<S>,
+    pk: &PeerId,
+    value_hash: sunset_store::Hash,
+    names_map: &Rc<RefCell<HashMap<PeerId, Option<String>>>>,
+    pending: &Rc<RefCell<HashMap<PeerId, sunset_store::Hash>>>,
+) {
+    match store.get_content(&value_hash).await {
+        Ok(Some(block)) => match postcard::from_bytes::<PresenceBody>(&block.data) {
+            Ok(body) => {
+                names_map.borrow_mut().insert(pk.clone(), body.name);
+                pending.borrow_mut().remove(pk);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    peer = %hex::encode(pk.verifying_key().as_bytes()),
+                    "presence body decode failed"
+                );
+                names_map.borrow_mut().insert(pk.clone(), None);
+                pending.borrow_mut().remove(pk);
+            }
+        },
+        Ok(None) => {
+            names_map.borrow_mut().insert(pk.clone(), None);
+            pending.borrow_mut().insert(pk.clone(), value_hash);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "presence body fetch failed");
+            names_map.borrow_mut().insert(pk.clone(), None);
+        }
     }
 }
 
@@ -393,6 +493,7 @@ fn maybe_fire_members(
     ttl_ms: u64,
     self_peer: &PeerId,
     presence_map: &HashMap<PeerId, u64>,
+    names: &HashMap<PeerId, Option<String>>,
     handles: &TrackerHandles,
 ) {
     let members = derive_members(
@@ -400,8 +501,11 @@ fn maybe_fire_members(
         interval_ms,
         ttl_ms,
         self_peer,
-        presence_map,
-        &handles.peer_kinds.borrow(),
+        &MemberInputs {
+            presence_map,
+            peer_kinds: &handles.peer_kinds.borrow(),
+            names,
+        },
     );
     let sig = members_signature(&members);
     if sig == *handles.last_signature.borrow() {
@@ -438,7 +542,18 @@ mod tests {
         let me = pk(1);
         let presence = HashMap::new();
         let kinds = HashMap::new();
-        let out = derive_members(0, 1000, 3000, &me, &presence, &kinds);
+        let names = HashMap::new();
+        let out = derive_members(
+            0,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert_eq!(out.len(), 1);
         assert!(out[0].is_self);
         assert_eq!(out[0].presence, Presence::Online);
@@ -452,8 +567,19 @@ mod tests {
         let mut presence = HashMap::new();
         presence.insert(bob.clone(), 0u64);
         let kinds = HashMap::new();
+        let names = HashMap::new();
         // bob's heartbeat is 5s old but ttl is 3s → Offline → dropped.
-        let out = derive_members(5000, 1000, 3000, &me, &presence, &kinds);
+        let out = derive_members(
+            5000,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert_eq!(out.len(), 1);
         assert!(out[0].is_self);
     }
@@ -473,7 +599,18 @@ mod tests {
         kinds.insert(carol.clone(), TransportKind::Secondary);
         // dave: no kind, but a Primary (bob) exists → dave's presence was
         // forwarded by the relay → "via_relay".
-        let out = derive_members(200, 1000, 3000, &me, &presence, &kinds);
+        let names = HashMap::new();
+        let out = derive_members(
+            200,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert_eq!(out.len(), 4);
         let modes: Vec<ConnectionMode> = out.iter().map(|m| m.connection_mode).collect();
         assert_eq!(
@@ -496,7 +633,18 @@ mod tests {
         // No Primary in peer_kinds → dave's presence has no traceable
         // route → "unknown".
         let kinds = HashMap::new();
-        let out = derive_members(200, 1000, 3000, &me, &presence, &kinds);
+        let names = HashMap::new();
+        let out = derive_members(
+            200,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].connection_mode, ConnectionMode::Unknown);
     }
@@ -508,9 +656,30 @@ mod tests {
         let mut presence = HashMap::new();
         presence.insert(bob.clone(), 0);
         let kinds = HashMap::new();
+        let names = HashMap::new();
 
-        let s1 = members_signature(&derive_members(500, 1000, 3000, &me, &presence, &kinds));
-        let s2 = members_signature(&derive_members(1500, 1000, 3000, &me, &presence, &kinds));
+        let s1 = members_signature(&derive_members(
+            500,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        ));
+        let s2 = members_signature(&derive_members(
+            1500,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        ));
         assert_ne!(s1, s2, "Online → Away should change signature");
     }
 
@@ -521,7 +690,18 @@ mod tests {
         let mut presence = HashMap::new();
         presence.insert(bob.clone(), 12_345_u64);
         let kinds = HashMap::new();
-        let out = derive_members(20_000, 30_000, 60_000, &me, &presence, &kinds);
+        let names = HashMap::new();
+        let out = derive_members(
+            20_000,
+            30_000,
+            60_000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert!(out[0].is_self);
         assert_eq!(out[0].last_heartbeat_ms, None);
         assert!(!out[1].is_self);
@@ -539,6 +719,7 @@ mod tests {
             connection_mode: ConnectionMode::ViaRelay,
             is_self: false,
             last_heartbeat_ms: Some(100),
+            name: None,
         };
         let m2 = Member {
             pubkey: vec![1; 32],
@@ -546,7 +727,386 @@ mod tests {
             connection_mode: ConnectionMode::ViaRelay,
             is_self: false,
             last_heartbeat_ms: Some(200),
+            name: None,
         };
         assert_eq!(members_signature(&[m1]), members_signature(&[m2]));
+    }
+
+    #[test]
+    fn derive_members_attaches_name_when_present() {
+        let me = pk(1);
+        let bob = pk(2);
+        let mut presence = HashMap::new();
+        presence.insert(bob.clone(), 0u64);
+        let kinds = HashMap::new();
+        let mut names = HashMap::new();
+        names.insert(bob.clone(), Some("bob".to_owned()));
+        let out = derive_members(
+            100,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_self);
+        assert_eq!(out[0].name, None);
+        assert_eq!(out[1].name, Some("bob".to_owned()));
+    }
+
+    #[test]
+    fn derive_members_attaches_self_name() {
+        let me = pk(1);
+        let presence = HashMap::new();
+        let kinds = HashMap::new();
+        let mut names = HashMap::new();
+        names.insert(me.clone(), Some("alice".to_owned()));
+        let out = derive_members(
+            0,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_self);
+        assert_eq!(out[0].name, Some("alice".to_owned()));
+    }
+
+    #[test]
+    fn members_signature_changes_on_name_change() {
+        let me = pk(1);
+        let bob = pk(2);
+        let mut presence = HashMap::new();
+        presence.insert(bob.clone(), 0u64);
+        let kinds = HashMap::new();
+
+        let mut names_a = HashMap::new();
+        names_a.insert(bob.clone(), Some("alice".to_owned()));
+        let mut names_b = HashMap::new();
+        names_b.insert(bob.clone(), Some("alicia".to_owned()));
+
+        let sig_a = members_signature(&derive_members(
+            100,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names_a,
+            },
+        ));
+        let sig_b = members_signature(&derive_members(
+            100,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names_b,
+            },
+        ));
+        assert_ne!(sig_a, sig_b);
+    }
+
+    // -- tracker integration tests --
+
+    fn make_test_store() -> std::sync::Arc<sunset_store_memory::MemoryStore> {
+        std::sync::Arc::new(sunset_store_memory::MemoryStore::new(std::sync::Arc::new(
+            sunset_store::AcceptAllVerifier,
+        )))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracker_picks_up_name_from_presence_body() {
+        use rand_core::OsRng;
+        use sunset_store::{ContentBlock, SignedKvEntry, canonical::signing_payload};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let store = make_test_store();
+                let me = crate::Identity::generate(&mut OsRng);
+                let me_pk = sunset_sync::PeerId(me.store_verifying_key());
+                let bob = crate::Identity::generate(&mut OsRng);
+
+                let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
+                let handles = TrackerHandles::new();
+                let cb_captured = captured.clone();
+                *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
+                    *cb_captured.borrow_mut() = ms.to_vec();
+                }));
+
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<sunset_sync::EngineEvent>();
+
+                spawn_tracker(
+                    store.clone(),
+                    rx,
+                    me_pk.clone(),
+                    PresenceConfig {
+                        room_fp_hex: "ffaa".to_owned(),
+                        interval_ms: 1000,
+                        ttl_ms: 60_000,
+                        refresh_ms: 50,
+                    },
+                    handles,
+                );
+
+                let body = PresenceBody {
+                    name: Some("bob".to_owned()),
+                };
+                let block = ContentBlock {
+                    data: bytes::Bytes::from(postcard::to_stdvec(&body).unwrap()),
+                    references: vec![],
+                };
+                let value_hash = block.hash();
+                let now_pri = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1);
+                let mut entry = SignedKvEntry {
+                    verifying_key: bob.store_verifying_key(),
+                    name: bytes::Bytes::from(format!(
+                        "ffaa/presence/{}",
+                        hex::encode(bob.store_verifying_key().as_bytes())
+                    )),
+                    value_hash,
+                    priority: now_pri,
+                    expires_at: Some(now_pri + 60_000),
+                    signature: bytes::Bytes::new(),
+                };
+                let payload = signing_payload(&entry);
+                let sig = bob.sign(&payload);
+                entry.signature = bytes::Bytes::copy_from_slice(&sig.to_bytes());
+                store.insert(entry, Some(block)).await.unwrap();
+
+                for _ in 0..200 {
+                    let ms = captured.borrow().clone();
+                    if let Some(b) = ms.iter().find(|m| !m.is_self) {
+                        if b.name == Some("bob".to_owned()) {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!(
+                    "tracker never observed bob's name; got {:?}",
+                    captured.borrow()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracker_treats_garbage_body_as_no_name() {
+        use rand_core::OsRng;
+        use sunset_store::{ContentBlock, SignedKvEntry, canonical::signing_payload};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let store = make_test_store();
+                let me = crate::Identity::generate(&mut OsRng);
+                let me_pk = sunset_sync::PeerId(me.store_verifying_key());
+                let bob = crate::Identity::generate(&mut OsRng);
+
+                let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
+                let handles = TrackerHandles::new();
+                let cb_captured = captured.clone();
+                *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
+                    *cb_captured.borrow_mut() = ms.to_vec();
+                }));
+
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<sunset_sync::EngineEvent>();
+
+                spawn_tracker(
+                    store.clone(),
+                    rx,
+                    me_pk.clone(),
+                    PresenceConfig {
+                        room_fp_hex: "ffaa".to_owned(),
+                        interval_ms: 1000,
+                        ttl_ms: 60_000,
+                        refresh_ms: 50,
+                    },
+                    handles,
+                );
+
+                // Garbage body that fails postcard decode.
+                let block = ContentBlock {
+                    data: bytes::Bytes::from(vec![0xff, 0xff, 0xff]),
+                    references: vec![],
+                };
+                let value_hash = block.hash();
+                let now_pri = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1);
+                let mut entry = SignedKvEntry {
+                    verifying_key: bob.store_verifying_key(),
+                    name: bytes::Bytes::from(format!(
+                        "ffaa/presence/{}",
+                        hex::encode(bob.store_verifying_key().as_bytes())
+                    )),
+                    value_hash,
+                    priority: now_pri,
+                    expires_at: Some(now_pri + 60_000),
+                    signature: bytes::Bytes::new(),
+                };
+                let payload = signing_payload(&entry);
+                let sig = bob.sign(&payload);
+                entry.signature = bytes::Bytes::copy_from_slice(&sig.to_bytes());
+                store.insert(entry, Some(block)).await.unwrap();
+
+                // Wait for bob to appear; verify name is None.
+                for _ in 0..200 {
+                    let ms = captured.borrow().clone();
+                    if ms.iter().any(|m| !m.is_self) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let ms = captured.borrow().clone();
+                let bob_member = ms.iter().find(|m| !m.is_self).expect("bob should appear");
+                assert_eq!(bob_member.name, None, "garbage body should yield name=None");
+            })
+            .await;
+    }
+
+    /// Tests the late-block arrival path via a re-insert with higher priority +
+    /// block attached. `MemoryStore::put_content` does not broadcast `BlobAdded`;
+    /// the real BlobAdded path fires from `insert` when a block is included.
+    /// So we simulate late arrival by: (1) insert entry without block so tracker
+    /// records the peer in pending_blocks with name=None, (2) re-insert same
+    /// entry key at higher priority WITH the block, which fires BlobAdded and
+    /// triggers the pending retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracker_late_block_arrival_updates_name() {
+        use rand_core::OsRng;
+        use sunset_store::{ContentBlock, SignedKvEntry, canonical::signing_payload};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let store = make_test_store();
+                let me = crate::Identity::generate(&mut OsRng);
+                let me_pk = sunset_sync::PeerId(me.store_verifying_key());
+                let bob = crate::Identity::generate(&mut OsRng);
+
+                let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
+                let handles = TrackerHandles::new();
+                let cb_captured = captured.clone();
+                *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
+                    *cb_captured.borrow_mut() = ms.to_vec();
+                }));
+
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<sunset_sync::EngineEvent>();
+
+                spawn_tracker(
+                    store.clone(),
+                    rx,
+                    me_pk.clone(),
+                    PresenceConfig {
+                        room_fp_hex: "ffaa".to_owned(),
+                        interval_ms: 1000,
+                        ttl_ms: 60_000,
+                        refresh_ms: 50,
+                    },
+                    handles,
+                );
+
+                let body = PresenceBody {
+                    name: Some("late-bob".to_owned()),
+                };
+                let block = ContentBlock {
+                    data: bytes::Bytes::from(postcard::to_stdvec(&body).unwrap()),
+                    references: vec![],
+                };
+                let value_hash = block.hash();
+                let now_pri = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1);
+                let entry_name = bytes::Bytes::from(format!(
+                    "ffaa/presence/{}",
+                    hex::encode(bob.store_verifying_key().as_bytes())
+                ));
+                let mut entry = SignedKvEntry {
+                    verifying_key: bob.store_verifying_key(),
+                    name: entry_name.clone(),
+                    value_hash,
+                    priority: now_pri,
+                    expires_at: Some(now_pri + 60_000),
+                    signature: bytes::Bytes::new(),
+                };
+                let payload = signing_payload(&entry);
+                let sig = bob.sign(&payload);
+                entry.signature = bytes::Bytes::copy_from_slice(&sig.to_bytes());
+
+                // Insert entry WITHOUT its block (lazy dangling ref).
+                store.insert(entry, None).await.unwrap();
+
+                // Wait for bob to appear with name=None.
+                for _ in 0..200 {
+                    let ms = captured.borrow().clone();
+                    if ms.iter().any(|m| !m.is_self) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                {
+                    let ms = captured.borrow().clone();
+                    let bob_member = ms
+                        .iter()
+                        .find(|m| !m.is_self)
+                        .expect("bob should appear without block");
+                    assert_eq!(
+                        bob_member.name, None,
+                        "name should be None before block arrives"
+                    );
+                }
+
+                // Re-insert at higher priority WITH the block. `insert` broadcasts
+                // BlobAdded which wakes the pending-blocks retry path in the tracker.
+                let pri2 = now_pri + 1;
+                let mut entry2 = SignedKvEntry {
+                    verifying_key: bob.store_verifying_key(),
+                    name: entry_name,
+                    value_hash,
+                    priority: pri2,
+                    expires_at: Some(pri2 + 60_000),
+                    signature: bytes::Bytes::new(),
+                };
+                let payload2 = signing_payload(&entry2);
+                let sig2 = bob.sign(&payload2);
+                entry2.signature = bytes::Bytes::copy_from_slice(&sig2.to_bytes());
+                store.insert(entry2, Some(block)).await.unwrap();
+
+                // Wait for name to flip to Some("late-bob").
+                for _ in 0..200 {
+                    let ms = captured.borrow().clone();
+                    if let Some(b) = ms.iter().find(|m| !m.is_self) {
+                        if b.name == Some("late-bob".to_owned()) {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!(
+                    "tracker never updated name after late block; got {:?}",
+                    captured.borrow()
+                );
+            })
+            .await;
     }
 }
