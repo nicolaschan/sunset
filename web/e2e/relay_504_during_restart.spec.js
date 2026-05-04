@@ -278,7 +278,9 @@ test.afterAll(async () => {
   }
 });
 
-test.setTimeout(180_000);
+// Whole-test budget: 3 s gap + ~10 s recovery + ~1 s B→A + setup
+// overhead is typically 15–20 s. 60 s is ~3× that.
+test.setTimeout(60_000);
 test("chat resumes after relay restart while proxy returns 504", async ({
   browser,
 }) => {
@@ -325,11 +327,26 @@ test("chat resumes after relay restart while proxy returns 504", async ({
   await expect(inputA).toBeVisible({ timeout: 15_000 });
   await expect(inputB).toBeVisible({ timeout: 15_000 });
 
+  // Run id mixed into every message so payloads cannot collide with
+  // earlier-or-concurrent traffic and msgPre cannot be confused with
+  // msgPost.
+  const runId = `${Date.now()}-${Math.floor(Math.random() * 1e12).toString(36)}`;
+  const nonce = () => Math.floor(Math.random() * 1e15).toString(36);
+
   // Pre-restart sanity.
-  const msgPre = `pre-504 from A — ${Date.now()}`;
+  const msgPre = `[e2e ${runId}] pre-504-A nonce=${nonce()}`;
+  expect(
+    await pageB.getByText(msgPre).count(),
+    "B must not see msgPre before A sends it",
+  ).toBe(0);
   await inputA.fill(msgPre);
   await inputA.press("Enter");
   await expect(pageB.getByText(msgPre)).toBeVisible({ timeout: 15_000 });
+
+  // Capture B's `performance.timeOrigin` before the kill so we can
+  // assert it's unchanged afterwards (proves the page wasn't reloaded
+  // — `timeOrigin` only changes when the document is fresh).
+  const pageBOriginBefore = await pageB.evaluate(() => performance.timeOrigin);
 
   // Simulate the production failure: kill the relay AND switch the
   // proxy to 504 mode. The browsers' existing WS forwards are torn
@@ -339,8 +356,14 @@ test("chat resumes after relay restart while proxy returns 504", async ({
   proxy.setMode("504");
   await stopRelay(relayProcess);
 
-  // Let the supervisor make at least a few failing attempts so we
-  // know we're testing the retry path, not just a one-shot recovery.
+  // Hold the gap open long enough that the supervisor's first
+  // post-disconnect retry definitely lands during 504 mode and fails
+  // transiently. That failure is exactly the path we're testing —
+  // `spawn_dial`'s background task transitions the intent to
+  // `Backoff` while the run loop is parked on a stale
+  // `pending::<()>` future. Without the wake-on-Backoff fix, the
+  // run loop never re-arms its sleep timer and the supervisor stays
+  // stuck even after the proxy returns to alive mode.
   await pageA.waitForTimeout(3_000);
 
   // Bring the relay back on the same port + same data_dir → same
@@ -351,30 +374,59 @@ test("chat resumes after relay restart while proxy returns 504", async ({
   expect(restarted.addr).toBe(relayBareAddr);
   proxy.setMode("alive");
 
-  async function waitForConnected(page) {
-    await page.waitForFunction(
-      () =>
-        window.sunsetClient &&
-        window.sunsetClient.intents &&
-        window.sunsetClient
-          .intents()
-          .then((arr) => arr.some((s) => s.state === "connected")),
-      { timeout: 90_000, polling: 250 },
-    );
-  }
-
-  await waitForConnected(pageA);
-  await waitForConnected(pageB);
-
-  const msgPost = `post-504 from A — ${Date.now()}`;
+  // Deliberately do NOT poll `intents()` between recovery and the
+  // message sends below. Each `intents()` call sends a
+  // `SupervisorCommand::Snapshot` that wakes the supervisor's
+  // `cmd_rx.recv()` arm, which would mask the exact liveness bug
+  // this test is meant to catch (run loop parked on a stale
+  // `pending::<()>()` while a background `spawn_dial` schedules a
+  // fresh `Backoff`).
+  //
+  // The user's UI doesn't poll; it only subscribes via
+  // `on_intent_changed`. Message-arrival on B is therefore the
+  // load-bearing canary: if A's supervisor were stuck, A could not
+  // push msgPost to the relay and B would never see it inside the
+  // expect timeout.
+  const msgPost = `[e2e ${runId}] post-504-A nonce=${nonce()}`;
+  expect(
+    await pageB.getByText(msgPost).count(),
+    "B must not see msgPost before A sends it",
+  ).toBe(0);
   await inputA.fill(msgPost);
   await inputA.press("Enter");
-  await expect(pageB.getByText(msgPost)).toBeVisible({ timeout: 60_000 });
+  // Recovery budget: 3 s gap + worst-case backoff escalation
+  // (1 s + 2 s + 4 s = 7 s) + handshake + push + B-side render —
+  // typically 9–11 s end-to-end on a dev box. 30 s leaves ~3× slack
+  // for CI variance without being so loose that a real regression
+  // takes a minute to surface.
+  await expect(pageB.getByText(msgPost)).toBeVisible({ timeout: 30_000 });
 
-  const msgPostB = `post-504 from B — ${Date.now()}`;
+  // Cross-checks: B was not reloaded and pre-restart history is
+  // intact. Both prove that the message arrived via the live engine
+  // → store → UI subscription path on the same browser context that
+  // was open before the kill.
+  await expect(
+    pageB.getByText(msgPre),
+    "msgPre must still be visible on B (proves no reload erased history)",
+  ).toBeVisible();
+  const pageBOriginAfter = await pageB.evaluate(() => performance.timeOrigin);
+  expect(
+    pageBOriginAfter,
+    "B's performance.timeOrigin must be unchanged across the restart (proves no reload)",
+  ).toBe(pageBOriginBefore);
+
+  // Bidirectional sanity.
+  const msgPostB = `[e2e ${runId}] post-504-B nonce=${nonce()}`;
+  expect(
+    await pageA.getByText(msgPostB).count(),
+    "A must not see msgPostB before B sends it",
+  ).toBe(0);
   await inputB.fill(msgPostB);
   await inputB.press("Enter");
-  await expect(pageA.getByText(msgPostB)).toBeVisible({ timeout: 60_000 });
+  // Both sides are reconnected to the (now-alive) relay by this
+  // point, so this is normal relay-mediated chat — sub-second on
+  // localhost.
+  await expect(pageA.getByText(msgPostB)).toBeVisible({ timeout: 15_000 });
 
   // Reproducer check: the user's prod log showed many
   // `promote failed: noise responder: raw transport error: ws recv: …
