@@ -6,15 +6,38 @@
 //! sunset-sync engine, with Noise_KK PFS encryption applied at that
 //! layer).
 //!
+//! ## Dispatch architecture
+//!
 //! A single shared dispatcher task (started lazily on the first
 //! `connect()` or `accept()` call) drains `signaler.recv()` and routes
-//! each incoming `WebRtcSignalKind` either onto the inbound `Offer`
-//! queue or onto the per-peer queue used by an in-progress handshake.
+//! each incoming `WebRtcSignalKind` according to the per-peer registry:
+//!
+//! - **Offer** from peer X: if `per_peer[X]` already exists (in-progress
+//!   connect or accept), the offer is forwarded to that queue (the
+//!   handshake's "duplicate Offer" arm ignores it). Otherwise the
+//!   dispatcher spawns a fresh per-peer accept task for X, registers
+//!   `per_peer[X]` BEFORE the spawn returns, and hands the task any
+//!   `early_ice[X]` candidates that arrived before the offer.
+//! - **Answer / IceCandidate** from peer X: if `per_peer[X]` exists,
+//!   forward to that queue. Otherwise append to `early_ice[X]` (a small
+//!   per-peer buffer with a 30 s TTL) so the per-peer task can drain it
+//!   when it spawns.
+//!
+//! This is the **parallel per-peer accept** model: every inbound peer
+//! gets its own task immediately, so a slow handshake with one peer
+//! doesn't starve a second peer's signaling. The single-worker model
+//! that preceded this would deadlock the 3-peer mesh because peer C's
+//! second offer (from B, after A) sat in the queue while A↔C ran, and
+//! B's early ICE was dropped from the dispatcher with no per_peer entry
+//! to land in.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::time::Duration;
+
+use web_time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -51,36 +74,51 @@ enum WebRtcSignalKind {
     IceCandidate(String),
 }
 
+/// How long a buffered early signaling message (Answer / ICE for a peer
+/// we haven't started handshaking with yet) lives before the dispatcher
+/// prunes it. Pruning is piggy-backed on dispatcher activity — no
+/// dedicated timer task. 30 s is generous: realistic ICE trickling
+/// completes in 1–5 s, so in steady state the buffer is empty whenever
+/// the per-peer task spawns.
+const EARLY_BUFFER_TTL: Duration = Duration::from_secs(30);
+
 pub struct WebRtcRawTransport {
     signaler: Rc<dyn Signaler>,
     local_peer: PeerId,
     ice_urls: Vec<String>,
     inner: Rc<RefCell<Inner>>,
-    /// Holds completed inbound connections produced by the background
-    /// accept worker. The worker drains `offers_rx` and runs the full
-    /// WebRTC handshake outside the engine's `select!` loop so it
-    /// survives the loop dropping its `accept()` future on every tick.
+    /// Holds completed inbound connections produced by the per-peer
+    /// accept tasks the dispatcher spawns on first inbound Offer. Each
+    /// task pushes its result here; the engine's `accept` loop drains.
     completed_rx: Rc<Mutex<mpsc::UnboundedReceiver<Result<WebRtcRawConnection>>>>,
 }
 
 struct Inner {
     dispatcher_started: bool,
-    accept_worker_started: bool,
     /// In-progress handshakes' inbound queues, keyed by remote peer.
     /// Connect-side registers before sending Offer; accept-side registers
-    /// after receiving Offer.
+    /// at dispatcher level the moment an Offer arrives, BEFORE the
+    /// per-peer task does any await (so subsequent ICE for the same peer
+    /// has somewhere to land).
     per_peer: HashMap<PeerId, mpsc::UnboundedSender<WebRtcSignalKind>>,
-    /// Drained by the accept worker. Each entry is (from_peer, offer_sdp).
-    offers_tx: mpsc::UnboundedSender<(PeerId, String)>,
-    offers_rx: Option<mpsc::UnboundedReceiver<(PeerId, String)>>,
-    completed_tx: Option<mpsc::UnboundedSender<Result<WebRtcRawConnection>>>,
+    /// Per-peer buffer for Answer / IceCandidate that arrived before
+    /// `per_peer[X]` was registered. Drained by the per-peer accept task
+    /// when it spawns; pruned by the dispatcher when entries exceed
+    /// `EARLY_BUFFER_TTL`.
+    early_ice: HashMap<PeerId, EarlyIceBuffer>,
+    /// Cloned into each per-peer accept task spawned by the dispatcher.
+    completed_tx: mpsc::UnboundedSender<Result<WebRtcRawConnection>>,
+}
+
+struct EarlyIceBuffer {
+    candidates: Vec<WebRtcSignalKind>,
+    inserted_at: Instant,
 }
 
 impl WebRtcRawTransport {
     /// `ice_urls` should typically contain at least one STUN server,
     /// e.g. `["stun:stun.l.google.com:19302".into()]`.
     pub fn new(signaler: Rc<dyn Signaler>, local_peer: PeerId, ice_urls: Vec<String>) -> Self {
-        let (offers_tx, offers_rx) = mpsc::unbounded::<(PeerId, String)>();
         let (completed_tx, completed_rx) = mpsc::unbounded::<Result<WebRtcRawConnection>>();
         Self {
             signaler,
@@ -88,17 +126,21 @@ impl WebRtcRawTransport {
             ice_urls,
             inner: Rc::new(RefCell::new(Inner {
                 dispatcher_started: false,
-                accept_worker_started: false,
                 per_peer: HashMap::new(),
-                offers_tx,
-                offers_rx: Some(offers_rx),
-                completed_tx: Some(completed_tx),
+                early_ice: HashMap::new(),
+                completed_tx,
             })),
             completed_rx: Rc::new(Mutex::new(completed_rx)),
         }
     }
 
-    /// Start the shared `signaler.recv()` drain task on first use.
+    /// Start the shared `signaler.recv()` drain task on first use. The
+    /// dispatcher does three jobs:
+    /// 1. Routes inbound Answer/ICE to the per_peer queue, or buffers
+    ///    in `early_ice` if no per_peer entry exists.
+    /// 2. On a fresh Offer (no per_peer entry yet), spawns a per-peer
+    ///    accept task and seeds it with any buffered early ICE.
+    /// 3. Prunes stale `early_ice` entries on each event.
     fn ensure_dispatcher(&self) {
         let mut inner = self.inner.borrow_mut();
         if inner.dispatcher_started {
@@ -106,6 +148,8 @@ impl WebRtcRawTransport {
         }
         inner.dispatcher_started = true;
         let signaler = self.signaler.clone();
+        let local_peer = self.local_peer.clone();
+        let ice_urls = self.ice_urls.clone();
         let inner_ref = self.inner.clone();
         spawn_local(async move {
             loop {
@@ -117,16 +161,73 @@ impl WebRtcRawTransport {
                     Ok(k) => k,
                     Err(_) => continue,
                 };
+                let from = msg.from;
+
+                // Lazy GC: drop early-ice buffers older than the TTL.
+                prune_early_ice(&inner_ref);
+
                 match kind {
                     WebRtcSignalKind::Offer(sdp) => {
-                        let tx = inner_ref.borrow().offers_tx.clone();
-                        let _ = tx.unbounded_send((msg.from, sdp));
+                        // If a handshake is already in flight for `from`
+                        // (active connect, or a prior accept that hasn't
+                        // finished), forward the duplicate Offer to that
+                        // queue and let the handshake's glare arm ignore
+                        // it. This is the symmetric "ignore duplicate
+                        // Offer" defense on both sides.
+                        let existing = inner_ref.borrow().per_peer.get(&from).cloned();
+                        if let Some(tx) = existing {
+                            let _ = tx.unbounded_send(WebRtcSignalKind::Offer(sdp));
+                            continue;
+                        }
+
+                        // Fresh accept. Register per_peer[from] BEFORE
+                        // spawning so subsequent dispatcher events that
+                        // arrive while the spawn is queued still land in
+                        // the per-peer queue. Drain any buffered early
+                        // ICE so the new task processes it first.
+                        let (peer_tx, peer_rx) = mpsc::unbounded::<WebRtcSignalKind>();
+                        let buffered = {
+                            let mut g = inner_ref.borrow_mut();
+                            g.per_peer.insert(from.clone(), peer_tx);
+                            g.early_ice
+                                .remove(&from)
+                                .map(|b| b.candidates)
+                                .unwrap_or_default()
+                        };
+                        let completed_tx = inner_ref.borrow().completed_tx.clone();
+                        spawn_local(spawn_accept_task(AcceptTask {
+                            signaler: signaler.clone(),
+                            local_peer: local_peer.clone(),
+                            ice_urls: ice_urls.clone(),
+                            inner: inner_ref.clone(),
+                            from_peer: from,
+                            offer_sdp: sdp,
+                            peer_in_rx: peer_rx,
+                            buffered,
+                            completed_tx,
+                        }));
                     }
                     other => {
-                        let from = msg.from;
                         let target = inner_ref.borrow().per_peer.get(&from).cloned();
                         if let Some(tx) = target {
                             let _ = tx.unbounded_send(other);
+                        } else {
+                            // No active handshake for `from`. ICE goes
+                            // into early_ice — the per-peer task drains
+                            // it when the matching Offer eventually
+                            // arrives. A stray Answer here is structurally
+                            // unreachable (connect-side registers per_peer
+                            // before sending Offer, so Answers always have
+                            // somewhere to land); drop it.
+                            if let WebRtcSignalKind::IceCandidate(_) = &other {
+                                let mut g = inner_ref.borrow_mut();
+                                let buf =
+                                    g.early_ice.entry(from).or_insert_with(|| EarlyIceBuffer {
+                                        candidates: Vec::new(),
+                                        inserted_at: Instant::now(),
+                                    });
+                                buf.candidates.push(other);
+                            }
                         }
                     }
                 }
@@ -139,10 +240,42 @@ impl WebRtcRawTransport {
         self.inner.borrow_mut().per_peer.insert(remote, tx);
         rx
     }
+}
 
-    fn unregister_peer(&self, remote: &PeerId) {
-        self.inner.borrow_mut().per_peer.remove(remote);
-    }
+/// Drop early-ice buffers whose oldest entry exceeds `EARLY_BUFFER_TTL`.
+/// Called piggy-back on each dispatcher event — no dedicated timer.
+fn prune_early_ice(inner: &Rc<RefCell<Inner>>) {
+    let now = Instant::now();
+    inner
+        .borrow_mut()
+        .early_ice
+        .retain(|_, b| now.duration_since(b.inserted_at) < EARLY_BUFFER_TTL);
+}
+
+/// Inputs to one inbound accept handshake. Bundled into a struct so
+/// the spawn site (and the worker function) stays under clippy's
+/// `too_many_arguments` threshold without `#[allow]` suppressions.
+struct AcceptTask {
+    signaler: Rc<dyn Signaler>,
+    local_peer: PeerId,
+    ice_urls: Vec<String>,
+    inner: Rc<RefCell<Inner>>,
+    from_peer: PeerId,
+    offer_sdp: String,
+    peer_in_rx: mpsc::UnboundedReceiver<WebRtcSignalKind>,
+    buffered: Vec<WebRtcSignalKind>,
+    completed_tx: mpsc::UnboundedSender<Result<WebRtcRawConnection>>,
+}
+
+/// Wrapper future for `spawn_local` — runs one accept handshake to
+/// completion, then forwards the result to `completed_tx`. The per_peer
+/// entry is removed by `run_accept_one` on the way out (success or
+/// failure) so stale ICE for this attempt drops at the dispatcher
+/// rather than crashing a fresh retry.
+async fn spawn_accept_task(task: AcceptTask) {
+    let completed_tx = task.completed_tx.clone();
+    let result = run_accept_one(task).await;
+    let _ = completed_tx.unbounded_send(result);
 }
 
 #[async_trait(?Send)]
@@ -154,6 +287,15 @@ impl RawTransport for WebRtcRawTransport {
 
         let remote_peer = parse_addr_peer_id(&addr)?;
         let mut peer_in_rx = self.register_peer(remote_peer.clone());
+        // Auto-cleanup if any `?` below errors out before we finish.
+        // Without this, the registry would still hold a dead sender;
+        // a retry's fresh Offer arriving at the dispatcher would route
+        // through this stale entry, and the connect-side ICE forwarder
+        // would resend candidates to a defunct queue.
+        let _connect_guard = PerPeerGuard {
+            inner: self.inner.clone(),
+            peer: remote_peer.clone(),
+        };
 
         let pc = build_peer_connection(&self.ice_urls)?;
 
@@ -255,25 +397,28 @@ impl RawTransport for WebRtcRawTransport {
                             })?;
                             got_answer = true;
                             for json in pending_ice.drain(..) {
-                                add_remote_ice(&pc, &json).await?;
+                                try_add_remote_ice(&pc, &json).await;
                             }
                         }
                         WebRtcSignalKind::IceCandidate(json) => {
                             if got_answer {
-                                add_remote_ice(&pc, &json).await?;
+                                try_add_remote_ice(&pc, &json).await;
                             } else {
                                 pending_ice.push(json);
                             }
                         }
                         WebRtcSignalKind::Offer(_) | WebRtcSignalKind::Answer(_) => {
-                            // Glare or duplicate — ignore.
+                            // Glare or duplicate Offer/Answer — ignore.
+                            // The dispatcher routes a duplicate Offer
+                            // here intentionally so the live handshake
+                            // makes the call (Q1 decision).
                         }
                     }
                 }
             }
         }
 
-        self.unregister_peer(&remote_peer);
+        // _connect_guard removes per_peer[remote_peer] on drop.
 
         Ok(WebRtcRawConnection {
             _pc: pc,
@@ -292,8 +437,7 @@ impl RawTransport for WebRtcRawTransport {
 
     async fn accept(&self) -> Result<Self::Connection> {
         self.ensure_dispatcher();
-        self.ensure_accept_worker();
-        // The background accept worker runs the full WebRTC handshake
+        // Per-peer accept tasks run the full WebRTC handshake
         // independently of the engine's `select!` loop (which would
         // otherwise drop our future on every tick, restarting the
         // handshake from scratch). Here we just await the next
@@ -302,69 +446,49 @@ impl RawTransport for WebRtcRawTransport {
         completed_rx
             .next()
             .await
-            .ok_or_else(|| Error::Transport("accept worker terminated".into()))?
+            .ok_or_else(|| Error::Transport("accept dispatcher terminated".into()))?
     }
 }
 
-impl WebRtcRawTransport {
-    /// Spawn the background accept worker on first use. The worker
-    /// drains `offers_rx` and runs the full WebRTC handshake for each
-    /// inbound offer, decoupled from the engine's `select!` loop.
-    fn ensure_accept_worker(&self) {
-        let (offers_rx_opt, completed_tx_opt) = {
-            let mut inner = self.inner.borrow_mut();
-            if inner.accept_worker_started {
-                return;
-            }
-            inner.accept_worker_started = true;
-            (inner.offers_rx.take(), inner.completed_tx.take())
-        };
-        let mut offers_rx = match offers_rx_opt {
-            Some(r) => r,
-            None => return,
-        };
-        let completed_tx = match completed_tx_opt {
-            Some(t) => t,
-            None => return,
-        };
-        let signaler = self.signaler.clone();
-        let local_peer = self.local_peer.clone();
-        let ice_urls = self.ice_urls.clone();
-        let inner_ref = self.inner.clone();
-        spawn_local(async move {
-            while let Some((from_peer, offer_sdp)) = offers_rx.next().await {
-                let result = run_accept_one(
-                    signaler.clone(),
-                    local_peer.clone(),
-                    ice_urls.clone(),
-                    inner_ref.clone(),
-                    from_peer,
-                    offer_sdp,
-                )
-                .await;
-                if completed_tx.unbounded_send(result).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-}
-
-/// Run one inbound WebRTC handshake to completion. Free function so
-/// the background accept worker (spawned with no `&self`) can call it.
-async fn run_accept_one(
-    signaler: Rc<dyn Signaler>,
-    local_peer: PeerId,
-    ice_urls: Vec<String>,
+/// RAII guard: ensures `per_peer[from_peer]` is removed when the per-peer
+/// accept task exits, regardless of success or failure. Without this, a
+/// failed handshake could leave a dead sender in the registry and any
+/// stale ICE for that peer would land in the dropped channel — or worse,
+/// route a fresh Offer back to the dead queue. On retry, we want stale
+/// ICE to drop at the dispatcher (no per_peer entry → buffer or drop),
+/// not crash the new attempt's `addIceCandidate`.
+struct PerPeerGuard {
     inner: Rc<RefCell<Inner>>,
-    from_peer: PeerId,
-    offer_sdp: String,
-) -> Result<WebRtcRawConnection> {
-    let (peer_in_tx, mut peer_in_rx) = mpsc::unbounded::<WebRtcSignalKind>();
-    inner
-        .borrow_mut()
-        .per_peer
-        .insert(from_peer.clone(), peer_in_tx);
+    peer: PeerId,
+}
+
+impl Drop for PerPeerGuard {
+    fn drop(&mut self) {
+        self.inner.borrow_mut().per_peer.remove(&self.peer);
+    }
+}
+
+/// Run one inbound WebRTC handshake to completion. The dispatcher has
+/// already registered `per_peer[from_peer]` and handed us its receiver
+/// (`peer_in_rx`) plus any ICE that arrived before the Offer
+/// (`buffered`). On exit (success or failure), `_guard` removes the
+/// per_peer entry so stale ICE from this attempt drops cleanly.
+async fn run_accept_one(task: AcceptTask) -> Result<WebRtcRawConnection> {
+    let AcceptTask {
+        signaler,
+        local_peer,
+        ice_urls,
+        inner,
+        from_peer,
+        offer_sdp,
+        mut peer_in_rx,
+        buffered,
+        completed_tx: _,
+    } = task;
+    let _guard = PerPeerGuard {
+        inner: inner.clone(),
+        peer: from_peer.clone(),
+    };
 
     let pc = build_peer_connection(&ice_urls)?;
     let (ice_tx, ice_rx) = mpsc::unbounded::<String>();
@@ -430,6 +554,18 @@ async fn run_accept_one(
         .await
         .map_err(|e| Error::Transport(format!("setRemoteDescription offer: {e:?}")))?;
 
+    // Drain any ICE that the dispatcher buffered before this task
+    // existed. Now that `setRemoteDescription(offer)` has run,
+    // `addIceCandidate` will not error with "remote description was
+    // null". One bad candidate is not a connection failure
+    // (Q2 decision: tolerate addIceCandidate errors), so we
+    // log+continue rather than `?` here.
+    for kind in buffered {
+        if let WebRtcSignalKind::IceCandidate(json) = kind {
+            try_add_remote_ice(&pc, &json).await;
+        }
+    }
+
     let answer = JsFuture::from(pc.create_answer())
         .await
         .map_err(|e| Error::Transport(format!("createAnswer: {e:?}")))?;
@@ -487,8 +623,19 @@ async fn run_accept_one(
                 let kind = opt.ok_or_else(|| {
                     Error::Transport("signaling closed mid-handshake".into())
                 })?;
-                if let WebRtcSignalKind::IceCandidate(json) = kind {
-                    add_remote_ice(&pc, &json).await?;
+                match kind {
+                    WebRtcSignalKind::IceCandidate(json) => {
+                        // Q2: tolerate addIceCandidate errors. One stale
+                        // / malformed candidate must not tear down the
+                        // handshake.
+                        try_add_remote_ice(&pc, &json).await;
+                    }
+                    WebRtcSignalKind::Offer(_) | WebRtcSignalKind::Answer(_) => {
+                        // Q1: dispatcher routes a duplicate Offer here
+                        // when an accept handshake is already in flight
+                        // for this peer. Symmetric with the connect-side
+                        // duplicate-Offer/Answer arm — ignore.
+                    }
                 }
             }
         }
@@ -497,7 +644,7 @@ async fn run_accept_one(
         }
     }
 
-    inner.borrow_mut().per_peer.remove(&from_peer);
+    // _guard removes per_peer[from_peer] on drop.
 
     let dc = dc_opt.ok_or_else(|| Error::Transport("no inbound reliable datachannel".into()))?;
     let dc_unrel =
@@ -714,6 +861,18 @@ fn spawn_ice_forwarder(
             seq += 1;
         }
     });
+}
+
+/// Apply a remote ICE candidate, but log+continue on any error rather
+/// than propagating. Stale candidates from a prior failed handshake will
+/// fail `addIceCandidate` (the new RTCPeerConnection has different
+/// ufrag/pwd) — that's expected, and treating it as a connection failure
+/// would tear down the new attempt. Likewise a single malformed
+/// candidate is not worth killing the connection over (Q2 decision).
+async fn try_add_remote_ice(pc: &RtcPeerConnection, cand_json: &str) {
+    if let Err(e) = add_remote_ice(pc, cand_json).await {
+        tracing::warn!(error = %e, "ignoring bad/stale remote ICE candidate");
+    }
 }
 
 async fn add_remote_ice(pc: &RtcPeerConnection, cand_json: &str) -> Result<()> {
