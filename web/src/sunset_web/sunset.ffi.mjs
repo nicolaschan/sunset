@@ -259,6 +259,7 @@ export function onMembersChanged(room, callback) {
         connection_mode: m.connection_mode,
         is_self: m.is_self,
         last_heartbeat_ms: m.last_heartbeat_ms,  // f64; -1 sentinel for "no heartbeat"
+        name: m.name,                    // String | undefined; None when unset
       }));
       Array.from(members).forEach((m) => m.free());
       callback(toList(copied));
