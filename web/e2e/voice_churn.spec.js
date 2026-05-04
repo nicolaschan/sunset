@@ -291,11 +291,18 @@ test("re-join: two epochs of monotonic counters", async ({ browser }) => {
 
   // A receives frames from both epoch-1 and epoch-2 of B.
   // Wait until A has ≥ 30 total frames from B (combining both epochs).
-  // Byte-exact counter checking is not reliable after Opus round-trip;
-  // the harness tests cover raw PCM integrity. Here we verify that the
-  // re-joined peer's audio continues to flow after re-joining.
   const allFrames = await waitForFrames(a.page, bBytes, 30, 3_000);
-  expect(allFrames.length).toBeGreaterThanOrEqual(30);
+
+  // Assert that frames from BOTH epochs are present, not just a count.
+  // epoch-1 was injected with counters 100-129; epoch-2 with 2000-2029.
+  expect(
+    allFrames.some((f) => f.seq_in_frame >= 100 && f.seq_in_frame < 130),
+    "first-epoch counters present",
+  ).toBe(true);
+  expect(
+    allFrames.some((f) => f.seq_in_frame >= 2000 && f.seq_in_frame < 2030),
+    "second-epoch counters present",
+  ).toBe(true);
 
   await a.ctx.close();
   await b.ctx.close();
