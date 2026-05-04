@@ -289,6 +289,22 @@ impl VoiceRuntime {
             .map(|(p, q)| (p.clone(), q.len()))
             .collect()
     }
+
+    /// Test-only: return clones of the frame and membership `Liveness`
+    /// arcs so tests can inject synthetic observations (e.g. to wake the
+    /// combiner task for in-flight cancellation verification).
+    #[cfg(feature = "test-hooks")]
+    pub fn test_liveness(
+        &self,
+    ) -> (
+        std::sync::Arc<sunset_core::liveness::Liveness>,
+        std::sync::Arc<sunset_core::liveness::Liveness>,
+    ) {
+        (
+            self.inner.frame_liveness.clone(),
+            self.inner.membership_liveness.clone(),
+        )
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

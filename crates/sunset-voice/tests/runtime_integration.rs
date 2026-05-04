@@ -15,7 +15,7 @@ use rand_chacha::rand_core::SeedableRng;
 use sunset_core::Identity;
 use sunset_core::Room;
 use sunset_core::bus::BusEvent;
-use sunset_store::{ContentBlock, SignedDatagram, SignedKvEntry};
+use sunset_store::{ContentBlock, SignedDatagram, SignedKvEntry, VerifyingKey};
 use sunset_sync::PeerId;
 use sunset_voice::runtime::{
     Dialer, DynBus, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime,
@@ -1010,7 +1010,12 @@ async fn dropping_runtime_terminates_all_tasks() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (alice, room) = make_identity_and_room(11);
+            // Keep a Rc<Room> clone for fingerprint computation (used below to
+            // build names that match the subscribe task's prefix filter).
+            let room_for_inject = room.clone();
             let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
+            // Keep a typed reference for post-drop injection (see below).
+            let bus_for_inject = bus_impl.clone();
             let bus: Rc<dyn DynBus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
@@ -1025,6 +1030,10 @@ async fn dropping_runtime_terminates_all_tasks() {
             let (runtime, tasks) =
                 VoiceRuntime::new(bus, room, alice, dialer, frame_sink, peer_state_sink);
 
+            // Capture liveness arcs BEFORE drop so we can inject a synthetic
+            // observation to wake the combiner task.
+            let (frame_liveness, membership_liveness) = runtime.test_liveness();
+
             let handles = vec![
                 tokio::task::spawn_local(tasks.heartbeat),
                 tokio::task::spawn_local(tasks.subscribe),
@@ -1034,15 +1043,84 @@ async fn dropping_runtime_terminates_all_tasks() {
                 tokio::task::spawn_local(tasks.voice_presence_publisher),
             ];
 
+            // Let each task enter its loop body and reach its first await
+            // point before we drop the runtime.  Without this yield, the
+            // tasks haven't started executing yet when drop(runtime) runs,
+            // so the very first weak.upgrade() already fails — the test
+            // never exercises in-flight cancellation.
+            //
+            // 50 ms is long enough for all six tasks to complete their
+            // initialization (subscribe to the bus/liveness, set up any
+            // codecs, etc.) and park inside their respective select!/await
+            // loops without spending even a single timer-sleep interval.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
             drop(runtime);
-            // Allow each task to observe the upgrade failure.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            for h in handles {
+
+            // --- Wake each event-driven task so it reaches its
+            //     weak.upgrade() check and observes the upgrade failure. ---
+
+            // Compute the room fingerprint so injected names match the
+            // tasks' prefix filters exactly.
+            let room_fp = room_for_inject.fingerprint().to_hex();
+
+            // subscribe task: blocked on stream.next(); inject a synthetic
+            // ephemeral matching the `voice/{room_fp}/` prefix so it wakes up
+            // and reaches the upgrade check inside its loop body.
+            let dummy_peer_vk = VerifyingKey::new(Bytes::from_static(b"dummydummydummy1"));
+            let voice_name = Bytes::from(format!("voice/{room_fp}/dummy-sender"));
+            bus_for_inject
+                .inject(SignedDatagram {
+                    verifying_key: dummy_peer_vk,
+                    name: voice_name,
+                    payload: Bytes::new(),
+                    signature: Bytes::new(),
+                })
+                .await;
+
+            // auto_connect task: blocked on select! over the durable presence
+            // stream + membership liveness stream.  The membership arm fires
+            // `weak.upgrade()` on Stale events.  Inject a peer with a timestamp
+            // at UNIX_EPOCH (effectively "56 years stale") and then run the sweep
+            // so the liveness emits a Stale event immediately — no need to wait
+            // the full 5-second MEMBERSHIP_STALE_AFTER window.
+            let stale_peer = PeerId(VerifyingKey::new(Bytes::from_static(b"dummydummydummy2")));
+            membership_liveness
+                .observe(stale_peer, std::time::SystemTime::UNIX_EPOCH)
+                .await;
+            membership_liveness.run_sweep().await;
+
+            // combiner task: blocked on select! over frame + membership liveness
+            // subscription streams (no bus traffic reaches it directly).  Inject
+            // a synthetic frame-liveness observation so the frame_sub stream yields
+            // an event and the combiner reaches its weak.upgrade() check.
+            let active_peer = PeerId(VerifyingKey::new(Bytes::from_static(b"dummydummydummy3")));
+            frame_liveness
+                .observe(
+                    active_peer,
+                    std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                )
+                .await;
+
+            // After the drop each task will observe the upgrade failure on
+            // its next loop iteration.  heartbeat and voice_presence_publisher
+            // sleep HEARTBEAT_INTERVAL (2 s) between iterations, so we give
+            // each task up to 3 s to exit (one full sleep cycle + slack).
+            let task_names = [
+                "heartbeat",
+                "subscribe",
+                "combiner",
+                "auto_connect",
+                "jitter_pump",
+                "voice_presence_publisher",
+            ];
+            for (i, h) in handles.into_iter().enumerate() {
                 assert!(
-                    tokio::time::timeout(Duration::from_millis(500), h)
+                    tokio::time::timeout(Duration::from_secs(3), h)
                         .await
                         .is_ok(),
-                    "task should finish after Drop"
+                    "task '{}' should finish after Drop",
+                    task_names[i]
                 );
             }
         })
