@@ -272,8 +272,12 @@ where
     pub async fn run(self: Rc<Self>) {
         let mut cmd_rx = match self.cmd_rx.borrow_mut().take() {
             Some(rx) => rx,
-            None => return, // run() called twice
+            None => {
+                tracing::error!("supervisor: run() called twice; second call is a no-op");
+                return;
+            }
         };
+        tracing::info!("supervisor: run loop starting");
         let mut events = self.engine.subscribe_engine_events().await;
 
         // Seed RNG. We use a simple counter-based seed so this works
@@ -344,11 +348,18 @@ where
                 let mut state = self.state.borrow_mut();
                 if let Some(id) = state.peer_to_intent.get(&peer_id).copied() {
                     if let Some(entry) = state.intents.get_mut(&id) {
+                        let prev = entry.state;
                         entry.state = IntentState::Connected;
                         entry.kind = Some(kind);
                         entry.attempt = 0;
                         entry.next_attempt_at = None;
                         Self::broadcast(&mut state, id);
+                        tracing::info!(
+                            intent_id = id,
+                            label = %state.intents[&id].label,
+                            prev = ?prev,
+                            "supervisor: PeerAdded → Connected",
+                        );
                     }
                 }
             }
@@ -366,9 +377,28 @@ where
                             );
                             let delay = self.policy.delay(entry.attempt, &mut rng);
                             entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
+                            let attempt = entry.attempt;
+                            let label = entry.label.clone();
                             Self::broadcast(&mut state, id);
+                            tracing::info!(
+                                intent_id = id,
+                                label = %label,
+                                attempt = attempt,
+                                next_attempt_in_ms = delay.as_millis() as u64,
+                                "supervisor: PeerRemoved → Backoff (will redial after delay)",
+                            );
+                        } else {
+                            tracing::debug!(
+                                intent_id = id,
+                                "supervisor: PeerRemoved on Cancelled intent (no-op)",
+                            );
                         }
                     }
+                } else {
+                    tracing::debug!(
+                        peer_id = ?peer_id,
+                        "supervisor: PeerRemoved for unknown peer (no intent owns this conn)",
+                    );
                 }
             }
             EngineEvent::PongObserved {
@@ -572,22 +602,81 @@ where
         let policy = self.policy.clone();
         crate::spawn::spawn_local(async move {
             // Snapshot the connectable for this attempt.
-            let connectable = {
+            let (connectable, attempt, label) = {
                 let s = state.borrow();
                 match s.intents.get(&id) {
-                    Some(entry) if entry.state != IntentState::Cancelled => {
-                        entry.connectable.clone()
-                    }
+                    Some(entry) if entry.state != IntentState::Cancelled => (
+                        entry.connectable.clone(),
+                        entry.attempt,
+                        entry.label.clone(),
+                    ),
                     _ => return,
                 }
             };
 
+            tracing::info!(
+                intent_id = id,
+                label = %label,
+                attempt = attempt,
+                "supervisor: dial begin",
+            );
+            let resolve_started = web_time::SystemTime::now();
             let attempt_result = match connectable.resolve_addr().await {
-                Ok(addr) => engine
-                    .add_peer(addr)
-                    .await
-                    .map_err(crate::connectable::ResolveErr::from),
-                Err(e) => Err(e),
+                Ok(addr) => {
+                    let resolve_ms = resolve_started
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let addr_str = String::from_utf8_lossy(addr.as_bytes()).into_owned();
+                    tracing::info!(
+                        intent_id = id,
+                        attempt = attempt,
+                        resolve_ms,
+                        addr = %addr_str,
+                        "supervisor: resolved addr; calling engine.add_peer",
+                    );
+                    let connect_started = web_time::SystemTime::now();
+                    let r = engine
+                        .add_peer(addr)
+                        .await
+                        .map_err(crate::connectable::ResolveErr::from);
+                    let connect_ms = connect_started
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    match &r {
+                        Ok((pid, kind)) => tracing::info!(
+                            intent_id = id,
+                            attempt = attempt,
+                            connect_ms,
+                            peer_id = ?pid,
+                            kind = ?kind,
+                            "supervisor: engine.add_peer ok (Hello complete)",
+                        ),
+                        Err(e) => tracing::warn!(
+                            intent_id = id,
+                            attempt = attempt,
+                            connect_ms,
+                            error = %e,
+                            "supervisor: engine.add_peer failed",
+                        ),
+                    }
+                    r
+                }
+                Err(e) => {
+                    let resolve_ms = resolve_started
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    tracing::warn!(
+                        intent_id = id,
+                        attempt = attempt,
+                        resolve_ms,
+                        error = %e,
+                        "supervisor: resolve_addr failed",
+                    );
+                    Err(e)
+                }
             };
 
             // Compute next state. The borrow is split into two scopes so
@@ -652,8 +741,13 @@ where
                         entry.kind = Some(kind);
                         entry.attempt = 0;
                         entry.next_attempt_at = None;
-                        s.peer_to_intent.insert(peer_id, id);
+                        s.peer_to_intent.insert(peer_id.clone(), id);
                         Self::broadcast(&mut s, id);
+                        tracing::info!(
+                            intent_id = id,
+                            peer_id = ?peer_id,
+                            "supervisor: dial success → Connected",
+                        );
                     }
                     Err(crate::connectable::ResolveErr::Parse(_)) => {
                         // Permanent — cancel the intent and clean up
@@ -695,7 +789,14 @@ where
                         );
                         let delay = policy.delay(entry.attempt, &mut rng);
                         entry.next_attempt_at = Some(web_time::SystemTime::now() + delay);
+                        let attempt = entry.attempt;
                         Self::broadcast(&mut s, id);
+                        tracing::info!(
+                            intent_id = id,
+                            attempt,
+                            next_attempt_in_ms = delay.as_millis() as u64,
+                            "supervisor: transient dial err → Backoff (will redial)",
+                        );
                     }
                 }
             }
@@ -726,7 +827,15 @@ where
                     }
                     entry.state = IntentState::Connecting;
                     entry.next_attempt_at = None;
+                    let attempt = entry.attempt;
+                    let label = entry.label.clone();
                     Self::broadcast(&mut state, id);
+                    tracing::info!(
+                        intent_id = id,
+                        label = %label,
+                        attempt,
+                        "supervisor: backoff timer fired → Connecting",
+                    );
                 }
             }
             self.clone().spawn_dial(id);
@@ -1423,6 +1532,180 @@ mod tests {
             }
             Ok(self.body.clone())
         }
+    }
+
+    /// Fake fetcher backed by an `Rc<Cell<String>>` so the test can
+    /// switch the response body between calls. Models a relay that
+    /// rotates its x25519 between deploys: `swap_body(new_body)` is the
+    /// test's "the relay just restarted with a new identity" lever.
+    struct SwitchableFakeFetch {
+        body: std::cell::RefCell<String>,
+        seen: std::cell::Cell<usize>,
+    }
+
+    impl SwitchableFakeFetch {
+        fn new(body: String) -> Rc<Self> {
+            Rc::new(Self {
+                body: std::cell::RefCell::new(body),
+                seen: std::cell::Cell::new(0),
+            })
+        }
+        fn swap_body(&self, new_body: String) {
+            *self.body.borrow_mut() = new_body;
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl sunset_relay_resolver::HttpFetch for SwitchableFakeFetch {
+        async fn get(&self, _url: &str) -> sunset_relay_resolver::Result<String> {
+            self.seen.set(self.seen.get() + 1);
+            Ok(self.body.borrow().clone())
+        }
+    }
+
+    /// Regression: a relay that restarts with a *new* x25519 identity
+    /// (e.g. the data dir wasn't persisted across deploys) must be
+    /// reconnected to with the new identity, not kept stuck dialing the
+    /// old one. The supervisor's `Resolving` connectable re-fetches the
+    /// relay's identity JSON on every attempt; this test exercises that
+    /// end-to-end through the engine + Hello round-trip.
+    ///
+    /// Sequence:
+    /// 1. Bob_v1 (peer_id = `b"bob_v1"`, canonical addr A) is online.
+    ///    Alice's supervisor connects via `Resolving { input: "bob" }`.
+    /// 2. Disconnect (modelled by `alice.remove_peer(bob_v1_pid)`).
+    /// 3. Switch the fetcher to return Bob_v2's body; bring Bob_v2 (peer_id
+    ///    = `b"bob_v2"`, canonical addr B) online.
+    /// 4. Within a bounded retry window, the intent must reach Connected
+    ///    with `peer_id == bob_v2_pid`. The OLD canonical addr must NOT
+    ///    be dialed once the resolver knows about the new identity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotated_relay_identity_picked_up_on_reconnect() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+
+                // Body for the OLD identity — x25519 key all-`00`. The
+                // resolver will append `#x25519=<hex>` to `wss://bob`.
+                let body_v1 = format!(
+                    "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"ws://bob\"}}",
+                    "00".repeat(32),
+                    "00".repeat(32),
+                );
+                let body_v2 = format!(
+                    "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"ws://bob\"}}",
+                    "11".repeat(32),
+                    "cd".repeat(32),
+                );
+
+                // Pre-compute canonical addresses so we can register
+                // each bob engine at exactly the addr the resolver will
+                // produce (TestNetwork routes by exact PeerAddr bytes).
+                let probe_v1: Rc<dyn sunset_relay_resolver::HttpFetch> =
+                    SwitchableFakeFetch::new(body_v1.clone());
+                let canonical_v1 = sunset_relay_resolver::Resolver::new(probe_v1)
+                    .resolve("bob")
+                    .await
+                    .expect("probe v1 resolve must succeed");
+                let probe_v2: Rc<dyn sunset_relay_resolver::HttpFetch> =
+                    SwitchableFakeFetch::new(body_v2.clone());
+                let canonical_v2 = sunset_relay_resolver::Resolver::new(probe_v2)
+                    .resolve("bob")
+                    .await
+                    .expect("probe v2 resolve must succeed");
+                assert_ne!(
+                    canonical_v1, canonical_v2,
+                    "test setup invariant: rotated identity must change the canonical addr"
+                );
+
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                let bob_v1 = engine_with_addr(&net, b"bob_v1", &canonical_v1);
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+                crate::spawn::spawn_local({
+                    let b = bob_v1.clone();
+                    async move { b.run().await }
+                });
+
+                // Tight backoff so the redial fires fast.
+                let policy = BackoffPolicy {
+                    initial: std::time::Duration::from_millis(50),
+                    max: std::time::Duration::from_millis(50),
+                    multiplier: 1.0,
+                    jitter: 0.0,
+                };
+                let sup = PeerSupervisor::new(alice.clone(), policy);
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                let fetch = SwitchableFakeFetch::new(body_v1.clone());
+                let id = sup
+                    .add(crate::connectable::Connectable::Resolving {
+                        input: "bob".into(),
+                        fetch: fetch.clone(),
+                    })
+                    .await
+                    .unwrap();
+
+                // Wait for the v1 connection to land.
+                let bob_v1_pid = PeerId(vk(b"bob_v1"));
+                let mut connected_v1 = false;
+                for _ in 0..200 {
+                    let snap = sup.snapshot().await;
+                    if let Some(s) = snap.iter().find(|s| s.id == id) {
+                        if s.state == IntentState::Connected
+                            && s.peer_id.as_ref() == Some(&bob_v1_pid)
+                        {
+                            connected_v1 = true;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(connected_v1, "intent never connected to bob_v1");
+
+                // Simulate the relay restarting:
+                //   - flip the resolver's response to Bob_v2's identity
+                //   - bring Bob_v2 online at the v2 canonical addr
+                //   - tear down the v1 connection at alice's engine
+                fetch.swap_body(body_v2.clone());
+                let bob_v2 = engine_with_addr(&net, b"bob_v2", &canonical_v2);
+                crate::spawn::spawn_local({
+                    let b = bob_v2.clone();
+                    async move { b.run().await }
+                });
+                alice.remove_peer(bob_v1_pid.clone()).await.ok();
+
+                // The supervisor must redial, re-resolve via the (now
+                // updated) fetcher, dial the v2 canonical addr, complete
+                // the handshake against Bob_v2 — and the intent must
+                // reflect peer_id = bob_v2_pid.
+                let bob_v2_pid = PeerId(vk(b"bob_v2"));
+                let mut connected_v2 = false;
+                for _ in 0..400 {
+                    let snap = sup.snapshot().await;
+                    if let Some(s) = snap.iter().find(|s| s.id == id) {
+                        if s.state == IntentState::Connected
+                            && s.peer_id.as_ref() == Some(&bob_v2_pid)
+                        {
+                            connected_v2 = true;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(
+                    connected_v2,
+                    "intent did not pick up the rotated relay identity; final snapshot: {:?}",
+                    sup.snapshot().await.into_iter().find(|s| s.id == id),
+                );
+            })
+            .await;
     }
 
     /// Resolver runs once per dial attempt — a rotated relay identity
