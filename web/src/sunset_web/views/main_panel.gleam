@@ -24,6 +24,7 @@ import sunset_web/domain.{
   Direct, OfflineP, OneHop, Online, SelfRelay, Speaking,
 }
 import sunset_web/markdown
+import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
@@ -171,11 +172,12 @@ fn messages_list(
         0 -> ""
         _ ->
           case list.first(list.drop(ms, i - 1)) {
-            Ok(prev) -> prev.author
+            Ok(prev) -> sunset.short_pubkey(prev.author_pubkey)
             Error(_) -> ""
           }
       }
-      let grouped = i > 0 && prev_author == m.author
+      let grouped =
+        i > 0 && prev_author == sunset.short_pubkey(m.author_pubkey)
       let picker_open = case reacting_to {
         Some(id) if id == m.id -> True
         _ -> False
@@ -670,7 +672,7 @@ fn message_header(p: Palette, m: Message, author_color: String) -> Element(msg) 
         html.span(
           [
             attribute.attribute("data-testid", "message-author"),
-            attribute.attribute("data-author", m.author),
+            attribute.attribute("data-author", sunset.short_pubkey(m.author_pubkey)),
             ui.css([
               #("font-weight", "600"),
               #("font-size", "16.25px"),
@@ -678,7 +680,7 @@ fn message_header(p: Palette, m: Message, author_color: String) -> Element(msg) 
               #("cursor", "default"),
             ]),
           ],
-          [html.text(m.author)],
+          [html.text(sunset.short_pubkey(m.author_pubkey))],
         ),
       ],
       [],
@@ -1094,9 +1096,9 @@ fn you_tag(p: Palette) -> Element(msg) {
 }
 
 /// Pick the color for a message author's name based on the matching
-/// member's connection state. Lookup is by `m.author == member.name`
-/// (both are derived from the first 4 bytes of the pubkey, so a single
-/// short-pubkey string identifies the peer).
+/// member's connection state. Lookup is by `short_pubkey(m.author_pubkey)
+/// == member.name` (both are derived from the first 4 bytes of the pubkey,
+/// so a single short-pubkey string identifies the peer).
 ///
 /// Mapping:
 ///   * own messages → palette accent (so "you" stands out)
@@ -1110,7 +1112,11 @@ fn author_color(p: Palette, m: Message, members: List(Member)) -> String {
   case m.you {
     True -> p.accent
     False ->
-      case list.find(members, fn(mem) { mem.name == m.author }) {
+      case
+        list.find(members, fn(mem) {
+          mem.name == sunset.short_pubkey(m.author_pubkey)
+        })
+      {
         Error(_) -> p.text
         Ok(mem) -> color_for_member(p, mem)
       }

@@ -214,7 +214,7 @@ pub fn messages() -> List(Message) {
   [
     Message(
       id: "m1",
-      author: "noor",
+      author_pubkey: <<>>,
       initials: "no",
       time: "5:47 pm",
       body: "shipping the relay path indicator in 10 — anyone want to look at the colors before I push?",
@@ -242,7 +242,7 @@ pub fn messages() -> List(Message) {
     ),
     Message(
       id: "m2",
-      author: "ravi",
+      author_pubkey: <<>>,
       initials: "ra",
       time: "5:48 pm",
       body: "yep one sec, joining call",
@@ -269,7 +269,7 @@ pub fn messages() -> List(Message) {
     ),
     Message(
       id: "m3",
-      author: "kasper_mc",
+      author_pubkey: <<>>,
       initials: "ka",
       time: "5:49 pm",
       body: "<kasper> just got the redstone gate working at spawn — come check before sunset",
@@ -295,7 +295,7 @@ pub fn messages() -> List(Message) {
     ),
     Message(
       id: "m4",
-      author: "you",
+      author_pubkey: <<>>,
       initials: "yo",
       time: "5:50 pm",
       body: "on my way. routing thru ravi rn, ping is fine",
@@ -327,7 +327,7 @@ pub fn messages() -> List(Message) {
     ),
     Message(
       id: "m5",
-      author: "elena",
+      author_pubkey: <<>>,
       initials: "el",
       time: "5:51 pm",
       body: "the gradient is too soft on the 1-hop state, hard to tell from direct",
@@ -351,7 +351,7 @@ pub fn messages() -> List(Message) {
     ),
     Message(
       id: "m6",
-      author: "tomo",
+      author_pubkey: <<>>,
       initials: "to",
       time: "5:52 pm",
       body: "+1, also the dot needs to pulse more obviously when reconnecting",
@@ -375,7 +375,7 @@ pub fn messages() -> List(Message) {
     ),
     Message(
       id: "m7",
-      author: "noor",
+      author_pubkey: <<>>,
       initials: "no",
       time: "5:53 pm",
       body: "noted. pushing a fix — should land in ~3m",

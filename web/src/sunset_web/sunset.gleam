@@ -278,3 +278,8 @@ pub fn format_time_ms_exact(ms: Int) -> String
 /// first call, caches the promise on subsequent calls.
 @external(javascript, "./sunset.ffi.mjs", "registerEmojiPicker")
 pub fn register_emoji_picker() -> Nil
+
+/// First 4 hex chars of the pubkey (2 raw bytes). Used as a compact
+/// fallback display name until a real self-name is resolved.
+@external(javascript, "./sunset.ffi.mjs", "shortPubkey")
+pub fn short_pubkey(bits: BitArray) -> String

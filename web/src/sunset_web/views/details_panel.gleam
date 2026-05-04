@@ -200,7 +200,7 @@ fn message_quote(p: Palette, m: Message) -> Element(msg) {
         ],
         [
           html.span([ui.css([#("font-weight", "600"), #("color", p.text)])], [
-            html.text(m.author),
+            html.text(sunset.short_pubkey(m.author_pubkey)),
           ]),
           html.span(
             [ui.css([#("color", p.text_faint), #("font-size", "13.125px")])],

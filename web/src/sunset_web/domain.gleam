@@ -142,7 +142,7 @@ pub type VoiceSettings {
 pub type Message {
   Message(
     id: String,
-    author: String,
+    author_pubkey: BitArray,
     initials: String,
     time: String,
     body: String,

@@ -1005,7 +1005,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let new_msg =
             domain.Message(
               id: sunset.inc_value_hash_hex(im),
-              author: short_pubkey(sunset.inc_author_pubkey(im)),
+              author_pubkey: sunset.inc_author_pubkey(im),
               initials: short_initials(sunset.inc_author_pubkey(im)),
               time: format_time_ms(sunset.inc_sent_at_ms(im)),
               body: sunset.inc_body(im),
