@@ -184,6 +184,13 @@ impl Client {
         Ok(crate::room_handle::RoomHandle::new(open))
     }
 
+    /// Update the display name carried in every open room's presence
+    /// heartbeats. Persists for the lifetime of the Client (the Gleam
+    /// layer is responsible for localStorage). Idempotent.
+    pub fn set_self_name(&self, name: String) {
+        self.inner.set_self_name(&name);
+    }
+
     /// Start voice in the room identified by `room_name`. The room
     /// must have been opened (`open_room`) first; this method takes
     /// the name (not a RoomHandle) for FFI simplicity. Spawns the
