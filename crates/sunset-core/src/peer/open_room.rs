@@ -217,6 +217,14 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         );
         *self.inner.publisher.borrow_mut() = Some(publisher);
 
+        // Apply any name cached before this room was opened (e.g. set
+        // via Peer::set_self_name in ClientReady before RoomOpened).
+        if let Some(name) = peer.cached_self_name() {
+            if let Some(p) = self.inner.publisher.borrow().as_ref() {
+                p.update_name(&name);
+            }
+        }
+
         let engine_events = peer.engine().subscribe_engine_events().await;
         let snapshot = peer.engine().current_peers().await;
         {
