@@ -16,10 +16,7 @@ import { spawn } from "child_process";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import {
-  openRoomsDrawer,
-  closeDrawer,
-} from "./helpers/viewport.js";
+import { openRoomsDrawer } from "./helpers/viewport.js";
 
 let relayProcess = null;
 let relayAddress = null;
