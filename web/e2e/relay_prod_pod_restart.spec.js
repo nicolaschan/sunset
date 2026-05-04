@@ -248,18 +248,17 @@ test.describe("prod relay pod restart", () => {
     expect(edAfter).not.toBe(edBefore);
     expect(podAfter).not.toBe(podBefore);
 
-    // The user-visible promise: both unrefreshed pages must end up
-    // connected to v2. The wait condition checks peer_pubkey == v2 ed,
-    // not just `state === "connected"` — that way a stale snapshot or
-    // a mid-flight handshake against v1 won't satisfy us.
-    await waitFor(
-      async () => (await readConnectedPeerPubkey(pageA)) === edAfter,
-      { timeoutMs: 120_000, label: "pageA reconnect to v2" },
-    );
-    await waitFor(
-      async () => (await readConnectedPeerPubkey(pageB)) === edAfter,
-      { timeoutMs: 120_000, label: "pageB reconnect to v2" },
-    );
+    // Deliberately do NOT poll `intents()` here. Polling sends a
+    // `SupervisorCommand::Snapshot` round-trip that wakes the
+    // supervisor's run loop on every poll — it masks the exact
+    // liveness bug this test is meant to catch (run loop parked on a
+    // stale `pending` sleep_fut while a background `spawn_dial`
+    // schedules a fresh `Backoff`). The user's UI doesn't poll; it
+    // only subscribes via `on_intent_changed`. The message-arrival
+    // assertions below are the single source of truth: if either
+    // page failed to reconnect on its own, msgPost wouldn't be
+    // pushable from A and wouldn't be visible on B inside the
+    // timeout. That's the user-visible contract we care about.
 
     // Build the post-restart payload AFTER the v2 reconnect has
     // happened — so the body literally cannot have been delivered
@@ -293,6 +292,21 @@ test.describe("prod relay pod restart", () => {
       pageBOriginAfter,
       "B's performance.timeOrigin must be unchanged across the restart (proves no reload)",
     ).toBe(pageBOriginBefore);
+
+    // Now that we've proven message flow works post-restart end-to-end,
+    // it's safe to also confirm via the supervisor snapshot that A is
+    // talking to the v2 relay specifically (this call polls and would
+    // wake the supervisor — but at this point the test has already
+    // passed its non-polling canary, so this is just an extra
+    // assertion, not the load-bearing one).
+    expect(
+      await readConnectedPeerPubkey(pageA),
+      "after msg flowed, pageA's connected peer should be v2 ed25519",
+    ).toBe(edAfter);
+    expect(
+      await readConnectedPeerPubkey(pageB),
+      "after msg flowed, pageB's connected peer should be v2 ed25519",
+    ).toBe(edAfter);
 
     // Bidirectional: send a fresh unique message from B → A.
     const msgPostB = `[e2e ${runId}] post-restart-B nonce=${nonce()} v2_ed=${edAfter.slice(0, 16)}`;
