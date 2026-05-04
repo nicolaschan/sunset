@@ -88,6 +88,13 @@ pub type Member {
     /// received from this peer. `None` for self or peers we have not
     /// heard from. The popover renders age as `now_ms - this`.
     last_heartbeat_ms: option.Option(Int),
+    /// Raw display name from the wasm side. `None` ⇒ peer hasn't set
+    /// one (the rendered `name` field above falls back to short_pubkey
+    /// in that case).
+    raw_name: option.Option(String),
+    /// Raw pubkey bytes — kept here so MembersUpdated can map raw
+    /// names by pubkey without re-deriving from MemberId.
+    pubkey: BitArray,
   )
 }
 
@@ -141,6 +148,24 @@ pub type VoiceSettings {
 
 pub type Message {
   Message(
+    id: String,
+    author_pubkey: BitArray,
+    initials: String,
+    time: String,
+    body: String,
+    seen_by: Int,
+    you: Bool,
+    pending: Bool,
+    reactions: List(Reaction),
+    details: DetailsOpt,
+  )
+}
+
+/// Pre-resolved view of a Message with the author display name baked in.
+/// Built once per render from the live name_map; view functions consume
+/// these instead of raw Message so they don't have to thread the dict around.
+pub type MessageView {
+  MessageView(
     id: String,
     author: String,
     initials: String,

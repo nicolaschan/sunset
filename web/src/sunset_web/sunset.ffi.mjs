@@ -85,6 +85,13 @@ export async function clientOpenRoom(client, name, callback) {
   callback(handle);
 }
 
+export function setSelfName(client, name, callback) {
+  // Empty string ⇒ clear the name (Rust normalizes whitespace + empty
+  // to None; passing "" through is fine).
+  client.set_self_name(name);
+  callback();
+}
+
 export async function clientConnectDirect(room, peerPubkey, callback) {
   try {
     const bytes = bitsToBytes(peerPubkey);
@@ -178,6 +185,11 @@ export function currentTimeMs() {
   return Date.now();
 }
 
+export function hexEncode(bits) {
+  const bytes = bitsToBytes(bits);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export function shortPubkey(bits) {
   const bytes = bitsToBytes(bits);
   return Array.from(bytes.slice(0, 4), (b) => b.toString(16).padStart(2, "0"))
@@ -247,6 +259,7 @@ export function onMembersChanged(room, callback) {
         connection_mode: m.connection_mode,
         is_self: m.is_self,
         last_heartbeat_ms: m.last_heartbeat_ms,  // f64; -1 sentinel for "no heartbeat"
+        name: m.name,                    // String | undefined; None when unset
       }));
       Array.from(members).forEach((m) => m.free());
       callback(toList(copied));
@@ -278,6 +291,13 @@ export function memLastHeartbeatMs(m) {
   // actual constructors, not bare values.
   const v = m.last_heartbeat_ms;
   if (v < 0) return new None();
+  return new Some(v);
+}
+export function memName(member) {
+  const v = member.name;
+  if (v === undefined || v === null || v === "") {
+    return new None();
+  }
   return new Some(v);
 }
 

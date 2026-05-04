@@ -24,6 +24,14 @@ pub fn read_saved_theme() -> String
 @external(javascript, "./storage.ffi.mjs", "writeSavedTheme")
 pub fn write_saved_theme(value: String) -> Nil
 
+/// "" when the user has never set a name. Otherwise the chosen name.
+@external(javascript, "./storage.ffi.mjs", "readSelfName")
+pub fn read_self_name() -> String
+
+/// Persist the user's chosen name. Empty string clears.
+@external(javascript, "./storage.ffi.mjs", "writeSelfName")
+pub fn write_self_name(value: String) -> Nil
+
 /// True when the OS / browser is currently advertising a dark colour
 /// scheme via prefers-color-scheme. Used as the fallback when the
 /// user hasn't toggled the theme yet.

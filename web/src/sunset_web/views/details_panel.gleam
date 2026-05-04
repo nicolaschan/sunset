@@ -28,7 +28,7 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Member, type Message, type MessageDetails, type RelayStatus, Direct,
+  type Member, type MessageDetails, type MessageView, type RelayStatus, Direct,
   HasDetails, MemberId, NoDetails, NoRelay, OneHop, SelfRelay, TwoHop, ViaPeer,
 }
 import sunset_web/sunset
@@ -37,10 +37,11 @@ import sunset_web/ui
 
 pub fn view(
   palette p: Palette,
-  message m: Message,
+  message m: MessageView,
   receipts r: Dict(String, Int),
   reactions reactions: Dict(String, Dict(String, Int)),
   members ms: List(Member),
+  name_map nm: Dict(String, String),
   on_close on_close: msg,
 ) -> Element(msg) {
   let detail_section = case m.details {
@@ -79,8 +80,8 @@ pub fn view(
         [
           message_quote(p, m),
           detail_section,
-          receipts_section(p, m, r, ms),
-          reactions_section(p, reactions, ms),
+          receipts_section(p, m, r, ms, nm),
+          reactions_section(p, reactions, nm),
         ],
       ),
     ],
@@ -176,7 +177,7 @@ fn close_button(p: Palette, on_close: msg) -> Element(msg) {
   )
 }
 
-fn message_quote(p: Palette, m: Message) -> Element(msg) {
+fn message_quote(p: Palette, m: MessageView) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -298,28 +299,51 @@ fn arrow(p: Palette) -> Element(msg) {
 
 fn receipts_section(
   p: Palette,
-  m: Message,
+  m: MessageView,
   r: Dict(String, Int),
   ms: List(Member),
+  nm: Dict(String, String),
 ) -> Element(msg) {
   // Order: matches member-rail order so receipts read consistently
   // across panels. Pubkeys not in the member list (peer left, never
   // seen, etc.) get appended at the end.
+  //
+  // Receipts are keyed by full-hex pubkey. Member ids are short-pubkey
+  // (8 hex chars). Match by comparing the first 8 chars of the receipt
+  // key against the member's short id.
   let from_members =
     list.filter_map(ms, fn(member) {
-      let MemberId(pk) = member.id
-      case dict.get(r, pk) {
-        Ok(ts) -> Ok(#(pk, member.name, member.relay, ts))
+      let MemberId(short) = member.id
+      case
+        list.find_map(dict.to_list(r), fn(pair) {
+          let #(full_hex, ts) = pair
+          case string.slice(full_hex, 0, 8) == short {
+            True -> Ok(#(full_hex, ts))
+            False -> Error(Nil)
+          }
+        })
+      {
+        Ok(#(full_hex, ts)) -> {
+          let name = case dict.get(nm, full_hex) {
+            Ok(n) -> n
+            Error(_) -> member.name
+          }
+          Ok(#(full_hex, name, member.relay, ts))
+        }
         Error(_) -> Error(Nil)
       }
     })
-  let known_pks = list.map(from_members, fn(t) { t.0 })
+  let known_hexes = list.map(from_members, fn(t) { t.0 })
   let stragglers =
     dict.to_list(r)
-    |> list.filter(fn(pair) { !list.contains(known_pks, pair.0) })
+    |> list.filter(fn(pair) { !list.contains(known_hexes, pair.0) })
     |> list.map(fn(pair) {
-      let #(pk, ts) = pair
-      #(pk, pk, NoRelay, ts)
+      let #(full_hex, ts) = pair
+      let name = case dict.get(nm, full_hex) {
+        Ok(n) -> n
+        Error(_) -> short_pubkey_from_hex(full_hex)
+      }
+      #(full_hex, name, NoRelay, ts)
     })
   let rows = list.append(from_members, stragglers)
 
@@ -357,7 +381,7 @@ fn receipts_section(
 /// Receipts only flow back for our own outgoing messages — peers don't
 /// emit acks for messages they sent. Tell the reader which case applies
 /// instead of just "no acks yet" everywhere.
-fn empty_state_text(m: Message) -> String {
+fn empty_state_text(m: MessageView) -> String {
   case m.you {
     True -> "No deliveries yet."
     False -> "Receipts are only tracked for messages you sent."
@@ -437,7 +461,7 @@ fn receipt_row(
 fn reactions_section(
   p: Palette,
   reactions: Dict(String, Dict(String, Int)),
-  ms: List(Member),
+  nm: Dict(String, String),
 ) -> Element(msg) {
   let entries =
     dict.to_list(reactions)
@@ -471,7 +495,7 @@ fn reactions_section(
           ],
           list.map(entries, fn(pair) {
             let #(emoji, authors) = pair
-            reaction_group(p, emoji, authors, ms)
+            reaction_group(p, emoji, authors, nm)
           }),
         )
     },
@@ -482,7 +506,7 @@ fn reaction_group(
   p: Palette,
   emoji: String,
   authors: Dict(String, Int),
-  ms: List(Member),
+  nm: Dict(String, String),
 ) -> Element(msg) {
   // Sort reactors oldest-first so the list reads as a chronological
   // story of who reacted when. Within equal timestamps fall back to
@@ -544,7 +568,7 @@ fn reaction_group(
         ],
         list.map(sorted, fn(pair) {
           let #(author_hex, ts) = pair
-          reactor_row(p, author_hex, ts, ms)
+          reactor_row(p, author_hex, ts, nm)
         }),
       ),
     ],
@@ -555,21 +579,14 @@ fn reactor_row(
   p: Palette,
   author_hex: String,
   sent_at_ms: Int,
-  ms: List(Member),
+  nm: Dict(String, String),
 ) -> Element(msg) {
-  // Member ids are short-pubkey (8 hex). Reaction author keys arrive
-  // from the reactions tracker as full hex. Match by prefix so the
-  // friendly name shows up when available; otherwise render the short
-  // hex form as the identifier.
-  let short = string.slice(author_hex, 0, 8)
-  let display_name = case
-    list.find(ms, fn(member) {
-      let MemberId(pk) = member.id
-      pk == short
-    })
-  {
-    Ok(member) -> member.name
-    Error(_) -> short
+  // Look up the reactor's chosen display name from name_map (keyed by
+  // full hex). Fall back to the 8-char hex prefix when no name has been
+  // observed — covers offline reactors and peers who haven't set a name.
+  let display_name = case dict.get(nm, author_hex) {
+    Ok(name) -> name
+    Error(_) -> short_pubkey_from_hex(author_hex)
   }
   html.div(
     [
@@ -607,6 +624,13 @@ fn reactor_row(
       ),
     ],
   )
+}
+
+/// Returns the first 8 hex characters of a full-hex pubkey string.
+/// Used as a fallback display name when no chosen name is in the map.
+/// Matches what short_pubkey() returns for the first 4 bytes of a key.
+fn short_pubkey_from_hex(hex: String) -> String {
+  string.slice(hex, 0, 8)
 }
 
 fn reactor_count_label(n: Int) -> String {

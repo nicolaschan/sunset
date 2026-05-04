@@ -34,6 +34,15 @@ pub fn open_room(
   callback: fn(RoomHandle) -> Nil,
 ) -> Nil
 
+/// Set the self-advertised name. Empty string clears the name; the
+/// Rust side normalizes whitespace + empty to None.
+@external(javascript, "./sunset.ffi.mjs", "setSelfName")
+pub fn set_self_name(
+  client: ClientHandle,
+  name: String,
+  callback: fn() -> Nil,
+) -> Nil
+
 /// Register a durable intent to keep connected to `url`. The
 /// callback is fired with `Ok(intent_id)` once the intent is
 /// recorded; `Error(msg)` is reserved for malformed input.
@@ -162,6 +171,9 @@ pub fn mem_is_self(m: MemberJs) -> Bool
 @external(javascript, "./sunset.ffi.mjs", "memLastHeartbeatMs")
 pub fn mem_last_heartbeat_ms(m: MemberJs) -> option.Option(Int)
 
+@external(javascript, "./sunset.ffi.mjs", "memName")
+pub fn mem_name(member: MemberJs) -> option.Option(String)
+
 /// Read presence-cadence params from `?presence_interval=&presence_ttl=&presence_refresh=`.
 /// Returns `#(interval_ms, ttl_ms, refresh_ms)`. Defaults: 30000/60000/5000.
 @external(javascript, "./sunset.ffi.mjs", "presenceParamsFromUrl")
@@ -266,3 +278,8 @@ pub fn format_time_ms_exact(ms: Int) -> String
 /// first call, caches the promise on subsequent calls.
 @external(javascript, "./sunset.ffi.mjs", "registerEmojiPicker")
 pub fn register_emoji_picker() -> Nil
+
+/// First 4 hex chars of the pubkey (2 raw bytes). Used as a compact
+/// fallback display name until a real self-name is resolved.
+@external(javascript, "./sunset.ffi.mjs", "shortPubkey")
+pub fn short_pubkey(bits: BitArray) -> String

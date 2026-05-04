@@ -14,7 +14,6 @@
 
 import gleam/dict.{type Dict}
 import gleam/float
-import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -28,8 +27,7 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, type Room, ChannelId, Reaction,
-  Room, RoomId,
+  type ChannelId, type Reaction, type Room, ChannelId, Reaction, Room, RoomId,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -83,7 +81,7 @@ pub type RoomState {
     handle: Option(RoomHandle),
     messages: List(domain.Message),
     members: List(domain.Member),
-    /// Per-message delivery acks: msg_id → from_pubkey (short hex) →
+    /// Per-message delivery acks: msg_id → from_pubkey (full hex) →
     /// unix-ms when the acknowledging peer composed the receipt. The
     /// timestamp is surfaced in the message-details panel as the
     /// per-recipient delivered-at stamp.
@@ -189,6 +187,16 @@ pub type Model {
     /// IntentId of the relay whose popover is currently open. Client-wide
     /// (not per-room) because relays are a client-level concept.
     relays_popover: option.Option(Float),
+    /// Peer display-name map, keyed by full hex pubkey. Rebuilt from each
+    /// room's member list on MembersUpdated. Used by display_name() to
+    /// resolve a peer's chosen name with short_pubkey fallback.
+    name_map: Dict(String, String),
+    /// The local user's own display name (read from localStorage on init;
+    /// updated when the user submits the settings name field).
+    self_name: String,
+    /// Monotonically-incrementing token used to debounce/sequence
+    /// set_self_name calls so stale callbacks don't clobber the UI.
+    self_name_token: Int,
   )
 }
 
@@ -264,6 +272,8 @@ pub type Msg {
     after: String,
     caret_at_between: Bool,
   )
+  UpdateSelfName(String)
+  SelfNameCommit(String, Int)
 }
 
 pub fn main() {
@@ -331,6 +341,9 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       now_ms: 0,
       rooms: dict.new(),
       relays_popover: None,
+      name_map: dict.new(),
+      self_name: storage.read_self_name(),
+      self_name_token: 0,
     )
 
   let subscribe_hash =
@@ -493,8 +506,60 @@ fn sanitize(raw: String) -> String {
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "currentTimeMs")
 fn current_time_ms() -> Int
 
+@external(javascript, "./sunset_web/storage.ffi.mjs", "scheduleAfterMs")
+fn schedule_after_ms(delay_ms: Int, callback: fn() -> Nil) -> Nil
+
+fn schedule_self_name_commit(
+  value: String,
+  token: Int,
+  dispatch: fn(Msg) -> Nil,
+) -> Nil {
+  schedule_after_ms(300, fn() { dispatch(SelfNameCommit(value, token)) })
+}
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "hexEncode")
+fn hex_encode_ffi(bits: BitArray) -> String
+
+/// Hex-encode a BitArray as a lowercase string for use as a name_map dict key.
+/// Matches the format the Rust membership tracker uses to key its names map
+/// (full hex of the verifying key bytes — NOT truncated short_pubkey).
+pub fn hex_encode(bits: BitArray) -> String {
+  hex_encode_ffi(bits)
+}
+
+/// Look up a peer's chosen display name from the name_map, falling back to
+/// `short_pubkey(pk)` when no name has been observed (or the peer cleared theirs).
+pub fn display_name(name_map: Dict(String, String), pk: BitArray) -> String {
+  case dict.get(name_map, hex_encode(pk)) {
+    Ok(name) -> name
+    Error(_) -> short_pubkey(pk)
+  }
+}
+
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortPubkey")
 fn short_pubkey(bits: BitArray) -> String
+
+/// Resolve a list of domain.Message into domain.MessageView, baking in the
+/// author display name (from name_map, falling back to short_pubkey).
+pub fn resolve_messages(
+  name_map: Dict(String, String),
+  messages: List(domain.Message),
+) -> List(domain.MessageView) {
+  list.map(messages, fn(m) {
+    domain.MessageView(
+      id: m.id,
+      author: display_name(name_map, m.author_pubkey),
+      initials: m.initials,
+      time: m.time,
+      body: m.body,
+      seen_by: m.seen_by,
+      you: m.you,
+      pending: m.pending,
+      reactions: m.reactions,
+      details: m.details,
+    )
+  })
+}
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortInitials")
 fn short_initials(bits: BitArray) -> String
@@ -931,6 +996,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // wiring fires them yet — re-wire as part of the per-room
       // reactions follow-up.
 
+      // Bootstrap self-name from localStorage: restore the persisted name
+      // so the first presence heartbeat carries it.
+      let bootstrap_eff = case model.self_name {
+        "" -> effect.none()
+        name ->
+          effect.from(fn(_dispatch) {
+            sunset.set_self_name(client, name, fn() { Nil })
+          })
+      }
+
       // Insert placeholder RoomState for every joined room so the
       // shell renders fully even before the first RoomOpened lands.
       let rooms_with_placeholders =
@@ -947,6 +1022,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           connect_eff,
           open_active_eff,
           open_others_eff,
+          bootstrap_eff,
         ]),
       )
     }
@@ -977,7 +1053,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             dispatch(IncomingReceipt(
               name,
               sunset.rec_for_value_hash_hex(r),
-              short_pubkey(sunset.rec_from_pubkey(r)),
+              hex_encode(sunset.rec_from_pubkey(r)),
               sunset.rec_sent_at_ms(r),
             ))
           })
@@ -1005,7 +1081,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let new_msg =
             domain.Message(
               id: sunset.inc_value_hash_hex(im),
-              author: short_pubkey(sunset.inc_author_pubkey(im)),
+              author_pubkey: sunset.inc_author_pubkey(im),
               initials: short_initials(sunset.inc_author_pubkey(im)),
               time: format_time_ms(sunset.inc_sent_at_ms(im)),
               body: sunset.inc_body(im),
@@ -1107,6 +1183,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
+          // Rebuild name_map: insert when raw_name is Some, delete when None.
+          let new_map =
+            list.fold(ms, model.name_map, fn(acc, m) {
+              let key = hex_encode(m.pubkey)
+              case m.raw_name {
+                option.Some(n) -> dict.insert(acc, key, n)
+                option.None -> dict.delete(acc, key)
+              }
+            })
           // If the open popover's target left, close it.
           let next_popover = case state.peer_status_popover {
             None -> None
@@ -1119,7 +1204,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let new_state =
             RoomState(..state, members: ms, peer_status_popover: next_popover)
           #(
-            Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
+            Model(
+              ..model,
+              rooms: dict.insert(model.rooms, name, new_state),
+              name_map: new_map,
+            ),
             effect.none(),
           )
         }
@@ -1402,6 +1491,31 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, full_picker_for: None, full_picker_anchor: None),
       effect.none(),
     )
+    UpdateSelfName(value) -> {
+      let new_token = model.self_name_token + 1
+      let updated = Model(..model, self_name: value, self_name_token: new_token)
+      let commit_eff =
+        effect.from(fn(dispatch) {
+          schedule_self_name_commit(value, new_token, dispatch)
+        })
+      #(updated, commit_eff)
+    }
+    SelfNameCommit(value, token) -> {
+      case token == model.self_name_token {
+        False -> #(model, effect.none())
+        True -> {
+          storage.write_self_name(value)
+          let eff = case model.client {
+            Some(client) ->
+              effect.from(fn(_dispatch) {
+                sunset.set_self_name(client, value, fn() { Nil })
+              })
+            None -> effect.none()
+          }
+          #(model, eff)
+        }
+      }
+    }
   }
 }
 
@@ -1470,9 +1584,12 @@ fn room_view_with_state(
       }
     })
 
+  let resolved_messages =
+    resolve_messages(model.name_map, messages_with_live_reactions)
+
   let detail_msg = case state.sheet {
     Some(domain.DetailsSheet(message_id: id)) ->
-      find_message(messages_with_live_reactions, id)
+      find_message(resolved_messages, id)
     _ -> None
   }
 
@@ -1583,6 +1700,8 @@ fn room_view_with_state(
         palette: palette,
         pref: model.theme_pref,
         placement: settings_popover.Floating,
+        self_name: model.self_name,
+        on_change_name: UpdateSelfName,
         on_select_pref: SetThemePref,
         on_reset: ResetLocalState,
         on_close: CloseSettings,
@@ -1601,6 +1720,8 @@ fn room_view_with_state(
           palette: palette,
           pref: model.theme_pref,
           placement: settings_popover.InSheet,
+          self_name: model.self_name,
+          on_change_name: UpdateSelfName,
           on_select_pref: SetThemePref,
           on_reset: ResetLocalState,
           on_close: CloseSettings,
@@ -1627,7 +1748,7 @@ fn room_view_with_state(
 
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
-      case find_message(messages_with_live_reactions, id) {
+      case find_message(resolved_messages, id) {
         Some(m) ->
           bottom_sheet.view(
             palette: palette,
@@ -1640,6 +1761,7 @@ fn room_view_with_state(
               receipts: receipts_for(state.receipts, m.id),
               reactions: reactions_for(model.reactions, m.id),
               members: state.members,
+              name_map: model.name_map,
               on_close: CloseDetail,
             ),
           )
@@ -1795,7 +1917,7 @@ fn room_view_with_state(
       palette: palette,
       viewport: model.viewport,
       current_channel: state.current_channel,
-      messages: messages_with_live_reactions,
+      messages: resolved_messages,
       draft: state.draft,
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
@@ -1830,6 +1952,7 @@ fn room_view_with_state(
           receipts: receipts_for(state.receipts, m.id),
           reactions: reactions_for(model.reactions, m.id),
           members: state.members,
+          name_map: model.name_map,
           on_close: CloseDetail,
         )
       _, _ ->
@@ -2091,7 +2214,10 @@ fn float_px(n: Float) -> String {
   float.to_string(n) <> "px"
 }
 
-fn find_message(ms: List(Message), id: String) -> Option(Message) {
+fn find_message(
+  ms: List(domain.MessageView),
+  id: String,
+) -> Option(domain.MessageView) {
   list.find(ms, fn(m) { m.id == id })
   |> option.from_result
 }
@@ -2192,9 +2318,14 @@ fn reactions_for(
 fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
   list.map(ms, fn(m) {
     let pk = sunset.mem_pubkey(m)
+    let raw = sunset.mem_name(m)
+    let name = case raw {
+      option.Some(n) -> n
+      option.None -> short_pubkey(pk)
+    }
     domain.Member(
       id: domain.MemberId(short_pubkey(pk)),
-      name: short_pubkey(pk),
+      name: name,
       initials: short_initials(pk),
       status: presence_to_status(sunset.mem_presence(m)),
       relay: connection_mode_to_relay(sunset.mem_connection_mode(m)),
@@ -2202,6 +2333,8 @@ fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
       in_call: False,
       role: domain.NoRole,
       last_heartbeat_ms: sunset.mem_last_heartbeat_ms(m),
+      raw_name: raw,
+      pubkey: pk,
     )
   })
 }

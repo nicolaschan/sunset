@@ -22,11 +22,22 @@ pub fn view(
   palette p: Palette,
   pref pref: Pref,
   placement placement: Placement,
+  self_name self_name: String,
+  on_change_name on_change_name: fn(String) -> msg,
   on_select_pref on_select_pref: fn(Pref) -> msg,
   on_reset on_reset: msg,
   on_close on_close: msg,
 ) -> Element(msg) {
-  let body = body_view(p, pref, on_select_pref, on_reset, on_close)
+  let body =
+    body_view(
+      p,
+      pref,
+      self_name,
+      on_change_name,
+      on_select_pref,
+      on_reset,
+      on_close,
+    )
   case placement {
     Floating ->
       html.div(
@@ -70,6 +81,8 @@ pub fn view(
 fn body_view(
   p: Palette,
   pref: Pref,
+  self_name: String,
+  on_change_name: fn(String) -> msg,
   on_select_pref: fn(Pref) -> msg,
   on_reset: msg,
   on_close: msg,
@@ -85,8 +98,55 @@ fn body_view(
     ],
     [
       header(p, on_close),
+      name_section(p, self_name, on_change_name),
       theme_section(p, pref, on_select_pref),
       reset_section(p, on_reset),
+    ],
+  )
+}
+
+fn name_section(
+  p: Palette,
+  self_name: String,
+  on_change_name: fn(String) -> msg,
+) -> Element(msg) {
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("gap", "6px"),
+      ]),
+    ],
+    [
+      section_label(p, "Name"),
+      html.input([
+        attribute.attribute("data-testid", "settings-name-input"),
+        attribute.attribute("type", "text"),
+        attribute.attribute("placeholder", "Set a name (optional)"),
+        attribute.attribute("maxlength", "64"),
+        attribute.value(self_name),
+        event.on_input(on_change_name),
+        ui.css([
+          #("padding", "8px 10px"),
+          #("border", "1px solid " <> p.border_soft),
+          #("background", p.surface_alt),
+          #("color", p.text),
+          #("border-radius", "6px"),
+          #("font-family", "inherit"),
+          #("font-size", "14px"),
+        ]),
+      ]),
+      html.span(
+        [
+          ui.css([
+            #("font-size", "12px"),
+            #("color", p.text_faint),
+            #("line-height", "1.4"),
+          ]),
+        ],
+        [html.text("Visible to peers in your rooms.")],
+      ),
     ],
   )
 }

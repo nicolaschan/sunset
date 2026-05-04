@@ -71,7 +71,13 @@ impl Store for MemoryStore {
     async fn put_content(&self, block: ContentBlock) -> Result<Hash> {
         let hash = block.hash();
         let mut inner = self.inner.lock().await;
+        let already = inner.blobs.contains_key(&hash);
         inner.blobs.entry(hash).or_insert(block);
+        // Broadcast WHILE holding the inner lock to serialize with subscribe
+        // (mirrors the pattern in `insert`; see subscription.rs invariant comment).
+        if !already {
+            self.subscriptions.broadcast(&Event::BlobAdded(hash));
+        }
         Ok(hash)
     }
 
