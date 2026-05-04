@@ -8,22 +8,26 @@
 //! pattern.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::crypto::envelope::ReactionAction;
 use crate::identity::IdentityKey;
 use sunset_store::Hash;
 
-/// Per-target snapshot: emoji → set of authors currently reacting with
-/// that emoji. Empty inner set means no live reactions for the emoji
-/// (the emoji entry should be omitted by `derive_snapshot`).
-pub type ReactionSnapshot = HashMap<String, BTreeSet<IdentityKey>>;
+/// Per-target snapshot: emoji → map of authors currently reacting with
+/// that emoji to the unix-ms timestamp on the LWW-winning Add entry.
+/// Empty inner map means no live reactions for the emoji (the emoji
+/// entry should be omitted by `derive_snapshot`).
+pub type ReactionSnapshot = HashMap<String, BTreeMap<IdentityKey, u64>>;
 
 /// Stable signature of a snapshot used for debounce. Sorted lex on
-/// emoji, then on author bytes — semantic equality, not allocation
-/// identity.
-pub type ReactionSig = Vec<(String, Vec<Vec<u8>>)>;
+/// emoji, then on author bytes, with each author's `sent_at_ms` paired
+/// in — semantic equality, not allocation identity. Including the
+/// timestamp means a re-Add with a later timestamp (which the message
+/// info panel surfaces as the user's most recent reaction time) refires
+/// the snapshot callback.
+pub type ReactionSig = Vec<(String, Vec<(Vec<u8>, u64)>)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReactionEntry {
@@ -107,10 +111,10 @@ pub(crate) fn derive_snapshot(state: &ReactionState, target: &Hash) -> ReactionS
         return out;
     };
     for (emoji, by_author) in by_emoji {
-        let mut authors = BTreeSet::new();
+        let mut authors = BTreeMap::new();
         for (author, entry) in by_author {
             if entry.action == ReactionAction::Add {
-                authors.insert(author.clone());
+                authors.insert(author.clone(), entry.sent_at_ms);
             }
         }
         if !authors.is_empty() {
@@ -220,9 +224,9 @@ pub fn reactions_signature(snapshot: &ReactionSnapshot) -> ReactionSig {
     emoji_keys
         .into_iter()
         .map(|emoji| {
-            let mut authors: Vec<Vec<u8>> = snapshot[emoji]
+            let mut authors: Vec<(Vec<u8>, u64)> = snapshot[emoji]
                 .iter()
-                .map(|k| k.as_bytes().to_vec())
+                .map(|(k, ts)| (k.as_bytes().to_vec(), *ts))
                 .collect();
             authors.sort();
             (emoji.clone(), authors)
@@ -267,7 +271,7 @@ mod apply_event_tests {
         assert!(changed, "first event should mark target as changed");
         let snap = derive_snapshot(&state, &target);
         let alice_set = snap.get("👍").unwrap();
-        assert!(alice_set.contains(&alice));
+        assert_eq!(alice_set.get(&alice), Some(&100));
     }
 
     #[test]
@@ -338,7 +342,7 @@ mod apply_event_tests {
         assert!(!changed, "stale event must not report a change");
         let snap = derive_snapshot(&state, &target);
         assert!(
-            snap.get("👍").unwrap().contains(&alice),
+            snap.get("👍").unwrap().contains_key(&alice),
             "stale Remove must not evict"
         );
     }
@@ -409,8 +413,8 @@ mod apply_event_tests {
         );
         let snap = derive_snapshot(&state, &target);
         let set = snap.get("👍").unwrap();
-        assert!(set.contains(&alice));
-        assert!(set.contains(&bob));
+        assert!(set.contains_key(&alice));
+        assert!(set.contains_key(&bob));
         assert_eq!(set.len(), 2);
     }
 
@@ -442,8 +446,8 @@ mod apply_event_tests {
             },
         );
         let snap = derive_snapshot(&state, &target);
-        assert!(snap.get("👍").unwrap().contains(&alice));
-        assert!(snap.get("🎉").unwrap().contains(&alice));
+        assert!(snap.get("👍").unwrap().contains_key(&alice));
+        assert!(snap.get("🎉").unwrap().contains_key(&alice));
     }
 }
 
@@ -461,8 +465,12 @@ mod signature_tests {
         let mut a = ReactionSnapshot::new();
         let mut b = ReactionSnapshot::new();
         let alice = alice();
-        a.entry("👍".to_owned()).or_default().insert(alice.clone());
-        b.entry("👍".to_owned()).or_default().insert(alice.clone());
+        a.entry("👍".to_owned())
+            .or_default()
+            .insert(alice.clone(), 100);
+        b.entry("👍".to_owned())
+            .or_default()
+            .insert(alice.clone(), 100);
         assert_eq!(reactions_signature(&a), reactions_signature(&b));
     }
 
@@ -470,9 +478,13 @@ mod signature_tests {
     fn signature_changes_when_emoji_added() {
         let mut a = ReactionSnapshot::new();
         let alice = alice();
-        a.entry("👍".to_owned()).or_default().insert(alice.clone());
+        a.entry("👍".to_owned())
+            .or_default()
+            .insert(alice.clone(), 100);
         let s1 = reactions_signature(&a);
-        a.entry("🎉".to_owned()).or_default().insert(alice.clone());
+        a.entry("🎉".to_owned())
+            .or_default()
+            .insert(alice.clone(), 100);
         let s2 = reactions_signature(&a);
         assert_ne!(s1, s2);
     }
@@ -482,11 +494,29 @@ mod signature_tests {
         let mut a = ReactionSnapshot::new();
         let key1 = alice();
         let key2 = alice(); // distinct identity
-        a.entry("👍".to_owned()).or_default().insert(key1);
+        a.entry("👍".to_owned()).or_default().insert(key1, 100);
         let s1 = reactions_signature(&a);
-        a.entry("👍".to_owned()).or_default().insert(key2);
+        a.entry("👍".to_owned()).or_default().insert(key2, 100);
         let s2 = reactions_signature(&a);
         assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn signature_changes_when_timestamp_changes() {
+        let mut a = ReactionSnapshot::new();
+        let alice = alice();
+        a.entry("👍".to_owned())
+            .or_default()
+            .insert(alice.clone(), 100);
+        let s1 = reactions_signature(&a);
+        a.entry("👍".to_owned())
+            .or_default()
+            .insert(alice.clone(), 200);
+        let s2 = reactions_signature(&a);
+        assert_ne!(
+            s1, s2,
+            "snapshot timestamp moves should re-fire the callback so the info panel updates"
+        );
     }
 
     #[test]
@@ -496,12 +526,15 @@ mod signature_tests {
         let key3 = alice();
         let mut snap = ReactionSnapshot::new();
         for author in [key1.clone(), key2.clone(), key3.clone()] {
-            snap.entry("👍".to_owned()).or_default().insert(author);
+            snap.entry("👍".to_owned()).or_default().insert(author, 100);
         }
         let s1 = reactions_signature(&snap);
         let mut snap2 = ReactionSnapshot::new();
         for author in [key3, key1, key2] {
-            snap2.entry("👍".to_owned()).or_default().insert(author);
+            snap2
+                .entry("👍".to_owned())
+                .or_default()
+                .insert(author, 100);
         }
         let s2 = reactions_signature(&snap2);
         assert_eq!(s1, s2);

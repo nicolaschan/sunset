@@ -82,7 +82,11 @@ pub type RoomState {
     handle: Option(RoomHandle),
     messages: List(domain.Message),
     members: List(domain.Member),
-    receipts: Dict(String, Set(String)),
+    /// Per-message delivery acks: msg_id → from_pubkey (short hex) →
+    /// unix-ms when the acknowledging peer composed the receipt. The
+    /// timestamp is surfaced in the message-details panel as the
+    /// per-recipient delivered-at stamp.
+    receipts: Dict(String, Dict(String, Int)),
     reactions: Dict(String, List(Reaction)),
     current_channel: ChannelId,
     draft: String,
@@ -139,10 +143,12 @@ pub type Model {
     /// global on the merged branch — the reactions tracker in
     /// sunset-core::reactions is currently per-Client (not per-room).
     /// Migrating reactions to per-OpenRoom (so each room has its own
-    /// `Dict(target_hex, Dict(emoji, Set(author_pubkey_hex)))`) is
+    /// `Dict(target_hex, Dict(emoji, Dict(author_pubkey_hex, sent_at_ms)))`) is
     /// tracked as a follow-up; ReactionsChanged from any room will
-    /// merge into this single dict for now.
-    reactions: Dict(String, Dict(String, Set(String))),
+    /// merge into this single dict for now. The inner-most `Int` is the
+    /// LWW-winning Add entry's unix-ms — the timestamp the message-details
+    /// panel renders next to each reactor.
+    reactions: Dict(String, Dict(String, Dict(String, Int))),
     /// Name of the room currently being dragged in the rooms rail.
     /// `None` between drag operations.
     dragging_room: Option(String),
@@ -202,7 +208,7 @@ pub type Msg {
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
   AddReaction(String, String)
-  ReactionsChanged(target: String, snapshot: Dict(String, Set(String)))
+  ReactionsChanged(target: String, snapshot: Dict(String, Dict(String, Int)))
   ToggleReactionEmoji(target: String, emoji: String)
   ReactionSent(Result(Nil, String))
   OpenFullEmojiPicker(String)
@@ -227,7 +233,12 @@ pub type Msg {
   /// A room's wasm-side handle is ready; register callbacks + start presence.
   RoomOpened(name: String, handle: RoomHandle)
   IncomingMsg(room: String, im: IncomingMessage)
-  IncomingReceipt(room: String, message_id: String, from_pubkey: String)
+  IncomingReceipt(
+    room: String,
+    message_id: String,
+    from_pubkey: String,
+    delivered_at_ms: Int,
+  )
   SubmitDraft
   MessageSent(Result(String, String))
   MembersUpdated(room: String, members: List(domain.Member))
@@ -954,6 +965,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               name,
               sunset.rec_for_value_hash_hex(r),
               short_pubkey(sunset.rec_from_pubkey(r)),
+              sunset.rec_sent_at_ms(r),
             ))
           })
           sunset.on_members_changed(handle, fn(ms) {
@@ -965,7 +977,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             let inner_dict =
               list.fold(entries, dict.new(), fn(d, pair) {
                 let #(emoji, authors) = pair
-                dict.insert(d, emoji, set.from_list(authors))
+                dict.insert(d, emoji, dict.from_list(authors))
               })
             dispatch(ReactionsChanged(target, inner_dict))
           })
@@ -1057,15 +1069,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     }
     MessageSent(_) -> #(model, effect.none())
-    IncomingReceipt(name, message_id, from_pubkey) -> {
+    IncomingReceipt(name, message_id, from_pubkey, delivered_at_ms) -> {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
           let existing = case dict.get(state.receipts, message_id) {
-            Ok(s) -> s
-            Error(_) -> set.new()
+            Ok(d) -> d
+            Error(_) -> dict.new()
           }
-          let updated = set.insert(existing, from_pubkey)
+          let updated = dict.insert(existing, from_pubkey, delivered_at_ms)
           let new_state =
             RoomState(
               ..state,
@@ -1310,7 +1322,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Ok(snap) ->
           case dict.get(snap, emoji), self_pubkey_hex_opt {
             Ok(authors), Some(me) ->
-              case set.contains(authors, me) {
+              case dict.has_key(authors, me) {
                 True -> "remove"
                 False -> "add"
               }
@@ -1550,6 +1562,7 @@ fn room_view_with_state(
               palette: palette,
               message: m,
               receipts: receipts_for(state.receipts, m.id),
+              reactions: reactions_for(model.reactions, m.id),
               members: state.members,
               on_close: CloseDetail,
             ),
@@ -1740,6 +1753,7 @@ fn room_view_with_state(
           palette: palette,
           message: m,
           receipts: receipts_for(state.receipts, m.id),
+          reactions: reactions_for(model.reactions, m.id),
           members: state.members,
           on_close: CloseDetail,
         )
@@ -1975,17 +1989,17 @@ fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
 /// `by_you` flag; `None` (no client yet) treats every reaction as
 /// not-by-you so the UI doesn't lie.
 fn snapshot_to_reactions(
-  snapshot: Dict(String, Set(String)),
+  snapshot: Dict(String, Dict(String, Int)),
   self_pubkey_hex: Option(String),
 ) -> List(domain.Reaction) {
   dict.to_list(snapshot)
   |> list.filter_map(fn(pair) {
     let #(emoji, authors) = pair
-    case set.size(authors) {
+    case dict.size(authors) {
       0 -> Error(Nil)
       n -> {
         let by_you = case self_pubkey_hex {
-          Some(me) -> set.contains(authors, me)
+          Some(me) -> dict.has_key(authors, me)
           None -> False
         }
         Ok(domain.Reaction(emoji: emoji, count: n, by_you: by_you))
@@ -1998,10 +2012,27 @@ fn client_pubkey_hex(c: ClientHandle) -> String {
   sunset.client_public_key_hex(c)
 }
 
-fn receipts_for(receipts: Dict(String, Set(String)), id: String) -> Set(String) {
+fn receipts_for(
+  receipts: Dict(String, Dict(String, Int)),
+  id: String,
+) -> Dict(String, Int) {
   case dict.get(receipts, id) {
-    Ok(s) -> s
-    Error(_) -> set.new()
+    Ok(d) -> d
+    Error(_) -> dict.new()
+  }
+}
+
+/// Reactions for a single message id, keyed by `model.reactions[message_id]`.
+/// Returns the empty dict when the engine hasn't surfaced any reactions for
+/// that message yet so the details panel can render an empty section
+/// instead of branching at the call site.
+fn reactions_for(
+  reactions: Dict(String, Dict(String, Dict(String, Int))),
+  id: String,
+) -> Dict(String, Dict(String, Int)) {
+  case dict.get(reactions, id) {
+    Ok(d) -> d
+    Error(_) -> dict.new()
   }
 }
 
