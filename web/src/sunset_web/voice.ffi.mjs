@@ -11,6 +11,19 @@ const peers = new Map(); // peerHex -> { worklet, gain }
 let captureNode = null;
 let captureStream = null;
 
+// Test-only handle. The bundled module is otherwise unreachable from
+// page.evaluate() because Lustre's prod build inlines it into sunset_web.js
+// (no `/javascript/...` URL to dynamic-import). With `window.SUNSET_TEST`
+// set we expose `setPeerVolume` and `getPeerGain` on `window.__voiceFfi`
+// so Playwright specs can drive and inspect per-peer GainNodes the same
+// way the popover's mute-for-me toggle does. No-op in production.
+if (typeof window !== "undefined" && window.SUNSET_TEST) {
+  window.__voiceFfi = {
+    setPeerVolume: (peerHex, gain) => setPeerVolume(peerHex, gain),
+    getPeerGain: (peerHex) => getPeerGain(peerHex),
+  };
+}
+
 export function ensureCtx() {
   if (!ctx) ctx = new AudioContext({ sampleRate: 48000 });
   return ctx;

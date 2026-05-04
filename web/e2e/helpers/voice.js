@@ -196,48 +196,20 @@ export async function waitForVoiceReady(page, timeoutMs = 5000) {
 // ---------------------------------------------------------------------------
 
 /**
- * Install `window.__voiceFfi` on the given Playwright `page` so tests can
- * inspect per-peer GainNode values without touching internal state directly.
+ * No-op kept for backward compatibility with specs written before
+ * voice.ffi.mjs grew its own SUNSET_TEST-gated `window.__voiceFfi`
+ * handle. The module attaches `{ setPeerVolume, getPeerGain }` itself
+ * when `window.SUNSET_TEST` is set before page load, so no init script
+ * is needed here.
  *
- * Must be called after `page.goto()` and before any voice session starts.
- * The underlying `getPeerGain` function lives in `voice.ffi.mjs` and is
- * already exported from the module — this helper wires it to a well-known
- * global so Playwright's `page.evaluate()` can reach it from outside the
- * ES-module scope.
+ * Usage in a spec (callers that set `window.SUNSET_TEST = true` via
+ * `addInitScript`, as the rest of these specs do):
  *
- * Usage in a spec:
- *
- *   await page.goto("/");
- *   await installVoiceFfi(page);
- *   // … start voice …
  *   const gain = await page.evaluate(hex => window.__voiceFfi.getPeerGain(hex), peerHex);
  *   expect(gain).toBe(0);  // muted-for-me
  *
- * @param {import("@playwright/test").Page} page
+ * @param {import("@playwright/test").Page} _page
  */
-export async function installVoiceFfi(page) {
-  await page.addInitScript(() => {
-    // voice.ffi.mjs exposes getPeerGain on the module scope but not on
-    // window. We attach a proxy at window.__voiceFfi so test code running
-    // via page.evaluate() (which has no ES-module scope) can call it.
-    //
-    // The actual wiring happens lazily on first access to handle cases
-    // where the voice FFI module hasn't been imported yet when the page
-    // first evaluates this script.
-    Object.defineProperty(window, "__voiceFfi", {
-      configurable: true,
-      get() {
-        // voice.ffi.mjs attaches itself to window.__voiceFfiModule when
-        // its getPeerGain is invoked (see the dynamic import below).
-        // Until then we return a shim that attempts the import.
-        return {
-          getPeerGain: async (peerHex) => {
-            // Dynamic import reaches the module's live bindings.
-            const m = await import("/javascript/sunset_web/sunset_web/voice.ffi.mjs");
-            return m.getPeerGain(peerHex);
-          },
-        };
-      },
-    });
-  });
+export async function installVoiceFfi(_page) {
+  // Intentionally empty. See voice.ffi.mjs for the SUNSET_TEST handle.
 }
