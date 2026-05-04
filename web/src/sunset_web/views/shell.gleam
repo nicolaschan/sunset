@@ -127,6 +127,9 @@ fn phone_view(
         ],
         [main],
       ),
+      // Each drawer's `background` must match the inner rail's own
+      // background colour — see `drawer_module.view`'s background
+      // doc-comment for why.
       drawer_module.view(
         palette: palette,
         open: channels_open,
@@ -134,6 +137,7 @@ fn phone_view(
         on_close: on_close_drawer,
         test_id: "channels-drawer",
         label: "Channels",
+        background: palette.surface_alt,
         content: channels,
       ),
       drawer_module.view(
@@ -143,6 +147,7 @@ fn phone_view(
         on_close: on_close_drawer,
         test_id: "rooms-drawer",
         label: "Rooms",
+        background: palette.surface,
         content: rooms,
       ),
       drawer_module.view(
@@ -152,6 +157,7 @@ fn phone_view(
         on_close: on_close_drawer,
         test_id: "members-drawer",
         label: "Members",
+        background: palette.surface,
         content: right_rail,
       ),
       details_sheet,

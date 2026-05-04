@@ -204,6 +204,61 @@ test("members drawer content fits inside the drawer's clipping box", async ({
   expect(dims.railBottom).toBeLessThanOrEqual(dims.drawerBottom + 2);
 });
 
+// Open `kind` and return the drawer wrapper's computed
+// `background-color` along with the inner rail's. Used by the
+// background-match contract test below.
+async function openDrawerAndCaptureBackgrounds(browser, kind) {
+  const { ctx, page } = await openChat(browser, "drawer-bg-" + kind);
+
+  if (kind === "channels") {
+    await page.getByTestId("phone-rooms-toggle").click();
+  } else if (kind === "members") {
+    await page.getByTestId("phone-members-toggle").click();
+  } else if (kind === "rooms") {
+    await page.getByTestId("phone-rooms-toggle").click();
+    await page.getByTestId("channels-room-title").click();
+  }
+
+  const drawerId = kind + "-drawer";
+  const drawer = page.getByTestId(drawerId);
+  await expect(drawer).toHaveAttribute("aria-hidden", "false");
+
+  const colours = await drawer.evaluate((el) => {
+    const rail = el.firstElementChild;
+    return {
+      drawer: getComputedStyle(el).backgroundColor,
+      rail: getComputedStyle(rail).backgroundColor,
+    };
+  });
+
+  await ctx.close();
+  return colours;
+}
+
+// On iOS PWA standalone mode the drawer wrapper paints the safe-area
+// bands (above the status bar, below the home indicator) with its own
+// background colour while the inner rail occupies the padded content
+// box. If the two colours don't match, the user sees a two-tone band
+// stuck to the screen edges. This test gates against that for each
+// drawer kind — channels uses surface_alt, rooms / members use
+// surface, so a single hard-coded drawer colour can never satisfy all
+// three.
+for (const kind of ["channels", "rooms", "members"]) {
+  test(`${kind} drawer wrapper background matches the inner rail`, async ({
+    browser,
+  }, testInfo) => {
+    skipDesktop(testInfo);
+    const { drawer, rail } = await openDrawerAndCaptureBackgrounds(
+      browser,
+      kind,
+    );
+    expect(
+      drawer,
+      `${kind}-drawer wrapper bg should equal inner rail bg`,
+    ).toBe(rail);
+  });
+}
+
 test("rooms-rail you-row stays inside the drawer's tappable area", async ({
   browser,
 }, testInfo) => {
