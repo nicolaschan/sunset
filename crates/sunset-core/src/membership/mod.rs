@@ -326,35 +326,61 @@ pub fn spawn_tracker<S: Store + 'static>(
         let mut presence_sub = presence_sub.fuse();
         let mut refresh_rx = refresh_rx.fuse();
         let presence_map: Rc<RefCell<HashMap<PeerId, u64>>> = Rc::new(RefCell::new(HashMap::new()));
-        // Task 5 will populate this from PresenceBody blobs; for now it
-        // is always empty so the tracker keeps its pre-name behavior.
-        let names_map: HashMap<PeerId, Option<String>> = HashMap::new();
+        let names_map: Rc<RefCell<HashMap<PeerId, Option<String>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let pending_blocks: Rc<RefCell<HashMap<PeerId, sunset_store::Hash>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         let prefix = format!("{room_fp_hex}/presence/");
 
         loop {
             futures::select! {
                 ev = presence_sub.next() => {
                     let Some(ev) = ev else { break };
-                    let entry = match ev {
-                        Ok(sunset_store::Event::Inserted(e)) => e,
-                        Ok(sunset_store::Event::Replaced { new, .. }) => new,
-                        Ok(_) => continue,
+                    match ev {
+                        Ok(sunset_store::Event::Inserted(entry))
+                        | Ok(sunset_store::Event::Replaced { new: entry, .. }) => {
+                            let Some(pk) = parse_presence_pk(&entry.name, &prefix) else { continue };
+                            presence_map.borrow_mut().insert(pk.clone(), entry.priority);
+                            fetch_and_set_name(&store, &pk, entry.value_hash, &names_map, &pending_blocks).await;
+                            maybe_fire_members(
+                                now_ms(),
+                                interval_ms,
+                                ttl_ms,
+                                &self_peer,
+                                &presence_map.borrow(),
+                                &names_map.borrow(),
+                                &handles,
+                            );
+                        }
+                        Ok(sunset_store::Event::BlobAdded(hash)) => {
+                            let candidates: Vec<PeerId> = pending_blocks
+                                .borrow()
+                                .iter()
+                                .filter(|(_, h)| **h == hash)
+                                .map(|(pk, _)| pk.clone())
+                                .collect();
+                            let mut changed = false;
+                            for pk in candidates {
+                                fetch_and_set_name(&store, &pk, hash, &names_map, &pending_blocks).await;
+                                changed = true;
+                            }
+                            if changed {
+                                maybe_fire_members(
+                                    now_ms(),
+                                    interval_ms,
+                                    ttl_ms,
+                                    &self_peer,
+                                    &presence_map.borrow(),
+                                    &names_map.borrow(),
+                                    &handles,
+                                );
+                            }
+                        }
+                        Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "presence event error");
-                            continue;
                         }
-                    };
-                    let Some(pk) = parse_presence_pk(&entry.name, &prefix) else { continue };
-                    presence_map.borrow_mut().insert(pk, entry.priority);
-                    maybe_fire_members(
-                        now_ms(),
-                        interval_ms,
-                        ttl_ms,
-                        &self_peer,
-                        &presence_map.borrow(),
-                        &names_map,
-                        &handles,
-                    );
+                    }
                 }
                 ev = recv_engine(&mut engine_events).fuse() => {
                     let Some(ev) = ev else { break };
@@ -365,7 +391,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         ttl_ms,
                         &self_peer,
                         &presence_map.borrow(),
-                        &names_map,
+                        &names_map.borrow(),
                         &handles,
                     );
                 }
@@ -379,7 +405,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         ttl_ms,
                         &self_peer,
                         &presence_map.borrow(),
-                        &names_map,
+                        &names_map.borrow(),
                         &handles,
                     );
                 }
@@ -423,6 +449,40 @@ fn handle_engine_event(handles: &TrackerHandles, ev: &EngineEvent) {
             // Membership tracker is identity-only; per-peer liveness
             // (last_pong/RTT) is consumed by the supervisor for
             // IntentSnapshot, not here.
+        }
+    }
+}
+
+async fn fetch_and_set_name<S: Store + 'static>(
+    store: &std::sync::Arc<S>,
+    pk: &PeerId,
+    value_hash: sunset_store::Hash,
+    names_map: &Rc<RefCell<HashMap<PeerId, Option<String>>>>,
+    pending: &Rc<RefCell<HashMap<PeerId, sunset_store::Hash>>>,
+) {
+    match store.get_content(&value_hash).await {
+        Ok(Some(block)) => match postcard::from_bytes::<PresenceBody>(&block.data) {
+            Ok(body) => {
+                names_map.borrow_mut().insert(pk.clone(), body.name);
+                pending.borrow_mut().remove(pk);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    peer = %hex::encode(pk.verifying_key().as_bytes()),
+                    "presence body decode failed"
+                );
+                names_map.borrow_mut().insert(pk.clone(), None);
+                pending.borrow_mut().remove(pk);
+            }
+        },
+        Ok(None) => {
+            names_map.borrow_mut().insert(pk.clone(), None);
+            pending.borrow_mut().insert(pk.clone(), value_hash);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "presence body fetch failed");
+            names_map.borrow_mut().insert(pk.clone(), None);
         }
     }
 }
@@ -757,5 +817,296 @@ mod tests {
             },
         ));
         assert_ne!(sig_a, sig_b);
+    }
+
+    // -- tracker integration tests --
+
+    fn make_test_store() -> std::sync::Arc<sunset_store_memory::MemoryStore> {
+        std::sync::Arc::new(sunset_store_memory::MemoryStore::new(std::sync::Arc::new(
+            sunset_store::AcceptAllVerifier,
+        )))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracker_picks_up_name_from_presence_body() {
+        use rand_core::OsRng;
+        use sunset_store::{ContentBlock, SignedKvEntry, canonical::signing_payload};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let store = make_test_store();
+                let me = crate::Identity::generate(&mut OsRng);
+                let me_pk = sunset_sync::PeerId(me.store_verifying_key());
+                let bob = crate::Identity::generate(&mut OsRng);
+
+                let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
+                let handles = TrackerHandles::new();
+                let cb_captured = captured.clone();
+                *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
+                    *cb_captured.borrow_mut() = ms.to_vec();
+                }));
+
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<sunset_sync::EngineEvent>();
+
+                spawn_tracker(
+                    store.clone(),
+                    rx,
+                    me_pk.clone(),
+                    PresenceConfig {
+                        room_fp_hex: "ffaa".to_owned(),
+                        interval_ms: 1000,
+                        ttl_ms: 60_000,
+                        refresh_ms: 50,
+                    },
+                    handles,
+                );
+
+                let body = PresenceBody {
+                    name: Some("bob".to_owned()),
+                };
+                let block = ContentBlock {
+                    data: bytes::Bytes::from(postcard::to_stdvec(&body).unwrap()),
+                    references: vec![],
+                };
+                let value_hash = block.hash();
+                let now_pri = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1);
+                let mut entry = SignedKvEntry {
+                    verifying_key: bob.store_verifying_key(),
+                    name: bytes::Bytes::from(format!(
+                        "ffaa/presence/{}",
+                        hex::encode(bob.store_verifying_key().as_bytes())
+                    )),
+                    value_hash,
+                    priority: now_pri,
+                    expires_at: Some(now_pri + 60_000),
+                    signature: bytes::Bytes::new(),
+                };
+                let payload = signing_payload(&entry);
+                let sig = bob.sign(&payload);
+                entry.signature = bytes::Bytes::copy_from_slice(&sig.to_bytes());
+                store.insert(entry, Some(block)).await.unwrap();
+
+                for _ in 0..200 {
+                    let ms = captured.borrow().clone();
+                    if let Some(b) = ms.iter().find(|m| !m.is_self) {
+                        if b.name == Some("bob".to_owned()) {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!(
+                    "tracker never observed bob's name; got {:?}",
+                    captured.borrow()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracker_treats_garbage_body_as_no_name() {
+        use rand_core::OsRng;
+        use sunset_store::{ContentBlock, SignedKvEntry, canonical::signing_payload};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let store = make_test_store();
+                let me = crate::Identity::generate(&mut OsRng);
+                let me_pk = sunset_sync::PeerId(me.store_verifying_key());
+                let bob = crate::Identity::generate(&mut OsRng);
+
+                let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
+                let handles = TrackerHandles::new();
+                let cb_captured = captured.clone();
+                *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
+                    *cb_captured.borrow_mut() = ms.to_vec();
+                }));
+
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<sunset_sync::EngineEvent>();
+
+                spawn_tracker(
+                    store.clone(),
+                    rx,
+                    me_pk.clone(),
+                    PresenceConfig {
+                        room_fp_hex: "ffaa".to_owned(),
+                        interval_ms: 1000,
+                        ttl_ms: 60_000,
+                        refresh_ms: 50,
+                    },
+                    handles,
+                );
+
+                // Garbage body that fails postcard decode.
+                let block = ContentBlock {
+                    data: bytes::Bytes::from(vec![0xff, 0xff, 0xff]),
+                    references: vec![],
+                };
+                let value_hash = block.hash();
+                let now_pri = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1);
+                let mut entry = SignedKvEntry {
+                    verifying_key: bob.store_verifying_key(),
+                    name: bytes::Bytes::from(format!(
+                        "ffaa/presence/{}",
+                        hex::encode(bob.store_verifying_key().as_bytes())
+                    )),
+                    value_hash,
+                    priority: now_pri,
+                    expires_at: Some(now_pri + 60_000),
+                    signature: bytes::Bytes::new(),
+                };
+                let payload = signing_payload(&entry);
+                let sig = bob.sign(&payload);
+                entry.signature = bytes::Bytes::copy_from_slice(&sig.to_bytes());
+                store.insert(entry, Some(block)).await.unwrap();
+
+                // Wait for bob to appear; verify name is None.
+                for _ in 0..200 {
+                    let ms = captured.borrow().clone();
+                    if ms.iter().any(|m| !m.is_self) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let ms = captured.borrow().clone();
+                let bob_member = ms.iter().find(|m| !m.is_self).expect("bob should appear");
+                assert_eq!(bob_member.name, None, "garbage body should yield name=None");
+            })
+            .await;
+    }
+
+    /// Tests the late-block arrival path via a re-insert with higher priority +
+    /// block attached. `MemoryStore::put_content` does not broadcast `BlobAdded`;
+    /// the real BlobAdded path fires from `insert` when a block is included.
+    /// So we simulate late arrival by: (1) insert entry without block so tracker
+    /// records the peer in pending_blocks with name=None, (2) re-insert same
+    /// entry key at higher priority WITH the block, which fires BlobAdded and
+    /// triggers the pending retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracker_late_block_arrival_updates_name() {
+        use rand_core::OsRng;
+        use sunset_store::{ContentBlock, SignedKvEntry, canonical::signing_payload};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let store = make_test_store();
+                let me = crate::Identity::generate(&mut OsRng);
+                let me_pk = sunset_sync::PeerId(me.store_verifying_key());
+                let bob = crate::Identity::generate(&mut OsRng);
+
+                let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
+                let handles = TrackerHandles::new();
+                let cb_captured = captured.clone();
+                *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
+                    *cb_captured.borrow_mut() = ms.to_vec();
+                }));
+
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<sunset_sync::EngineEvent>();
+
+                spawn_tracker(
+                    store.clone(),
+                    rx,
+                    me_pk.clone(),
+                    PresenceConfig {
+                        room_fp_hex: "ffaa".to_owned(),
+                        interval_ms: 1000,
+                        ttl_ms: 60_000,
+                        refresh_ms: 50,
+                    },
+                    handles,
+                );
+
+                let body = PresenceBody {
+                    name: Some("late-bob".to_owned()),
+                };
+                let block = ContentBlock {
+                    data: bytes::Bytes::from(postcard::to_stdvec(&body).unwrap()),
+                    references: vec![],
+                };
+                let value_hash = block.hash();
+                let now_pri = web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1);
+                let entry_name = bytes::Bytes::from(format!(
+                    "ffaa/presence/{}",
+                    hex::encode(bob.store_verifying_key().as_bytes())
+                ));
+                let mut entry = SignedKvEntry {
+                    verifying_key: bob.store_verifying_key(),
+                    name: entry_name.clone(),
+                    value_hash,
+                    priority: now_pri,
+                    expires_at: Some(now_pri + 60_000),
+                    signature: bytes::Bytes::new(),
+                };
+                let payload = signing_payload(&entry);
+                let sig = bob.sign(&payload);
+                entry.signature = bytes::Bytes::copy_from_slice(&sig.to_bytes());
+
+                // Insert entry WITHOUT its block (lazy dangling ref).
+                store.insert(entry, None).await.unwrap();
+
+                // Wait for bob to appear with name=None.
+                for _ in 0..200 {
+                    let ms = captured.borrow().clone();
+                    if ms.iter().any(|m| !m.is_self) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                {
+                    let ms = captured.borrow().clone();
+                    let bob_member = ms
+                        .iter()
+                        .find(|m| !m.is_self)
+                        .expect("bob should appear without block");
+                    assert_eq!(
+                        bob_member.name, None,
+                        "name should be None before block arrives"
+                    );
+                }
+
+                // Re-insert at higher priority WITH the block. `insert` broadcasts
+                // BlobAdded which wakes the pending-blocks retry path in the tracker.
+                let pri2 = now_pri + 1;
+                let mut entry2 = SignedKvEntry {
+                    verifying_key: bob.store_verifying_key(),
+                    name: entry_name,
+                    value_hash,
+                    priority: pri2,
+                    expires_at: Some(pri2 + 60_000),
+                    signature: bytes::Bytes::new(),
+                };
+                let payload2 = signing_payload(&entry2);
+                let sig2 = bob.sign(&payload2);
+                entry2.signature = bytes::Bytes::copy_from_slice(&sig2.to_bytes());
+                store.insert(entry2, Some(block)).await.unwrap();
+
+                // Wait for name to flip to Some("late-bob").
+                for _ in 0..200 {
+                    let ms = captured.borrow().clone();
+                    if let Some(b) = ms.iter().find(|m| !m.is_self) {
+                        if b.name == Some("late-bob".to_owned()) {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!(
+                    "tracker never updated name after late block; got {:?}",
+                    captured.borrow()
+                );
+            })
+            .await;
     }
 }
