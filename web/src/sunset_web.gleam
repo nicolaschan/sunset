@@ -81,7 +81,7 @@ pub type RoomState {
     handle: Option(RoomHandle),
     messages: List(domain.Message),
     members: List(domain.Member),
-    /// Per-message delivery acks: msg_id → from_pubkey (short hex) →
+    /// Per-message delivery acks: msg_id → from_pubkey (full hex) →
     /// unix-ms when the acknowledging peer composed the receipt. The
     /// timestamp is surfaced in the message-details panel as the
     /// per-recipient delivered-at stamp.
@@ -1053,7 +1053,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             dispatch(IncomingReceipt(
               name,
               sunset.rec_for_value_hash_hex(r),
-              short_pubkey(sunset.rec_from_pubkey(r)),
+              hex_encode(sunset.rec_from_pubkey(r)),
               sunset.rec_sent_at_ms(r),
             ))
           })
@@ -1761,6 +1761,7 @@ fn room_view_with_state(
               receipts: receipts_for(state.receipts, m.id),
               reactions: reactions_for(model.reactions, m.id),
               members: state.members,
+              name_map: model.name_map,
               on_close: CloseDetail,
             ),
           )
@@ -1951,6 +1952,7 @@ fn room_view_with_state(
           receipts: receipts_for(state.receipts, m.id),
           reactions: reactions_for(model.reactions, m.id),
           members: state.members,
+          name_map: model.name_map,
           on_close: CloseDetail,
         )
       _, _ ->
