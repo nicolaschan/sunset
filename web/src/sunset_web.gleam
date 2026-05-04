@@ -1709,7 +1709,6 @@ fn room_view_with_state(
       mode: model.mode,
       on_toggle_mode: ToggleMode,
     ),
-    // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
     channels.view(
       palette: palette,
       room: active_room,
@@ -1724,6 +1723,9 @@ fn room_view_with_state(
       on_open_voice_popover: OpenVoicePopover,
       viewport: model.viewport,
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
+      on_join_voice: JoinVoice(active_room.id),
+      on_leave_voice: LeaveVoice,
+      self_in_call: option.is_some(model.voice.self_in_call),
     ),
     main_panel.view(
       palette: palette,
