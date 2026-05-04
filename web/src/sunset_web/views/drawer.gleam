@@ -22,11 +22,6 @@ pub fn view(
   on_close on_close: msg,
   test_id test_id: String,
   label label: String,
-  /// Background colour painted edge-to-edge (including under iOS
-  /// status bar / home indicator in PWA standalone mode). Should
-  /// match the inner rail's own background — otherwise the safe-area
-  /// bands above and below the rail show through in the wrong colour
-  /// and the user perceives a two-tone band stuck to the screen edges.
   background background: String,
   content content: Element(msg),
 ) -> Element(msg) {
