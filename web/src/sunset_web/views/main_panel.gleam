@@ -43,7 +43,8 @@ pub fn view(
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker on_open_full_picker: fn(String, Option(#(Float, Float))) ->
+    msg,
   on_open_detail on_open_detail: fn(String) -> msg,
   receipts receipts: Dict(String, Dict(String, Int)),
   selected_msg_id selected_msg_id: Option(String),
@@ -152,7 +153,7 @@ fn messages_list(
   detail_msg_id: Option(String),
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
   on_open_detail: fn(String) -> msg,
   receipts: Dict(String, Dict(String, Int)),
   selected_msg_id: Option(String),
@@ -238,7 +239,7 @@ fn message_view(
   selected: Bool,
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
   on_open_detail: fn(String) -> msg,
   on_toggle_selected: fn(String) -> msg,
   receipts: Dict(String, Dict(String, Int)),
@@ -474,7 +475,7 @@ fn reaction_picker(
   p: Palette,
   msg_id: String,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
 ) -> Element(msg) {
   let quick_buttons =
     list.map(quick_reactions, fn(emoji) {
@@ -505,7 +506,18 @@ fn reaction_picker(
       [
         attribute.title("More reactions"),
         attribute.attribute("data-testid", "reaction-picker-more"),
-        event.on_click(on_open_full_picker(msg_id)),
+        // Capture the click's `clientY` and the live viewport height
+        // (`view.innerHeight`) so the desktop overlay can decide
+        // whether there's more room above or below the trigger before
+        // it positions itself. Both fields are read directly off the
+        // MouseEvent — the `view` accessor is the WindowProxy that
+        // owns the document, which is non-null for any UIEvent fired
+        // from a click.
+        event.on("click", {
+          use cy <- decode.subfield(["clientY"], decode.float)
+          use vh <- decode.subfield(["view", "innerHeight"], decode.float)
+          decode.success(on_open_full_picker(msg_id, option.Some(#(cy, vh))))
+        }),
         ui.css([
           #("width", "32px"),
           #("height", "32px"),

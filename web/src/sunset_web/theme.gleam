@@ -46,6 +46,12 @@ pub type Palette {
     surface: String,
     surface_alt: String,
     surface_sunk: String,
+    /// Background tint used for the message-row hover / active state.
+    /// A separate token from `surface_alt` so the YOU tag and reaction
+    /// pills (which themselves use `surface_alt` as a background) stay
+    /// visible against the highlight — using `surface_alt` here makes
+    /// those nested chips blend into the highlighted row.
+    row_highlight: String,
     border: String,
     border_soft: String,
     text: String,
@@ -93,6 +99,10 @@ fn light() -> Palette {
     surface: "#ffffff",
     surface_alt: "#f4eadf",
     surface_sunk: "#ecdfcd",
+    // Sits between `surface` and `surface_alt` — visible as a row-
+    // hover tint without obscuring the YOU tag / reaction pills that
+    // themselves render on `surface_alt`.
+    row_highlight: "#fbf6ed",
     border: "#e5d4be",
     border_soft: "#ede0c9",
     text: "#1f1c1a",
@@ -118,6 +128,10 @@ fn dark() -> Palette {
     surface: "#1c1814",
     surface_alt: "#181410",
     surface_sunk: "#100c08",
+    // Slightly *lighter* than `surface` so a hovered row reads as
+    // raised in dark mode (the rest of the chrome — including
+    // surface_alt — sinks darker).
+    row_highlight: "#241f1a",
     border: "#2a221c",
     border_soft: "#221c17",
     text: "#ece4d6",
