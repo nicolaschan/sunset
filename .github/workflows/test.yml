@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: tests-${{ github.ref }}
@@ -27,6 +28,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
       - name: cargo fmt --all --check
         run: |
           nix develop --command cargo fmt --all --check
@@ -50,6 +52,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
       - name: gleam format --check
         run: |
           nix develop --command bash -c 'cd web && gleam format --check src test'
@@ -67,6 +70,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
       - name: Build web bundle
         run: nix build .#web
       - name: Run Playwright suite
