@@ -80,7 +80,7 @@ C2c adds:
 
 Today this directory contains the protocol logic that's being lifted out (`subscriber.rs`, `transport.rs`, `liveness.rs`). After C2c it contains only:
 
-- `mod.rs` — FFI entry points (`voice_start`, `voice_stop`, `voice_input`, `voice_set_muted`, `voice_set_deafened`, `voice_set_peer_volume`).
+- `mod.rs` — FFI entry points (`voice_start`, `voice_stop`, `voice_input`, `voice_set_muted`, `voice_set_deafened`).
 - `audio.rs` — capture/playback worklet integration (the existing JS bridge).
 - `dialer.rs` — `Dialer` impl wrapping `RoomHandle::connect_direct`.
 - `frame_sink.rs` — `FrameSink` impl that pushes PCM to a per-peer playback worklet via `postMessage`, and manages the per-peer `GainNode` table.
@@ -235,6 +235,8 @@ Per peer, the `auto_connect` task observes membership_liveness events and runs t
 
 2. **Voice auto-connect: glare avoidance.** With both peers running auto-connect off the same voice-presence signal, both would call `Dialer::ensure_direct` simultaneously. The browser WebRTC transport handles glare by ignoring duplicate Offers from a peer it's already mid-handshake with — which drops the *initiator-side* Offer too, leaving each side with one connect-side handshake waiting for an Answer that's been suppressed and one accept-side handshake answering the peer's Offer. The two independently-derived `RTCPeerConnection`s then race ICE/SCTP setup and neither completes within the test/UX budget. Fix: only the lexicographically smaller pubkey side initiates the dial; the other side's auto-connect FSM defers to its accept path. This is the cheapest possible tiebreak — no negotiation rounds, no clocks, no state. A future Perfect Negotiation implementation could replace the asymmetry with proper rollback semantics.
 
+**Revision (Phase 6.1, post-implementation review):** Per-peer playback volume management does **not** flow through the Rust FFI. The original spec showed `Client::voice_set_peer_volume(peer_id, gain)` (and an `on_set_peer_volume` JS callback registered at `voice_start`) on the assumption that the runtime should own the desired-gain table and replay queued values to late-allocated GainNodes. In practice the GainNode is a fundamentally browser-shaped concept — it's allocated by `voice.ffi.mjs::deliverFrame` on the first frame from a peer, lives in the per-peer `{ worklet, gain }` table on the JS side, and has no native counterpart any non-browser host would share. Threading the value through Rust adds a function-pointer hop and a `RefCell<HashMap>` of pending gains for zero functional benefit. The Gleam UI calls `voice.ffi.mjs::setPeerVolume(peerHex, gain)` directly; if the GainNode isn't allocated yet, the call is dropped on the floor (the volume slider is rendered only for peers already in the popover, which means the UI has already heard from them and the slot exists). Future native hosts (TUI, Minecraft mod) that grow per-peer volume will define their own host-shaped surface; nothing in the protocol layer cares. This drops `Client::voice_set_peer_volume`, the `on_set_peer_volume` callback parameter on `voice_start`, and the `pending_gains` map.
+
 ## Jitter buffer
 
 Per peer, single FIFO of decoded PCM frames (`VecDeque<Vec<f32>>`).
@@ -262,7 +264,7 @@ impl Client {
 
     pub fn voice_set_muted(&self, muted: bool);
     pub fn voice_set_deafened(&self, deafened: bool);
-    pub fn voice_set_peer_volume(&self, peer_id: &Uint8Array, gain: f32);
+    // Per-peer volume is intentionally JS-only — see Phase 6.1 revision above.
 
     // Test hooks — compiled in only with feature `test-hooks`.
     #[cfg(feature = "test-hooks")]
@@ -288,7 +290,7 @@ Behaviour:
 - `voice_start`: creates the `Dialer`/`FrameSink`/`PeerStateSink` adapters, constructs `VoiceRuntime`, spawns its five tasks via `spawn_local`. Initiates `getUserMedia`; on user denial, returns `Err(JsError::new("microphone permission denied"))` and does not spawn anything.
 - `voice_stop`: drops `VoiceRuntime` (cancels all tasks within one iteration), tears down per-peer worklets and GainNodes, releases the MediaStream.
 - `voice_input`: arrives from the capture worklet (real audio); calls `runtime.send_pcm(pcm)`.
-- `voice_set_peer_volume`: looks up the per-peer `GainNode` and sets `gain.value = gain`. If no node exists yet (peer not yet heard from), record the desired gain and apply on first allocation.
+- Per-peer volume: see Phase 6.1 revision above. The Gleam UI calls `voice.ffi.mjs::setPeerVolume(peerHex, gain)` directly — no Rust hop.
 - `voice_inject_pcm`: bypasses the capture worklet and calls `runtime.send_pcm` directly. Used by tests to inject deterministic synthetic PCM.
 - `voice_install_frame_recorder`: wraps the `FrameSink` in a recording adapter that captures `(peer, pcm)` pairs into an in-memory ring per peer.
 - `voice_recorded_frames`: returns `[{seq_in_frame: number, len: 960, checksum: hex_string}, ...]` for the given peer. `seq_in_frame` is the embedded counter from the first sample (see test fixtures). `checksum` is a hash of the PCM bytes for byte-equal verification.

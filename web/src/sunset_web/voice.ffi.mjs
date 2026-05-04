@@ -2,7 +2,9 @@
 // - the AudioContext (created lazily on first start)
 // - per-peer { workletNode, gainNode } table
 // - capture worklet stream
-// - GainNode value updates from voice_set_peer_volume
+// - per-peer GainNode updates (setPeerVolume), called directly from
+//   the Gleam UI; not threaded through Rust (the GainNode is a
+//   browser-shaped concept — see voice/mod.rs for the spec rationale).
 
 import { Ok, Error as GError } from "../../prelude.mjs";
 
@@ -139,9 +141,6 @@ export function wasmVoiceStart(client, roomHandle, callback) {
             if (window.__voicePeerStateHandler) {
               window.__voicePeerStateHandler(hex, inCall, talking, isMuted);
             }
-          },
-          (_peerId, _gain) => {
-            // on_set_peer_volume: JS-side GainNode is managed by deliverFrame/setPeerVolume
           },
         );
         callback(new Ok(null));

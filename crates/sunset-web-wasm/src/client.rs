@@ -189,14 +189,17 @@ impl Client {
     /// - `on_pcm(peer_id: Uint8Array, pcm: Float32Array)` — per-frame delivery
     /// - `on_drop_peer(peer_id: Uint8Array)` — peer left the call
     /// - `on_voice_peer_state(peer_id, in_call, talking, is_muted)` — state change
-    /// - `on_set_peer_volume(peer_id: Uint8Array, gain: number)` — set GainNode
+    ///
+    /// Per-peer playback volume is intentionally not threaded through Rust:
+    /// the GainNode is a browser-shaped concept and the runtime has no need
+    /// to know. JS callers manage it directly via `voice.ffi.mjs::setPeerVolume`.
+    /// See spec revision (2026-05-03) for the rationale.
     pub fn voice_start(
         &self,
         room_handle: &crate::room_handle::RoomHandle,
         on_pcm: js_sys::Function,
         on_drop_peer: js_sys::Function,
         on_voice_peer_state: js_sys::Function,
-        on_set_peer_volume: js_sys::Function,
     ) -> Result<(), JsError> {
         crate::voice::voice_start(
             &self.voice,
@@ -206,7 +209,6 @@ impl Client {
             on_pcm,
             on_drop_peer,
             on_voice_peer_state,
-            on_set_peer_volume,
         )
     }
 
@@ -233,13 +235,6 @@ impl Client {
     /// tracking continues.
     pub fn voice_set_deafened(&self, deafened: bool) {
         crate::voice::voice_set_deafened(&self.voice, deafened);
-    }
-
-    /// Set per-peer playback volume. `gain` is a linear multiplier
-    /// (0.0 = mute, 1.0 = unity, >1.0 = boost). Forwarded to JS via
-    /// the `on_set_peer_volume` callback registered at `voice_start`.
-    pub fn voice_set_peer_volume(&self, peer_id: &[u8], gain: f32) {
-        crate::voice::voice_set_peer_volume(&self.voice, peer_id, gain);
     }
 
     // ---- Test hooks (compiled in only with feature "test-hooks") ----

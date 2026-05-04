@@ -11,7 +11,6 @@ mod peer_state_sink;
 pub(crate) mod test_hooks;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use js_sys::{Float32Array, Function};
@@ -28,11 +27,6 @@ use crate::room_handle::RoomHandle;
 pub(crate) type BusT = BusImpl<MemoryStore, MultiTransport<WsT, RtcT>>;
 pub(crate) type BusArc = Rc<BusT>;
 
-/// Per-peer gain pending application. Stored so that a volume call for
-/// a peer that hasn't been heard from yet is applied when the worklet
-/// allocates.
-type PendingGains = HashMap<sunset_sync::PeerId, f32>;
-
 pub(crate) struct ActiveVoice {
     runtime: VoiceRuntime,
     /// Shared with `WebFrameSink` so `install_recorder` can find the
@@ -40,12 +34,6 @@ pub(crate) struct ActiveVoice {
     /// runtime (belt-and-suspenders, since the runtime holds an Rc too).
     #[cfg(feature = "test-hooks")]
     frame_sink_rc: Rc<dyn FrameSink>,
-    /// JS callback for per-peer gain forwarding. Accessed directly from
-    /// `voice_set_peer_volume`; not owned by any inner type.
-    on_set_peer_volume: Rc<RefCell<Option<Function>>>,
-    /// Desired per-peer gain. Stored so late-joining peers get their
-    /// configured gain applied on first `voice_set_peer_volume` call.
-    pending_gains: RefCell<PendingGains>,
     #[cfg(feature = "test-hooks")]
     recorder: RefCell<Option<Rc<test_hooks::RecordingFrameSink>>>,
 }
@@ -67,7 +55,6 @@ pub(crate) fn voice_start(
     on_pcm: Function,
     on_drop_peer: Function,
     on_voice_peer_state: Function,
-    on_set_peer_volume: Function,
 ) -> Result<(), JsError> {
     if cell.borrow().is_some() {
         return Err(JsError::new("voice already started"));
@@ -76,7 +63,6 @@ pub(crate) fn voice_start(
     let on_pcm_rc = Rc::new(RefCell::new(Some(on_pcm)));
     let on_drop_rc = Rc::new(RefCell::new(Some(on_drop_peer)));
     let on_state_rc = Rc::new(RefCell::new(Some(on_voice_peer_state)));
-    let on_volume_rc = Rc::new(RefCell::new(Some(on_set_peer_volume)));
 
     let web_frame_sink: Rc<dyn FrameSink> = Rc::new(frame_sink::WebFrameSink {
         on_pcm: on_pcm_rc,
@@ -113,8 +99,6 @@ pub(crate) fn voice_start(
         runtime,
         #[cfg(feature = "test-hooks")]
         frame_sink_rc: web_frame_sink,
-        on_set_peer_volume: on_volume_rc,
-        pending_gains: RefCell::new(HashMap::new()),
         #[cfg(feature = "test-hooks")]
         recorder: RefCell::new(None),
     });
@@ -155,27 +139,6 @@ pub(crate) fn voice_set_muted(cell: &VoiceCell, muted: bool) {
 pub(crate) fn voice_set_deafened(cell: &VoiceCell, deafened: bool) {
     if let Some(v) = cell.borrow().as_ref() {
         v.runtime.set_deafened(deafened);
-    }
-}
-
-/// Forward a desired per-peer volume to JS via the `on_set_peer_volume`
-/// callback. JS is responsible for setting the GainNode's gain.value.
-pub(crate) fn voice_set_peer_volume(cell: &VoiceCell, peer_bytes: &[u8], gain: f32) {
-    let slot = cell.borrow();
-    let Some(v) = slot.as_ref() else {
-        return;
-    };
-    if peer_bytes.len() != 32 {
-        return;
-    }
-    let pk = sunset_store::VerifyingKey::new(bytes::Bytes::copy_from_slice(peer_bytes));
-    let peer = sunset_sync::PeerId(pk);
-    // Record the desired gain for late-joining peers.
-    v.pending_gains.borrow_mut().insert(peer.clone(), gain);
-    // Forward to JS immediately if the callback is registered.
-    if let Some(f) = v.on_set_peer_volume.borrow().as_ref() {
-        let id = js_sys::Uint8Array::from(peer.0.as_bytes());
-        let _ = f.call2(&JsValue::NULL, &id, &JsValue::from_f64(gain as f64));
     }
 }
 
