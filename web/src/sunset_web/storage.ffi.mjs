@@ -99,6 +99,28 @@ export function writeSavedTheme(value) {
   }
 }
 
+const SELF_NAME_KEY = "sunset/self-name";
+
+/// Returns the user's chosen display name as a string. "" when unset.
+export function readSelfName() {
+  try {
+    return window.localStorage.getItem(SELF_NAME_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/// Persists the user's chosen display name. Empty string clears.
+export function writeSelfName(value) {
+  try {
+    if (value === "") {
+      window.localStorage.removeItem(SELF_NAME_KEY);
+    } else {
+      window.localStorage.setItem(SELF_NAME_KEY, value);
+    }
+  } catch {}
+}
+
 // True if the OS / browser is currently advertising a dark colour
 // scheme via the prefers-color-scheme media query. Used as the
 // fallback when the user hasn't picked a theme yet.
