@@ -146,3 +146,49 @@ test("relay row appears, popover opens, live metrics update", async ({ page }, t
   await popover.locator('[data-testid="relay-popover-close"]').click();
   await expect(popover).toBeHidden();
 });
+
+test("desktop relay popover docks next to the channels rail, not the right column", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "phone uses the relay-sheet bottom sheet instead",
+  );
+  page.on("pageerror", (err) =>
+    process.stderr.write(`[pageerror] ${err.stack || err}\n`),
+  );
+
+  await page.goto(buildUrl());
+  await expect(page.locator('[data-testid="relays-section"]')).toBeVisible({
+    timeout: 10_000,
+  });
+
+  const row = page.locator(
+    `[data-testid="relay-row"][data-relay-host="${expectedHost()}"]`,
+  );
+  await expect(row).toBeVisible();
+  await row.click();
+
+  const popover = page.locator('[data-testid="relay-popover"]');
+  await expect(popover).toBeVisible();
+
+  // The popover's left edge should be just to the right of the
+  // relays listing (which lives at the bottom of the channels rail).
+  // Pre-fix the popover was anchored to `right: 260px`, putting it
+  // past the main chat column on the far right of the viewport —
+  // visually disconnected from the row that triggered it. We assert:
+  // the popover sits to the right of the relays section but in the
+  // left half of the viewport, and doesn't run off-screen.
+  const rects = await page.evaluate(() => {
+    const popoverEl = document.querySelector('[data-testid="relay-popover"]');
+    const sectionEl = document.querySelector('[data-testid="relays-section"]');
+    return {
+      popover: popoverEl.getBoundingClientRect(),
+      section: sectionEl.getBoundingClientRect(),
+      vw: window.innerWidth,
+    };
+  });
+  expect(rects.popover.left).toBeGreaterThanOrEqual(rects.section.right);
+  expect(rects.popover.left).toBeLessThan(rects.vw / 2);
+  expect(rects.popover.right).toBeLessThan(rects.vw);
+});

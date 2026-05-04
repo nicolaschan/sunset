@@ -269,7 +269,13 @@ fn state_attr(s: RelayConnState) -> String {
 }
 
 pub type Placement {
-  Floating
+  /// Desktop floating popover. `anchor_left_px` is where the popover's
+  /// left edge sits — set by the caller to the channels-rail right
+  /// edge + small gap so the popover docks next to the relays section
+  /// instead of the chat shell's right column. Threaded as a number
+  /// rather than baked in here because the channels rail's left
+  /// position depends on whether the rooms rail is collapsed.
+  Floating(anchor_left_px: Int)
   InSheet
 }
 
@@ -308,14 +314,19 @@ pub fn popover(
     )
 
   case placement {
-    Floating ->
+    Floating(anchor_left_px) ->
       html.div(
         [
           attribute.attribute("data-testid", "relay-popover"),
           ui.css([
             #("position", "fixed"),
-            #("top", "120px"),
-            #("right", "260px"),
+            // Bottom-anchored: the relays section is the last block in
+            // the channels rail, so a bottom-aligned popover reads as
+            // tied to that section even though we don't measure the row
+            // exactly. The 14px gap matches the page's other floating
+            // overlays.
+            #("bottom", "14px"),
+            #("left", int.to_string(anchor_left_px) <> "px"),
             #("width", "300px"),
             #("background", p.surface),
             #("color", p.text),

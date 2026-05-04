@@ -1746,7 +1746,6 @@ fn room_view_with_state(
     model.rooms_collapsed,
     detail_msg != None,
     model.drawer,
-    ToggleMode,
     CloseDrawer,
     rooms.view(
       palette: palette,
@@ -1927,7 +1926,11 @@ fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
             palette: palette,
             relay: r,
             now_ms: model.now_ms,
-            placement: relays_view.Floating,
+            placement: relays_view.Floating(
+              anchor_left_px: rooms_rail_width_px(model.rooms_collapsed)
+              + channels_rail_width_px
+              + 8,
+            ),
             on_close: CloseRelayPopover,
           )
         Error(_) -> element.fragment([])
@@ -1936,6 +1939,21 @@ fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
     _, _ -> element.fragment([])
   }
 }
+
+/// Mirrors `shell.desktop_view`'s grid-template-columns rooms slot.
+/// Kept here (and not threaded as a constant from `shell`) because the
+/// only desktop overlay that needs the channels-rail right edge is the
+/// relay popover, and Lustre doesn't measure layout from the inside —
+/// the popover's `left` has to come from the layout's source of truth.
+fn rooms_rail_width_px(collapsed: Bool) -> Int {
+  case collapsed {
+    True -> 54
+    False -> 260
+  }
+}
+
+/// Mirrors `shell.desktop_view`'s grid-template-columns channels slot.
+const channels_rail_width_px: Int = 230
 
 fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
   let needle = string.lowercase(string.trim(search))

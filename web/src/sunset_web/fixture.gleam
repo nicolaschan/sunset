@@ -114,13 +114,6 @@ pub fn channels() -> List(Channel) {
       in_call: 3,
       unread: 0,
     ),
-    Channel(
-      id: ChannelId("focus"),
-      name: "Focus",
-      kind: Voice,
-      in_call: 0,
-      unread: 0,
-    ),
   ]
 }
 
