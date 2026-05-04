@@ -4,6 +4,8 @@
 // - capture worklet stream
 // - GainNode value updates from voice_set_peer_volume
 
+import { Ok, Error as GError } from "../../prelude.mjs";
+
 let ctx = null;
 const peers = new Map(); // peerHex -> { worklet, gain }
 let captureNode = null;
@@ -102,34 +104,37 @@ function uint8ToHex(a) {
     .join("");
 }
 
-export async function wasmVoiceStart(client, roomHandle) {
-  try {
-    await startCapture(client);
-    client.voice_start(
-      roomHandle,
-      (peerId, pcm) => {
-        const hex = uint8ToHex(new Uint8Array(peerId));
-        deliverFrame(hex, new Float32Array(pcm));
-      },
-      (peerId) => {
-        const hex = uint8ToHex(new Uint8Array(peerId));
-        dropPeer(hex);
-      },
-      (peerId, inCall, talking, isMuted) => {
-        const hex = uint8ToHex(new Uint8Array(peerId));
-        // Forward to a registered Gleam callback; see Task 21.
-        if (window.__voicePeerStateHandler) {
-          window.__voicePeerStateHandler(hex, inCall, talking, isMuted);
-        }
-      },
-      (_peerId, _gain) => {
-        // on_set_peer_volume: JS-side GainNode is managed by deliverFrame/setPeerVolume
-      },
-    );
-    return { Ok: null };
-  } catch (e) {
-    return { Error: String(e?.message || e) };
-  }
+// wasmVoiceStart uses the callback pattern (matching the rest of the Gleam
+// bridge) so Gleam doesn't need a `gleam_javascript` dependency for Promises.
+// `callback` receives `Ok(null)` or `Error(message)` as a Gleam Result.
+export function wasmVoiceStart(client, roomHandle, callback) {
+  startCapture(client)
+    .then(() => {
+      client.voice_start(
+        roomHandle,
+        (peerId, pcm) => {
+          const hex = uint8ToHex(new Uint8Array(peerId));
+          deliverFrame(hex, new Float32Array(pcm));
+        },
+        (peerId) => {
+          const hex = uint8ToHex(new Uint8Array(peerId));
+          dropPeer(hex);
+        },
+        (peerId, inCall, talking, isMuted) => {
+          const hex = uint8ToHex(new Uint8Array(peerId));
+          if (window.__voicePeerStateHandler) {
+            window.__voicePeerStateHandler(hex, inCall, talking, isMuted);
+          }
+        },
+        (_peerId, _gain) => {
+          // on_set_peer_volume: JS-side GainNode is managed by deliverFrame/setPeerVolume
+        },
+      );
+      callback(new Ok(null));
+    })
+    .catch((e) => {
+      callback(new GError(String(e?.message || e)));
+    });
 }
 
 export function wasmVoiceStop(client) {
@@ -147,4 +152,8 @@ export function wasmVoiceSetMuted(client, m) {
 
 export function wasmVoiceSetDeafened(client, d) {
   client.voice_set_deafened(!!d);
+}
+
+export function installVoiceStateHandler(cb) {
+  window.__voicePeerStateHandler = cb;
 }
