@@ -720,3 +720,62 @@ test("Enter on the landing input does not insert a newline into the composer", a
 
   await ctx.close();
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// 7. Row hover highlight is distinct from surface_alt
+// ─────────────────────────────────────────────────────────────────────
+
+test("light-mode row highlight is distinct from surface_alt (YOU tag stays visible)", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "the row highlight tint is most visible on the desktop hover state",
+  );
+
+  // Force light mode via localStorage *before* the page boots so the
+  // app reads it on init. The bug we're guarding against (YOU tag
+  // and reaction pills sharing a colour with the hover backdrop) is
+  // the worst-case in light mode where `surface_alt` is a strong
+  // warm beige.
+  const { ctx, page, composer } = await openChat(browser, "row-highlight");
+  await page.evaluate(() => {
+    try {
+      localStorage.setItem("sunset-web/theme", "light");
+    } catch {}
+  });
+  await page.reload();
+  await expect(page.getByText("sunset", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+  await composer.fill(`row-highlight-${Date.now()}`);
+  await composer.press("Enter");
+  const msgRow = page.locator(".msg-row").last();
+  await expect(msgRow).toBeVisible({ timeout: 15_000 });
+
+  // Open the reaction picker so the row picks up `.is-active` — the
+  // same backdrop color as `:hover`, but driven by model state
+  // instead of the CSS pseudo-class. Headless Chromium doesn't apply
+  // `:hover` reliably from synthetic mouse events, but `.is-active`
+  // is bound to a class that we can fully observe.
+  await msgRow.locator('button[aria-label="React"]').click({ force: true });
+  await expect(msgRow).toHaveClass(/is-active/, { timeout: 5_000 });
+
+  // Compare the highlighted row's background to the YOU tag's
+  // background (palette.surface_alt). The two must NOT be the same —
+  // a regression back to `palette.surface_alt` for the highlight
+  // would make the YOU tag invisible on hover.
+  const { hoverBg, youBg } = await msgRow.evaluate((row) => {
+    const spans = row.querySelectorAll("span");
+    const youTag = Array.from(spans).find((s) => s.textContent === "you");
+    return {
+      hoverBg: getComputedStyle(row).backgroundColor,
+      youBg: youTag ? getComputedStyle(youTag).backgroundColor : null,
+    };
+  });
+  expect(hoverBg).not.toBe("rgba(0, 0, 0, 0)");
+  expect(youBg).not.toBeNull();
+  expect(hoverBg).not.toBe(youBg);
+
+  await ctx.close();
+});

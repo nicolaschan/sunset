@@ -203,6 +203,12 @@ pub fn rec_for_value_hash_hex(r: IncomingReceipt) -> String
 @external(javascript, "./sunset.ffi.mjs", "recFromPubkey")
 pub fn rec_from_pubkey(r: IncomingReceipt) -> BitArray
 
+/// Wall-clock unix-ms when the acknowledging peer composed this Receipt.
+/// Surfaced in the message-details panel as the per-recipient delivered-at
+/// stamp.
+@external(javascript, "./sunset.ffi.mjs", "recSentAtMs")
+pub fn rec_sent_at_ms(r: IncomingReceipt) -> Int
+
 /// Snapshot payload delivered to `on_reactions_changed`. Opaque on the
 /// Gleam side; accessors below extract the concrete fields.
 pub type IncomingReactionsSnapshot
@@ -212,13 +218,15 @@ pub fn reactions_snapshot_target_hex(
   snapshot: IncomingReactionsSnapshot,
 ) -> String
 
-/// Returns the snapshot as a `List(#(emoji, List(author_pubkey_hex)))`.
-/// The FFI side flattens the JS Map<emoji, Set<author_hex>> into this
-/// shape so Gleam doesn't need to interop with Map/Set directly.
+/// Returns the snapshot as a `List(#(emoji, List(#(author_pubkey_hex, sent_at_ms))))`.
+/// The FFI side flattens the JS Map<emoji, Map<author_hex, sent_at_ms>> into
+/// this shape so Gleam doesn't need to interop with Map/Set directly. The
+/// `sent_at_ms` is the unix-ms timestamp of the LWW-winning Add entry — it's
+/// what the message-details panel renders next to each reactor.
 @external(javascript, "./sunset.ffi.mjs", "reactionsSnapshotEntries")
 pub fn reactions_snapshot_entries(
   snapshot: IncomingReactionsSnapshot,
-) -> List(#(String, List(String)))
+) -> List(#(String, List(#(String, Int))))
 
 /// Register the per-target snapshot callback. Fires on initial replay
 /// and again whenever the target's reaction state changes.
@@ -246,6 +254,12 @@ pub fn client_public_key_hex(client: ClientHandle) -> String
 /// to render the relay's peer_id.
 @external(javascript, "./sunset.ffi.mjs", "bitsToHex")
 pub fn bits_to_hex(bits: BitArray) -> String
+
+/// HH:MM:SS local time of a unix-ms timestamp. The exact-seconds form
+/// is what the message-details panel renders for delivery acks and
+/// reaction timestamps.
+@external(javascript, "./sunset.ffi.mjs", "formatTimeMsExact")
+pub fn format_time_ms_exact(ms: Int) -> String
 
 /// Lazily registers the `emoji-picker-element` web component. Idempotent;
 /// safe to call on every picker open. Resolves the dynamic import on

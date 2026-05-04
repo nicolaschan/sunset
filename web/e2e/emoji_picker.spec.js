@@ -222,3 +222,83 @@ test("emoji picker carries the app's resolved theme class (dark)", async ({
 
   await ctx.close();
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// Desktop full picker is anchored near the trigger + dismissable
+// ─────────────────────────────────────────────────────────────────────
+
+test("desktop full picker opens near the trigger, not at viewport center", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "mobile uses a bottom sheet — anchoring is desktop-only",
+  );
+
+  const { ctx, page, composer } = await openChat(browser, {
+    hash: "picker-anchor",
+  });
+  // Send a couple of messages so the trigger sits well below the
+  // viewport's vertical center; if the picker opens at viewport
+  // center the gap to the trigger will be huge, and the assertion
+  // below catches that.
+  for (let i = 0; i < 3; i += 1) {
+    await composer.fill(`anchor-${i}-${Date.now()}`);
+    await composer.press("Enter");
+  }
+  const msgRow = page.locator(".msg-row").last();
+  await expect(msgRow).toBeVisible({ timeout: 15_000 });
+
+  await msgRow.locator('button[aria-label="React"]').click({ force: true });
+  const small = page.locator('[data-testid="reaction-picker"]').first();
+  await expect(small).toBeVisible({ timeout: 5_000 });
+
+  const moreBtn = page.locator('[data-testid="reaction-picker-more"]').first();
+  const triggerCenterY = await moreBtn.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    return r.top + r.height / 2;
+  });
+  await moreBtn.click();
+
+  const overlay = page.locator('[data-testid="full-emoji-picker-overlay"]');
+  await expect(overlay).toBeVisible({ timeout: 10_000 });
+
+  const overlayBox = await overlay.boundingBox();
+  expect(overlayBox).not.toBeNull();
+
+  // The picker should be vertically near the trigger — within one
+  // picker-height (≈ 410px) of the click. If it lands at the
+  // viewport's vertical center, the gap is unbounded by the
+  // viewport's halfway point (~340 on desktop).
+  const overlayCenterY = overlayBox.y + overlayBox.height / 2;
+  expect(Math.abs(overlayCenterY - triggerCenterY)).toBeLessThan(420);
+
+  await ctx.close();
+});
+
+test("desktop full picker closes when clicking the backdrop", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "mobile dismisses via the bottom-sheet backdrop, covered elsewhere",
+  );
+
+  const { ctx, page, composer } = await openChat(browser, {
+    hash: "picker-backdrop-close",
+  });
+  await openFullPicker(page, false, composer);
+
+  const overlay = page.locator('[data-testid="full-emoji-picker-overlay"]');
+  await expect(overlay).toBeVisible({ timeout: 5_000 });
+
+  // The backdrop spans the entire viewport; click well outside the
+  // picker so we hit the backdrop, not the picker itself. Top-left
+  // corner is a reliable anchor here — the picker is anchored to
+  // the right side of the chat column.
+  await page.mouse.click(8, 8);
+
+  await expect(overlay).not.toBeVisible({ timeout: 5_000 });
+
+  await ctx.close();
+});

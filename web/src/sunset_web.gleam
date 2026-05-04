@@ -13,6 +13,7 @@
 //// so a refresh restores the user's state.
 
 import gleam/dict.{type Dict}
+import gleam/float
 import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -82,7 +83,11 @@ pub type RoomState {
     handle: Option(RoomHandle),
     messages: List(domain.Message),
     members: List(domain.Member),
-    receipts: Dict(String, Set(String)),
+    /// Per-message delivery acks: msg_id → from_pubkey (short hex) →
+    /// unix-ms when the acknowledging peer composed the receipt. The
+    /// timestamp is surfaced in the message-details panel as the
+    /// per-recipient delivered-at stamp.
+    receipts: Dict(String, Dict(String, Int)),
     reactions: Dict(String, List(Reaction)),
     current_channel: ChannelId,
     draft: String,
@@ -135,14 +140,23 @@ pub type Model {
     /// (not per-room) because only one picker is open at a time and it
     /// dismisses if you switch rooms anyway.
     full_picker_for: Option(String),
+    /// Click-relative position of the trigger that opened the desktop
+    /// full emoji picker, plus the viewport height at the time of the
+    /// click. `None` for sheet-mode (mobile) opens; for desktop opens
+    /// it lets the overlay anchor itself near the trigger and decide
+    /// whether there's space to render below or above. Cleared on
+    /// `CloseFullEmojiPicker`.
+    full_picker_anchor: Option(#(Float, Float)),
     /// Per-target reaction state from the bridge tracker. TEMPORARILY
     /// global on the merged branch — the reactions tracker in
     /// sunset-core::reactions is currently per-Client (not per-room).
     /// Migrating reactions to per-OpenRoom (so each room has its own
-    /// `Dict(target_hex, Dict(emoji, Set(author_pubkey_hex)))`) is
+    /// `Dict(target_hex, Dict(emoji, Dict(author_pubkey_hex, sent_at_ms)))`) is
     /// tracked as a follow-up; ReactionsChanged from any room will
-    /// merge into this single dict for now.
-    reactions: Dict(String, Dict(String, Set(String))),
+    /// merge into this single dict for now. The inner-most `Int` is the
+    /// LWW-winning Add entry's unix-ms — the timestamp the message-details
+    /// panel renders next to each reactor.
+    reactions: Dict(String, Dict(String, Dict(String, Int))),
     /// Name of the room currently being dragged in the rooms rail.
     /// `None` between drag operations.
     dragging_room: Option(String),
@@ -202,10 +216,14 @@ pub type Msg {
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
   AddReaction(String, String)
-  ReactionsChanged(target: String, snapshot: Dict(String, Set(String)))
+  ReactionsChanged(target: String, snapshot: Dict(String, Dict(String, Int)))
   ToggleReactionEmoji(target: String, emoji: String)
   ReactionSent(Result(Nil, String))
-  OpenFullEmojiPicker(String)
+  /// Open the full emoji picker. The optional `#(client_y, viewport_h)`
+  /// is captured by the trigger's click decoder on desktop so the
+  /// overlay can anchor itself to the click; mobile uses a bottom
+  /// sheet and passes `None`.
+  OpenFullEmojiPicker(target: String, anchor: Option(#(Float, Float)))
   CloseFullEmojiPicker
   OpenDetail(String)
   CloseDetail
@@ -227,7 +245,12 @@ pub type Msg {
   /// A room's wasm-side handle is ready; register callbacks + start presence.
   RoomOpened(name: String, handle: RoomHandle)
   IncomingMsg(room: String, im: IncomingMessage)
-  IncomingReceipt(room: String, message_id: String, from_pubkey: String)
+  IncomingReceipt(
+    room: String,
+    message_id: String,
+    from_pubkey: String,
+    delivered_at_ms: Int,
+  )
   SubmitDraft
   MessageSent(Result(String, String))
   MembersUpdated(room: String, members: List(domain.Member))
@@ -296,6 +319,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       landing_input: "",
       sidebar_search: "",
       full_picker_for: None,
+      full_picker_anchor: None,
       reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
@@ -954,6 +978,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               name,
               sunset.rec_for_value_hash_hex(r),
               short_pubkey(sunset.rec_from_pubkey(r)),
+              sunset.rec_sent_at_ms(r),
             ))
           })
           sunset.on_members_changed(handle, fn(ms) {
@@ -965,7 +990,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             let inner_dict =
               list.fold(entries, dict.new(), fn(d, pair) {
                 let #(emoji, authors) = pair
-                dict.insert(d, emoji, set.from_list(authors))
+                dict.insert(d, emoji, dict.from_list(authors))
               })
             dispatch(ReactionsChanged(target, inner_dict))
           })
@@ -1057,15 +1082,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     }
     MessageSent(_) -> #(model, effect.none())
-    IncomingReceipt(name, message_id, from_pubkey) -> {
+    IncomingReceipt(name, message_id, from_pubkey, delivered_at_ms) -> {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
           let existing = case dict.get(state.receipts, message_id) {
-            Ok(s) -> s
-            Error(_) -> set.new()
+            Ok(d) -> d
+            Error(_) -> dict.new()
           }
-          let updated = set.insert(existing, from_pubkey)
+          let updated = dict.insert(existing, from_pubkey, delivered_at_ms)
           let new_state =
             RoomState(
               ..state,
@@ -1310,7 +1335,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Ok(snap) ->
           case dict.get(snap, emoji), self_pubkey_hex_opt {
             Ok(authors), Some(me) ->
-              case set.contains(authors, me) {
+              case dict.has_key(authors, me) {
                 True -> "remove"
                 False -> "add"
               }
@@ -1318,7 +1343,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         Error(_) -> "add"
       }
-      let next_model = Model(..model, full_picker_for: None)
+      let next_model =
+        Model(..model, full_picker_for: None, full_picker_anchor: None)
       let send_eff = case dict.get(model.rooms, active_name) {
         Ok(state) ->
           case state.handle {
@@ -1345,7 +1371,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(Model(..next_model, rooms: rooms), send_eff)
     }
     ReactionSent(_) -> #(model, effect.none())
-    OpenFullEmojiPicker(target) -> {
+    OpenFullEmojiPicker(target, anchor) -> {
       // Closing the per-room quick-picker prevents both pickers from
       // rendering at once; full picker takes over.
       let active_name = active_room_name(model)
@@ -1363,12 +1389,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let register_eff =
         effect.from(fn(_dispatch) { sunset.register_emoji_picker() })
       #(
-        Model(..model, rooms: rooms, full_picker_for: Some(target)),
+        Model(
+          ..model,
+          rooms: rooms,
+          full_picker_for: Some(target),
+          full_picker_anchor: anchor,
+        ),
         register_eff,
       )
     }
     CloseFullEmojiPicker -> #(
-      Model(..model, full_picker_for: None),
+      Model(..model, full_picker_for: None, full_picker_anchor: None),
       effect.none(),
     )
   }
@@ -1457,12 +1488,69 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
-  // Full emoji picker. Desktop renders a centered overlay; phone
-  // renders a bottom sheet. Each goes into its viewport's slot in
-  // `shell.view` (overlay / reaction_sheet) so only the right one is
-  // visible at a time.
-  let full_picker_overlay_el = case model.full_picker_for {
-    Some(target) ->
+  // Full emoji picker. Desktop renders a click-anchored overlay
+  // (placed above or below the trigger depending on viewport space);
+  // phone renders a bottom sheet. Each goes into its viewport's slot
+  // in `shell.view` so only the right one is visible at a time.
+  //
+  // Two desktop pieces:
+  //   * `full_picker_backdrop_el` — transparent, full-viewport, sits
+  //     just under the picker. Its only job is to dispatch
+  //     `CloseFullEmojiPicker` on click, giving the picker a normal
+  //     "click outside to dismiss" affordance.
+  //   * `full_picker_overlay_el` — the picker itself, positioned
+  //     against the click anchor stored in `full_picker_anchor`.
+  let full_picker_backdrop_el = case model.viewport, model.full_picker_for {
+    domain.Desktop, Some(_) ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "full-emoji-picker-backdrop"),
+          event.on_click(CloseFullEmojiPicker),
+          ui.css([
+            #("position", "fixed"),
+            #("inset", "0"),
+            #("background", "transparent"),
+            #("z-index", "99"),
+          ]),
+        ],
+        [],
+      )
+    _, _ -> element.fragment([])
+  }
+
+  let full_picker_overlay_el = case
+    model.viewport,
+    model.full_picker_for,
+    model.full_picker_anchor
+  {
+    domain.Desktop, Some(target), Some(#(anchor_y, viewport_h)) ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "full-emoji-picker-overlay"),
+          // Position the picker against the click anchor:
+          //   * `top` is clamped via CSS to keep the picker fully on-
+          //     screen even at the viewport edges.
+          //   * `left` is centered horizontally — the picker is
+          //     ~360px wide, so we offset by 180px and clamp to keep
+          //     a small gutter from the edges.
+          // Vertical placement flips above the trigger when there
+          // isn't ~`PICKER_HEIGHT + 16px` of room below the click,
+          // so the picker doesn't visually fall off the bottom of
+          // the viewport.
+          ui.css(picker_anchor_styles(palette, anchor_y, viewport_h)),
+        ],
+        [
+          emoji_picker.view(
+            palette: palette,
+            mode: model.mode,
+            on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+          ),
+        ],
+      )
+    domain.Desktop, Some(target), None ->
+      // Anchor data is missing (e.g. the picker was opened by some
+      // path other than the on-row "+" button). Fall back to the
+      // viewport-centered overlay so the picker is still reachable.
       html.div(
         [
           attribute.attribute("data-testid", "full-emoji-picker-overlay"),
@@ -1486,7 +1574,7 @@ fn room_view_with_state(
           ),
         ],
       )
-    None -> element.fragment([])
+    _, _, _ -> element.fragment([])
   }
 
   let settings_overlay_el = case model.viewport, model.settings_open {
@@ -1550,6 +1638,7 @@ fn room_view_with_state(
               palette: palette,
               message: m,
               receipts: receipts_for(state.receipts, m.id),
+              reactions: reactions_for(model.reactions, m.id),
               members: state.members,
               on_close: CloseDetail,
             ),
@@ -1740,6 +1829,7 @@ fn room_view_with_state(
           palette: palette,
           message: m,
           receipts: receipts_for(state.receipts, m.id),
+          reactions: reactions_for(model.reactions, m.id),
           members: state.members,
           on_close: CloseDetail,
         )
@@ -1754,6 +1844,7 @@ fn room_view_with_state(
       voice_popover_overlay(palette, model, state),
       peer_status_popover_overlay(palette, model, state),
       relay_popover_overlay(palette, model),
+      full_picker_backdrop_el,
       full_picker_overlay_el,
       settings_overlay_el,
     ]),
@@ -1924,6 +2015,64 @@ pub fn relay_status_pill(
   }
 }
 
+/// Compute inline styles for the desktop full-emoji-picker overlay
+/// based on the click anchor (`anchor_y` is the click's `clientY`,
+/// `viewport_h` is the live `view.innerHeight`).
+///
+/// Placement rule: open below the trigger when there's at least one
+/// picker height + 16px of room; otherwise flip above. Horizontal
+/// position is centered on the right side of the chat (the trigger
+/// always sits in the message-row toolbar at the right edge), with a
+/// `clamp` to keep the picker fully on-screen. The picker is sized
+/// at ~360×400px by emoji-picker-element's defaults.
+fn picker_anchor_styles(
+  palette: theme.Palette,
+  anchor_y: Float,
+  viewport_h: Float,
+) -> List(#(String, String)) {
+  let picker_h = 410.0
+  let gap = 8.0
+  let space_below = viewport_h -. anchor_y
+  // Vertical placement:
+  //   * room below → place picker just below the trigger
+  //   * not enough room below → flip above the trigger
+  let top_css = case space_below >. picker_h +. gap {
+    True ->
+      "clamp(8px, "
+      <> float_px(anchor_y +. gap)
+      <> ", calc(100dvh - "
+      <> float_px(picker_h +. 8.0)
+      <> "))"
+    False ->
+      "clamp(8px, "
+      <> float_px(anchor_y -. picker_h -. gap)
+      <> ", calc(100dvh - "
+      <> float_px(picker_h +. 8.0)
+      <> "))"
+  }
+  // Horizontal: keep the picker right-anchored in the chat column —
+  // the trigger sits at the right edge of the message row, so
+  // pinning the picker's right edge a small gutter inside the
+  // viewport's right edge feels natural.
+  let right_css = "clamp(8px, 16px, calc(100dvw - 372px))"
+  [
+    #("position", "fixed"),
+    #("top", top_css),
+    #("right", right_css),
+    #("z-index", "100"),
+    #("background", palette.surface),
+    #("border", "1px solid " <> palette.border),
+    #("border-radius", "8px"),
+    #("box-shadow", palette.shadow_lg),
+  ]
+}
+
+fn float_px(n: Float) -> String {
+  // Round-down formatting that keeps CSS happy without printing a
+  // trailing decimal for whole-pixel values.
+  float.to_string(n) <> "px"
+}
+
 fn find_message(ms: List(Message), id: String) -> Option(Message) {
   list.find(ms, fn(m) { m.id == id })
   |> option.from_result
@@ -1975,17 +2124,17 @@ fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
 /// `by_you` flag; `None` (no client yet) treats every reaction as
 /// not-by-you so the UI doesn't lie.
 fn snapshot_to_reactions(
-  snapshot: Dict(String, Set(String)),
+  snapshot: Dict(String, Dict(String, Int)),
   self_pubkey_hex: Option(String),
 ) -> List(domain.Reaction) {
   dict.to_list(snapshot)
   |> list.filter_map(fn(pair) {
     let #(emoji, authors) = pair
-    case set.size(authors) {
+    case dict.size(authors) {
       0 -> Error(Nil)
       n -> {
         let by_you = case self_pubkey_hex {
-          Some(me) -> set.contains(authors, me)
+          Some(me) -> dict.has_key(authors, me)
           None -> False
         }
         Ok(domain.Reaction(emoji: emoji, count: n, by_you: by_you))
@@ -1998,10 +2147,27 @@ fn client_pubkey_hex(c: ClientHandle) -> String {
   sunset.client_public_key_hex(c)
 }
 
-fn receipts_for(receipts: Dict(String, Set(String)), id: String) -> Set(String) {
+fn receipts_for(
+  receipts: Dict(String, Dict(String, Int)),
+  id: String,
+) -> Dict(String, Int) {
   case dict.get(receipts, id) {
-    Ok(s) -> s
-    Error(_) -> set.new()
+    Ok(d) -> d
+    Error(_) -> dict.new()
+  }
+}
+
+/// Reactions for a single message id, keyed by `model.reactions[message_id]`.
+/// Returns the empty dict when the engine hasn't surfaced any reactions for
+/// that message yet so the details panel can render an empty section
+/// instead of branching at the call site.
+fn reactions_for(
+  reactions: Dict(String, Dict(String, Dict(String, Int))),
+  id: String,
+) -> Dict(String, Dict(String, Int)) {
+  case dict.get(reactions, id) {
+    Ok(d) -> d
+    Error(_) -> dict.new()
   }
 }
 
@@ -2069,7 +2235,9 @@ fn phone_reaction_grid(
         attribute.title("More reactions"),
         attribute.attribute("aria-label", "More reactions"),
         attribute.attribute("data-testid", "reaction-picker-more"),
-        event.on_click(OpenFullEmojiPicker(message_id)),
+        // Mobile uses the bottom-sheet variant of the full picker; no
+        // anchor is needed (the sheet is its own placement).
+        event.on_click(OpenFullEmojiPicker(message_id, None)),
         ui.css([
           #("padding", "12px"),
           #("font-size", "26px"),

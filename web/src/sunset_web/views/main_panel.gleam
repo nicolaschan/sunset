@@ -14,7 +14,6 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
-import gleam/set.{type Set}
 import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
@@ -44,9 +43,10 @@ pub fn view(
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker on_open_full_picker: fn(String, Option(#(Float, Float))) ->
+    msg,
   on_open_detail on_open_detail: fn(String) -> msg,
-  receipts receipts: Dict(String, Set(String)),
+  receipts receipts: Dict(String, Dict(String, Int)),
   selected_msg_id selected_msg_id: Option(String),
   on_toggle_selected on_toggle_selected: fn(String) -> msg,
   is_spoiler_revealed is_revealed: fn(markdown.SpoilerKey) -> Bool,
@@ -153,9 +153,9 @@ fn messages_list(
   detail_msg_id: Option(String),
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
   on_open_detail: fn(String) -> msg,
-  receipts: Dict(String, Set(String)),
+  receipts: Dict(String, Dict(String, Int)),
   selected_msg_id: Option(String),
   on_toggle_selected: fn(String) -> msg,
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
@@ -239,10 +239,10 @@ fn message_view(
   selected: Bool,
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
   on_open_detail: fn(String) -> msg,
   on_toggle_selected: fn(String) -> msg,
-  receipts: Dict(String, Set(String)),
+  receipts: Dict(String, Dict(String, Int)),
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
   on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
   author_color: String,
@@ -251,7 +251,7 @@ fn message_view(
     m.you
     && {
       case dict.get(receipts, m.id) {
-        Ok(s) -> set.size(s) == 0
+        Ok(d) -> dict.size(d) == 0
         Error(_) -> True
       }
     }
@@ -475,7 +475,7 @@ fn reaction_picker(
   p: Palette,
   msg_id: String,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String) -> msg,
+  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
 ) -> Element(msg) {
   let quick_buttons =
     list.map(quick_reactions, fn(emoji) {
@@ -506,7 +506,18 @@ fn reaction_picker(
       [
         attribute.title("More reactions"),
         attribute.attribute("data-testid", "reaction-picker-more"),
-        event.on_click(on_open_full_picker(msg_id)),
+        // Capture the click's `clientY` and the live viewport height
+        // (`view.innerHeight`) so the desktop overlay can decide
+        // whether there's more room above or below the trigger before
+        // it positions itself. Both fields are read directly off the
+        // MouseEvent — the `view` accessor is the WindowProxy that
+        // owns the document, which is non-null for any UIEvent fired
+        // from a click.
+        event.on("click", {
+          use cy <- decode.subfield(["clientY"], decode.float)
+          use vh <- decode.subfield(["view", "innerHeight"], decode.float)
+          decode.success(on_open_full_picker(msg_id, option.Some(#(cy, vh))))
+        }),
         ui.css([
           #("width", "32px"),
           #("height", "32px"),

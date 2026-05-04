@@ -263,7 +263,7 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
         message_view) so the background paints to the column edges. */
      @media (hover: hover) {
        .msg-row:hover {
-         background: " <> palette.surface_alt <> ";
+         background: " <> palette.row_highlight <> ";
        }
      }
      /* `.is-active` pins the highlight while the row's reaction picker
@@ -271,7 +271,7 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
         row. Without this the highlight would flicker off as soon as
         the user moved their mouse to the picker. */
      .msg-row.is-active {
-       background: " <> palette.surface_alt <> ";
+       background: " <> palette.row_highlight <> ";
      }
      /* On touch devices the action toolbar ('overflow menu') becomes
         visible by tapping a message row — `is-selected` pins it. The
@@ -282,7 +282,7 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
         with the more transient :hover on pointer devices). */
      @media (hover: none) {
        .msg-row.is-selected {
-         background: " <> palette.surface_alt <> ";
+         background: " <> palette.row_highlight <> ";
        }
      }
      /* Action toolbar visibility splits cleanly by input modality:

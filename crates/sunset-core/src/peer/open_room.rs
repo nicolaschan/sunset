@@ -14,7 +14,7 @@ use crate::membership::TrackerHandles;
 use crate::message::DecodedMessage;
 
 pub(crate) type MessageCallback = Box<dyn Fn(&DecodedMessage, bool /* is_self */)>;
-pub(crate) type ReceiptCallback = Box<dyn Fn(sunset_store::Hash, &crate::IdentityKey)>;
+pub(crate) type ReceiptCallback = Box<dyn Fn(sunset_store::Hash, &crate::IdentityKey, u64)>;
 
 #[derive(Default)]
 pub(crate) struct RoomCallbacks {
@@ -87,7 +87,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         }
     }
 
-    pub fn on_receipt<F: Fn(sunset_store::Hash, &crate::IdentityKey) + 'static>(&self, cb: F) {
+    pub fn on_receipt<F: Fn(sunset_store::Hash, &crate::IdentityKey, u64) + 'static>(&self, cb: F) {
         let mut cbs = self.inner.callbacks.borrow_mut();
         let was_unregistered = cbs.on_message.is_none() && cbs.on_receipt.is_none();
         cbs.on_receipt = Some(Box::new(cb));
@@ -173,7 +173,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                         }
                         crate::MessageBody::Receipt { for_value_hash } => {
                             if let Some(cb) = cbs.on_receipt.as_ref() {
-                                cb(*for_value_hash, &decoded.author_key);
+                                cb(*for_value_hash, &decoded.author_key, decoded.sent_at_ms);
                             }
                         }
                         // Reactions are handled by ReactionTracker

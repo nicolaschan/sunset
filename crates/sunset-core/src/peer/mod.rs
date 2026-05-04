@@ -469,15 +469,15 @@ mod tests {
                 let peer = helpers::mk_peer(ident(12)).await;
                 let room = peer.open_room("alpha").await.expect("open_room");
 
-                let received: Rc<RefCell<Vec<sunset_store::Hash>>> =
+                let received: Rc<RefCell<Vec<(sunset_store::Hash, u64)>>> =
                     Rc::new(RefCell::new(Vec::new()));
                 let received_clone = received.clone();
                 // Register a no-op on_message so the decode loop spawns even
                 // though we only care about receipts here. (The loop spawns on
                 // first on_message OR on_receipt registration — either works.)
                 room.on_message(|_, _| {});
-                room.on_receipt(move |for_hash, _from: &crate::IdentityKey| {
-                    received_clone.borrow_mut().push(for_hash);
+                room.on_receipt(move |for_hash, _from: &crate::IdentityKey, sent_at_ms| {
+                    received_clone.borrow_mut().push((for_hash, sent_at_ms));
                 });
 
                 // Compose+insert a Receipt referencing some target hash.
@@ -501,7 +501,7 @@ mod tests {
                 for _ in 0..50 {
                     tokio::task::yield_now().await;
                 }
-                assert_eq!(received.borrow().clone(), vec![target]);
+                assert_eq!(received.borrow().clone(), vec![(target, 1_700_000_000_000)]);
             })
             .await;
     }
