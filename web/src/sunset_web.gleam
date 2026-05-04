@@ -51,6 +51,7 @@ import sunset_web/views/phone_header
 import sunset_web/views/rooms
 import sunset_web/views/shell
 import sunset_web/views/touch_drag
+import sunset_web/views/voice_error_toast
 import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
 import sunset_web/voice
@@ -1832,6 +1833,15 @@ fn room_view_with_state(
       voice_popover_overlay(palette, model, state),
       peer_status_popover_overlay(palette, model, state),
       full_picker_overlay_el,
+      case model.voice.permission_error {
+        Some(msg) ->
+          voice_error_toast.view(
+            palette: palette,
+            message: msg,
+            on_close: ResetVoiceError,
+          )
+        None -> element.fragment([])
+      },
     ]),
     phone_header.view(
       palette: palette,
