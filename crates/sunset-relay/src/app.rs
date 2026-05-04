@@ -54,6 +54,14 @@ async fn dashboard_handler(State(state): State<AppState>) -> Response {
 
 /// Either a WebSocket upgrade (engine path) or the JSON identity descriptor
 /// for browsers/clients that GET / without an Upgrade header.
+///
+/// Every JSON response — success AND the early-503 paths — sets
+/// `Access-Control-Allow-Origin: *`. Without it, browsers from a
+/// different origin (e.g. `https://sunset.chat` fetching from
+/// `https://relay.sunset.chat`) CORS-block 5xx responses, so the
+/// resolver upstream sees a generic network error instead of a clean
+/// `status 503`. That difference is invisible to the supervisor's
+/// retry logic but extremely confusing in browser console logs.
 async fn root_handler(
     State(state): State<AppState>,
     upgrade: Option<WebSocketUpgrade>,
@@ -61,15 +69,21 @@ async fn root_handler(
     if let Some(ws) = upgrade {
         return ws_handler(ws, state.ws_tx).await;
     }
+
+    fn cors_503(reason: &'static str) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+        headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        (StatusCode::SERVICE_UNAVAILABLE, headers, reason).into_response()
+    }
+
     let (reply, rx) = oneshot::channel();
     if state.cmd_tx.send(RelayCommand::Identity { reply }).is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable\n").into_response();
+        return cors_503("engine unavailable: cmd_tx closed\n");
     }
     let snap = match rx.await {
         Ok(s) => s,
-        Err(_) => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable\n").into_response();
-        }
+        Err(_) => return cors_503("engine unavailable: reply dropped\n"),
     };
     let body = render_identity(&snap);
     let mut headers = HeaderMap::new();
