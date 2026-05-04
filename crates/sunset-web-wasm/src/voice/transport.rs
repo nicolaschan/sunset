@@ -13,17 +13,16 @@ use wasmtimer::tokio::sleep;
 
 use sunset_core::bus::{Bus, BusImpl};
 use sunset_core::{Identity, Room};
-use sunset_noise::NoiseTransport;
 use sunset_store_memory::MemoryStore;
 use sunset_sync::MultiTransport;
-use sunset_sync_webrtc_browser::WebRtcRawTransport;
-use sunset_sync_ws_browser::WebSocketRawTransport;
 
 use super::VoiceCell;
 
-type WsT = NoiseTransport<WebSocketRawTransport>;
-type RtcT = NoiseTransport<WebRtcRawTransport>;
-pub(crate) type BusArc = Rc<BusImpl<MemoryStore, MultiTransport<WsT, RtcT>>>;
+// Re-use the Client's transport types so the voice subsystem's `Bus`
+// shares one `SyncEngine` instance with the rest of the app. Without
+// this alignment the inbound WebRTC pipeline would fragment.
+pub(crate) type BusArc =
+    Rc<BusImpl<MemoryStore, MultiTransport<crate::client::WsT, crate::client::RtcT>>>;
 
 /// Heartbeat cadence. Liveness considers a peer "in-call" if heartbeats
 /// arrive within ~5 s, so 2 s leaves room for one or two losses.

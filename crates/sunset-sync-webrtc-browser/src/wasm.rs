@@ -30,7 +30,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit,
+    Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit,
     RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit, RtcIceServer, RtcPeerConnection,
     RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
 };
@@ -51,6 +51,13 @@ enum WebRtcSignalKind {
     IceCandidate(String),
 }
 
+/// `Clone` is shallow: every field is `Rc`/`PeerId`/`Vec<String>`, so
+/// clones share the same dispatcher, accept worker, signaler, and
+/// `completed_rx` queue. This is intentional — it lets callers wrap
+/// the same transport instance in two roles (e.g. the inbound side
+/// inside a `SpawningAcceptor` pump and the outbound side as the
+/// connector) without losing signaling routing or duplicating state.
+#[derive(Clone)]
 pub struct WebRtcRawTransport {
     signaler: Rc<dyn Signaler>,
     local_peer: PeerId,
@@ -183,13 +190,25 @@ impl RawTransport for WebRtcRawTransport {
 
         let on_open = make_open_closure(open_tx);
         dc.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-        let on_msg = make_msg_closure(msg_tx);
+        let on_msg = make_msg_closure(msg_tx.clone());
         dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+        // Without on_close, a peer-side DC drop leaves our recv_reliable
+        // poll_fn parked forever (the mpsc Sender lives inside the
+        // on_msg closure, which we keep alive — so the Receiver never
+        // sees `None`). That hang propagates up through Noise's
+        // recv_reliable, NoiseTransport.connect, and engine.add_peer,
+        // which prevents the supervisor from observing the failure and
+        // retrying. Closing the channel here turns a remote drop into
+        // an `Err("dc closed")` that the supervisor can act on.
+        let on_close = make_close_closure(msg_tx);
+        dc.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
         let on_open_unrel = make_open_closure(open_tx_unrel);
         dc_unrel.set_onopen(Some(on_open_unrel.as_ref().unchecked_ref()));
-        let on_msg_unrel = make_msg_closure(msg_tx_unrel);
+        let on_msg_unrel = make_msg_closure(msg_tx_unrel.clone());
         dc_unrel.set_onmessage(Some(on_msg_unrel.as_ref().unchecked_ref()));
+        let on_close_unrel = make_close_closure(msg_tx_unrel);
+        dc_unrel.set_onclose(Some(on_close_unrel.as_ref().unchecked_ref()));
 
         // Create offer + setLocalDescription.
         let offer = JsFuture::from(pc.create_offer())
@@ -284,8 +303,10 @@ impl RawTransport for WebRtcRawTransport {
             _on_ice: on_ice,
             _on_open: Some(on_open),
             _on_msg: Some(on_msg),
+            _on_close: Some(on_close),
             _on_open_unrel: Some(on_open_unrel),
             _on_msg_unrel: Some(on_msg_unrel),
+            _on_close_unrel: Some(on_close_unrel),
             _on_dc: None,
         })
     }
@@ -397,6 +418,13 @@ async fn run_accept_one(
                 dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
                 on_msg.forget();
 
+                // Mirror the connect-side close handler: a peer-side
+                // drop must surface as `Err("dc closed")` from
+                // recv_reliable instead of an indefinite poll_fn park.
+                let on_close = make_close_closure(msg_tx_for_dc.clone());
+                dc.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+                on_close.forget();
+
                 if let Some(tx) = dc_tx_cell.borrow_mut().take() {
                     let _ = tx.send(dc);
                 }
@@ -409,6 +437,10 @@ async fn run_accept_one(
                 let on_msg = make_msg_closure(msg_tx_for_dc_unrel.clone());
                 dc.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
                 on_msg.forget();
+
+                let on_close = make_close_closure(msg_tx_for_dc_unrel.clone());
+                dc.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+                on_close.forget();
 
                 if let Some(tx) = dc_tx_unrel_cell.borrow_mut().take() {
                     let _ = tx.send(dc);
@@ -511,8 +543,10 @@ async fn run_accept_one(
         _on_ice: on_ice,
         _on_open: None,
         _on_msg: None,
+        _on_close: None,
         _on_open_unrel: None,
         _on_msg_unrel: None,
+        _on_close_unrel: None,
         _on_dc: Some(on_dc),
     })
 }
@@ -532,10 +566,17 @@ pub struct WebRtcRawConnection {
     /// `None` on the accept side.
     _on_open: Option<Closure<dyn FnMut(JsValue)>>,
     _on_msg: Option<Closure<dyn FnMut(MessageEvent)>>,
+    /// Reliable-channel `onclose` handler — drops the message Sender so
+    /// recv_reliable wakes up with `Err("dc closed")` on remote drop.
+    /// Like `_on_open`/`_on_msg`, only set on the connect side; accept
+    /// side leaks it in the ondatachannel callback.
+    _on_close: Option<Closure<dyn FnMut(Event)>>,
     /// Connect side keeps these on the connection (mirrors `_on_open` /
     /// `_on_msg` for the unreliable channel). `None` on the accept side.
     _on_open_unrel: Option<Closure<dyn FnMut(JsValue)>>,
     _on_msg_unrel: Option<Closure<dyn FnMut(MessageEvent)>>,
+    /// Unreliable-channel `onclose`, mirrors `_on_close`.
+    _on_close_unrel: Option<Closure<dyn FnMut(Event)>>,
     /// Only set on the accept side.
     _on_dc: Option<Closure<dyn FnMut(RtcDataChannelEvent)>>,
 }
@@ -655,6 +696,18 @@ fn make_open_closure_from_cell(
         if let Some(tx) = cell.borrow_mut().take() {
             let _ = tx.send(());
         }
+    })
+}
+
+/// `onclose` closure: closes the message-side channel so any pending
+/// `recv_reliable` poll wakes up with `Err("dc closed")` instead of
+/// hanging until the WebRtcRawConnection itself is dropped.
+/// `close_channel` is the right primitive here — it's idempotent and
+/// it also takes effect even if the on_msg closure is still holding a
+/// clone of the Sender.
+fn make_close_closure(tx: mpsc::UnboundedSender<Bytes>) -> Closure<dyn FnMut(Event)> {
+    Closure::<dyn FnMut(Event)>::new(move |_: Event| {
+        tx.close_channel();
     })
 }
 
