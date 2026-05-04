@@ -589,6 +589,125 @@ async fn combiner_emits_state_on_heartbeat() {
         .await;
 }
 
+/// Regression: a peer that sends frames but never sends a heartbeat must
+/// have `in_call` flip back to `false` once frames stop. Before this was
+/// fixed, `in_call` was sticky-true: frame Stale dropped `talking` but
+/// couldn't safely flip `in_call` (it didn't know membership state), and
+/// no membership Stale ever fired (no entry to time out for). The combiner
+/// now tracks frame_alive and membership_alive independently and computes
+/// `in_call = frame_alive || membership_alive`, so frame Stale alone is
+/// sufficient when membership has never fired Live.
+///
+/// Mirrors the hard-departure churn case where a peer closes the tab
+/// before its first heartbeat reaches us: only the in-flight frames
+/// registered the peer, and we still need to evict them within the
+/// liveness budget.
+#[tokio::test(flavor = "current_thread")]
+async fn combiner_evicts_peer_seen_only_via_frames() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(40);
+            let (bob, _) = make_identity_and_room(41);
+            let alice_pk = alice.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let events: EventSink = Rc::new(RefCell::new(vec![]));
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: events.clone(),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::spawn_local(tasks.combiner);
+            tokio::task::yield_now().await;
+
+            // Inject one frame from alice — no heartbeat ever.
+            let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
+            let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
+            let bytes = enc.encode(&pcm).unwrap();
+            let now_ms: u64 = web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let pkt = sunset_voice::packet::VoicePacket::Frame {
+                codec_id: sunset_voice::CODEC_ID.to_string(),
+                seq: 1,
+                sender_time_ms: now_ms,
+                payload: bytes,
+            };
+            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(401);
+            let ev =
+                sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng).unwrap();
+            let payload = postcard::to_stdvec(&ev).unwrap();
+            let room_fp = room.fingerprint().to_hex();
+            let sender_pk = hex::encode(alice_pk.as_bytes());
+            let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
+            let dgram = SignedDatagram {
+                verifying_key: alice_pk.clone(),
+                name,
+                payload: Bytes::from(payload),
+                signature: Bytes::new(),
+            };
+            bob_bus_impl.inject(dgram).await;
+
+            // Wait for in_call=true emission (frame Live).
+            let alice_peer = PeerId(alice_pk.clone());
+            let live = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if events
+                        .borrow()
+                        .iter()
+                        .any(|e| e.peer == alice_peer && e.in_call && e.talking)
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(live.is_ok(), "expected frame Live emission within 2s");
+
+            // No more frames + no heartbeats → frame_liveness must go Stale
+            // within FRAME_STALE_AFTER (1000ms) + sweep cycle (~500ms).
+            // Then in_call must flip false because membership_alive is also
+            // false (never observed). Allow up to 4s for safety.
+            let stale = tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    if events
+                        .borrow()
+                        .iter()
+                        .any(|e| e.peer == alice_peer && !e.in_call && !e.talking)
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            assert!(
+                stale.is_ok(),
+                "expected in_call=false after frame Stale, got events: {:?}",
+                events.borrow()
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn auto_connect_dials_on_voice_presence_only_once() {
     tokio::task::LocalSet::new()

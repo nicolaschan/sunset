@@ -1,6 +1,15 @@
 //! Combines the two `Liveness` streams into `VoicePeerState`. Debounces
 //! by suppressing emissions when (in_call, talking, is_muted) doesn't
 //! change for a peer.
+//!
+//! `in_call = frame_alive || membership_alive`. Both signals must be tracked
+//! independently because a peer can register in `last_emitted` via frames
+//! before any heartbeat arrives (or vice versa). If we computed `in_call`
+//! from only the most-recent event, a hard departure that happened before
+//! the first heartbeat reached us would leave `in_call` stuck at true: frame
+//! Stale would drop `talking` but couldn't safely flip `in_call` (the peer
+//! might still be heartbeating), and no membership Stale would ever fire
+//! because membership_liveness has no entry to time out for that peer.
 
 use std::rc::Weak;
 
@@ -31,13 +40,12 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     let mut last = inner.last_emitted.borrow_mut();
                     let entry = last.entry(ev.peer.clone()).or_insert(EmittedState {
                         in_call: false, talking: false, is_muted: false,
+                        frame_alive: false, membership_alive: false,
                     });
                     let mut new = *entry;
+                    new.frame_alive = alive;
                     new.talking = alive;
-                    // Talking implies in_call.
-                    if alive {
-                        new.in_call = true;
-                    }
+                    new.in_call = new.frame_alive || new.membership_alive;
                     if new != *entry {
                         *entry = new;
                         let state = VoicePeerState {
@@ -57,10 +65,11 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     let mut last = inner.last_emitted.borrow_mut();
                     let entry = last.entry(ev.peer.clone()).or_insert(EmittedState {
                         in_call: false, talking: false, is_muted: false,
+                        frame_alive: false, membership_alive: false,
                     });
                     let mut new = *entry;
-                    // membership Live → in_call=true; Stale → in_call depends on talking
-                    new.in_call = alive || new.talking;
+                    new.membership_alive = alive;
+                    new.in_call = new.frame_alive || new.membership_alive;
                     if new != *entry {
                         *entry = new;
                         let state = VoicePeerState {

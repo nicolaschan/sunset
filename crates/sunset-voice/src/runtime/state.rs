@@ -59,12 +59,23 @@ pub(crate) enum AutoConnectState {
     Dialing,
 }
 
-/// Shape of the last `VoicePeerState` we emitted for a peer (for debounce).
+/// Shape of the last `VoicePeerState` we emitted for a peer (for debounce),
+/// plus the underlying liveness flags so the combiner can compute
+/// `in_call = frame_alive || membership_alive` deterministically regardless
+/// of the order frame/membership Stale events arrive in.
+///
+/// Without `frame_alive` / `membership_alive` the combiner can't distinguish
+/// "I never received a heartbeat from this peer" (membership has no entry,
+/// so no Stale event will ever fire) from "membership Stale already fired."
+/// In the former case, after a hard departure the frame Stale event would
+/// drop `talking` to false but leave `in_call` stuck at true forever.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct EmittedState {
     pub in_call: bool,
     pub talking: bool,
     pub is_muted: bool,
+    pub frame_alive: bool,
+    pub membership_alive: bool,
 }
 
 impl RuntimeInner {
@@ -76,6 +87,8 @@ impl RuntimeInner {
             in_call: false,
             talking: false,
             is_muted: false,
+            frame_alive: false,
+            membership_alive: false,
         });
         if entry.is_muted != is_muted {
             entry.is_muted = is_muted;
