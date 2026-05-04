@@ -23,6 +23,10 @@ const testHooks = process.env.SUNSET_TEST_HOOKS === "1";
 
 export default defineConfig({
   testDir: "e2e",
+  // Voice runner only runs voice_*.spec.js; chat runner skips voice.
+  // The voice runner uses webVoiceUiTestDist which lacks PWA assets (apple-touch-icon,
+  // manifest) that shell.spec.js asserts on, so non-voice specs would fail spuriously.
+  testMatch: testHooks ? [/voice_.*\.spec\.js$/] : undefined,
   testIgnore: testHooks ? [] : [/voice_.*\.spec\.js$/],
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
