@@ -14,6 +14,7 @@ pub(crate) struct WebSysFetch;
 #[async_trait(?Send)]
 impl HttpFetch for WebSysFetch {
     async fn get(&self, url: &str) -> Result<String> {
+        tracing::info!(%url, "resolver fetch: GET");
         let opts = RequestInit::new();
         opts.set_method("GET");
         let req = Request::new_with_str_and_init(url, &opts)
@@ -21,12 +22,23 @@ impl HttpFetch for WebSysFetch {
         let window = web_sys::window().ok_or_else(|| Error::Http("no window".into()))?;
         let resp_value = JsFuture::from(window.fetch_with_request(&req))
             .await
-            .map_err(|e| Error::Http(format!("fetch: {e:?}")))?;
+            .map_err(|e| {
+                // CORS-blocked / network-error responses surface as a JsValue
+                // that doesn't carry a status code — the browser DevTools
+                // console message ("Access … blocked by CORS policy" or
+                // "net::ERR_FAILED 503") is the only signal. Log the raw
+                // JsValue so the next prod repro shows what we got.
+                let msg = format!("fetch: {e:?}");
+                tracing::warn!(%url, "resolver fetch: network/CORS error: {msg}");
+                Error::Http(msg)
+            })?;
         let resp: Response = resp_value
             .dyn_into()
             .map_err(|_| Error::Http("not a Response".into()))?;
         if !resp.ok() {
-            return Err(Error::Http(format!("status {}", resp.status())));
+            let status = resp.status();
+            tracing::warn!(%url, status, "resolver fetch: non-2xx response");
+            return Err(Error::Http(format!("status {status}")));
         }
         let text_promise = resp
             .text()
@@ -34,7 +46,10 @@ impl HttpFetch for WebSysFetch {
         let text = JsFuture::from(text_promise)
             .await
             .map_err(|e| Error::Http(format!("await text: {e:?}")))?;
-        text.as_string()
-            .ok_or_else(|| Error::Http("body not a string".into()))
+        let s = text
+            .as_string()
+            .ok_or_else(|| Error::Http("body not a string".into()))?;
+        tracing::info!(%url, len = s.len(), "resolver fetch: ok");
+        Ok(s)
     }
 }
