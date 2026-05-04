@@ -11,8 +11,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
   type Channel, type ChannelId, type ConnStatus, type Member, type Room,
-  type Viewport, Bridge, Connected, Desktop, Minecraft, MutedP, Offline, Phone,
-  Reconnecting, Speaking, TextChannel, Voice,
+  type Viewport, Bridge, Connected, Desktop, MemberId, Minecraft, MutedP,
+  Offline, Phone, Reconnecting, Speaking, TextChannel, Voice,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -509,6 +509,7 @@ fn voice_member_row(
   popover_open: Option(String),
   on_open_voice_popover: fn(String) -> msg,
 ) -> Element(msg) {
+  let MemberId(id_str) = m.id
   let dot_color = case m.status {
     MutedP -> p.text_faint
     Speaking -> p.live
@@ -517,7 +518,7 @@ fn voice_member_row(
   let speaking = m.status == Speaking
   let muted = m.status == MutedP
   let active = case popover_open {
-    Some(name) -> name == m.name
+    Some(open_id) -> open_id == id_str
     None -> False
   }
   let bg = case active {
@@ -528,7 +529,7 @@ fn voice_member_row(
     [
       attribute.attribute("data-testid", "voice-member"),
       attribute.attribute("data-voice-name", m.name),
-      event.on_click(on_open_voice_popover(m.name)),
+      event.on_click(on_open_voice_popover(id_str)),
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),

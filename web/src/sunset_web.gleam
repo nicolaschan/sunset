@@ -1306,26 +1306,45 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     // ---- Voice control handlers ----
     JoinVoice(room_id) -> {
-      // Eagerly set self_in_call; roll back in VoicePermissionDenied if mic fails.
-      let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
       let active_name = active_room_name(model)
-      let eff = case model.client, dict.get(model.rooms, active_name) {
+      case model.client, dict.get(model.rooms, active_name) {
         Some(client), Ok(state) ->
           case state.handle {
-            Some(handle) ->
-              effect.from(fn(dispatch) {
-                voice.voice_start(client, handle, fn(result) {
-                  case result {
-                    Ok(_) -> Nil
-                    Error(msg) -> dispatch(VoicePermissionDenied(msg))
-                  }
+            Some(handle) -> {
+              // Eagerly set self_in_call; roll back in VoicePermissionDenied if mic fails.
+              let new_voice =
+                VoiceModel(..model.voice, self_in_call: Some(room_id))
+              let eff =
+                effect.from(fn(dispatch) {
+                  voice.voice_start(client, handle, fn(result) {
+                    case result {
+                      Ok(_) -> Nil
+                      Error(msg) -> dispatch(VoicePermissionDenied(msg))
+                    }
+                  })
                 })
-              })
-            None -> effect.none()
+              #(Model(..model, voice: new_voice), eff)
+            }
+            None -> {
+              let new_voice =
+                VoiceModel(
+                  ..model.voice,
+                  permission_error: Some(
+                    "Voice not ready, try again in a moment.",
+                  ),
+                )
+              #(Model(..model, voice: new_voice), effect.none())
+            }
           }
-        _, _ -> effect.none()
+        _, _ -> {
+          let new_voice =
+            VoiceModel(
+              ..model.voice,
+              permission_error: Some("Voice not ready, try again in a moment."),
+            )
+          #(Model(..model, voice: new_voice), effect.none())
+        }
       }
-      #(Model(..model, voice: new_voice), eff)
     }
 
     LeaveVoice -> {
@@ -1594,6 +1613,27 @@ fn room_view_with_state(
     None -> element.fragment([])
   }
 
+  // Derive in_call status from real voice state: a member is in_call if
+  // their id (short pubkey hex) appears as a key in model.voice.peers with
+  // in_call = True. Self is in_call if model.voice.self_in_call is Some.
+  // Falls back to fixture.members() when state.members is empty (pre-connect).
+  let members_for_channels = case state.members {
+    [] -> fixture.members()
+    ms ->
+      list.map(ms, fn(m) {
+        let MemberId(id_str) = m.id
+        let in_call_from_voice = case m.you {
+          True -> option.is_some(model.voice.self_in_call)
+          False ->
+            case dict.get(model.voice.peers, id_str) {
+              Ok(ps) -> ps.in_call
+              Error(_) -> False
+            }
+        }
+        domain.Member(..m, in_call: in_call_from_voice)
+      })
+  }
+
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
       case find_message(messages_with_live_reactions, id) {
@@ -1617,8 +1657,8 @@ fn room_view_with_state(
   }
 
   let voice_sheet_el = case model.viewport, state.sheet {
-    domain.Phone, Some(domain.VoiceSheet(member_name: name)) ->
-      case list.find(fixture.members(), fn(m) { m.name == name }) {
+    domain.Phone, Some(domain.VoiceSheet(member_name: id_str)) ->
+      case list.find(members_for_channels, fn(m) { m.id == MemberId(id_str) }) {
         Ok(m) ->
           bottom_sheet.view(
             palette: palette,
@@ -1629,12 +1669,14 @@ fn room_view_with_state(
               palette: palette,
               placement: voice_popover.InSheet,
               member: m,
-              settings: member_voice_settings(model.voice_settings, name),
+              settings: member_voice_settings(model.voice_settings, id_str),
               on_close: CloseVoicePopover,
-              on_set_volume: fn(v) { SetMemberVolume(name, v) },
-              on_toggle_denoise: ToggleMemberDenoise(name),
-              on_toggle_deafen: ToggleMemberDeafen(name),
-              on_reset: ResetMemberVoice(name),
+              on_set_volume: fn(v) {
+                SetPeerVolume(id_str, int.to_float(v) /. 100.0)
+              },
+              on_toggle_denoise: ToggleMemberDenoise(id_str),
+              on_toggle_deafen: ToggleMuteForPeer(id_str),
+              on_reset: ResetMemberVoice(id_str),
             ),
           )
         Error(_) -> element.fragment([])
@@ -1679,7 +1721,7 @@ fn room_view_with_state(
       voice_minibar.view(
         palette: palette,
         channel_name: active_voice_channel_name,
-        on_open: OpenVoicePopover("you"),
+        on_open: OpenVoicePopover("u3"),
         on_mute: ToggleSelfMute,
         on_deafen: ToggleSelfDeafen,
         on_leave: LeaveVoice,
@@ -1687,27 +1729,6 @@ fn room_view_with_state(
         self_deafened: model.voice.self_deafened,
       )
     _, _ -> element.fragment([])
-  }
-
-  // Derive in_call status from real voice state: a member is in_call if
-  // their id (short pubkey hex) appears as a key in model.voice.peers with
-  // in_call = True. Self is in_call if model.voice.self_in_call is Some.
-  // Falls back to fixture.members() when state.members is empty (pre-connect).
-  let members_for_channels = case state.members {
-    [] -> fixture.members()
-    ms ->
-      list.map(ms, fn(m) {
-        let MemberId(id_str) = m.id
-        let in_call_from_voice = case m.you {
-          True -> option.is_some(model.voice.self_in_call)
-          False ->
-            case dict.get(model.voice.peers, id_str) {
-              Ok(ps) -> ps.in_call
-              Error(_) -> False
-            }
-        }
-        domain.Member(..m, in_call: in_call_from_voice)
-      })
   }
 
   shell.view(
@@ -1815,7 +1836,7 @@ fn room_view_with_state(
         )
     },
     element.fragment([
-      voice_popover_overlay(palette, model, state),
+      voice_popover_overlay(palette, model, state, members_for_channels),
       peer_status_popover_overlay(palette, model, state),
       full_picker_overlay_el,
       case model.voice.permission_error {
@@ -1845,23 +1866,25 @@ fn voice_popover_overlay(
   palette,
   model: Model,
   state: RoomState,
+  members_for_channels: List(domain.Member),
 ) -> Element(Msg) {
   case model.viewport, state.sheet {
-    domain.Desktop, Some(domain.VoiceSheet(member_name: name)) ->
-      // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
-      case list.find(fixture.members(), fn(m) { m.name == name }) {
+    domain.Desktop, Some(domain.VoiceSheet(member_name: id_str)) ->
+      case list.find(members_for_channels, fn(m) { m.id == MemberId(id_str) }) {
         Error(_) -> element.fragment([])
         Ok(m) ->
           voice_popover.view(
             palette: palette,
             placement: voice_popover.Floating,
             member: m,
-            settings: member_voice_settings(model.voice_settings, name),
+            settings: member_voice_settings(model.voice_settings, id_str),
             on_close: CloseVoicePopover,
-            on_set_volume: fn(v) { SetMemberVolume(name, v) },
-            on_toggle_denoise: ToggleMemberDenoise(name),
-            on_toggle_deafen: ToggleMemberDeafen(name),
-            on_reset: ResetMemberVoice(name),
+            on_set_volume: fn(v) {
+              SetPeerVolume(id_str, int.to_float(v) /. 100.0)
+            },
+            on_toggle_denoise: ToggleMemberDenoise(id_str),
+            on_toggle_deafen: ToggleMuteForPeer(id_str),
+            on_reset: ResetMemberVoice(id_str),
           )
       }
     _, _ -> element.fragment([])

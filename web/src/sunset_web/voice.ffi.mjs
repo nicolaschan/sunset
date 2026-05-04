@@ -110,27 +110,32 @@ function uint8ToHex(a) {
 export function wasmVoiceStart(client, roomHandle, callback) {
   startCapture(client)
     .then(() => {
-      client.voice_start(
-        roomHandle,
-        (peerId, pcm) => {
-          const hex = uint8ToHex(new Uint8Array(peerId));
-          deliverFrame(hex, new Float32Array(pcm));
-        },
-        (peerId) => {
-          const hex = uint8ToHex(new Uint8Array(peerId));
-          dropPeer(hex);
-        },
-        (peerId, inCall, talking, isMuted) => {
-          const hex = uint8ToHex(new Uint8Array(peerId));
-          if (window.__voicePeerStateHandler) {
-            window.__voicePeerStateHandler(hex, inCall, talking, isMuted);
-          }
-        },
-        (_peerId, _gain) => {
-          // on_set_peer_volume: JS-side GainNode is managed by deliverFrame/setPeerVolume
-        },
-      );
-      callback(new Ok(null));
+      try {
+        client.voice_start(
+          roomHandle,
+          (peerId, pcm) => {
+            const hex = uint8ToHex(new Uint8Array(peerId));
+            deliverFrame(hex, new Float32Array(pcm));
+          },
+          (peerId) => {
+            const hex = uint8ToHex(new Uint8Array(peerId));
+            dropPeer(hex);
+          },
+          (peerId, inCall, talking, isMuted) => {
+            const hex = uint8ToHex(new Uint8Array(peerId));
+            if (window.__voicePeerStateHandler) {
+              window.__voicePeerStateHandler(hex, inCall, talking, isMuted);
+            }
+          },
+          (_peerId, _gain) => {
+            // on_set_peer_volume: JS-side GainNode is managed by deliverFrame/setPeerVolume
+          },
+        );
+        callback(new Ok(null));
+      } catch (e) {
+        stopCapture();
+        callback(new GError(String(e?.message || e)));
+      }
     })
     .catch((e) => {
       callback(new GError(String(e?.message || e)));
@@ -147,11 +152,19 @@ export function wasmVoiceStop(client) {
 }
 
 export function wasmVoiceSetMuted(client, m) {
-  client.voice_set_muted(!!m);
+  try {
+    client.voice_set_muted(!!m);
+  } catch (e) {
+    console.warn("voice_set_muted failed", e);
+  }
 }
 
 export function wasmVoiceSetDeafened(client, d) {
-  client.voice_set_deafened(!!d);
+  try {
+    client.voice_set_deafened(!!d);
+  } catch (e) {
+    console.warn("voice_set_deafened failed", e);
+  }
 }
 
 export function installVoiceStateHandler(cb) {
