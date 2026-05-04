@@ -30,7 +30,11 @@ pub fn view(
   on_open_rooms on_open_rooms: msg,
   on_join_voice on_join_voice: msg,
   on_leave_voice on_leave_voice: msg,
+  on_mute_self on_mute_self: msg,
+  on_deafen_self on_deafen_self: msg,
   self_in_call self_in_call: Bool,
+  self_muted self_muted: Bool,
+  self_deafened self_deafened: Bool,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
@@ -115,7 +119,11 @@ pub fn view(
             c.name,
             on_leave_voice,
             on_join_voice,
+            on_mute_self,
+            on_deafen_self,
             self_in_call,
+            self_muted,
+            self_deafened,
           )
         _, _ -> element.fragment([])
       },
@@ -658,7 +666,11 @@ fn self_control_bar(
   channel_name: String,
   on_leave: msg,
   on_join: msg,
+  on_mute: msg,
+  on_deafen: msg,
   self_in_call: Bool,
+  self_muted: Bool,
+  self_deafened: Bool,
 ) -> Element(msg) {
   let _ = on_join
   // Fixed 64px height with a 1px border-top so this row aligns visually
@@ -731,8 +743,26 @@ fn self_control_bar(
           ),
         ],
       ),
-      self_btn(p, "Mute mic", mic_icon(), False, None),
-      self_btn(p, "Deafen", headphones_icon(), False, None),
+      self_btn(
+        p,
+        case self_muted {
+          True -> "Unmute mic"
+          False -> "Mute mic"
+        },
+        mic_icon(),
+        self_muted,
+        Some(on_mute),
+      ),
+      self_btn(
+        p,
+        case self_deafened {
+          True -> "Undeafen"
+          False -> "Deafen"
+        },
+        headphones_icon(),
+        self_deafened,
+        Some(on_deafen),
+      ),
       case self_in_call {
         True -> leave_btn(p, on_leave)
         False -> element.fragment([])
@@ -745,14 +775,14 @@ fn self_btn(
   p: Palette,
   title: String,
   icon: Element(msg),
-  danger: Bool,
+  active: Bool,
   on_click: Option(msg),
 ) -> Element(msg) {
-  let bg = case danger {
+  let bg = case active {
     True -> p.warn_soft
     False -> p.surface_alt
   }
-  let color = case danger {
+  let color = case active {
     True -> p.warn
     False -> p.text
   }

@@ -1654,14 +1654,15 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
-  let user_in_call = list.any(fixture.members(), fn(m) { m.you && m.in_call })
+  // Use real voice model state: show minibar when user is in call.
+  let user_in_call = option.is_some(model.voice.self_in_call)
 
   let active_voice_channel_name =
     list.find(fixture.channels(), fn(c) {
       c.kind == domain.Voice && c.in_call > 0
     })
     |> result.map(fn(c) { c.name })
-    |> result.unwrap("")
+    |> result.unwrap("voice")
 
   let voice_minibar_el = case model.viewport, user_in_call {
     domain.Phone, True ->
@@ -1669,6 +1670,11 @@ fn room_view_with_state(
         palette: palette,
         channel_name: active_voice_channel_name,
         on_open: OpenVoicePopover("you"),
+        on_mute: ToggleSelfMute,
+        on_deafen: ToggleSelfDeafen,
+        on_leave: LeaveVoice,
+        self_muted: model.voice.self_muted,
+        self_deafened: model.voice.self_deafened,
       )
     _, _ -> element.fragment([])
   }
@@ -1725,7 +1731,11 @@ fn room_view_with_state(
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
       on_join_voice: JoinVoice(active_room.id),
       on_leave_voice: LeaveVoice,
+      on_mute_self: ToggleSelfMute,
+      on_deafen_self: ToggleSelfDeafen,
       self_in_call: option.is_some(model.voice.self_in_call),
+      self_muted: model.voice.self_muted,
+      self_deafened: model.voice.self_deafened,
     ),
     main_panel.view(
       palette: palette,
