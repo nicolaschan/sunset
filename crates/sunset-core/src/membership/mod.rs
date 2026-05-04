@@ -27,7 +27,7 @@
 //! `sunset-web-wasm`) and native client-surface callbacks (TUI, mod).
 
 pub mod publisher;
-pub use publisher::spawn_publisher;
+pub use publisher::{PublisherHandle, spawn_publisher};
 
 pub mod body;
 pub use body::PresenceBody;

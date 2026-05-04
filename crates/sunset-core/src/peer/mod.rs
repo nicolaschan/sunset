@@ -151,6 +151,7 @@ where
             room,
             peer_weak: Rc::downgrade(self),
             presence_started: std::cell::Cell::new(false),
+            publisher: std::cell::RefCell::new(None),
             tracker_handles: Rc::new(crate::membership::TrackerHandles::new()),
             reaction_handles,
             cancel_decode: cancel,
@@ -191,6 +192,31 @@ where
     /// change after that.
     pub async fn subscribe_intents(&self) -> tokio::sync::mpsc::UnboundedReceiver<IntentSnapshot> {
         self.supervisor.subscribe_intents().await
+    }
+
+    /// Update the display name carried in every open room's presence
+    /// heartbeats. Silently skips rooms whose `OpenRoom` has been
+    /// dropped (the corresponding `Weak<RoomState>` upgrade fails).
+    /// Silently skips rooms that have not called `start_presence` yet.
+    pub fn set_self_name(&self, name: &str) {
+        let rooms = match self.open_rooms.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                // Lock is held by an in-flight open_room; the new room
+                // will inherit the name from a follow-up call. We could
+                // store a "pending name" but YAGNI for now — rename is
+                // user-driven and concurrent-with-open is rare.
+                tracing::debug!("set_self_name skipped: open_rooms lock contended");
+                return;
+            }
+        };
+        for weak in rooms.values() {
+            if let Some(state) = weak.upgrade() {
+                if let Some(p) = state.publisher.borrow().as_ref() {
+                    p.update_name(name);
+                }
+            }
+        }
     }
 
     // Accessor methods consumed by Phase 5+ (open_room, send_text, etc.).
@@ -542,6 +568,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn set_self_name_updates_every_open_room() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(40)).await;
+                let alpha = peer.open_room("alpha").await.expect("open_room alpha");
+                let beta = peer.open_room("beta").await.expect("open_room beta");
+                alpha.start_presence(50, 1000, 100).await;
+                beta.start_presence(50, 1000, 100).await;
+
+                peer.set_self_name("alice");
+
+                // After the immediate republish, both rooms' presence bodies
+                // should decode to name = Some("alice").
+                let pk_hex = hex::encode(peer.public_key());
+                for (room_fp_hex, label) in [
+                    (alpha.fingerprint().to_hex(), "alpha"),
+                    (beta.fingerprint().to_hex(), "beta"),
+                ] {
+                    let key = format!("{room_fp_hex}/presence/{pk_hex}");
+                    let store = peer.store().clone();
+                    // Wait up to 1s for the body name to flip to Some("alice").
+                    let mut found = false;
+                    for _ in 0..100 {
+                        if let Some(body) = read_presence_body(&store, &key).await {
+                            if body.name == Some("alice".to_owned()) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    assert!(found, "body name never became Some(alice) for room {label}");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn renewal_loop_exits_when_cancel_set() {
         let local = tokio::task::LocalSet::new();
         local
@@ -630,6 +695,29 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// Read the current `PresenceBody` for an exact store key.
+    /// Returns `None` if no entry is present yet.
+    async fn read_presence_body(
+        store: &std::sync::Arc<MemoryStore>,
+        name: &str,
+    ) -> Option<crate::membership::PresenceBody> {
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use sunset_store::{Filter, Replay, Store as _};
+        let mut sub = store
+            .subscribe(Filter::Namespace(Bytes::from(name.to_owned())), Replay::All)
+            .await
+            .ok()?;
+        let ev = sub.next().await?.ok()?;
+        let entry = match ev {
+            sunset_store::Event::Inserted(e) => e,
+            sunset_store::Event::Replaced { new, .. } => new,
+            _ => return None,
+        };
+        let block = store.get_content(&entry.value_hash).await.ok()??;
+        postcard::from_bytes(&block.data).ok()
     }
 
     pub(super) mod helpers {
