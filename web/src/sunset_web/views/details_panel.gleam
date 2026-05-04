@@ -28,7 +28,7 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Member, type Message, type MessageDetails, type RelayStatus, Direct,
+  type Member, type MessageDetails, type MessageView, type RelayStatus, Direct,
   HasDetails, MemberId, NoDetails, NoRelay, OneHop, SelfRelay, TwoHop, ViaPeer,
 }
 import sunset_web/sunset
@@ -37,7 +37,7 @@ import sunset_web/ui
 
 pub fn view(
   palette p: Palette,
-  message m: Message,
+  message m: MessageView,
   receipts r: Dict(String, Int),
   reactions reactions: Dict(String, Dict(String, Int)),
   members ms: List(Member),
@@ -176,7 +176,7 @@ fn close_button(p: Palette, on_close: msg) -> Element(msg) {
   )
 }
 
-fn message_quote(p: Palette, m: Message) -> Element(msg) {
+fn message_quote(p: Palette, m: MessageView) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -200,7 +200,7 @@ fn message_quote(p: Palette, m: Message) -> Element(msg) {
         ],
         [
           html.span([ui.css([#("font-weight", "600"), #("color", p.text)])], [
-            html.text(sunset.short_pubkey(m.author_pubkey)),
+            html.text(m.author),
           ]),
           html.span(
             [ui.css([#("color", p.text_faint), #("font-size", "13.125px")])],
@@ -298,7 +298,7 @@ fn arrow(p: Palette) -> Element(msg) {
 
 fn receipts_section(
   p: Palette,
-  m: Message,
+  m: MessageView,
   r: Dict(String, Int),
   ms: List(Member),
 ) -> Element(msg) {
@@ -357,7 +357,7 @@ fn receipts_section(
 /// Receipts only flow back for our own outgoing messages — peers don't
 /// emit acks for messages they sent. Tell the reader which case applies
 /// instead of just "no acks yet" everywhere.
-fn empty_state_text(m: Message) -> String {
+fn empty_state_text(m: MessageView) -> String {
   case m.you {
     True -> "No deliveries yet."
     False -> "Receipts are only tracked for messages you sent."

@@ -161,6 +161,24 @@ pub type Message {
   )
 }
 
+/// Pre-resolved view of a Message with the author display name baked in.
+/// Built once per render from the live name_map; view functions consume
+/// these instead of raw Message so they don't have to thread the dict around.
+pub type MessageView {
+  MessageView(
+    id: String,
+    author: String,
+    initials: String,
+    time: String,
+    body: String,
+    seen_by: Int,
+    you: Bool,
+    pending: Bool,
+    reactions: List(Reaction),
+    details: DetailsOpt,
+  )
+}
+
 pub type RoleOpt {
   HasRole(String)
   NoRole

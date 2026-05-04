@@ -20,11 +20,10 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ChannelId, type Member, type Message, type Reaction, Away, ChannelId,
+  type ChannelId, type Member, type MessageView, type Reaction, Away, ChannelId,
   Direct, OfflineP, OneHop, Online, SelfRelay, Speaking,
 }
 import sunset_web/markdown
-import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
@@ -34,7 +33,7 @@ pub fn view(
   palette p: Palette,
   viewport viewport: domain.Viewport,
   current_channel cur: ChannelId,
-  messages ms: List(Message),
+  messages ms: List(MessageView),
   draft draft: String,
   on_draft on_draft: fn(String) -> msg,
   on_submit on_submit: msg,
@@ -149,7 +148,7 @@ fn channel_header(p: Palette, name: String) -> Element(msg) {
 fn messages_list(
   p: Palette,
   viewport: domain.Viewport,
-  ms: List(Message),
+  ms: List(MessageView),
   reacting_to: Option(String),
   detail_msg_id: Option(String),
   on_react_toggle: fn(String) -> msg,
@@ -172,12 +171,11 @@ fn messages_list(
         0 -> ""
         _ ->
           case list.first(list.drop(ms, i - 1)) {
-            Ok(prev) -> sunset.short_pubkey(prev.author_pubkey)
+            Ok(prev) -> prev.author
             Error(_) -> ""
           }
       }
-      let grouped =
-        i > 0 && prev_author == sunset.short_pubkey(m.author_pubkey)
+      let grouped = i > 0 && prev_author == m.author
       let picker_open = case reacting_to {
         Some(id) if id == m.id -> True
         _ -> False
@@ -233,7 +231,7 @@ fn messages_list(
 fn message_view(
   p: Palette,
   viewport: domain.Viewport,
-  m: Message,
+  m: MessageView,
   grouped: Bool,
   show_read_marker: Bool,
   picker_open: Bool,
@@ -377,7 +375,7 @@ fn message_view(
 /// hover via the .msg-row CSS rule in shell.gleam.
 fn actions_toolbar(
   p: Palette,
-  m: Message,
+  m: MessageView,
   picker_open: Bool,
   on_react_toggle: fn(String) -> msg,
   _on_add_reaction: fn(String, String) -> msg,
@@ -657,7 +655,7 @@ fn info_icon() -> Element(msg) {
   )
 }
 
-fn message_header(p: Palette, m: Message, author_color: String) -> Element(msg) {
+fn message_header(p: Palette, m: MessageView, author_color: String) -> Element(msg) {
   html.div(
     [
       ui.css([
@@ -672,7 +670,7 @@ fn message_header(p: Palette, m: Message, author_color: String) -> Element(msg) 
         html.span(
           [
             attribute.attribute("data-testid", "message-author"),
-            attribute.attribute("data-author", sunset.short_pubkey(m.author_pubkey)),
+            attribute.attribute("data-author", m.author),
             ui.css([
               #("font-weight", "600"),
               #("font-size", "16.25px"),
@@ -680,7 +678,7 @@ fn message_header(p: Palette, m: Message, author_color: String) -> Element(msg) 
               #("cursor", "default"),
             ]),
           ],
-          [html.text(sunset.short_pubkey(m.author_pubkey))],
+          [html.text(m.author)],
         ),
       ],
       [],
@@ -1096,9 +1094,9 @@ fn you_tag(p: Palette) -> Element(msg) {
 }
 
 /// Pick the color for a message author's name based on the matching
-/// member's connection state. Lookup is by `short_pubkey(m.author_pubkey)
-/// == member.name` (both are derived from the first 4 bytes of the pubkey,
-/// so a single short-pubkey string identifies the peer).
+/// member's connection state. Lookup is by `m.author == member.name`
+/// (both hold the resolved display name, or the short-pubkey fallback
+/// when no name has been set).
 ///
 /// Mapping:
 ///   * own messages → palette accent (so "you" stands out)
@@ -1108,15 +1106,11 @@ fn you_tag(p: Palette) -> Element(msg) {
 ///   * away → palette warn
 ///   * offline → palette text_faint
 ///   * fallback (no member match yet) → palette text
-fn author_color(p: Palette, m: Message, members: List(Member)) -> String {
+fn author_color(p: Palette, m: MessageView, members: List(Member)) -> String {
   case m.you {
     True -> p.accent
     False ->
-      case
-        list.find(members, fn(mem) {
-          mem.name == sunset.short_pubkey(m.author_pubkey)
-        })
-      {
+      case list.find(members, fn(mem) { mem.name == m.author }) {
         Error(_) -> p.text
         Ok(mem) -> color_for_member(p, mem)
       }
@@ -1137,11 +1131,11 @@ fn color_for_member(p: Palette, mem: Member) -> String {
 
 /// Index of the last own message that's been seen by anyone — that's
 /// where the "read up to here" marker goes.
-fn last_own_seen_index(ms: List(Message)) -> Int {
+fn last_own_seen_index(ms: List(MessageView)) -> Int {
   do_last_own_seen(ms, 0, -1)
 }
 
-fn do_last_own_seen(ms: List(Message), i: Int, best: Int) -> Int {
+fn do_last_own_seen(ms: List(MessageView), i: Int, best: Int) -> Int {
   case ms {
     [] -> best
     [m, ..rest] -> {

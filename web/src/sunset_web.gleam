@@ -14,7 +14,6 @@
 
 import gleam/dict.{type Dict}
 import gleam/float
-import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -28,8 +27,7 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, type Room, ChannelId, Reaction,
-  Room, RoomId,
+  type ChannelId, type Reaction, type Room, ChannelId, Reaction, Room, RoomId,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -527,6 +525,28 @@ pub fn display_name(name_map: Dict(String, String), pk: BitArray) -> String {
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortPubkey")
 fn short_pubkey(bits: BitArray) -> String
+
+/// Resolve a list of domain.Message into domain.MessageView, baking in the
+/// author display name (from name_map, falling back to short_pubkey).
+pub fn resolve_messages(
+  name_map: Dict(String, String),
+  messages: List(domain.Message),
+) -> List(domain.MessageView) {
+  list.map(messages, fn(m) {
+    domain.MessageView(
+      id: m.id,
+      author: display_name(name_map, m.author_pubkey),
+      initials: m.initials,
+      time: m.time,
+      body: m.body,
+      seen_by: m.seen_by,
+      you: m.you,
+      pending: m.pending,
+      reactions: m.reactions,
+      details: m.details,
+    )
+  })
+}
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortInitials")
 fn short_initials(bits: BitArray) -> String
@@ -1515,9 +1535,12 @@ fn room_view_with_state(
       }
     })
 
+  let resolved_messages =
+    resolve_messages(model.name_map, messages_with_live_reactions)
+
   let detail_msg = case state.sheet {
     Some(domain.DetailsSheet(message_id: id)) ->
-      find_message(messages_with_live_reactions, id)
+      find_message(resolved_messages, id)
     _ -> None
   }
 
@@ -1672,7 +1695,7 @@ fn room_view_with_state(
 
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
-      case find_message(messages_with_live_reactions, id) {
+      case find_message(resolved_messages, id) {
         Some(m) ->
           bottom_sheet.view(
             palette: palette,
@@ -1840,7 +1863,7 @@ fn room_view_with_state(
       palette: palette,
       viewport: model.viewport,
       current_channel: state.current_channel,
-      messages: messages_with_live_reactions,
+      messages: resolved_messages,
       draft: state.draft,
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
@@ -2136,7 +2159,10 @@ fn float_px(n: Float) -> String {
   float.to_string(n) <> "px"
 }
 
-fn find_message(ms: List(Message), id: String) -> Option(Message) {
+fn find_message(
+  ms: List(domain.MessageView),
+  id: String,
+) -> Option(domain.MessageView) {
   list.find(ms, fn(m) { m.id == id })
   |> option.from_result
 }
