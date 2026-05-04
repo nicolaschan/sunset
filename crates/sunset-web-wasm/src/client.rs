@@ -284,4 +284,41 @@ impl Client {
         let pcm = crate::voice::test_hooks::synth_pcm_with_counter(counter);
         js_sys::Float32Array::from(pcm.as_slice())
     }
+
+    /// Peers seen by the voice runtime's auto-connect FSM (i.e. peers
+    /// for which we observed a `voice-presence/...` durable entry over
+    /// sunset-sync). Returns `Uint8Array[]`.
+    #[cfg(feature = "test-hooks")]
+    pub fn voice_auto_connect_peers(&self) -> Result<JsValue, JsError> {
+        crate::voice::auto_connect_peers(&self.voice)
+    }
+
+    /// Peers from whom the voice runtime has decoded at least one
+    /// inbound voice payload (Frame or Heartbeat). Returns
+    /// `Uint8Array[]`.
+    #[cfg(feature = "test-hooks")]
+    pub fn voice_observed_voice_peers(&self) -> Result<JsValue, JsError> {
+        crate::voice::observed_voice_peers(&self.voice)
+    }
+
+    /// Per-peer jitter buffer depth as `[{peer_id, depth}]`. Indicates
+    /// frames received but not yet drained by the jitter pump.
+    #[cfg(feature = "test-hooks")]
+    pub fn voice_jitter_depths(&self) -> Result<JsValue, JsError> {
+        crate::voice::jitter_depths(&self.voice)
+    }
+
+    /// Peers currently connected at the engine level (i.e. PeerHello
+    /// completed). Returns `Uint8Array[]`. Useful for distinguishing
+    /// "WebRTC handshake complete" from "WebRTC handshake hung".
+    #[cfg(feature = "test-hooks")]
+    pub async fn voice_engine_connected_peers(&self) -> Result<JsValue, JsError> {
+        use js_sys::{Array, Uint8Array};
+        let peers = self.inner.engine_handle().connected_peers().await;
+        let arr = Array::new();
+        for p in peers {
+            arr.push(&Uint8Array::from(p.0.as_bytes()));
+        }
+        Ok(arr.into())
+    }
 }

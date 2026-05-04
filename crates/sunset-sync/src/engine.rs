@@ -62,6 +62,52 @@ fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     ));
 }
 
+/// Long-running accept loop. Spawned by `SyncEngine::run` once at
+/// startup, lives for the engine's lifetime. Owns its own clones of the
+/// `Arc<T>` transport and the `next_conn_id` counter, and a clone of
+/// the `inbound_tx` sender that per-peer tasks fan into.
+///
+/// Why this exists as a separate task instead of a `select!` arm: the
+/// secondary transport's `accept()` (e.g. `NoiseTransport::accept`)
+/// internally awaits a multi-RTT cryptographic handshake on the raw
+/// connection it just dequeued. Dropping that future mid-handshake
+/// drops the dequeued connection; the connection cannot be reclaimed
+/// (it's already off the per-transport completed channel). Running
+/// here means cancellation only happens on engine shutdown.
+fn spawn_accept_loop<T: crate::transport::Transport + 'static>(
+    transport: Arc<T>,
+    next_conn_id: Arc<Mutex<u64>>,
+    env: crate::peer::PeerEnv,
+    inbound_tx: mpsc::UnboundedSender<InboundEvent>,
+) where
+    T::Connection: 'static,
+{
+    crate::spawn::spawn_local(async move {
+        loop {
+            match transport.accept().await {
+                Ok(conn) => {
+                    let conn_id = {
+                        let mut n = next_conn_id.lock().await;
+                        let id = *n;
+                        *n += 1;
+                        ConnectionId(id)
+                    };
+                    spawn_run_peer(conn, env.clone(), conn_id, inbound_tx.clone(), None);
+                }
+                Err(e) => {
+                    // A single accept failure (e.g. an upstream pump
+                    // that's shutting down) must not tear down the
+                    // engine — log and keep accepting. If the channel
+                    // underneath has truly closed, every subsequent
+                    // accept will return an error too; that's fine —
+                    // eventually the engine task is aborted by the host.
+                    tracing::warn!(error = %e, "transport accept failed; continuing");
+                }
+            }
+        }
+    });
+}
+
 /// A command sent from the public API into the running engine.
 pub(crate) enum EngineCommand {
     AddPeer {
@@ -379,22 +425,36 @@ where
         // isn't duplicated immediately after PeerHello.
         anti_entropy.tick().await;
 
+        // Spawn the accept loop in its own task so its in-flight
+        // post-accept work (e.g. NoiseTransport's IK handshake on the
+        // raw connection that `transport.accept().await` just returned)
+        // is NOT a `tokio::select!` arm in the engine's main loop.
+        //
+        // Why this matters: `select!` cancels every other branch the
+        // moment any one branch returns Ready. If the accept arm sat in
+        // `select!`, then any unrelated wakeup (a peer's PeerHello
+        // landing on `inbound_rx`, an outbound command on `cmd_rx`, an
+        // anti-entropy tick) while the secondary transport's Noise
+        // responder was awaiting msg1 would cancel the accept future
+        // mid-handshake. The dequeued `WebRtcRawConnection` (already
+        // taken off the per-transport `completed_rx`) would be dropped
+        // along with it, and that connection is gone for good — the
+        // remote peer's dial sits in `Connecting` until its
+        // `engine.add_peer` await eventually times out (or, for
+        // `WebRtcRawTransport::connect`, never).
+        //
+        // Running accept in its own task isolates it from the select!:
+        // dequeue + Noise + run_peer spawn all happen without competing
+        // for poll cycles with the engine's other branches.
+        spawn_accept_loop(
+            self.transport.clone(),
+            self.next_conn_id.clone(),
+            self.peer_env(),
+            inbound_tx.clone(),
+        );
+
         loop {
             tokio::select! {
-                accept_res = self.transport.accept() => {
-                    match accept_res {
-                        Ok(conn) => self.spawn_peer(conn, inbound_tx.clone()).await,
-                        Err(e) => {
-                            // A single accept failure (e.g. an upstream pump that's
-                            // shutting down) must not tear down the engine — log and
-                            // keep accepting. If the channel underneath has truly
-                            // closed, every subsequent accept will return an error
-                            // too; that's fine — eventually the engine task is
-                            // aborted by the host.
-                            tracing::warn!(error = %e, "transport accept failed; continuing");
-                        }
-                    }
-                }
                 Some(cmd) = cmd_rx.recv() => {
                     self.handle_command(cmd, &inbound_tx).await;
                 }
@@ -488,15 +548,6 @@ where
                 let _ = ack.send(Ok(()));
             }
         }
-    }
-
-    async fn spawn_peer(
-        &self,
-        conn: T::Connection,
-        inbound_tx: mpsc::UnboundedSender<InboundEvent>,
-    ) {
-        let conn_id = self.alloc_conn_id().await;
-        spawn_run_peer(conn, self.peer_env(), conn_id, inbound_tx, None);
     }
 
     async fn handle_inbound_event(&self, event: InboundEvent) {

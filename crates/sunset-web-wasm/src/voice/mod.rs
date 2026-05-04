@@ -244,6 +244,57 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
 }
 
 #[cfg(feature = "test-hooks")]
+pub(crate) fn auto_connect_peers(cell: &VoiceCell) -> Result<JsValue, JsError> {
+    use js_sys::{Array, Uint8Array};
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    let arr = Array::new();
+    for peer in v.runtime.auto_connect_peers() {
+        arr.push(&Uint8Array::from(peer.0.as_bytes()));
+    }
+    Ok(arr.into())
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn observed_voice_peers(cell: &VoiceCell) -> Result<JsValue, JsError> {
+    use js_sys::{Array, Uint8Array};
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    let arr = Array::new();
+    for peer in v.runtime.observed_voice_peers() {
+        arr.push(&Uint8Array::from(peer.0.as_bytes()));
+    }
+    Ok(arr.into())
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn jitter_depths(cell: &VoiceCell) -> Result<JsValue, JsError> {
+    use js_sys::{Array, Object, Uint8Array};
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    let arr = Array::new();
+    for (peer, depth) in v.runtime.jitter_depths() {
+        let obj = Object::new();
+        let id = Uint8Array::from(peer.0.as_bytes());
+        js_sys::Reflect::set(&obj, &JsValue::from_str("peer_id"), &id).unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("depth"),
+            &JsValue::from_f64(depth as f64),
+        )
+        .unwrap();
+        arr.push(&obj);
+    }
+    Ok(arr.into())
+}
+
+#[cfg(feature = "test-hooks")]
 pub(crate) fn active_peers(cell: &VoiceCell) -> Result<JsValue, JsError> {
     use js_sys::{Array, Object, Uint8Array};
     let slot = cell.borrow();

@@ -247,6 +247,48 @@ impl VoiceRuntime {
             })
             .collect()
     }
+
+    /// Test-only: peers observed by the auto-connect FSM (i.e. seen via
+    /// the durable `voice-presence/...` subscription). Useful for
+    /// distinguishing R1 (presence never reached) from R2 (presence
+    /// reached but auto-connect didn't act).
+    #[cfg(feature = "test-hooks")]
+    pub fn auto_connect_peers(&self) -> Vec<sunset_sync::PeerId> {
+        self.inner
+            .auto_connect_state
+            .borrow()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Test-only: peers for which the subscribe loop has decoded at
+    /// least one inbound voice payload (Frame or Heartbeat). Frames go
+    /// to `jitter`; Heartbeats land in `last_emitted`. The union of
+    /// these two maps' keys tells us which peers the receiver has
+    /// actually heard from over the WebRTC datachannel.
+    #[cfg(feature = "test-hooks")]
+    pub fn observed_voice_peers(&self) -> Vec<sunset_sync::PeerId> {
+        let mut peers: std::collections::HashSet<sunset_sync::PeerId> =
+            self.inner.jitter.borrow().keys().cloned().collect();
+        for k in self.inner.last_emitted.borrow().keys() {
+            peers.insert(k.clone());
+        }
+        peers.into_iter().collect()
+    }
+
+    /// Test-only: depth of each per-peer jitter buffer. Useful for
+    /// distinguishing R4 (frames flowing) from R5 (combiner not
+    /// observing them).
+    #[cfg(feature = "test-hooks")]
+    pub fn jitter_depths(&self) -> Vec<(sunset_sync::PeerId, usize)> {
+        self.inner
+            .jitter
+            .borrow()
+            .iter()
+            .map(|(p, q)| (p.clone(), q.len()))
+            .collect()
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
