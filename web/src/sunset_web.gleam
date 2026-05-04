@@ -27,8 +27,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
-  Reaction, Room, RoomId, VoiceModel, VoicePeerStateUI,
+  type ChannelId, type Message, type Reaction, type Room, ChannelId, MemberId,
+  NoBridge, Reaction, Room, RoomId, VoiceModel, VoicePeerStateUI,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -1703,6 +1703,27 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
+  // Derive in_call status from real voice state: a member is in_call if
+  // their id (short pubkey hex) appears as a key in model.voice.peers with
+  // in_call = True. Self is in_call if model.voice.self_in_call is Some.
+  // Falls back to fixture.members() when state.members is empty (pre-connect).
+  let members_for_channels = case state.members {
+    [] -> fixture.members()
+    ms ->
+      list.map(ms, fn(m) {
+        let MemberId(id_str) = m.id
+        let in_call_from_voice = case m.you {
+          True -> option.is_some(model.voice.self_in_call)
+          False ->
+            case dict.get(model.voice.peers, id_str) {
+              Ok(ps) -> ps.in_call
+              Error(_) -> False
+            }
+        }
+        domain.Member(..m, in_call: in_call_from_voice)
+      })
+  }
+
   shell.view(
     model.mode,
     palette,
@@ -1743,7 +1764,7 @@ fn room_view_with_state(
       palette: palette,
       room: active_room,
       channels: fixture.channels(),
-      members: fixture.members(),
+      members: members_for_channels,
       current_channel: state.current_channel,
       voice_popover_open: case state.sheet {
         Some(domain.VoiceSheet(member_name: name)) -> Some(name)
