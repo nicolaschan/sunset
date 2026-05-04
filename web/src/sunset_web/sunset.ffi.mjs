@@ -350,3 +350,5 @@ export function registerEmojiPicker() {
   }
   return emojiPickerLoaded;
 }
+
+export function truncFloat(f) { return Math.trunc(f); }

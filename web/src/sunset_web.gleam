@@ -13,7 +13,7 @@
 //// so a refresh restores the user's state.
 
 import gleam/dict.{type Dict}
-import gleam/io
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -28,7 +28,7 @@ import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
   type ChannelId, type Message, type Reaction, type Room, ChannelId, NoBridge,
-  Reaction, Room, RoomId,
+  Reaction, Room, RoomId, VoiceModel, VoicePeerStateUI,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -53,6 +53,7 @@ import sunset_web/views/shell
 import sunset_web/views/touch_drag
 import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
+import sunset_web/voice
 
 /// Relays the client dials at startup when the URL has no
 /// `?relay=…` query parameter. Each entry is fed through
@@ -160,6 +161,8 @@ pub type Model {
     /// (draft, selected message, revealed spoilers) so it resets
     /// naturally when the user navigates to a different room.
     rooms: Dict(String, RoomState),
+    /// Voice subsystem state: self_in_call, mute, deafen, per-peer live state.
+    voice: domain.VoiceModel,
   )
 }
 
@@ -220,6 +223,21 @@ pub type Msg {
     after: String,
     caret_at_between: Bool,
   )
+  // Voice control msgs:
+  JoinVoice(domain.RoomId)
+  LeaveVoice
+  ToggleSelfMute
+  ToggleSelfDeafen
+  VoicePeerStateChanged(
+    peer_hex: String,
+    in_call: Bool,
+    talking: Bool,
+    is_muted: Bool,
+  )
+  SetPeerVolume(peer_hex: String, gain: Float)
+  ToggleMuteForPeer(peer_hex: String)
+  VoicePermissionDenied(message: String)
+  ResetVoiceError
 }
 
 pub fn main() {
@@ -287,6 +305,13 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       drawer: None,
       now_ms: 0,
       rooms: dict.new(),
+      voice: VoiceModel(
+        self_in_call: None,
+        self_muted: False,
+        self_deafened: False,
+        peers: dict.new(),
+        permission_error: None,
+      ),
     )
 
   let subscribe_hash =
@@ -352,6 +377,13 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       composer.attach_shortcut_prevent_default("composer-textarea")
     })
 
+  let install_voice_handler_eff =
+    effect.from(fn(dispatch) {
+      voice.install_voice_state_handler(fn(hex, in_call, talking, is_muted) {
+        dispatch(VoicePeerStateChanged(hex, in_call, talking, is_muted))
+      })
+    })
+
   #(
     model,
     effect.batch([
@@ -363,6 +395,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       subscribe_touch_drag,
       ticker_eff,
       attach_shortcuts_eff,
+      install_voice_handler_eff,
     ]),
   )
 }
@@ -395,6 +428,25 @@ fn member_voice_settings(
       domain.VoiceSettings(volume: 100, denoise: True, deafened: False)
   }
 }
+
+/// Convert a linear gain float (0.0–2.0) to an integer volume percent (0–200).
+fn float_to_volume_int(gain: Float) -> Int {
+  let clamped = case gain <. 0.0 {
+    True -> 0.0
+    False ->
+      case gain >. 2.0 {
+        True -> 2.0
+        False -> gain
+      }
+  }
+  // Truncate to int by flooring: multiply, convert via string parse as fallback.
+  // Using integer division as the JS target represents floats precisely enough.
+  // `int.to_float(x) == f` isn't available directly; nearest: truncate via cast.
+  float_truncate(clamped *. 100.0)
+}
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "truncFloat")
+fn float_truncate(f: Float) -> Int
 
 /// Add `name` to `existing` if it isn't already present (prepending
 /// at the head, which is where new rooms appear). If `name` is
@@ -1235,6 +1287,149 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(Model(..next_model, rooms: rooms), send_eff)
     }
     ReactionSent(_) -> #(model, effect.none())
+
+    // ---- Voice control handlers ----
+
+    JoinVoice(room_id) -> {
+      // Eagerly set self_in_call; roll back in VoicePermissionDenied if mic fails.
+      let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
+      let active_name = active_room_name(model)
+      let eff = case model.client, dict.get(model.rooms, active_name) {
+        Some(client), Ok(state) ->
+          case state.handle {
+            Some(handle) ->
+              effect.from(fn(dispatch) {
+                voice.voice_start(client, handle, fn(result) {
+                  case result {
+                    Ok(_) -> Nil
+                    Error(msg) -> dispatch(VoicePermissionDenied(msg))
+                  }
+                })
+              })
+            None -> effect.none()
+          }
+        _, _ -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    LeaveVoice -> {
+      let new_voice =
+        VoiceModel(
+          ..model.voice,
+          self_in_call: None,
+          self_muted: False,
+          self_deafened: False,
+        )
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) {
+            voice.voice_stop(client)
+          })
+        None -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    ToggleSelfMute -> {
+      let new_muted = !model.voice.self_muted
+      let new_voice = VoiceModel(..model.voice, self_muted: new_muted)
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) {
+            voice.voice_set_muted(client, new_muted)
+          })
+        None -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    ToggleSelfDeafen -> {
+      let new_deafened = !model.voice.self_deafened
+      let new_voice = VoiceModel(..model.voice, self_deafened: new_deafened)
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) {
+            voice.voice_set_deafened(client, new_deafened)
+          })
+        None -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    VoicePeerStateChanged(hex, in_call, talking, is_muted) -> {
+      let new_peers =
+        dict.insert(
+          model.voice.peers,
+          hex,
+          VoicePeerStateUI(in_call: in_call, talking: talking, is_muted: is_muted),
+        )
+      let new_voice = VoiceModel(..model.voice, peers: new_peers)
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    SetPeerVolume(peer_hex, gain) -> {
+      let eff =
+        effect.from(fn(_) {
+          voice.set_peer_volume(peer_hex, gain)
+        })
+      // Also store in voice_settings (by hex) for display.
+      let vol = float_to_volume_int(gain)
+      let settings = member_voice_settings(model.voice_settings, peer_hex)
+      let new_settings = domain.VoiceSettings(..settings, volume: vol)
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(model.voice_settings, peer_hex, new_settings),
+        ),
+        eff,
+      )
+    }
+
+    ToggleMuteForPeer(peer_hex) -> {
+      let settings = member_voice_settings(model.voice_settings, peer_hex)
+      // `deafened` in VoiceSettings = "muted for me" for this peer.
+      let new_muted_for_me = !settings.deafened
+      let gain = case new_muted_for_me {
+        True -> 0.0
+        False -> int.to_float(settings.volume) /. 100.0
+      }
+      let new_settings =
+        domain.VoiceSettings(..settings, deafened: new_muted_for_me)
+      let eff =
+        effect.from(fn(_) {
+          voice.set_peer_volume(peer_hex, gain)
+        })
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(
+            model.voice_settings,
+            peer_hex,
+            new_settings,
+          ),
+        ),
+        eff,
+      )
+    }
+
+    VoicePermissionDenied(msg) -> {
+      let new_voice =
+        VoiceModel(
+          ..model.voice,
+          self_in_call: None,
+          permission_error: Some(
+            "Microphone access required to join voice. (" <> msg <> ")",
+          ),
+        )
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    ResetVoiceError -> {
+      let new_voice = VoiceModel(..model.voice, permission_error: None)
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
     OpenFullEmojiPicker(target) -> {
       // Closing the per-room quick-picker prevents both pickers from
       // rendering at once; full picker takes over.
