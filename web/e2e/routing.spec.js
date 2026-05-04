@@ -269,6 +269,35 @@ test.describe("landing + routing", () => {
       // Input should be near full-width minus our 24px gutters.
       expect(inputBox.width).toBeGreaterThan(viewport.width - 60);
     });
+
+    // On iOS PWA standalone with `viewport-fit=cover` the page extends
+    // under the status bar / home indicator. The landing wrapper paints
+    // its own bg via `position: fixed; inset: 0`, but rubber-banding
+    // and the safe-area bands can expose whatever's behind it. Without
+    // an html/body bg in landing's reset_style, those regions show the
+    // OS default (white in light mode) — a visible band stuck to the
+    // screen edges. Even at zero inset, a missing body bg shows up as
+    // a computed colour mismatch between the landing wrapper and html.
+    test("landing html bg matches the landing wrapper bg", async ({ page }) => {
+      await page.goto("/");
+      await expect(page.getByTestId("landing-view")).toBeVisible();
+      const colours = await page.evaluate(() => {
+        const wrapper = document.querySelector('[data-testid="landing-view"]');
+        return {
+          wrapper: getComputedStyle(wrapper).backgroundColor,
+          html: getComputedStyle(document.documentElement).backgroundColor,
+          body: getComputedStyle(document.body).backgroundColor,
+        };
+      });
+      expect(
+        colours.html,
+        "html bg should match landing wrapper bg so iOS safe-area bands don't show OS default",
+      ).toBe(colours.wrapper);
+      expect(
+        colours.body,
+        "body bg should match landing wrapper bg",
+      ).toBe(colours.wrapper);
+    });
   });
 
   test.describe("phone — touch drag-drop", () => {
