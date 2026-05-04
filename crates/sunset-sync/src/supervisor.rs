@@ -155,6 +155,22 @@ pub struct PeerSupervisor<S: Store, T: Transport> {
     pub(crate) cmd_rx: RefCell<Option<mpsc::UnboundedReceiver<SupervisorCommand>>>,
     pub(crate) state: Rc<RefCell<SupervisorState>>,
     pub(crate) policy: BackoffPolicy,
+    /// Pinged whenever a *concurrent* task (currently only `spawn_dial`)
+    /// transitions an intent into `Backoff`. The run loop's `select!`
+    /// includes this as a wake-up source so it re-evaluates
+    /// `next_backoff_sleep()` instead of staying parked on a stale
+    /// `pending::<()>()` future.
+    ///
+    /// Why this is load-bearing: when `fire_due_backoffs` transitions an
+    /// intent `Backoff → Connecting` and spawns the dial, the run loop's
+    /// next iteration sees no `Backoff` intents, so it computes
+    /// `next_backoff_sleep() == None` and the sleep arm becomes
+    /// `pending::<()>()`. If `spawn_dial` then fails transiently and
+    /// schedules a fresh `Backoff` from its background task, the run
+    /// loop is still parked on the now-stale `pending` and would never
+    /// fire that backoff — the user observes "stuck reconnecting"
+    /// forever. Notifying here re-arms the timer.
+    pub(crate) wake: Rc<tokio::sync::Notify>,
 }
 
 impl<S, T> PeerSupervisor<S, T>
@@ -178,6 +194,7 @@ where
                 subscribers: Vec::new(),
             })),
             policy,
+            wake: Rc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -318,6 +335,13 @@ where
                 }
                 _ = sleep_fut => {
                     self.clone().fire_due_backoffs(&mut rng).await;
+                }
+                _ = self.wake.notified() => {
+                    // Wake-up only — the loop iterates and recomputes
+                    // `next_backoff_sleep()` from the current state.
+                    // Sent by `spawn_dial` when its transient-err arm
+                    // schedules a fresh `Backoff` from a background task.
+                    tracing::debug!("supervisor: wake notified; re-evaluating sleep");
                 }
                 else => return,
             }
@@ -600,6 +624,7 @@ where
         let engine = self.engine.clone();
         let state = self.state.clone();
         let policy = self.policy.clone();
+        let wake = self.wake.clone();
         crate::spawn::spawn_local(async move {
             // Snapshot the connectable for this attempt.
             let (connectable, attempt, label) = {
@@ -797,6 +822,13 @@ where
                             next_attempt_in_ms = delay.as_millis() as u64,
                             "supervisor: transient dial err → Backoff (will redial)",
                         );
+                        // Drop the borrow before notifying the run loop,
+                        // matching the codebase convention of never
+                        // holding a `RefCell` borrow across an await
+                        // (notify_one is sync but this keeps the
+                        // ordering crisp).
+                        drop(s);
+                        wake.notify_one();
                     }
                 }
             }
@@ -935,6 +967,108 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 assert!(connected, "intent did not reach Connected");
+            })
+            .await;
+    }
+
+    /// Liveness regression: after a transient dial failure, the
+    /// supervisor must redial **without anyone poking it**. The
+    /// existing `first_dial_failure_enters_backoff_and_retries` test
+    /// hides this bug because it polls `sup.snapshot().await` every
+    /// 10 ms — every poll sends a `SupervisorCommand::Snapshot` which
+    /// wakes the run loop's `select!`, causing it to re-evaluate
+    /// `next_backoff_sleep()`. Production UI does NOT poll: it only
+    /// subscribes via `on_intent_changed`. So if the run loop parks
+    /// on `pending::<()>` between iterations and `spawn_dial`
+    /// schedules a fresh `Backoff` from its background task, nothing
+    /// pokes the loop and the timer never fires — user sees "stuck
+    /// reconnecting" indefinitely.
+    ///
+    /// This test reproduces the bug by reading state ONLY through
+    /// `subscribe_intents` (which uses the broadcast channel — no
+    /// command round-trip). Without the fix, the second wait below
+    /// times out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redial_fires_after_first_failure_without_external_poke() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = engine_with_addr(&net, b"alice", "alice");
+                crate::spawn::spawn_local({
+                    let a = alice.clone();
+                    async move { a.run().await }
+                });
+
+                // Tight backoff so the redial fires within the test's
+                // wait window without making the test slow.
+                let policy = BackoffPolicy {
+                    initial: std::time::Duration::from_millis(50),
+                    max: std::time::Duration::from_millis(50),
+                    multiplier: 1.0,
+                    jitter: 0.0,
+                };
+                let sup = PeerSupervisor::new(alice.clone(), policy);
+                crate::spawn::spawn_local({
+                    let s = sup.clone();
+                    async move { s.run().await }
+                });
+
+                // Subscribe BEFORE adding the intent so we observe every
+                // state transition without ever calling `snapshot()` /
+                // `intents()` (which would mask the bug by waking the
+                // run loop).
+                let mut sub = sup.subscribe_intents().await;
+
+                // No engine listening at "ghost". First dial fails fast.
+                let ghost = PeerAddr::new(Bytes::from_static(b"ghost"));
+                let id = sup
+                    .add(crate::connectable::Connectable::Direct(ghost))
+                    .await
+                    .expect("add must return Ok");
+
+                // Drain broadcasts until we see Backoff (proves
+                // spawn_dial transient-err arm fired AND broadcast).
+                async fn wait_for_state(
+                    sub: &mut mpsc::UnboundedReceiver<IntentSnapshot>,
+                    id: IntentId,
+                    target: IntentState,
+                ) -> bool {
+                    for _ in 0..50 {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            sub.recv(),
+                        )
+                        .await
+                        {
+                            Ok(Some(snap)) if snap.id == id && snap.state == target => {
+                                return true;
+                            }
+                            Ok(Some(_)) => continue,
+                            Ok(None) | Err(_) => return false,
+                        }
+                    }
+                    false
+                }
+
+                assert!(
+                    wait_for_state(&mut sub, id, IntentState::Backoff).await,
+                    "intent never reached Backoff after first dial failure",
+                );
+
+                // Bring "ghost" online. Critically: do NOT poll
+                // `sup.snapshot()` afterwards — the supervisor must
+                // redial on its own when its backoff timer fires.
+                let _ghost_engine = engine_with_addr(&net, b"ghost", "ghost");
+                crate::spawn::spawn_local({
+                    let g = _ghost_engine.clone();
+                    async move { g.run().await }
+                });
+
+                assert!(
+                    wait_for_state(&mut sub, id, IntentState::Connected).await,
+                    "supervisor did not redial on its own — run loop stuck on stale `pending` sleep_fut?",
+                );
             })
             .await;
     }
