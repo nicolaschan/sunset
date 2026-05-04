@@ -166,10 +166,9 @@ test("early leaver is removed from active peers; remaining peers keep hearing ea
     { timeout: 2_000 },
   );
 
-  // A and B should see C absent from active peers.
-  // MEMBERSHIP_STALE_AFTER = 5 s; HEARTBEAT_INTERVAL = 2 s. Worst-case
-  // detection lag is MEMBERSHIP_STALE_AFTER + HEARTBEAT_INTERVAL = 7 s.
-  // Use 10 s for headroom without masking real liveness failures.
+  // A and B should see C absent from active peers within the spec budget
+  // ("Leaving voice → in_call light off on peer | < 6 s"). MEMBERSHIP_STALE_AFTER
+  // = 5 s; the runtime detects departure within one heartbeat tick of staleness.
   // voice_active_peers() returns [{ peer_id: Uint8Array, in_call, talking, is_muted }]
   const isPeerGoneFromActivePeers = ([bytes]) => {
     try {
@@ -191,10 +190,10 @@ test("early leaver is removed from active peers; remaining peers keep hearing ea
   };
 
   await a.page.waitForFunction(isPeerGoneFromActivePeers, [cBytes], {
-    timeout: 10_000,
+    timeout: 6_000,
   });
   await b.page.waitForFunction(isPeerGoneFromActivePeers, [cBytes], {
-    timeout: 10_000,
+    timeout: 6_000,
   });
 
   // A injects; B still receives ≥ 40 frames from A within 3 s.
@@ -208,8 +207,9 @@ test("early leaver is removed from active peers; remaining peers keep hearing ea
 });
 
 // Hard departure: C closes its context (tab crash / close).
-// A and B detect C gone via voice_active_peers() within the liveness window.
-// MEMBERSHIP_STALE_AFTER = 5 s; HEARTBEAT_INTERVAL = 2 s; allow 10 s.
+// A and B detect C gone via voice_active_peers() within the spec's 6 s
+// "Leaving voice → in_call light off" budget (membership_liveness 5 s
+// + cadence). 6 s is the upper bound users still consider responsive.
 test("hard departure detected within liveness window", async ({ browser }) => {
   const a = await openPeer(browser, relay.addr);
   const b = await openPeer(browser, relay.addr);
@@ -244,8 +244,8 @@ test("hard departure detected within liveness window", async ({ browser }) => {
     }
   };
 
-  await a.page.waitForFunction(isPeerGone, [cBytes], { timeout: 10_000 });
-  await b.page.waitForFunction(isPeerGone, [cBytes], { timeout: 10_000 });
+  await a.page.waitForFunction(isPeerGone, [cBytes], { timeout: 6_000 });
+  await b.page.waitForFunction(isPeerGone, [cBytes], { timeout: 6_000 });
 
   await a.ctx.close();
   await b.ctx.close();
