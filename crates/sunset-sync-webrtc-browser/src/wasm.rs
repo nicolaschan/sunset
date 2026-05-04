@@ -226,6 +226,12 @@ impl WebRtcRawTransport {
                                         candidates: Vec::new(),
                                         inserted_at: Instant::now(),
                                     });
+                                // Refresh the TTL on every push so slowly-
+                                // trickling ICE candidates (e.g. last
+                                // candidate arriving at t=29s on a 30s TTL)
+                                // all survive until the accept worker spawns
+                                // and drains the buffer.
+                                buf.inserted_at = Instant::now();
                                 buf.candidates.push(other);
                             }
                         }
