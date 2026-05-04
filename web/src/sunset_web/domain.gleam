@@ -88,6 +88,13 @@ pub type Member {
     /// received from this peer. `None` for self or peers we have not
     /// heard from. The popover renders age as `now_ms - this`.
     last_heartbeat_ms: option.Option(Int),
+    /// Raw display name from the wasm side. `None` ⇒ peer hasn't set
+    /// one (the rendered `name` field above falls back to short_pubkey
+    /// in that case).
+    raw_name: option.Option(String),
+    /// Raw pubkey bytes — kept here so MembersUpdated can map raw
+    /// names by pubkey without re-deriving from MemberId.
+    pubkey: BitArray,
   )
 }
 

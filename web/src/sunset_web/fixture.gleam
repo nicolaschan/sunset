@@ -129,6 +129,8 @@ pub fn members() -> List(Member) {
       in_call: True,
       role: HasRole("host"),
       last_heartbeat_ms: option.None,
+      raw_name: option.None,
+      pubkey: <<>>,
     ),
     Member(
       id: MemberId("u2"),
@@ -140,6 +142,8 @@ pub fn members() -> List(Member) {
       in_call: True,
       role: NoRole,
       last_heartbeat_ms: option.None,
+      raw_name: option.None,
+      pubkey: <<>>,
     ),
     Member(
       id: MemberId("u3"),
@@ -151,6 +155,8 @@ pub fn members() -> List(Member) {
       in_call: True,
       role: NoRole,
       last_heartbeat_ms: option.None,
+      raw_name: option.None,
+      pubkey: <<>>,
     ),
     Member(
       id: MemberId("u4"),
@@ -162,6 +168,8 @@ pub fn members() -> List(Member) {
       in_call: True,
       role: NoRole,
       last_heartbeat_ms: option.None,
+      raw_name: option.None,
+      pubkey: <<>>,
     ),
     Member(
       id: MemberId("u5"),
@@ -173,6 +181,8 @@ pub fn members() -> List(Member) {
       in_call: False,
       role: NoRole,
       last_heartbeat_ms: option.None,
+      raw_name: option.None,
+      pubkey: <<>>,
     ),
     Member(
       id: MemberId("u6"),
@@ -184,6 +194,8 @@ pub fn members() -> List(Member) {
       in_call: False,
       role: NoRole,
       last_heartbeat_ms: option.None,
+      raw_name: option.None,
+      pubkey: <<>>,
     ),
     Member(
       id: MemberId("u7"),
@@ -195,6 +207,8 @@ pub fn members() -> List(Member) {
       in_call: False,
       role: NoRole,
       last_heartbeat_ms: option.None,
+      raw_name: option.None,
+      pubkey: <<>>,
     ),
     Member(
       id: MemberId("u8"),
@@ -206,6 +220,8 @@ pub fn members() -> List(Member) {
       in_call: False,
       role: NoRole,
       last_heartbeat_ms: option.None,
+      raw_name: option.None,
+      pubkey: <<>>,
     ),
   ]
 }

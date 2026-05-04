@@ -185,6 +185,11 @@ export function currentTimeMs() {
   return Date.now();
 }
 
+export function hexEncode(bits) {
+  const bytes = bitsToBytes(bits);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export function shortPubkey(bits) {
   const bytes = bitsToBytes(bits);
   return Array.from(bytes.slice(0, 4), (b) => b.toString(16).padStart(2, "0"))

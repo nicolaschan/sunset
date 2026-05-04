@@ -189,6 +189,16 @@ pub type Model {
     /// IntentId of the relay whose popover is currently open. Client-wide
     /// (not per-room) because relays are a client-level concept.
     relays_popover: option.Option(Float),
+    /// Peer display-name map, keyed by full hex pubkey. Rebuilt from each
+    /// room's member list on MembersUpdated. Used by display_name() to
+    /// resolve a peer's chosen name with short_pubkey fallback.
+    name_map: Dict(String, String),
+    /// The local user's own display name (read from localStorage on init;
+    /// updated when the user submits the settings name field).
+    self_name: String,
+    /// Monotonically-incrementing token used to debounce/sequence
+    /// set_self_name calls so stale callbacks don't clobber the UI.
+    self_name_token: Int,
   )
 }
 
@@ -331,6 +341,9 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       now_ms: 0,
       rooms: dict.new(),
       relays_popover: None,
+      name_map: dict.new(),
+      self_name: storage.read_self_name(),
+      self_name_token: 0,
     )
 
   let subscribe_hash =
@@ -492,6 +505,25 @@ fn sanitize(raw: String) -> String {
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "currentTimeMs")
 fn current_time_ms() -> Int
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "hexEncode")
+fn hex_encode_ffi(bits: BitArray) -> String
+
+/// Hex-encode a BitArray as a lowercase string for use as a name_map dict key.
+/// Matches the format the Rust membership tracker uses to key its names map
+/// (full hex of the verifying key bytes — NOT truncated short_pubkey).
+pub fn hex_encode(bits: BitArray) -> String {
+  hex_encode_ffi(bits)
+}
+
+/// Look up a peer's chosen display name from the name_map, falling back to
+/// `short_pubkey(pk)` when no name has been observed (or the peer cleared theirs).
+pub fn display_name(name_map: Dict(String, String), pk: BitArray) -> String {
+  case dict.get(name_map, hex_encode(pk)) {
+    Ok(name) -> name
+    Error(_) -> short_pubkey(pk)
+  }
+}
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortPubkey")
 fn short_pubkey(bits: BitArray) -> String
@@ -1107,6 +1139,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
+          // Rebuild name_map: insert when raw_name is Some, delete when None.
+          let new_map =
+            list.fold(ms, model.name_map, fn(acc, m) {
+              let key = hex_encode(m.pubkey)
+              case m.raw_name {
+                option.Some(n) -> dict.insert(acc, key, n)
+                option.None -> dict.delete(acc, key)
+              }
+            })
           // If the open popover's target left, close it.
           let next_popover = case state.peer_status_popover {
             None -> None
@@ -1119,7 +1160,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let new_state =
             RoomState(..state, members: ms, peer_status_popover: next_popover)
           #(
-            Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
+            Model(
+              ..model,
+              rooms: dict.insert(model.rooms, name, new_state),
+              name_map: new_map,
+            ),
             effect.none(),
           )
         }
@@ -2192,9 +2237,14 @@ fn reactions_for(
 fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
   list.map(ms, fn(m) {
     let pk = sunset.mem_pubkey(m)
+    let raw = sunset.mem_name(m)
+    let name = case raw {
+      option.Some(n) -> n
+      option.None -> short_pubkey(pk)
+    }
     domain.Member(
       id: domain.MemberId(short_pubkey(pk)),
-      name: short_pubkey(pk),
+      name: name,
       initials: short_initials(pk),
       status: presence_to_status(sunset.mem_presence(m)),
       relay: connection_mode_to_relay(sunset.mem_connection_mode(m)),
@@ -2202,6 +2252,8 @@ fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
       in_call: False,
       role: domain.NoRole,
       last_heartbeat_ms: sunset.mem_last_heartbeat_ms(m),
+      raw_name: raw,
+      pubkey: pk,
     )
   })
 }
