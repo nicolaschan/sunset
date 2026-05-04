@@ -2124,6 +2124,125 @@ mod tests {
             .await;
     }
 
+    /// Helper: fetch the SUBSCRIBE_NAME entry written by `vk_bytes` from an
+    /// engine's store and decode its payload as a `Filter`.
+    async fn read_stored_filter(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        vk_bytes: &[u8],
+    ) -> Filter {
+        use sunset_store::Store as _;
+
+        let verifying_key = vk(vk_bytes);
+        let entry = engine
+            .store
+            .get_entry(&verifying_key, reserved::SUBSCRIBE_NAME)
+            .await
+            .expect("get_entry")
+            .expect("SUBSCRIBE_NAME entry must exist");
+        let block = engine
+            .store
+            .get_content(&entry.value_hash)
+            .await
+            .expect("get_content")
+            .expect("blob for SUBSCRIBE_NAME entry must be present");
+        postcard::from_bytes::<Filter>(&block.data)
+            .expect("SUBSCRIBE_NAME blob must decode as Filter")
+    }
+
+    /// Calling `publish_subscription` once stores the bare filter (not
+    /// wrapped in `Filter::Union`) in the SUBSCRIBE_NAME entry. This
+    /// preserves wire-format compatibility with pre-accumulation clients
+    /// in the common single-subsystem case.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_subscription_single_filter_writes_bare_filter() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = make_engine("alice", b"alice");
+
+                let f = Filter::NamePrefix(Bytes::from_static(b"chat/"));
+                engine
+                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("publish_subscription must succeed");
+
+                let stored = read_stored_filter(&engine, b"alice").await;
+                assert_eq!(
+                    stored, f,
+                    "single publish_subscription must store the bare filter, not Filter::Union([f])"
+                );
+            })
+            .await;
+    }
+
+    /// Calling `publish_subscription` twice with distinct filters stores a
+    /// `Filter::Union` that contains both filters. This ensures neither
+    /// subsystem's interest is silently clobbered by the other's call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_subscription_two_filters_writes_union() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = make_engine("alice", b"alice");
+
+                let f1 = Filter::NamePrefix(Bytes::from_static(b"chat/"));
+                let f2 = Filter::NamePrefix(Bytes::from_static(b"voice/"));
+                engine
+                    .do_publish_subscription(f1.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("first publish_subscription must succeed");
+                engine
+                    .do_publish_subscription(f2.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("second publish_subscription must succeed");
+
+                let stored = read_stored_filter(&engine, b"alice").await;
+                match &stored {
+                    Filter::Union(filters) => {
+                        assert!(
+                            filters.contains(&f1),
+                            "union must contain first filter; got {filters:?}"
+                        );
+                        assert!(
+                            filters.contains(&f2),
+                            "union must contain second filter; got {filters:?}"
+                        );
+                    }
+                    other => panic!("expected Filter::Union, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// Calling `publish_subscription` twice with the same filter must
+    /// deduplicate — the stored result must be the bare filter (not
+    /// `Filter::Union([f, f])`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_subscription_dedupe_same_filter() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = make_engine("alice", b"alice");
+
+                let f = Filter::NamePrefix(Bytes::from_static(b"chat/"));
+                engine
+                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("first publish_subscription must succeed");
+                engine
+                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("second publish_subscription (same filter) must succeed");
+
+                let stored = read_stored_filter(&engine, b"alice").await;
+                assert_eq!(
+                    stored, f,
+                    "duplicate publish_subscription must not wrap in Union; got {stored:?}"
+                );
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn own_published_filters_returns_self_authored_subscribe_entries_only() {
         use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
