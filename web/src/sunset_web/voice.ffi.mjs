@@ -16,13 +16,16 @@ let captureStream = null;
 // Test-only handle. The bundled module is otherwise unreachable from
 // page.evaluate() because Lustre's prod build inlines it into sunset_web.js
 // (no `/javascript/...` URL to dynamic-import). With `window.SUNSET_TEST`
-// set we expose `setPeerVolume` and `getPeerGain` on `window.__voiceFfi`
-// so Playwright specs can drive and inspect per-peer GainNodes the same
-// way the popover's mute-for-me toggle does. No-op in production.
+// set we expose `setPeerVolume` / `getPeerGain` for per-peer GainNode
+// drive + inspect, plus `stopCaptureSource` which detaches the mic
+// capture worklet from the live MediaStream so deterministic
+// `voice_inject_pcm` tests aren't polluted by fake-mic noise. No-op
+// in production.
 if (typeof window !== "undefined" && window.SUNSET_TEST) {
   window.__voiceFfi = {
     setPeerVolume: (peerHex, gain) => setPeerVolume(peerHex, gain),
     getPeerGain: (peerHex) => getPeerGain(peerHex),
+    stopCaptureSource: () => stopCaptureSource(),
   };
 }
 
@@ -72,6 +75,27 @@ export function stopCapture() {
     }
   }
   peers.clear();
+}
+
+// Test-only: silence the capture worklet path so the fake mic
+// (Chromium's --use-fake-device-for-media-stream supplies a continuous
+// tone) stops feeding `client.voice_input`. We:
+//   - stop all live MediaStream tracks (no new audio enters the worklet)
+//   - clear the worklet's message handler (any already-queued postMessage
+//     frames from the worklet drop on the floor instead of reaching
+//     `voice_input`, which is what would otherwise leak into the
+//     deterministic per-counter checksum assertion in tests).
+// Keeps the per-peer playback chain alive so injected frames still
+// flow. Idempotent. No-op in production (only the SUNSET_TEST handle
+// calls this).
+function stopCaptureSource() {
+  if (captureStream) {
+    for (const t of captureStream.getTracks()) t.stop();
+    captureStream = null;
+  }
+  if (captureNode) {
+    captureNode.port.onmessage = null;
+  }
 }
 
 export function deliverFrame(peerHex, pcm) {

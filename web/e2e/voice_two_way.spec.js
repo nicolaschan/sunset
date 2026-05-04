@@ -16,6 +16,7 @@ import {
   teardownRelay,
   freshSeedHex,
   syntheticPcm,
+  pcmChecksum,
 } from "./helpers/voice.js";
 
 let relay;
@@ -94,6 +95,15 @@ test("alice + bob hear each other through real Gleam UI", async ({
   // callback before flipping `self_in_call`). Once visible, test-hook
   // methods like `voice_install_frame_recorder` are safe to call.
 
+  // Detach the fake mic from the capture worklet on the injecting side
+  // so only `voice_inject_pcm` frames flow into `runtime.send_pcm`.
+  // Otherwise Chromium's --use-fake-device-for-media-stream feeds a
+  // continuous 440 Hz tone and Bob's recorder records both kinds of
+  // frame interleaved, which breaks the spec's per-counter checksum
+  // assertion. (The capture worklet path is exercised separately by
+  // voice_real_mic.spec.js.)
+  await alice.page.evaluate(() => window.__voiceFfi.stopCaptureSource());
+
   // Install frame recorders on both so delivered frames are captured.
   await alice.page.evaluate(() =>
     window.sunsetClient.voice_install_frame_recorder(),
@@ -119,10 +129,10 @@ test("alice + bob hear each other through real Gleam UI", async ({
     new Uint8Array(aliceHex.match(/.{2}/g).map((b) => parseInt(b, 16))),
   );
 
-  // Bob must receive ≥ 40 frames from Alice within 3 s.
-  // The voice pipeline (fake mic + injected frames → Opus codec → Bob)
-  // is validated at the frame-count level here; byte-exact checksums are
-  // not meaningful after Opus round-trip (the harness tests cover raw PCM).
+  // Bob must receive ≥ 40 frames from Alice within 3 s. The codec is
+  // passthrough in C2c, so frames arrive byte-equal — that means the
+  // recorder's per-frame SHA-256 must equal the JS-side checksum of
+  // the same `syntheticPcm(counter)` we injected.
   const recordedHandle = await bob.page.waitForFunction(
     ([bytes]) => {
       try {
@@ -140,6 +150,96 @@ test("alice + bob hear each other through real Gleam UI", async ({
   const frames = await recordedHandle.jsonValue();
   expect(frames.length).toBeGreaterThanOrEqual(40);
 
+  // Spec section 3 (voice_two_way): the three content checks that catch
+  // "looks fine but is silent / repeated / swapped peer". Alice injected
+  // counters 1..50; the spec budgets ≤ 20% jitter-buffer drop (≥ 40
+  // distinct counters surviving).
+  assertContentChecks(
+    frames,
+    { minCounter: 1, maxCounter: 50, minCount: 40 },
+    "alice → bob",
+  );
+
   await alice.ctx.close();
   await bob.ctx.close();
 });
+
+/**
+ * Spec content checks (section 3 of the voice-c2c spec).
+ *
+ * We can't simply assert "every recorded frame has a matching
+ * checksum" because in this test environment Chromium's
+ * `--use-fake-device-for-media-stream` feeds a 440 Hz tone into the
+ * capture worklet alongside the synthetic injection. We call
+ * `stopCaptureSource` before installing the recorder to silence that
+ * path, but already-in-flight frames can still arrive at the receiver
+ * after the recorder is installed — and those frames have the same
+ * codec/transport shape as injected ones, just with mic-derived PCM.
+ *
+ * To filter cleanly: for each `c` in the injected counter range we
+ * pre-compute the expected `(counter, checksum)` pair. Real injected
+ * frames hit one of these pairs exactly (codec is passthrough →
+ * byte-equal). Mic-derived frames almost surely don't (a 32-byte
+ * SHA-256 collision against a known set of 50 values is astronomical).
+ * The spec checks are then applied to only the confirmed-injected
+ * subset:
+ *   - Counter sequence is monotonically increasing within the subset.
+ *   - No stretch of identical counter values longer than 5 frames
+ *     (catches stuck-frame; jitter-pump may pad an underrun by
+ *     repeating the last delivered frame).
+ *   - Every confirmed frame's `(counter, checksum)` is in the
+ *     expected set (catches empty / wrong-frame / cross-peer mixup).
+ *   - At least `minCount` distinct injected counters land in the
+ *     recorder (catches lost frames; spec budgets ≤ 20% drop).
+ *
+ * @param {Array<{seq_in_frame: number, len: number, checksum: string}>} frames
+ * @param {{minCounter: number, maxCounter: number, minCount: number}} opts
+ *   Inclusive range of injected counters and the minimum number of
+ *   distinct counters expected to survive jitter-buffer drop.
+ * @param {string} label  Used in failure messages (e.g. "alice → bob").
+ */
+function assertContentChecks(frames, opts, label) {
+  const { minCounter, maxCounter, minCount } = opts;
+  // Pre-compute the expected (counter, checksum) pairs.
+  const expectedByCounter = new Map();
+  for (let c = minCounter; c <= maxCounter; c++) {
+    expectedByCounter.set(c, pcmChecksum(syntheticPcm(c)));
+  }
+
+  const confirmed = frames.filter(
+    (f) =>
+      expectedByCounter.has(f.seq_in_frame) &&
+      f.checksum === expectedByCounter.get(f.seq_in_frame),
+  );
+  expect(
+    confirmed.length,
+    `${label}: only ${confirmed.length} confirmed-injected frames; expected ≥ ${minCount}`,
+  ).toBeGreaterThanOrEqual(minCount);
+
+  let prev = -Infinity;
+  let runLen = 0;
+  let runVal = null;
+  const distinct = new Set();
+  for (const f of confirmed) {
+    expect(
+      f.seq_in_frame,
+      `${label}: counter regression (prev=${prev}, got=${f.seq_in_frame})`,
+    ).toBeGreaterThanOrEqual(prev);
+    if (f.seq_in_frame === runVal) {
+      runLen += 1;
+    } else {
+      runVal = f.seq_in_frame;
+      runLen = 1;
+    }
+    expect(
+      runLen,
+      `${label}: stuck-frame: ${runLen} consecutive frames with counter=${runVal}`,
+    ).toBeLessThanOrEqual(5);
+    distinct.add(f.seq_in_frame);
+    prev = f.seq_in_frame;
+  }
+  expect(
+    distinct.size,
+    `${label}: only ${distinct.size} distinct injected counters delivered`,
+  ).toBeGreaterThanOrEqual(minCount);
+}
