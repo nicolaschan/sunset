@@ -22,6 +22,12 @@ pub fn view(
   on_close on_close: msg,
   test_id test_id: String,
   label label: String,
+  /// Background colour painted edge-to-edge (including under iOS
+  /// status bar / home indicator in PWA standalone mode). Should
+  /// match the inner rail's own background — otherwise the safe-area
+  /// bands above and below the rail show through in the wrong colour
+  /// and the user perceives a two-tone band stuck to the screen edges.
+  background background: String,
   content content: Element(msg),
 ) -> Element(msg) {
   let translate_closed = case side {
@@ -64,7 +70,12 @@ pub fn view(
           // handling already used by phone_header for the main shell.
           #("padding-top", "env(safe-area-inset-top)"),
           #("padding-bottom", "env(safe-area-inset-bottom)"),
-          #("background", p.surface),
+          // Caller-supplied: must match the inner rail's background
+          // so the safe-area bands and the rail read as one continuous
+          // surface. The channels rail's `p.surface_alt` differs from
+          // the rooms / members rails' `p.surface`, so a single drawer-
+          // owned colour would always be wrong for one of the three.
+          #("background", background),
           #("color", p.text),
           #("border-right", case side {
             Left -> "1px solid " <> p.border
