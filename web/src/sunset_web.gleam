@@ -226,6 +226,11 @@ pub type Msg {
   )
   // Voice control msgs:
   JoinVoice(domain.RoomId)
+  /// Dispatched from the FFI's success callback once `voice_start()` resolves
+  /// `Ok` on the WASM side. Only at this point is `self_in_call` set, so the
+  /// minibar appears exactly when the runtime is ready to accept input —
+  /// callers that observe the minibar can safely call `voice_inject_pcm` etc.
+  VoiceStarted(domain.RoomId)
   LeaveVoice
   ToggleSelfMute
   ToggleSelfDeafen
@@ -1311,19 +1316,21 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Some(client), Ok(state) ->
           case state.handle {
             Some(handle) -> {
-              // Eagerly set self_in_call; roll back in VoicePermissionDenied if mic fails.
-              let new_voice =
-                VoiceModel(..model.voice, self_in_call: Some(room_id))
+              // Don't set self_in_call yet — wait for VoiceStarted from the
+              // FFI's Ok callback. Otherwise the minibar appears before the
+              // WASM voice runtime is ready, leading callers (UI clicks,
+              // tests) to act on a half-initialised pipeline. On Error we
+              // dispatch VoicePermissionDenied which surfaces a toast.
               let eff =
                 effect.from(fn(dispatch) {
                   voice.voice_start(client, handle, fn(result) {
                     case result {
-                      Ok(_) -> Nil
+                      Ok(_) -> dispatch(VoiceStarted(room_id))
                       Error(msg) -> dispatch(VoicePermissionDenied(msg))
                     }
                   })
                 })
-              #(Model(..model, voice: new_voice), eff)
+              #(model, eff)
             }
             None -> {
               let new_voice =
@@ -1345,6 +1352,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           #(Model(..model, voice: new_voice), effect.none())
         }
       }
+    }
+
+    VoiceStarted(room_id) -> {
+      let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
+      #(Model(..model, voice: new_voice), effect.none())
     }
 
     LeaveVoice -> {

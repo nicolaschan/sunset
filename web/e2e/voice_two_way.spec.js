@@ -16,7 +16,6 @@ import {
   teardownRelay,
   freshSeedHex,
   syntheticPcm,
-  waitForVoiceReady,
 } from "./helpers/voice.js";
 
 let relay;
@@ -90,10 +89,10 @@ test("alice + bob hear each other through real Gleam UI", async ({
     timeout: 500,
   });
 
-  // Wait for voice_start() to complete on the WASM side before calling
-  // test-hook methods (which throw "voice not started" until ready).
-  await waitForVoiceReady(alice.page);
-  await waitForVoiceReady(bob.page);
+  // The minibar appears once `voice_start()` resolves Ok on the WASM side
+  // (the Gleam UI dispatches `VoiceStarted` from the FFI's success
+  // callback before flipping `self_in_call`). Once visible, test-hook
+  // methods like `voice_install_frame_recorder` are safe to call.
 
   // Install frame recorders on both so delivered frames are captured.
   await alice.page.evaluate(() =>

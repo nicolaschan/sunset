@@ -9,7 +9,6 @@ import {
   teardownRelay,
   freshSeedHex,
   syntheticPcm,
-  waitForVoiceReady,
 } from "./helpers/voice.js";
 
 let relay;
@@ -95,10 +94,10 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
     timeout: 500,
   });
 
-  // Wait for voice_start() to complete on the WASM side for all three.
-  await waitForVoiceReady(alice.page);
-  await waitForVoiceReady(bob.page);
-  await waitForVoiceReady(carol.page);
+  // The minibar appears once `voice_start()` resolves Ok on the WASM side
+  // (Gleam UI dispatches `VoiceStarted` from the FFI's success callback
+  // before flipping `self_in_call`). Once visible, test-hook methods are
+  // safe to call.
 
   // Install frame recorders on all three.
   for (const peer of [alice, bob, carol]) {

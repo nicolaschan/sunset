@@ -7,7 +7,6 @@ import {
   freshSeedHex,
   syntheticPcm,
   installVoiceFfi,
-  waitForVoiceReady,
 } from "./helpers/voice.js";
 
 let relay;
@@ -72,13 +71,14 @@ async function joinVoice(page) {
   await page.locator('[data-testid="voice-channel-row"]').first().click();
   // Both layouts render the leave button once self_in_call is true:
   // the phone minibar uses voice-leave, and the desktop self_control_bar
-  // uses the same testid (channels.gleam ~825).
+  // uses the same testid (channels.gleam ~825). `self_in_call` flips only
+  // after `voice_start()` resolves Ok on the WASM side (the Gleam UI
+  // dispatches `VoiceStarted` from the FFI success callback), so this
+  // visibility assertion is also a "voice runtime ready" gate.
   await expect(page.locator('[data-testid="voice-leave"]')).toBeVisible({
     timeout: 2_000,
   });
   await dismissDrawerIfPresent(page);
-  // Wait for voice_start() to complete on the WASM side.
-  await waitForVoiceReady(page);
 }
 
 async function getPubkeyBytes(page) {

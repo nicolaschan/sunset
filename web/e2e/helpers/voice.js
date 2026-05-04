@@ -155,43 +155,6 @@ export function pcmChecksum(samples) {
 }
 
 // ---------------------------------------------------------------------------
-// Voice readiness helper
-// ---------------------------------------------------------------------------
-
-/**
- * Wait until the WASM voice session is fully started so test-hook methods
- * like `voice_install_frame_recorder` and `voice_inject_pcm` can be called
- * without throwing "voice not started".
- *
- * The WASM `voice_start()` is invoked asynchronously (getUserMedia → worklet
- * addModule → voice_start) after the UI dispatches JoinVoice. The minibar
- * appearing only means the UI has dispatched the intent; `voice_start()` on
- * the WASM side may still be in flight. This helper polls `voice_active_peers`
- * (which throws "voice not started" until voice is ready) and returns once
- * it succeeds.
- *
- * @param {import("@playwright/test").Page} page
- * @param {number} [timeoutMs=5000]
- */
-export async function waitForVoiceReady(page, timeoutMs = 5000) {
-  await page.waitForFunction(
-    () => {
-      try {
-        // voice_active_peers() throws "voice not started" until voice_start
-        // completes on the WASM side; once it returns (even an empty array),
-        // the voice session is up and test-hook methods are safe to call.
-        const peers = window.sunsetClient.voice_active_peers();
-        return Array.isArray(peers);
-      } catch (_) {
-        return false;
-      }
-    },
-    null,
-    { timeout: timeoutMs },
-  );
-}
-
-// ---------------------------------------------------------------------------
 // GainNode test affordance
 // ---------------------------------------------------------------------------
 

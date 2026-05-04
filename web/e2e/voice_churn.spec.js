@@ -8,7 +8,6 @@ import {
   freshSeedHex,
   syntheticPcm,
   pcmChecksum,
-  waitForVoiceReady,
 } from "./helpers/voice.js";
 
 let relay;
@@ -50,8 +49,12 @@ async function joinVoice(page) {
   // On phone the channels rail is in a drawer; open it before clicking.
   await page.locator('[data-testid="phone-rooms-toggle"]').click();
   await page.locator('[data-testid="voice-channel-row"]').first().click();
+  // The minibar appears once the WASM `voice_start()` resolves Ok (the UI
+  // dispatches `VoiceStarted` from the FFI's success callback before
+  // setting `self_in_call`). Waiting on it is sufficient — no need for an
+  // engine-internal probe.
   await expect(page.locator('[data-testid="voice-minibar"]')).toBeVisible({
-    timeout: 500,
+    timeout: 2_000,
   });
   // Dismiss the drawer — its backdrop intercepts pointer events while open.
   // The drawer aside (z-index 30) sits inside the backdrop (z-index 29).
@@ -60,9 +63,6 @@ async function joinVoice(page) {
   await page.locator('[data-testid="drawer-backdrop"]').nth(0).click({
     position: { x: 380, y: 400 },
   });
-  // Wait for voice_start() to complete on the WASM side (getUserMedia +
-  // AudioWorklet addModule are async; minibar appearing is UI-only).
-  await waitForVoiceReady(page);
 }
 
 async function getPubkeyBytes(page) {

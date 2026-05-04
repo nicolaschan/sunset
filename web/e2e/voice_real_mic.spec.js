@@ -13,7 +13,7 @@
 // No content check (raw mic audio is not byte-deterministic across runs).
 
 import { test, expect, devices } from "@playwright/test";
-import { spawnRelay, teardownRelay, freshSeedHex, waitForVoiceReady } from "./helpers/voice.js";
+import { spawnRelay, teardownRelay, freshSeedHex } from "./helpers/voice.js";
 
 // This spec is only matched by the chromium-real-mic project (see playwright.config.js).
 
@@ -80,9 +80,10 @@ test("real-mic capture: bob receives ≥ 40 frames from alice within 5 s", async
     timeout: 2_000,
   });
 
-  // Wait for voice_start() to complete on the WASM side for both peers.
-  await waitForVoiceReady(alice.page);
-  await waitForVoiceReady(bob.page);
+  // The voice-leave button appears once `voice_start()` resolves Ok on
+  // the WASM side (the Gleam UI dispatches `VoiceStarted` from the FFI's
+  // success callback before flipping `self_in_call`). Asserted above —
+  // safe to call test-hook methods now.
 
   // Install frame recorder on bob to capture alice's transmitted frames.
   await bob.page.evaluate(() =>
