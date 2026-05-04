@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 concurrency:
   group: docker-${{ github.ref }}
@@ -26,6 +27,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
       - name: Build image
         run: |
           nix build .#sunset-relay-docker
@@ -44,6 +46,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
       - name: Build image
         run: |
           nix build .#sunset-relay-docker
