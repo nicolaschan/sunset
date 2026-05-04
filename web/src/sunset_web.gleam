@@ -1169,10 +1169,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let next = domain.VoiceSettings(..settings, volume: value)
       // Also forward to FFI so real peers (when name == peer_hex) get updated.
       let gain = int.to_float(value) /. 100.0
-      let eff =
-        effect.from(fn(_) {
-          voice.set_peer_volume(name, gain)
-        })
+      let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
         Model(
           ..model,
@@ -1202,10 +1199,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         True -> 0.0
         False -> int.to_float(settings.volume) /. 100.0
       }
-      let eff =
-        effect.from(fn(_) {
-          voice.set_peer_volume(name, gain)
-        })
+      let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
         Model(
           ..model,
@@ -1216,10 +1210,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     ResetMemberVoice(name) -> {
       // Reset volume to 100% and restore GainNode via FFI.
-      let eff =
-        effect.from(fn(_) {
-          voice.set_peer_volume(name, 1.0)
-        })
+      let eff = effect.from(fn(_) { voice.set_peer_volume(name, 1.0) })
       #(
         Model(
           ..model,
@@ -1314,7 +1305,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     ReactionSent(_) -> #(model, effect.none())
 
     // ---- Voice control handlers ----
-
     JoinVoice(room_id) -> {
       // Eagerly set self_in_call; roll back in VoicePermissionDenied if mic fails.
       let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
@@ -1347,10 +1337,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           self_deafened: False,
         )
       let eff = case model.client {
-        Some(client) ->
-          effect.from(fn(_) {
-            voice.voice_stop(client)
-          })
+        Some(client) -> effect.from(fn(_) { voice.voice_stop(client) })
         None -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
@@ -1361,9 +1348,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let new_voice = VoiceModel(..model.voice, self_muted: new_muted)
       let eff = case model.client {
         Some(client) ->
-          effect.from(fn(_) {
-            voice.voice_set_muted(client, new_muted)
-          })
+          effect.from(fn(_) { voice.voice_set_muted(client, new_muted) })
         None -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
@@ -1374,9 +1359,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let new_voice = VoiceModel(..model.voice, self_deafened: new_deafened)
       let eff = case model.client {
         Some(client) ->
-          effect.from(fn(_) {
-            voice.voice_set_deafened(client, new_deafened)
-          })
+          effect.from(fn(_) { voice.voice_set_deafened(client, new_deafened) })
         None -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
@@ -1387,17 +1370,18 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         dict.insert(
           model.voice.peers,
           hex,
-          VoicePeerStateUI(in_call: in_call, talking: talking, is_muted: is_muted),
+          VoicePeerStateUI(
+            in_call: in_call,
+            talking: talking,
+            is_muted: is_muted,
+          ),
         )
       let new_voice = VoiceModel(..model.voice, peers: new_peers)
       #(Model(..model, voice: new_voice), effect.none())
     }
 
     SetPeerVolume(peer_hex, gain) -> {
-      let eff =
-        effect.from(fn(_) {
-          voice.set_peer_volume(peer_hex, gain)
-        })
+      let eff = effect.from(fn(_) { voice.set_peer_volume(peer_hex, gain) })
       // Also store in voice_settings (by hex) for display.
       let vol = float_to_volume_int(gain)
       let settings = member_voice_settings(model.voice_settings, peer_hex)
@@ -1405,7 +1389,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(
         Model(
           ..model,
-          voice_settings: dict.insert(model.voice_settings, peer_hex, new_settings),
+          voice_settings: dict.insert(
+            model.voice_settings,
+            peer_hex,
+            new_settings,
+          ),
         ),
         eff,
       )
@@ -1421,10 +1409,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       let new_settings =
         domain.VoiceSettings(..settings, deafened: new_muted_for_me)
-      let eff =
-        effect.from(fn(_) {
-          voice.set_peer_volume(peer_hex, gain)
-        })
+      let eff = effect.from(fn(_) { voice.set_peer_volume(peer_hex, gain) })
       #(
         Model(
           ..model,

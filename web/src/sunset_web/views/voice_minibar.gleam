@@ -72,11 +72,7 @@ pub fn view(
   )
 }
 
-fn label_button(
-  _p: Palette,
-  channel_name: String,
-  on_open: msg,
-) -> Element(msg) {
+fn label_button(_p: Palette, channel_name: String, on_open: msg) -> Element(msg) {
   html.button(
     [
       attribute.attribute("aria-label", "Voice controls for " <> channel_name),
