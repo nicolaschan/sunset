@@ -996,6 +996,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // wiring fires them yet — re-wire as part of the per-room
       // reactions follow-up.
 
+      // Bootstrap self-name from localStorage: restore the persisted name
+      // so the first presence heartbeat carries it.
+      let bootstrap_eff = case model.self_name {
+        "" -> effect.none()
+        name ->
+          effect.from(fn(_dispatch) {
+            sunset.set_self_name(client, name, fn() { Nil })
+          })
+      }
+
       // Insert placeholder RoomState for every joined room so the
       // shell renders fully even before the first RoomOpened lands.
       let rooms_with_placeholders =
@@ -1012,6 +1022,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           connect_eff,
           open_active_eff,
           open_others_eff,
+          bootstrap_eff,
         ]),
       )
     }
