@@ -6,6 +6,10 @@
 // point Playwright's `baseURL` at it.
 
 import { defineConfig, devices } from "@playwright/test";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const dist = process.env.SUNSET_WEB_DIST;
 if (!dist) {
@@ -34,8 +38,52 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
   projects: [
-    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
-    { name: "mobile-chrome", use: { ...devices["Pixel 7"] } },
+    {
+      name: "chromium",
+      use: {
+        ...devices["Desktop Chrome"],
+        // Voice tests require microphone access.
+        permissions: ["microphone"],
+        // Provide a fake audio device so getUserMedia succeeds in headless
+        // environments without a real microphone.
+        launchOptions: {
+          args: [
+            "--use-fake-device-for-media-stream",
+            "--use-fake-ui-for-media-stream",
+          ],
+        },
+      },
+    },
+    {
+      name: "mobile-chrome",
+      use: {
+        ...devices["Pixel 7"],
+        permissions: ["microphone"],
+        launchOptions: {
+          args: [
+            "--use-fake-device-for-media-stream",
+            "--use-fake-ui-for-media-stream",
+          ],
+        },
+      },
+    },
+    // Chromium project with a fake WAV file piped as the mic input.
+    // Used exclusively by voice_real_mic.spec.js (testMatch below).
+    {
+      name: "chromium-real-mic",
+      use: {
+        ...devices["Desktop Chrome"],
+        permissions: ["microphone"],
+        launchOptions: {
+          args: [
+            "--use-fake-device-for-media-stream",
+            "--use-fake-ui-for-media-stream",
+            `--use-file-for-fake-audio-capture=${resolve(__dirname, "audio/test-fixtures/sweep.wav")}`,
+          ],
+        },
+      },
+      testMatch: /voice_real_mic\.spec\.js/,
+    },
   ],
   webServer: {
     // static-web-server serves the dist directory; --port is bound on

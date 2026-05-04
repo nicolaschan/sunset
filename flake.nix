@@ -173,8 +173,53 @@
           '';
         };
 
-        # Voice protocol e2e test runner. Uses the test-hooks WASM build
-        # so Playwright can exercise voice_inject_pcm / voice_recorded_frames.
+        # Full Gleam UI built with the test-hooks WASM bundle. Used by Tasks 28–33
+        # (real Gleam UI Playwright tests) so voice_install_frame_recorder,
+        # voice_inject_pcm, voice_recorded_frames, and voice_active_peers are
+        # available on window.sunsetClient when window.SUNSET_TEST=true.
+        webVoiceUiTestDist = gleamLib.buildGleamPackage {
+          name = "sunset-web-voice-ui-test";
+          src = ./web;
+          manifest = ./web/manifest.toml;
+          target = "javascript";
+          lustre = true;
+          buildPhase = ''
+            runHook preBuild
+            ln -sfn ${webNodeModules}/node_modules ./node_modules
+            gleam build
+            # Use test-hooks WASM so voice_inject_pcm / voice_recorded_frames etc. work.
+            cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm.js build/dev/javascript/
+            cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm_bg.wasm build/dev/javascript/
+            gleam run -m lustre/dev build sunset_web --minify
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/audio/test-fixtures
+            cp -r dist/* $out/
+            if [ -d priv ]; then
+              cp -r priv/. $out/
+            fi
+            cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm.js $out/
+            cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm_bg.wasm $out/
+            cp ${./web/voice-e2e-test.html} $out/voice-e2e-test.html
+            cp audio/voice-capture-worklet.js $out/audio/
+            cp audio/voice-playback-worklet.js $out/audio/
+            # Generate a 5-second 440 Hz sine sweep WAV for the real-mic test.
+            ${pkgs.sox}/bin/sox -n -r 48000 -c 1 -e signed-integer -b 16 \
+              $out/audio/test-fixtures/sweep.wav synth 5 sine 440
+            ${pkgs.gnused}/bin/sed -i \
+              's|src="/sunset_web\.js"|src="sunset_web.js"|' \
+              $out/index.html
+            touch $out/.nojekyll
+            runHook postInstall
+          '';
+        };
+
+        # Voice protocol e2e test runner. Uses the full Gleam UI with
+        # test-hooks WASM so all voice Playwright specs (Tasks 19, 28–33)
+        # work. voice_protocol.spec.js still serves from /voice-e2e-test.html
+        # (included in the dist); Tasks 28–33 use the real Gleam UI at /.
         webTestRunnerVoice = pkgs.writeShellScriptBin "sunset-web-test-voice" ''
           set -euo pipefail
 
@@ -186,7 +231,7 @@
           export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
           export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
           export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-          export SUNSET_WEB_DIST="${webVoiceTestDist}"
+          export SUNSET_WEB_DIST="${webVoiceUiTestDist}"
 
           cd "$(${pkgs.git}/bin/git rev-parse --show-toplevel)/web"
           rm -f node_modules
@@ -244,6 +289,7 @@
             pkgs.static-web-server
             pkgs.wasm-bindgen-cli
             pkgs.wasm-pack
+            pkgs.sox
           ];
           shellHook = ''
             ${if webHexDeps != null
@@ -257,7 +303,7 @@
             # run voice_protocol.spec.js from the dev shell without a separate
             # `nix run .#web-test-voice` invocation. Override with the full
             # prod dist when running the entire test suite via `nix run .#web-test`.
-            export SUNSET_WEB_DIST="''${SUNSET_WEB_DIST:-${webVoiceTestDist}}"
+            export SUNSET_WEB_DIST="''${SUNSET_WEB_DIST:-${webVoiceUiTestDist}}"
             # Make sunset-relay available in the dev shell for Playwright tests.
             export PATH="${pkgs.lib.makeBinPath [ sunsetRelayPkg ]}:$PATH"
           '';
@@ -268,6 +314,7 @@
           sunset-web-wasm = sunsetWebWasmPkg;
           sunset-web-wasm-test-hooks = sunsetWebWasmTestHooksPkg;
           web-voice-test-dist = webVoiceTestDist;
+          web-voice-ui-test-dist = webVoiceUiTestDist;
 
           sunset-relay-docker = pkgs.dockerTools.buildLayeredImage {
             name = "sunset-relay";
