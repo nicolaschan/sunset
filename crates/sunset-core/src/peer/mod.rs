@@ -665,7 +665,7 @@ mod tests {
                 let room = peer.open_room("alpha").await.expect("open_room");
 
                 // Seed last_signature with something non-empty so we can verify
-                // the registration clears it. MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode)>
+                // the registration clears it. MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode, Option<String>)>
                 room.inner
                     .tracker_handles
                     .last_signature
@@ -674,6 +674,7 @@ mod tests {
                         vec![1, 2, 3],
                         crate::membership::Presence::Online,
                         crate::membership::ConnectionMode::Direct,
+                        None,
                     ));
                 assert!(
                     !room

@@ -108,13 +108,18 @@ pub struct Member {
     /// peer we've heard nothing from. UI surfaces compute
     /// `now_ms - last_heartbeat_ms` for the "heard from N ago" string.
     pub last_heartbeat_ms: Option<u64>,
+    /// Display name claimed by this peer in their most recent
+    /// `PresenceBody`. `None` ⇒ peer has not set a name (or their
+    /// presence body is not local yet — see tracker block-fetch
+    /// notes). UI surfaces fall back to `short_pubkey` rendering.
+    pub name: Option<String>,
 }
 
 /// Stable per-member signature row used for debounce:
-/// `(pubkey, presence, connection_mode)`. Excludes
+/// `(pubkey, presence, connection_mode, name)`. Excludes
 /// `last_heartbeat_ms` so the tracker doesn't re-emit on every
 /// heartbeat tick.
-pub type MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode)>;
+pub type MemberSig = Vec<(Vec<u8>, Presence, ConnectionMode, Option<String>)>;
 
 /// Callback fired with the current rendered member list whenever it
 /// changes (per `members_signature` debounce).
@@ -140,6 +145,14 @@ pub fn presence_bucket(age_ms: u64, interval_ms: u64, ttl_ms: u64) -> Presence {
     }
 }
 
+/// Inputs derived from the tracker's maps. Bundled so derive_members
+/// stays under the clippy `too_many_arguments` threshold (default 7).
+pub struct MemberInputs<'a> {
+    pub presence_map: &'a HashMap<PeerId, u64>,
+    pub peer_kinds: &'a HashMap<PeerId, TransportKind>,
+    pub names: &'a HashMap<PeerId, Option<String>>,
+}
+
 /// Pure derivation: given the current state, return the rendered
 /// member list. Self is always present and always Online. Others
 /// whose age exceeds `ttl_ms` are filtered out.
@@ -148,9 +161,13 @@ pub fn derive_members(
     interval_ms: u64,
     ttl_ms: u64,
     self_peer: &PeerId,
-    presence_map: &HashMap<PeerId, u64>,
-    peer_kinds: &HashMap<PeerId, TransportKind>,
+    inputs: &MemberInputs<'_>,
 ) -> Vec<Member> {
+    let MemberInputs {
+        presence_map,
+        peer_kinds,
+        names,
+    } = inputs;
     let mut out = Vec::new();
     out.push(Member {
         pubkey: self_peer.verifying_key().as_bytes().to_vec(),
@@ -158,6 +175,7 @@ pub fn derive_members(
         connection_mode: ConnectionMode::Self_,
         is_self: true,
         last_heartbeat_ms: None,
+        name: names.get(self_peer).cloned().unwrap_or(None),
     });
     let mut others: Vec<(&PeerId, &u64)> = presence_map
         .iter()
@@ -196,6 +214,7 @@ pub fn derive_members(
             connection_mode,
             is_self: false,
             last_heartbeat_ms: Some(*last_ms),
+            name: names.get(pk).cloned().unwrap_or(None),
         });
     }
     out
@@ -207,7 +226,14 @@ pub fn derive_members(
 pub fn members_signature(members: &[Member]) -> MemberSig {
     members
         .iter()
-        .map(|m| (m.pubkey.clone(), m.presence, m.connection_mode))
+        .map(|m| {
+            (
+                m.pubkey.clone(),
+                m.presence,
+                m.connection_mode,
+                m.name.clone(),
+            )
+        })
         .collect()
 }
 
@@ -300,6 +326,9 @@ pub fn spawn_tracker<S: Store + 'static>(
         let mut presence_sub = presence_sub.fuse();
         let mut refresh_rx = refresh_rx.fuse();
         let presence_map: Rc<RefCell<HashMap<PeerId, u64>>> = Rc::new(RefCell::new(HashMap::new()));
+        // Task 5 will populate this from PresenceBody blobs; for now it
+        // is always empty so the tracker keeps its pre-name behavior.
+        let names_map: HashMap<PeerId, Option<String>> = HashMap::new();
         let prefix = format!("{room_fp_hex}/presence/");
 
         loop {
@@ -323,6 +352,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         ttl_ms,
                         &self_peer,
                         &presence_map.borrow(),
+                        &names_map,
                         &handles,
                     );
                 }
@@ -335,6 +365,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         ttl_ms,
                         &self_peer,
                         &presence_map.borrow(),
+                        &names_map,
                         &handles,
                     );
                 }
@@ -348,6 +379,7 @@ pub fn spawn_tracker<S: Store + 'static>(
                         ttl_ms,
                         &self_peer,
                         &presence_map.borrow(),
+                        &names_map,
                         &handles,
                     );
                 }
@@ -401,6 +433,7 @@ fn maybe_fire_members(
     ttl_ms: u64,
     self_peer: &PeerId,
     presence_map: &HashMap<PeerId, u64>,
+    names: &HashMap<PeerId, Option<String>>,
     handles: &TrackerHandles,
 ) {
     let members = derive_members(
@@ -408,8 +441,11 @@ fn maybe_fire_members(
         interval_ms,
         ttl_ms,
         self_peer,
-        presence_map,
-        &handles.peer_kinds.borrow(),
+        &MemberInputs {
+            presence_map,
+            peer_kinds: &handles.peer_kinds.borrow(),
+            names,
+        },
     );
     let sig = members_signature(&members);
     if sig == *handles.last_signature.borrow() {
@@ -446,7 +482,18 @@ mod tests {
         let me = pk(1);
         let presence = HashMap::new();
         let kinds = HashMap::new();
-        let out = derive_members(0, 1000, 3000, &me, &presence, &kinds);
+        let names = HashMap::new();
+        let out = derive_members(
+            0,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert_eq!(out.len(), 1);
         assert!(out[0].is_self);
         assert_eq!(out[0].presence, Presence::Online);
@@ -460,8 +507,19 @@ mod tests {
         let mut presence = HashMap::new();
         presence.insert(bob.clone(), 0u64);
         let kinds = HashMap::new();
+        let names = HashMap::new();
         // bob's heartbeat is 5s old but ttl is 3s → Offline → dropped.
-        let out = derive_members(5000, 1000, 3000, &me, &presence, &kinds);
+        let out = derive_members(
+            5000,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert_eq!(out.len(), 1);
         assert!(out[0].is_self);
     }
@@ -481,7 +539,18 @@ mod tests {
         kinds.insert(carol.clone(), TransportKind::Secondary);
         // dave: no kind, but a Primary (bob) exists → dave's presence was
         // forwarded by the relay → "via_relay".
-        let out = derive_members(200, 1000, 3000, &me, &presence, &kinds);
+        let names = HashMap::new();
+        let out = derive_members(
+            200,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert_eq!(out.len(), 4);
         let modes: Vec<ConnectionMode> = out.iter().map(|m| m.connection_mode).collect();
         assert_eq!(
@@ -504,7 +573,18 @@ mod tests {
         // No Primary in peer_kinds → dave's presence has no traceable
         // route → "unknown".
         let kinds = HashMap::new();
-        let out = derive_members(200, 1000, 3000, &me, &presence, &kinds);
+        let names = HashMap::new();
+        let out = derive_members(
+            200,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].connection_mode, ConnectionMode::Unknown);
     }
@@ -516,9 +596,30 @@ mod tests {
         let mut presence = HashMap::new();
         presence.insert(bob.clone(), 0);
         let kinds = HashMap::new();
+        let names = HashMap::new();
 
-        let s1 = members_signature(&derive_members(500, 1000, 3000, &me, &presence, &kinds));
-        let s2 = members_signature(&derive_members(1500, 1000, 3000, &me, &presence, &kinds));
+        let s1 = members_signature(&derive_members(
+            500,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        ));
+        let s2 = members_signature(&derive_members(
+            1500,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        ));
         assert_ne!(s1, s2, "Online → Away should change signature");
     }
 
@@ -529,7 +630,18 @@ mod tests {
         let mut presence = HashMap::new();
         presence.insert(bob.clone(), 12_345_u64);
         let kinds = HashMap::new();
-        let out = derive_members(20_000, 30_000, 60_000, &me, &presence, &kinds);
+        let names = HashMap::new();
+        let out = derive_members(
+            20_000,
+            30_000,
+            60_000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
         assert!(out[0].is_self);
         assert_eq!(out[0].last_heartbeat_ms, None);
         assert!(!out[1].is_self);
@@ -547,6 +659,7 @@ mod tests {
             connection_mode: ConnectionMode::ViaRelay,
             is_self: false,
             last_heartbeat_ms: Some(100),
+            name: None,
         };
         let m2 = Member {
             pubkey: vec![1; 32],
@@ -554,7 +667,95 @@ mod tests {
             connection_mode: ConnectionMode::ViaRelay,
             is_self: false,
             last_heartbeat_ms: Some(200),
+            name: None,
         };
         assert_eq!(members_signature(&[m1]), members_signature(&[m2]));
+    }
+
+    #[test]
+    fn derive_members_attaches_name_when_present() {
+        let me = pk(1);
+        let bob = pk(2);
+        let mut presence = HashMap::new();
+        presence.insert(bob.clone(), 0u64);
+        let kinds = HashMap::new();
+        let mut names = HashMap::new();
+        names.insert(bob.clone(), Some("bob".to_owned()));
+        let out = derive_members(
+            100,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_self);
+        assert_eq!(out[0].name, None);
+        assert_eq!(out[1].name, Some("bob".to_owned()));
+    }
+
+    #[test]
+    fn derive_members_attaches_self_name() {
+        let me = pk(1);
+        let presence = HashMap::new();
+        let kinds = HashMap::new();
+        let mut names = HashMap::new();
+        names.insert(me.clone(), Some("alice".to_owned()));
+        let out = derive_members(
+            0,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names,
+            },
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_self);
+        assert_eq!(out[0].name, Some("alice".to_owned()));
+    }
+
+    #[test]
+    fn members_signature_changes_on_name_change() {
+        let me = pk(1);
+        let bob = pk(2);
+        let mut presence = HashMap::new();
+        presence.insert(bob.clone(), 0u64);
+        let kinds = HashMap::new();
+
+        let mut names_a = HashMap::new();
+        names_a.insert(bob.clone(), Some("alice".to_owned()));
+        let mut names_b = HashMap::new();
+        names_b.insert(bob.clone(), Some("alicia".to_owned()));
+
+        let sig_a = members_signature(&derive_members(
+            100,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names_a,
+            },
+        ));
+        let sig_b = members_signature(&derive_members(
+            100,
+            1000,
+            3000,
+            &me,
+            &MemberInputs {
+                presence_map: &presence,
+                peer_kinds: &kinds,
+                names: &names_b,
+            },
+        ));
+        assert_ne!(sig_a, sig_b);
     }
 }
