@@ -11,35 +11,9 @@
 
 import { test, expect, devices } from "@playwright/test";
 
-// FIXME (BLOCKED on Gleam UI bug): VoicePermissionDenied dispatch from
-// the wasmVoiceStart promise rejection callback does not propagate to
-// the model in the prod-built bundle. The callback runs (verified —
-// stdout shows the rejected getUserMedia + the .catch handler firing,
-// and `self_in_call` IS rolled back to None so the minibar disappears),
-// but `permission_error: Some(...)` never lands on `model.voice` and
-// the toast div is never inserted into the DOM. The handler at
-// sunset_web.gleam:1445 (VoicePermissionDenied) sets BOTH self_in_call
-// and permission_error in a single record update; only self_in_call
-// takes effect. Toast string "Microphone access required..." is in the
-// bundle and would appear if the update landed. Reproducer in this
-// spec — page.addInitScript overrides navigator.mediaDevices.getUserMedia
-// to reject with NotAllowedError, exactly the shape Chrome surfaces
-// when a user clicks Block. Granted-mic case (below) takes the same
-// JoinVoice → voice_start path and works, so the dispatch system is
-// not entirely broken — only the async-rejection branch is.
-//
-// Investigation tried: confirming class identity (single class def in
-// bundle), tracing dispatch through K0 → effect.from → actions.dispatch
-// → Lustre runtime.dispatch (which checks #shouldQueue, but should be
-// false at async callback time so the message processes immediately),
-// confirming the stringified error message reaches the inner callback,
-// adding window.error / unhandledrejection listeners (no errors fired).
-// Needs a Gleam/Lustre owner to look at why this specific async dispatch
-// pattern silently no-ops here while every other one (HashChanged,
-// VoicePeerStateChanged, IdentityReady, etc.) works.
-test.fixme(
-  "denied microphone shows toast and does not show minibar",
-  async ({ browser }) => {
+test("denied microphone shows toast and does not show minibar", async ({
+  browser,
+}) => {
   const ctx = await browser.newContext({
     ...devices["Pixel 7"],
     permissions: [],
@@ -114,8 +88,7 @@ test.fixme(
   await expect(page.locator('[data-testid="voice-minibar"]')).not.toBeVisible();
 
   await ctx.close();
-  },
-);
+});
 
 test("granted microphone allows voice join", async ({ browser }) => {
   const ctx = await browser.newContext({
