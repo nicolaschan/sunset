@@ -8,17 +8,53 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+use std::time::Duration;
+
 use sunset_core::{Ed25519Verifier, Identity};
-use sunset_noise::{NoiseIdentity, NoiseTransport};
+use sunset_noise::{NoiseIdentity, NoiseTransport, do_handshake_responder};
 use sunset_store_memory::MemoryStore;
-use sunset_sync::{MultiTransport, PeerId, Signer, SyncConfig, SyncEngine};
+use sunset_sync::{MultiTransport, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine};
 use sunset_sync_webrtc_browser::WebRtcRawTransport;
 use sunset_sync_ws_browser::WebSocketRawTransport;
 
 use crate::identity::identity_from_seed;
 
 pub(crate) type WsT = NoiseTransport<WebSocketRawTransport>;
-pub(crate) type RtcT = NoiseTransport<WebRtcRawTransport>;
+/// The browser's inbound WebRTC pipeline mirrors the relay's
+/// WebSocket wiring (see `sunset-relay/src/relay.rs`):
+///   raw WebRTC accept → spawn task → Noise IK responder → ready conn
+/// The `SpawningAcceptor` wrapper is load-bearing. Without it, the
+/// engine's `select!` loop in `SyncEngine::run` would drop the
+/// in-flight `NoiseTransport::accept` future (and the
+/// `do_handshake_responder` it's running) every time *any* other arm
+/// fires — store events, cmd_rx, anti-entropy ticks. That drop closes
+/// the underlying `WebRtcRawConnection`'s data channels, which
+/// (combined with the on_close handler in `wasm.rs`) bubbles back to
+/// the dialer as `Err("dc closed")` partway through Noise IK. We saw
+/// this manifest as `voice_network`/`presence`/`kill_relay` flakes
+/// where alice's webrtc:// dial timed out at 10 s waiting for
+/// `connection_mode == "direct"`. The connector half of the
+/// `SpawningAcceptor` (a clone of the same `WebRtcRawTransport`) is
+/// what handles outbound `webrtc://` dials — sharing the underlying
+/// transport via the `WebRtcRawTransport: Clone` impl keeps signaling
+/// state coherent between the two halves.
+pub(crate) type RtcT = SpawningAcceptor<
+    WebRtcRawTransport,
+    NoiseTransport<WebRtcRawTransport>,
+    RtcPromoteFn,
+    RtcPromoteFut,
+    sunset_noise::NoiseConnection<sunset_sync_webrtc_browser::WebRtcRawConnection>,
+>;
+type RtcPromoteFut = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = sunset_sync::Result<
+                    sunset_noise::NoiseConnection<sunset_sync_webrtc_browser::WebRtcRawConnection>,
+                >,
+            >,
+    >,
+>;
+type RtcPromoteFn = Box<dyn Fn(sunset_sync_webrtc_browser::WebRtcRawConnection) -> RtcPromoteFut>;
 
 /// Adapter so sunset-core's `Identity` works as a NoiseIdentity.
 struct IdentityNoiseAdapter(Identity);
@@ -69,10 +105,32 @@ impl Client {
             local_peer.clone(),
             vec!["stun:stun.l.google.com:19302".into()],
         );
-        let rtc_noise =
-            NoiseTransport::new(rtc_raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
+        let rtc_noise_id: Arc<dyn NoiseIdentity> = Arc::new(IdentityNoiseAdapter(identity.clone()));
+        // Outbound dialer half: Noise IK initiator on top of the same
+        // raw transport. The clone shares signaling state via Rc so
+        // outgoing offers/answers/ICE flow through the same dispatcher
+        // the inbound pump is reading from.
+        let rtc_connector = NoiseTransport::new(rtc_raw.clone(), rtc_noise_id.clone());
+        let rtc_promote: RtcPromoteFn = {
+            let identity = rtc_noise_id.clone();
+            Box::new(move |raw_conn| {
+                let identity = identity.clone();
+                Box::pin(async move {
+                    do_handshake_responder(raw_conn, identity)
+                        .await
+                        .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
+                })
+            })
+        };
+        // 60 s handshake timeout matches the relay's default and is
+        // generous for a localhost WebRTC handshake (~tens of ms in
+        // practice). Hits only as a backstop against a peer that
+        // signals an Offer but never finishes the data-channel
+        // handshake.
+        let rtc =
+            SpawningAcceptor::new(rtc_raw, rtc_connector, rtc_promote, Duration::from_secs(60));
 
-        let multi = MultiTransport::new(ws_noise, rtc_noise);
+        let multi = MultiTransport::new(ws_noise, rtc);
         let signer: Arc<dyn Signer> = Arc::new(identity.clone());
 
         let mut config = SyncConfig::default();
