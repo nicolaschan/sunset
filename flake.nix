@@ -174,6 +174,14 @@
             cp ${sunsetWebWasmPkg}/sunset_web_wasm_bg.wasm $out/
             # Copy the C2b voice e2e test harness so Playwright can fetch it via static-web-server.
             cp ${./web/voice-e2e-test.html} $out/voice-e2e-test.html
+            # Audio worklets — the Gleam UI's voice.ffi.mjs loads these via
+            # ctx.audioWorklet.addModule("/audio/voice-{capture,playback}-worklet.js").
+            # Without this copy the production deployment 404s the worklet URLs
+            # and getUserMedia rolls back with "Unable to load a worklet's
+            # module" / "operation was aborted" depending on the browser.
+            mkdir -p $out/audio
+            cp ${./web/audio/voice-capture-worklet.js} $out/audio/voice-capture-worklet.js
+            cp ${./web/audio/voice-playback-worklet.js} $out/audio/voice-playback-worklet.js
             # Lustre emits an absolute `/sunset_web.js` script src which only
             # works at site root. Rewrite to a relative path so the artefact
             # serves correctly under any GitHub Pages sub-path.
