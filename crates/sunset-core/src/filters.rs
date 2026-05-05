@@ -30,7 +30,7 @@ mod tests {
     use sunset_store::VerifyingKey;
 
     use crate::crypto::constants::test_fast_params;
-    use crate::crypto::envelope::MessageBody;
+    use crate::crypto::envelope::{ChannelLabel, MessageBody};
     use crate::identity::Identity;
     use crate::message::compose_message;
 
@@ -49,6 +49,7 @@ mod tests {
             &room,
             0,
             1,
+            ChannelLabel::default_general(),
             MessageBody::Text("x".to_owned()),
             &mut OsRng,
         )
@@ -68,6 +69,7 @@ mod tests {
             &alice_room,
             0,
             1,
+            ChannelLabel::default_general(),
             MessageBody::Text("x".to_owned()),
             &mut OsRng,
         )

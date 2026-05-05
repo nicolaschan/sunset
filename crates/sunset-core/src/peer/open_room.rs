@@ -69,6 +69,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             &self.inner.room,
             crate::V1_EPOCH_ID,
             sent_at_ms,
+            crate::ChannelLabel::default_general(),
             MessageBody::Text(body),
             &mut rng,
         )?;
@@ -356,6 +357,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             &self.inner.room,
             crate::V1_EPOCH_ID,
             sent_at_ms,
+            crate::ChannelLabel::default_general(),
             &crate::ReactionPayload {
                 for_value_hash: target,
                 emoji: &emoji,
@@ -402,6 +404,7 @@ async fn send_receipt<St: Store + 'static>(
         room,
         crate::V1_EPOCH_ID,
         now_ms,
+        crate::ChannelLabel::default_general(),
         for_value_hash,
         rng,
     ) {

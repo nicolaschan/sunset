@@ -45,6 +45,7 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
                 &room,
                 0,
                 100,
+                sunset_core::ChannelLabel::default_general(),
                 &ReactionPayload {
                     for_value_hash: target,
                     emoji: "👍",
@@ -85,6 +86,7 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
                 &room,
                 0,
                 200,
+                sunset_core::ChannelLabel::default_general(),
                 &ReactionPayload {
                     for_value_hash: target,
                     emoji: "👍",
@@ -158,6 +160,7 @@ async fn tracker_debounces_duplicate_state() {
                 &room,
                 0,
                 100,
+                sunset_core::ChannelLabel::default_general(),
                 &ReactionPayload {
                     for_value_hash: target,
                     emoji: "👍",

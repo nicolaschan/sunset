@@ -41,7 +41,16 @@ async fn reaction_round_trip_between_two_identities() {
             );
 
             // 1. Alice composes a Text and inserts it on her store; sync to bob.
-            let text = compose_text(&alice, &room, 0, 1, "hello bob", &mut OsRng).unwrap();
+            let text = compose_text(
+                &alice,
+                &room,
+                0,
+                1,
+                sunset_core::ChannelLabel::default_general(),
+                "hello bob",
+                &mut OsRng,
+            )
+            .unwrap();
             let target = text.entry.value_hash;
             alice_store
                 .insert(text.entry.clone(), Some(text.block.clone()))
@@ -58,6 +67,7 @@ async fn reaction_round_trip_between_two_identities() {
                 &room,
                 0,
                 100,
+                sunset_core::ChannelLabel::default_general(),
                 &ReactionPayload {
                     for_value_hash: target,
                     emoji: "👍",
@@ -95,6 +105,7 @@ async fn reaction_round_trip_between_two_identities() {
                 &room,
                 0,
                 200,
+                sunset_core::ChannelLabel::default_general(),
                 &ReactionPayload {
                     for_value_hash: target,
                     emoji: "👍",

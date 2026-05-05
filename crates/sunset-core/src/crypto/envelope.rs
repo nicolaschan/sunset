@@ -2,7 +2,7 @@
 //!
 //! Wire layering (top is innermost — the AEAD plaintext):
 //!
-//!   SignedMessage   { inner_signature, sent_at_ms, body }
+//!   SignedMessage   { inner_signature, sent_at_ms, channel, body }
 //!         |  postcard
 //!         v
 //!   <plaintext bytes>
@@ -16,6 +16,9 @@
 //! The `inner_signature` covers the canonical `InnerSigPayload` (defined
 //! below) and is verified by recipients after AEAD-decrypt — this is the
 //! authentication property from the crypto spec's third non-negotiable.
+//! The `channel` rides inside the AEAD plaintext (so the relay never sees
+//! it) and is covered by the inner signature (so a peer can't tamper with
+//! it). See `docs/superpowers/specs/2026-05-04-channels-within-rooms-design.md`.
 
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -76,12 +79,77 @@ impl<'de> Deserialize<'de> for Signature {
     }
 }
 
+/// Channel label carried by every chat message (Text, Receipt, Reaction).
+/// Lives inside the AEAD plaintext and is covered by the inner Ed25519
+/// signature, so the relay sees only `<room_fp>/msg/<hash>` — never the
+/// channel. Validated to be 1..=64 bytes UTF-8, no ASCII control
+/// characters, not all-whitespace.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ChannelLabel(String);
+
+/// The default channel name; every room implicitly has it.
+pub const DEFAULT_CHANNEL: &str = "general";
+
+impl ChannelLabel {
+    pub fn try_new(s: impl Into<String>) -> crate::Result<Self> {
+        let s = s.into();
+        if s.is_empty() {
+            return Err(crate::Error::BadChannel("empty".to_owned()));
+        }
+        if s.len() > 64 {
+            return Err(crate::Error::BadChannel(format!(
+                "too long ({} bytes)",
+                s.len()
+            )));
+        }
+        if s.chars().any(|c| c.is_control()) {
+            return Err(crate::Error::BadChannel(
+                "contains control character".to_owned(),
+            ));
+        }
+        if s.chars().all(char::is_whitespace) {
+            return Err(crate::Error::BadChannel("all whitespace".to_owned()));
+        }
+        Ok(Self(s))
+    }
+
+    pub fn default_general() -> Self {
+        // Constructed by hand so we never panic at construction time
+        // for the default constant.
+        Self(DEFAULT_CHANNEL.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ChannelLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ChannelLabel {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChannelLabel {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Self::try_new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Plaintext-inside-the-AEAD. The author's Ed25519 signature over
 /// `InnerSigPayload` is `inner_signature`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedMessage {
     pub inner_signature: Signature,
     pub sent_at_ms: u64,
+    pub channel: ChannelLabel,
     pub body: MessageBody,
 }
 
@@ -92,6 +160,7 @@ pub struct InnerSigPayload<'a> {
     pub room_fingerprint: &'a [u8; 32],
     pub epoch_id: u64,
     pub sent_at_ms: u64,
+    pub channel: &'a ChannelLabel,
     pub body: &'a MessageBody,
 }
 
@@ -99,12 +168,14 @@ pub fn inner_sig_payload_bytes(
     room_fp: &RoomFingerprint,
     epoch_id: u64,
     sent_at_ms: u64,
+    channel: &ChannelLabel,
     body: &MessageBody,
 ) -> Vec<u8> {
     postcard::to_stdvec(&InnerSigPayload {
         room_fingerprint: room_fp.as_bytes(),
         epoch_id,
         sent_at_ms,
+        channel,
         body,
     })
     .expect("postcard encoding of InnerSigPayload is infallible for in-memory inputs")
@@ -169,6 +240,7 @@ mod tests {
         let m = SignedMessage {
             inner_signature: Signature([9u8; 64]),
             sent_at_ms: 1_700_000_000_000,
+            channel: ChannelLabel::default_general(),
             body: MessageBody::Text("hello".to_owned()),
         };
         let bytes = postcard::to_stdvec(&m).unwrap();
@@ -191,14 +263,16 @@ mod tests {
     #[test]
     fn inner_sig_payload_changes_with_each_field() {
         let fp = RoomFingerprint([1u8; 32]);
-        let a = inner_sig_payload_bytes(&fp, 0, 100, &MessageBody::Text("hi".to_owned()));
-        let b = inner_sig_payload_bytes(&fp, 1, 100, &MessageBody::Text("hi".to_owned())); // epoch differs
-        let c = inner_sig_payload_bytes(&fp, 0, 101, &MessageBody::Text("hi".to_owned())); // sent_at differs
-        let d = inner_sig_payload_bytes(&fp, 0, 100, &MessageBody::Text("hello".to_owned())); // body differs
+        let g = ChannelLabel::default_general();
+        let a = inner_sig_payload_bytes(&fp, 0, 100, &g, &MessageBody::Text("hi".to_owned()));
+        let b = inner_sig_payload_bytes(&fp, 1, 100, &g, &MessageBody::Text("hi".to_owned())); // epoch differs
+        let c = inner_sig_payload_bytes(&fp, 0, 101, &g, &MessageBody::Text("hi".to_owned())); // sent_at differs
+        let d = inner_sig_payload_bytes(&fp, 0, 100, &g, &MessageBody::Text("hello".to_owned())); // body differs
         let e = inner_sig_payload_bytes(
             &RoomFingerprint([2u8; 32]),
             0,
             100,
+            &g,
             &MessageBody::Text("hi".to_owned()),
         ); // room differs
         assert_ne!(a, b);
@@ -318,6 +392,138 @@ mod tests {
         let bytes = postcard::to_stdvec(&body).unwrap();
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "00026869");
+    }
+
+    #[test]
+    fn channel_label_accepts_default_general() {
+        let c = ChannelLabel::try_new("general").unwrap();
+        assert_eq!(c.as_str(), "general");
+    }
+
+    #[test]
+    fn channel_label_accepts_unicode_and_spaces() {
+        assert!(ChannelLabel::try_new("café 🌅").is_ok());
+    }
+
+    #[test]
+    fn channel_label_rejects_empty() {
+        assert!(matches!(
+            ChannelLabel::try_new(""),
+            Err(crate::error::Error::BadChannel(_))
+        ));
+    }
+
+    #[test]
+    fn channel_label_rejects_all_whitespace() {
+        assert!(matches!(
+            ChannelLabel::try_new("   \t  "),
+            Err(crate::error::Error::BadChannel(_))
+        ));
+    }
+
+    #[test]
+    fn channel_label_rejects_control_chars() {
+        assert!(matches!(
+            ChannelLabel::try_new("hi\nthere"),
+            Err(crate::error::Error::BadChannel(_))
+        ));
+        assert!(matches!(
+            ChannelLabel::try_new("nul\0byte"),
+            Err(crate::error::Error::BadChannel(_))
+        ));
+    }
+
+    #[test]
+    fn channel_label_rejects_over_64_bytes() {
+        let s = "a".repeat(65);
+        assert!(matches!(
+            ChannelLabel::try_new(&s),
+            Err(crate::error::Error::BadChannel(_))
+        ));
+    }
+
+    #[test]
+    fn channel_label_accepts_max_64_bytes() {
+        let s = "a".repeat(64);
+        assert!(ChannelLabel::try_new(&s).is_ok());
+    }
+
+    #[test]
+    fn channel_label_default_general_constructor() {
+        let c = ChannelLabel::default_general();
+        assert_eq!(c.as_str(), "general");
+    }
+
+    #[test]
+    fn channel_label_postcard_roundtrip() {
+        let c = ChannelLabel::try_new("links").unwrap();
+        let bytes = postcard::to_stdvec(&c).unwrap();
+        let back: ChannelLabel = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn channel_label_postcard_decode_validates() {
+        // Encode an empty string at the wire layer and verify deserialize rejects it.
+        let bad = postcard::to_stdvec(&"".to_owned()).unwrap();
+        let err = postcard::from_bytes::<ChannelLabel>(&bad).unwrap_err();
+        // postcard surfaces validation errors as `Error::DeserializeBadVarint`
+        // or as a custom serde error string; just assert it errored.
+        let _ = err;
+    }
+
+    #[test]
+    fn signed_message_postcard_hex_pin() {
+        // Pin the SignedMessage wire format so accidental drift breaks the build.
+        // postcard layout: signature(varint-len 0x40 + 64 raw bytes — Signature
+        // serializes via `serialize_bytes` which postcard length-prefixes),
+        // sent_at_ms(varint), channel(len-varint + utf8), body(...).
+        let m = SignedMessage {
+            inner_signature: Signature([0u8; 64]),
+            sent_at_ms: 1,
+            channel: ChannelLabel::default_general(),
+            body: MessageBody::Text("hi".to_owned()),
+        };
+        let bytes = postcard::to_stdvec(&m).unwrap();
+        // [0]: 0x40 = signature length varint (64 bytes).
+        assert_eq!(bytes[0], 0x40);
+        // [1..65]: zeroed signature bytes.
+        assert!(bytes[1..65].iter().all(|b| *b == 0));
+        // [65]: 0x01 = sent_at_ms varint(1).
+        assert_eq!(bytes[65], 0x01);
+        // [66]: 0x07 = channel length varint, "general" = 7 bytes.
+        assert_eq!(bytes[66], 0x07);
+        assert_eq!(&bytes[67..74], b"general");
+        // [74..]: MessageBody::Text("hi") tail = 00 02 68 69.
+        assert_eq!(&bytes[74..], &[0x00, 0x02, 0x68, 0x69]);
+    }
+
+    #[test]
+    fn signed_message_round_trips_channel() {
+        let m = SignedMessage {
+            inner_signature: Signature([7u8; 64]),
+            sent_at_ms: 42,
+            channel: ChannelLabel::try_new("links").unwrap(),
+            body: MessageBody::Text("hello".to_owned()),
+        };
+        let bytes = postcard::to_stdvec(&m).unwrap();
+        let back: SignedMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.channel.as_str(), "links");
+    }
+
+    #[test]
+    fn inner_sig_payload_changes_with_channel() {
+        let fp = RoomFingerprint([1u8; 32]);
+        let body = MessageBody::Text("hi".to_owned());
+        let general = ChannelLabel::default_general();
+        let links = ChannelLabel::try_new("links").unwrap();
+        let a = inner_sig_payload_bytes(&fp, 0, 100, &general, &body);
+        let b = inner_sig_payload_bytes(&fp, 0, 100, &links, &body);
+        assert_ne!(
+            a, b,
+            "channel must be domain-separated by the inner signature"
+        );
     }
 
     /// Frozen wire-format vector for `EncryptedMessage`. Failing means the

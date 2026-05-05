@@ -447,6 +447,7 @@ mod tests {
                     &room.inner.room,
                     crate::V1_EPOCH_ID,
                     1_700_000_000_000,
+                    crate::ChannelLabel::default_general(),
                     crate::MessageBody::Text("from-other".to_owned()),
                     &mut rng,
                 )
@@ -546,6 +547,7 @@ mod tests {
                     &room.inner.room,
                     0,
                     1_700_000_000_000,
+                    crate::ChannelLabel::default_general(),
                     target,
                     &mut rng,
                 )
