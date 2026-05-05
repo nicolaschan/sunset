@@ -4,8 +4,16 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    # libopus 1.5.2 — the C source `sunset-voice/build.rs` compiles
+    # into the wasm voice codec. Pinned-by-rev to match the
+    # `vendor/libopus` git submodule developers use locally; the rev
+    # itself lives in `.gitmodules` (path: vendor/libopus).
+    libopus = {
+      url = "github:xiph/opus/v1.5.2";
+      flake = false;
+    };
   };
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, libopus }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -17,6 +25,39 @@
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
           targets = [ "wasm32-unknown-unknown" ];
         };
+
+        # Workspace source merged with vendored libopus. Nix flakes do
+        # not include git submodule contents in `self`, so we paste
+        # the libopus tree (from the `libopus` flake input) into
+        # `vendor/libopus` ourselves before any rust crate that
+        # transitively builds `sunset-voice` is compiled.
+        srcWithLibopus = pkgs.runCommand "sunset-src" {} ''
+          mkdir -p $out
+          cp -r --no-preserve=mode,ownership ${self}/. $out/
+          mkdir -p $out/vendor
+          cp -r --no-preserve=mode,ownership ${libopus} $out/vendor/libopus
+        '';
+
+        # Unwrapped clang for compiling vendored libopus to wasm32.
+        # We need the unwrapped binary because Nix's `cc-wrapper`:
+        #
+        #   - injects host-target hardening flags clang rejects for
+        #     wasm32 (`-fzero-call-used-regs=used-gpr` etc.); and
+        #   - chains its `<stdint.h>` to glibc's, which fails the
+        #     wasm32 build with `gnu/stubs-32.h: file not found`
+        #     because glibc-x86_64 doesn't ship 32-bit ABI stubs.
+        #
+        # The unwrapped clang ships its own freestanding versions of
+        # `<stdint.h>` / `<stddef.h>` that work on any target. The
+        # other libc headers libopus reaches for (`<math.h>`,
+        # `<string.h>`, `<stdlib.h>`, `<stdio.h>`, `<alloca.h>`) are
+        # supplied by stub headers under
+        # `crates/sunset-voice/csrc/wasm_libc/` (see that directory
+        # for the rationale). The function declarations there match
+        # the symbols `codec::wasm_runtime` exports for wasm-ld to
+        # resolve at link time.
+        clangForWasm = pkgs.llvmPackages.clang-unwrapped;
+        llvmArForWasm = pkgs.llvmPackages.bintools-unwrapped;
         gleamLib = import ./nix/gleam { inherit pkgs; };
         webHexDeps =
           if builtins.pathExists ./web/manifest.toml
@@ -63,14 +104,35 @@
         mkSunsetWebWasmPkg = { features ? [] }: pkgs.rustPlatform.buildRustPackage {
           pname = "sunset-web-wasm";
           version = "0.1.0";
-          src = ./.;
+          src = srcWithLibopus;
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = false;
-          nativeBuildInputs = [ pkgs.wasm-bindgen-cli pkgs.lld ];
+          # cc-wrapper's stack-protector / FORTIFY / similar flags
+          # break clang when compiling for wasm32 (no host runtime).
+          hardeningDisable = [ "all" ];
+          # `clangForWasm` provides a wasm32-capable C compiler for
+          # cc-rs to build vendored libopus into the wasm bundle.
+          # `llvmArForWasm` supplies the matching `llvm-ar`.
+          nativeBuildInputs = [
+            pkgs.wasm-bindgen-cli
+            pkgs.lld
+            clangForWasm
+            llvmArForWasm
+          ];
           cargo = rustToolchain;
           rustc = rustToolchain;
           buildPhase = ''
             runHook preBuild
+            # Nix's stdenv exports `CC=gcc` for the host build env.
+            # cc-rs treats CC as a global override regardless of target,
+            # which would force libopus through gcc → x86-64 ELF objects
+            # that wasm-ld can't link. Steer cc-rs to the unwrapped
+            # clang for the wasm target so it produces wasm32 object
+            # files (the wrapped `pkgs.clang` injects host-only
+            # hardening flags that clang rejects for wasm32).
+            export CC_wasm32_unknown_unknown=${clangForWasm}/bin/clang
+            export AR_wasm32_unknown_unknown=${llvmArForWasm}/bin/llvm-ar
+            unset CC CXX
             cargo build \
               -j $NIX_BUILD_CORES \
               --offline \
@@ -290,10 +352,14 @@
         sunsetRelayPkg = pkgs.rustPlatform.buildRustPackage {
           pname = "sunset-relay";
           version = "0.1.0";
-          src = ./.;
+          src = srcWithLibopus;
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = [ "-p" "sunset-relay" "--bin" "sunset-relay" ];
           doCheck = false;
+          # `sunset-relay` doesn't link libopus itself, but transitively
+          # depends on `sunset-voice` whose `build.rs` always runs
+          # cc-rs against `vendor/libopus`. For the host target the
+          # default Nix CC (gcc) is fine and clang is not needed.
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.openssl ];
           cargo = rustToolchain;
@@ -314,6 +380,13 @@
             pkgs.wasm-bindgen-cli
             pkgs.wasm-pack
             pkgs.sox
+            # Required by `sunset-voice/build.rs` to compile vendored
+            # libopus into wasm32 object files. We use unwrapped
+            # binaries because Nix's `cc-wrapper` injects host-only
+            # flags that clang rejects when targeting wasm32.
+            clangForWasm
+            llvmArForWasm
+            pkgs.lld
           ];
           shellHook = ''
             ${if webHexDeps != null
@@ -322,6 +395,12 @@
             export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
             export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
             export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+            # cc-rs picks compilers per-target via `CC_<target>` env
+            # vars (see `crates/sunset-voice/build.rs`). For wasm32
+            # builds from the dev shell we need the unwrapped clang,
+            # not the host CC=gcc that Nix's stdenv exports.
+            export CC_wasm32_unknown_unknown=${clangForWasm}/bin/clang
+            export AR_wasm32_unknown_unknown=${llvmArForWasm}/bin/llvm-ar
             # Default SUNSET_WEB_DIST to the voice-test dist (test-hooks WASM +
             # harness HTML + audio worklets). This lets `npx playwright test`
             # run voice_protocol.spec.js from the dev shell without a separate
@@ -355,16 +434,27 @@
           sunset-core-wasm = pkgs.rustPlatform.buildRustPackage {
             pname = "sunset-core-wasm";
             version = "0.1.0";
-            src = ./.;
+            # Includes vendor/libopus because sunset-core depends on
+            # sunset-voice, whose build.rs always compiles libopus.
+            src = srcWithLibopus;
             cargoLock.lockFile = ./Cargo.lock;
             doCheck = false;
-            nativeBuildInputs = [ pkgs.wasm-bindgen-cli pkgs.lld ];
+            hardeningDisable = [ "all" ];
+            nativeBuildInputs = [
+              pkgs.wasm-bindgen-cli
+              pkgs.lld
+              clangForWasm
+              llvmArForWasm
+            ];
             cargo = rustToolchain;
             rustc = rustToolchain;
             # rustPlatform's cargoBuildHook hard-codes `--target <host-triple>`
             # so we sidestep it and run our own build / wasm-bindgen / install.
             buildPhase = ''
               runHook preBuild
+              export CC_wasm32_unknown_unknown=${clangForWasm}/bin/clang
+              export AR_wasm32_unknown_unknown=${llvmArForWasm}/bin/llvm-ar
+              unset CC CXX
               cargo build \
                 -j $NIX_BUILD_CORES \
                 --offline \

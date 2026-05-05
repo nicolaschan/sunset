@@ -92,6 +92,13 @@ pub struct Client {
 impl Client {
     #[wasm_bindgen(constructor)]
     pub fn new(seed: &[u8], heartbeat_interval_ms: u32) -> Result<Client, JsError> {
+        // Route Rust panics through `console.error` once, on the first
+        // Client construction. Without this a panic in any background
+        // task surfaces only as `RuntimeError: unreachable` in the
+        // browser, which is unhelpful when debugging FFI shims.
+        // `set_once` makes repeated `Client::new` calls idempotent.
+        console_error_panic_hook::set_once();
+
         let identity = identity_from_seed(seed).map_err(|e| JsError::new(&e))?;
         let store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
 
@@ -328,7 +335,7 @@ impl Client {
         crate::voice::install_recorder(&self.voice)
     }
 
-    /// Return per-peer recorded frames as `[{seq_in_frame, len, checksum}]`.
+    /// Return per-peer recorded frames as `[{len, checksum, rms}]`.
     /// Requires `voice_install_frame_recorder` to have been called first.
     #[cfg(feature = "test-hooks")]
     pub fn voice_recorded_frames(&self, peer_id: &[u8]) -> Result<JsValue, JsError> {
@@ -342,10 +349,11 @@ impl Client {
         crate::voice::active_peers(&self.voice)
     }
 
-    /// Generate a synthetic PCM frame with an embedded counter in
-    /// `pcm[0]`. Useful from JS test code to create deterministic
-    /// frames whose counter can be verified at the receiver.
-    /// `pcm[0] = counter / 1_000_000.0`.
+    /// Generate one 20 ms PCM frame of continuous 440 Hz sine. The
+    /// `counter` parameter advances the phase by exactly one frame so
+    /// successive counter values produce a continuous tone (which is
+    /// what an Opus encoder is designed to compress + decode
+    /// faithfully).
     #[cfg(feature = "test-hooks")]
     pub fn voice_synth_pcm(counter: i32) -> js_sys::Float32Array {
         let pcm = crate::voice::test_hooks::synth_pcm_with_counter(counter);

@@ -1,13 +1,16 @@
-// Shared voice test fixtures for Phase 5 Playwright specs (Tasks 28-33).
+// Shared voice test fixtures for Phase 5 Playwright specs.
 //
 // Exports:
 //   spawnRelay()          — spawn a sunset-relay subprocess and capture its
 //                           listen address from the banner; returns { proc, dir, addr }
 //   teardownRelay(state)  — SIGTERM the relay and delete the temp data dir
 //   freshSeedHex()        — 64-char hex seed from Math.random (one per peer/test)
-//   syntheticPcm(counter) — Float32Array(960) matching Rust synth_pcm_with_counter
-//   decodeCounter(val)    — inverse of syntheticPcm: recover counter from pcm[0]
-//   pcmChecksum(samples)  — SHA-256 of f32 LE bytes (matches Rust recorder)
+//   syntheticPcm(counter) — Float32Array(960) of continuous 440 Hz sine
+//                           (counter advances phase by one frame). Matches
+//                           Rust `synth_pcm_with_counter` so JS-side and
+//                           WASM-side fixtures are byte-equal pre-encode.
+//   pcmRms(samples)       — RMS amplitude of a Float32Array (real audio
+//                           lands ~0.35 on a 0.5-amplitude sine; silence ≈ 0).
 //
 // GainNode test affordance
 //   installVoiceFfi(page) — call after page.goto() to expose window.__voiceFfi
@@ -19,7 +22,6 @@ import { spawn } from "child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createHash } from "crypto";
 
 // ---------------------------------------------------------------------------
 // Relay lifecycle
@@ -115,43 +117,44 @@ export function freshSeedHex() {
 // ---------------------------------------------------------------------------
 
 /**
- * Build a synthetic PCM frame that matches Rust `synth_pcm_with_counter(counter)`:
- *   pcm[0] = counter / 1_000_000.0
- *   pcm[i] = sin((counter + i) / 1_000_000.0)  for i >= 1
+ * Build one 20 ms PCM frame of continuous 440 Hz sine at amplitude 0.5.
+ * `counter` advances the phase by exactly one frame so consecutive
+ * `syntheticPcm(c)` outputs are continuous (no clicks). This matches the
+ * Rust `synth_pcm_with_counter` and is what an Opus encoder is built to
+ * compress + decode faithfully — pre-Opus we packed a counter into
+ * `pcm[0]`, but Opus is lossy and individual sample values do not
+ * survive, so we identify frames by their per-peer ordering and
+ * checksum-distinctness in the recorder instead.
  *
- * @param {number} counter  Non-negative integer counter value.
- * @returns {Float32Array}  960-sample frame.
+ * @param {number} counter  Frame index (any integer; controls phase only).
+ * @returns {Float32Array}  960-sample frame at 48 kHz.
  */
 export function syntheticPcm(counter) {
-  const pcm = new Float32Array(960);
-  pcm[0] = counter / 1_000_000;
-  for (let i = 1; i < 960; i++) {
-    pcm[i] = Math.sin((counter + i) / 1_000_000);
+  const FREQ_HZ = 440;
+  const SR = 48_000;
+  const FRAME = 960;
+  const pcm = new Float32Array(FRAME);
+  const offset = counter * FRAME;
+  for (let i = 0; i < FRAME; i++) {
+    const t = (offset + i) / SR;
+    pcm[i] = 0.5 * Math.sin(2 * Math.PI * FREQ_HZ * t);
   }
   return pcm;
 }
 
 /**
- * Recover the counter value embedded in the first sample of a synthetic frame.
- * Inverse of `syntheticPcm`.
- *
- * @param {number} firstSampleVal  `pcm[0]` from a received frame.
- * @returns {number}  The original counter integer.
- */
-export function decodeCounter(firstSampleVal) {
-  return Math.round(firstSampleVal * 1_000_000);
-}
-
-/**
- * Compute SHA-256 of PCM samples encoded as little-endian f32 bytes.
- * Matches the Rust recorder checksum so tests can assert byte-equal delivery.
+ * RMS amplitude of a Float32Array. Used to distinguish "real audio
+ * delivered" (≥ ~0.1 for a 0.5-amplitude sine through Opus) from
+ * "silence padding / underrun" (≈ 0).
  *
  * @param {Float32Array} samples
- * @returns {string}  Lowercase hex digest.
+ * @returns {number}
  */
-export function pcmChecksum(samples) {
-  const buf = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
-  return createHash("sha256").update(buf).digest("hex");
+export function pcmRms(samples) {
+  if (samples.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i];
+  return Math.sqrt(sumSq / samples.length);
 }
 
 // ---------------------------------------------------------------------------

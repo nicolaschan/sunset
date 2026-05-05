@@ -9,7 +9,6 @@ import {
   teardownRelay,
   freshSeedHex,
   syntheticPcm,
-  pcmChecksum,
 } from "./helpers/voice.js";
 
 let relay;
@@ -100,11 +99,12 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
   // before flipping `self_in_call`). Once visible, test-hook methods are
   // safe to call.
 
-  // Detach the fake mic from the capture worklet on every peer so only
-  // `voice_inject_pcm` frames flow into `runtime.send_pcm`. Without this
-  // Chromium's fake-device tone interleaves with the synthetic injected
-  // frames at receivers and breaks the per-counter checksum assertion.
-  // (Capture-path coverage lives in voice_real_mic.spec.js.)
+  // Detach the fake mic from the capture worklet on every peer so
+  // only `voice_inject_pcm` frames flow into `runtime.send_pcm`.
+  // Without this Chromium's fake-device 440 Hz tone interleaves with
+  // our injected sine in the recorder, which doesn't break the
+  // count-based assertions but pollutes the RMS-based "real audio"
+  // signal. (Capture-path coverage lives in voice_real_mic.spec.js.)
   for (const peer of [alice, bob, carol]) {
     await peer.page.evaluate(() => window.__voiceFfi.stopCaptureSource());
   }
@@ -119,10 +119,9 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
   const aliceBytes = await getPubkeyBytes(alice.page);
   const carolBytes = await getPubkeyBytes(carol.page);
 
-  // Alice injects 50 frames — bob and carol must each receive ≥ 40 total
-  // frames. The codec is passthrough, so we also verify the spec's three
-  // content checks (monotonic counters, no stuck-frame run > 5, per-counter
-  // checksum match) for both receivers.
+  // Alice injects 50 frames — bob and carol must each receive ≥ 40
+  // total frames with non-trivial RMS (real Opus-decoded audio, not
+  // silence underrun padding).
   for (let c = 1; c <= 50; c++) {
     const pcm = syntheticPcm(c);
     await alice.page.evaluate(
@@ -132,19 +131,15 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
     await alice.page.waitForTimeout(20);
   }
 
-  const aliceRange = { minCounter: 1, maxCounter: 50, minCount: 40 };
-
   const bobFromAlice = await waitForFrames(bob.page, aliceBytes, 40, 4_000);
-  expect(bobFromAlice.length).toBeGreaterThanOrEqual(40);
-  assertContentChecks(bobFromAlice, aliceRange, "alice → bob");
+  assertOpusFramesDelivered(bobFromAlice, 40, "alice → bob");
 
   const carolFromAlice = await waitForFrames(carol.page, aliceBytes, 40, 4_000);
-  expect(carolFromAlice.length).toBeGreaterThanOrEqual(40);
-  assertContentChecks(carolFromAlice, aliceRange, "alice → carol");
+  assertOpusFramesDelivered(carolFromAlice, 40, "alice → carol");
 
-  // Carol injects 50 frames — alice and bob must each receive ≥ 40 total
-  // frames, and pass the same content checks (catches the bug where audio
-  // is delivered to one peer but not another).
+  // Carol injects 50 frames — alice and bob must each receive ≥ 40
+  // total frames, same shape (catches the bug where audio is
+  // delivered to one peer but not another).
   for (let c = 1001; c <= 1050; c++) {
     const pcm = syntheticPcm(c);
     await carol.page.evaluate(
@@ -154,15 +149,11 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
     await carol.page.waitForTimeout(20);
   }
 
-  const carolRange = { minCounter: 1001, maxCounter: 1050, minCount: 40 };
-
   const aliceFromCarol = await waitForFrames(alice.page, carolBytes, 40, 4_000);
-  expect(aliceFromCarol.length).toBeGreaterThanOrEqual(40);
-  assertContentChecks(aliceFromCarol, carolRange, "carol → alice");
+  assertOpusFramesDelivered(aliceFromCarol, 40, "carol → alice");
 
   const bobFromCarol = await waitForFrames(bob.page, carolBytes, 40, 4_000);
-  expect(bobFromCarol.length).toBeGreaterThanOrEqual(40);
-  assertContentChecks(bobFromCarol, carolRange, "carol → bob");
+  assertOpusFramesDelivered(bobFromCarol, 40, "carol → bob");
 
   await alice.ctx.close();
   await bob.ctx.close();
@@ -170,56 +161,48 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
 });
 
 /**
- * Spec content checks (section 3 of the voice-c2c spec). Same
- * semantics as voice_two_way's helper — see there for the rationale
- * on why we filter to confirmed-injected frames (Chromium's fake
- * mic interleaves with synthetic injection in this test environment).
+ * Validates that a peer's recorded frames look like real Opus-decoded
+ * audio rather than silence padding or stuck repeats.
  *
- * @param {Array<{seq_in_frame: number, len: number, checksum: string}>} frames
- * @param {{minCounter: number, maxCounter: number, minCount: number}} opts
- * @param {string} label
+ *   - At least `minCount` of the recorded frames have RMS ≥ 0.05
+ *     (Opus-decoded sine at amplitude 0.5 lands ~0.35 RMS; silence
+ *     underrun is 0.0; this threshold rejects the latter cleanly).
+ *   - No stretch of identical SHA-256 checksums longer than 5
+ *     among the *non-silence* frames. Long silence runs are fine —
+ *     they're the jitter pump correctly padding underruns with
+ *     zero-PCM, not stuck-frame stutter — but a real user would
+ *     still notice if every Opus-decoded frame from a peer was the
+ *     same audio repeated.
+ *
+ * Pre-Opus this check matched per-frame counters back to the
+ * injected sequence; with a lossy codec individual sample values
+ * don't survive, so identification by injected-counter is no longer
+ * meaningful. The two assertions here encode what's actually
+ * shippable to a real user.
+ *
+ * @param {Array<{len: number, checksum: string, rms: number}>} frames
+ * @param {number} minCount  Minimum non-silence frames expected.
+ * @param {string} label     Used in failure messages.
  */
-function assertContentChecks(frames, opts, label) {
-  const { minCounter, maxCounter, minCount } = opts;
-  const expectedByCounter = new Map();
-  for (let c = minCounter; c <= maxCounter; c++) {
-    expectedByCounter.set(c, pcmChecksum(syntheticPcm(c)));
-  }
-
-  const confirmed = frames.filter(
-    (f) =>
-      expectedByCounter.has(f.seq_in_frame) &&
-      f.checksum === expectedByCounter.get(f.seq_in_frame),
-  );
+function assertOpusFramesDelivered(frames, minCount, label) {
+  const real = frames.filter((f) => f.rms >= 0.05);
   expect(
-    confirmed.length,
-    `${label}: only ${confirmed.length} confirmed-injected frames; expected ≥ ${minCount}`,
+    real.length,
+    `${label}: only ${real.length} non-silence frames; expected ≥ ${minCount}`,
   ).toBeGreaterThanOrEqual(minCount);
 
-  let prev = -Infinity;
   let runLen = 0;
   let runVal = null;
-  const distinct = new Set();
-  for (const f of confirmed) {
-    expect(
-      f.seq_in_frame,
-      `${label}: counter regression (prev=${prev}, got=${f.seq_in_frame})`,
-    ).toBeGreaterThanOrEqual(prev);
-    if (f.seq_in_frame === runVal) {
+  for (const f of real) {
+    if (f.checksum === runVal) {
       runLen += 1;
     } else {
-      runVal = f.seq_in_frame;
+      runVal = f.checksum;
       runLen = 1;
     }
     expect(
       runLen,
-      `${label}: stuck-frame: ${runLen} consecutive frames with counter=${runVal}`,
+      `${label}: stuck-frame: ${runLen} consecutive non-silence frames with the same decoded PCM`,
     ).toBeLessThanOrEqual(5);
-    distinct.add(f.seq_in_frame);
-    prev = f.seq_in_frame;
   }
-  expect(
-    distinct.size,
-    `${label}: only ${distinct.size} distinct injected counters delivered`,
-  ).toBeGreaterThanOrEqual(minCount);
 }

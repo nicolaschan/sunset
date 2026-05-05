@@ -126,7 +126,7 @@ mod tests {
 
     fn fixed_packet_frame() -> VoicePacket {
         VoicePacket::Frame {
-            codec_id: "pcm-f32-le".to_string(),
+            codec_id: "opus".to_string(),
             seq: 42,
             sender_time_ms: 1_700_000_000_000,
             payload: (0..3840u32).map(|i| (i & 0xff) as u8).collect(),
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn voice_packet_frame_postcard_frozen_vector() {
         let pkt = VoicePacket::Frame {
-            codec_id: "pcm-f32-le".to_string(),
+            codec_id: "opus".to_string(),
             seq: 7,
             sender_time_ms: 1_700_000_000_000,
             payload: vec![0xAA, 0xBB, 0xCC, 0xDD],
@@ -243,7 +243,7 @@ mod tests {
         let bytes = postcard::to_stdvec(&pkt).unwrap();
         assert_eq!(
             hex::encode(&bytes),
-            "000a70636d2d6633322d6c650780d095ffbc3104aabbccdd",
+            "00046f7075730780d095ffbc3104aabbccdd",
             "If this fails, serde field order / postcard encoding drifted — DO NOT update without a wire-format bump.",
         );
     }

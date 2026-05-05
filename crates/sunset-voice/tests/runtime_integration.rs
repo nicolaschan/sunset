@@ -376,7 +376,11 @@ async fn send_pcm_publishes_frame_when_unmuted() {
             };
             let mut decoder = sunset_voice::VoiceDecoder::new().unwrap();
             let decoded = decoder.decode(&bytes).unwrap();
-            assert_eq!(decoded, pcm);
+            // Opus is lossy; we just need the frame to round-trip
+            // through encrypt → bus → decrypt → decode and produce
+            // the right-sized PCM frame.
+            assert_eq!(decoded.len(), sunset_voice::FRAME_SAMPLES);
+            assert!(decoded.iter().all(|s| s.is_finite()));
         })
         .await;
 }
