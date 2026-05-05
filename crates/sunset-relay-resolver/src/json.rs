@@ -15,6 +15,31 @@
 
 use crate::error::{Error, Result};
 
+/// Extract an optional string-valued field from the relay's flat JSON
+/// identity body. Returns `None` if the field is absent (forwards-
+/// compatible: old relays don't ship `webtransport_address`); returns
+/// `Err` if the field exists but is malformed.
+pub fn extract_string_field(body: &str, field: &str) -> Result<Option<String>> {
+    let key = format!("\"{field}\"");
+    let key_start = match body.find(&key) {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    let after_key = &body[key_start + key.len()..];
+    let after_colon = after_key
+        .trim_start()
+        .strip_prefix(':')
+        .ok_or_else(|| Error::BadJson(format!("expected ':' after \"{field}\"")))?;
+    let value = after_colon.trim_start();
+    let body_quoted = value
+        .strip_prefix('"')
+        .ok_or_else(|| Error::BadJson(format!("\"{field}\" value not a quoted string")))?;
+    let close_quote = body_quoted
+        .find('"')
+        .ok_or_else(|| Error::BadJson(format!("unterminated \"{field}\" string")))?;
+    Ok(Some(body_quoted[..close_quote].to_string()))
+}
+
 pub fn extract_x25519_from_json(body: &str) -> Result<[u8; 32]> {
     let key = "\"x25519\"";
     let key_start = body

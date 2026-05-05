@@ -2615,6 +2615,7 @@ dependencies = [
  "sunset-store-memory",
  "sunset-sync",
  "sunset-sync-webrtc-browser",
+ "sunset-sync-webtransport-browser",
  "sunset-sync-ws-browser",
  "sunset-voice",
  "thiserror 2.0.18",
