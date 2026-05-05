@@ -25,6 +25,11 @@ use crate::{Error, FRAME_SAMPLES, Result, SAMPLE_RATE};
 /// fullband mono speech.
 const TARGET_BITRATE_BPS: i32 = 24_000;
 
+/// Upper bound on encoded packet size, per libopus's documented
+/// "always large enough" ceiling for one Opus packet at any
+/// configuration. Used as the encode-output buffer length.
+const MAX_OPUS_PACKET_BYTES: usize = 4000;
+
 /// Encoder for one peer's outgoing audio stream. libopus encoders are
 /// stateful — each frame's encoded output depends on prior frames'
 /// internal state — so this struct owns its `OpusEncoder` for its
@@ -33,7 +38,7 @@ pub struct OpusFrameEncoder {
     encoder: *mut OpusEncoder,
 }
 
-unsafe fn opus_err(code: i32) -> Error {
+fn opus_err(code: i32) -> Error {
     Error::Codec(format!("opus error {}", code))
 }
 
@@ -46,10 +51,13 @@ impl OpusFrameEncoder {
         let encoder =
             unsafe { opus_encoder_create(SAMPLE_RATE as i32, 1, OPUS_APPLICATION_VOIP, &mut err) };
         if err != OPUS_OK || encoder.is_null() {
-            return Err(unsafe { opus_err(err) });
+            return Err(opus_err(err));
         }
         // Configure target bitrate and enable inband FEC so a single
         // dropped packet is recoverable from the next packet.
+        // SAFETY: encoder is a valid heap-allocated `*mut OpusEncoder`
+        // we just constructed; opus_encoder_ctl reads/writes only its
+        // internal state and the variadic int we pass.
         unsafe {
             let rc = opus_encoder_ctl(encoder, OPUS_SET_BITRATE_REQUEST, TARGET_BITRATE_BPS);
             if rc != OPUS_OK {
@@ -80,9 +88,10 @@ impl OpusFrameEncoder {
                 got: pcm.len(),
             });
         }
-        // 4000 bytes is libopus's own documented "always large enough"
-        // ceiling for one Opus packet.
-        let mut out = vec![0u8; 4000];
+        let mut out = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        // SAFETY: `self.encoder` is the libopus state we own;
+        // `pcm`/`out` are valid slices we hand directly to the
+        // C function.
         let written = unsafe {
             opus_encode_float(
                 self.encoder,
@@ -93,7 +102,7 @@ impl OpusFrameEncoder {
             )
         };
         if written < 0 {
-            return Err(unsafe { opus_err(written) });
+            return Err(opus_err(written));
         }
         out.truncate(written as usize);
         Ok(out)
@@ -120,7 +129,7 @@ impl OpusFrameDecoder {
         // SAFETY: see OpusFrameEncoder::new.
         let decoder = unsafe { opus_decoder_create(SAMPLE_RATE as i32, 1, &mut err) };
         if err != OPUS_OK || decoder.is_null() {
-            return Err(unsafe { opus_err(err) });
+            return Err(opus_err(err));
         }
         Ok(Self { decoder })
     }
@@ -130,6 +139,7 @@ impl OpusFrameDecoder {
             return Err(Error::EmptyEncoded);
         }
         let mut out = vec![0f32; FRAME_SAMPLES];
+        // SAFETY: same as encode — owned decoder, valid slices.
         let samples = unsafe {
             opus_decode_float(
                 self.decoder,
@@ -141,7 +151,7 @@ impl OpusFrameDecoder {
             )
         };
         if samples < 0 {
-            return Err(unsafe { opus_err(samples) });
+            return Err(opus_err(samples));
         }
         out.truncate(samples as usize);
         Ok(out)

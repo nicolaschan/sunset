@@ -122,10 +122,12 @@ mod tests {
         let mut enc = VoiceEncoder::new().unwrap();
         let mut dec = VoiceDecoder::new().unwrap();
         let silence = vec![0.0_f32; FRAME_SAMPLES];
-        // Opus needs a few frames of priming for its predictor; loop
-        // and assert on the last frame.
+        // Opus needs a few frames of priming for its predictor.
+        // Match `round_trip_preserves_sine_energy`'s 20-frame budget
+        // so a libopus update that lengthens the predictor's
+        // priming window doesn't fail spuriously.
         let mut last = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..20 {
             let bytes = enc.encode(&silence).unwrap();
             last = dec.decode(&bytes).unwrap();
         }

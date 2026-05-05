@@ -9,8 +9,6 @@
 //                           (counter advances phase by one frame). Matches
 //                           Rust `synth_pcm_with_counter` so JS-side and
 //                           WASM-side fixtures are byte-equal pre-encode.
-//   pcmRms(samples)       — RMS amplitude of a Float32Array (real audio
-//                           lands ~0.35 on a 0.5-amplitude sine; silence ≈ 0).
 //
 // GainNode test affordance
 //   installVoiceFfi(page) — call after page.goto() to expose window.__voiceFfi
@@ -140,21 +138,6 @@ export function syntheticPcm(counter) {
     pcm[i] = 0.5 * Math.sin(2 * Math.PI * FREQ_HZ * t);
   }
   return pcm;
-}
-
-/**
- * RMS amplitude of a Float32Array. Used to distinguish "real audio
- * delivered" (≥ ~0.1 for a 0.5-amplitude sine through Opus) from
- * "silence padding / underrun" (≈ 0).
- *
- * @param {Float32Array} samples
- * @returns {number}
- */
-export function pcmRms(samples) {
-  if (samples.length === 0) return 0;
-  let sumSq = 0;
-  for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i];
-  return Math.sqrt(sumSq / samples.length);
 }
 
 // ---------------------------------------------------------------------------

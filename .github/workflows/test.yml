@@ -22,6 +22,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `cargo build` runs directly against the worktree, and
+          # `sunset-voice/build.rs` reads vendored libopus C source
+          # from `vendor/libopus`. Without `submodules: recursive`
+          # the directory is empty in CI and cc-rs fails. The
+          # nix-based jobs below merge libopus from the `libopus`
+          # flake input, so they don't need this — but enabling it
+          # everywhere keeps developer-vs-CI parity.
+          submodules: recursive
       - uses: Swatinem/rust-cache@v2
       - uses: cachix/install-nix-action@v27
         with:

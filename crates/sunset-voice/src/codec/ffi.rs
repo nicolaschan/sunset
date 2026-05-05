@@ -52,8 +52,16 @@ unsafe extern "C" {
     // declaring this with concrete `value: i32` produces a call that
     // libopus's `va_arg` reads as garbage, surfacing as `OPUS_BAD_ARG`.
     // Declaring the function variadic in Rust matches what clang
-    // emits on the C side. The value type for every CTL request we
-    // use is `opus_int32`, so callers pass `i32`.
+    // emits on the C side.
+    //
+    // **Restriction**: only `opus_int32`-valued SET requests are
+    // safe to call through this signature. CTLs that expect a
+    // pointer (`OPUS_GET_BITRATE_REQUEST` and friends) read
+    // `*opus_int32` from `va_list`; calling them through a `...`
+    // signature with a Rust `i32` would corrupt memory. The
+    // `OpusFrameEncoder::new` call sites are the only callers and
+    // hard-code int-only requests; new CTL usage that needs a
+    // pointer must add a separately-typed declaration.
     pub fn opus_encoder_ctl(st: *mut OpusEncoder, request: i32, ...) -> i32;
 
     pub fn opus_decoder_create(fs: i32, channels: i32, error: *mut i32) -> *mut OpusDecoder;

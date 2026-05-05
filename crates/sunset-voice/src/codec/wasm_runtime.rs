@@ -221,13 +221,19 @@ pub extern "C" fn frexp(x: f64, e: *mut c_int) -> f64 {
     }
     m
 }
+// `lrint` / `lrintf` should follow the current rounding mode (per
+// ISO C). FE_TONEAREST (round-half-to-even) is the default on every
+// platform we ship, so we use `rint` rather than `round`
+// (round-half-away-from-zero). For libopus's quantization paths the
+// two agree on essentially every input — half-integer samples are
+// vanishingly rare — but matching the C standard keeps us honest.
 #[unsafe(no_mangle)]
 pub extern "C" fn lrint(x: f64) -> i32 {
-    libm::round(x) as i32
+    libm::rint(x) as i32
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn lrintf(x: f32) -> i32 {
-    libm::roundf(x) as i32
+    libm::rintf(x) as i32
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn round(x: f64) -> f64 {
