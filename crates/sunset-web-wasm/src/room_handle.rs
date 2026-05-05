@@ -64,7 +64,10 @@ impl RoomHandle {
 
     pub fn on_receipt(&self, callback: js_sys::Function) {
         self.inner
-            .on_receipt(move |for_hash, from_pubkey, sent_at_ms| {
+            .on_receipt(move |for_hash, from_pubkey, _channel, sent_at_ms| {
+                // Channel is plumbed through to the JS surface in Task
+                // 6; the current `receipt_to_js` shape is unchanged so
+                // we ignore the channel here for now.
                 let incoming =
                     crate::messages::receipt_to_js(for_hash.to_hex(), from_pubkey, sent_at_ms);
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from(incoming));
