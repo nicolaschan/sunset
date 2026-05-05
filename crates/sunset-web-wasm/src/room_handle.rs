@@ -1,5 +1,7 @@
 //! `#[wasm_bindgen]` wrapper around `sunset_core::OpenRoom`.
 
+use std::rc::Rc;
+
 use wasm_bindgen::prelude::*;
 
 use sunset_core::OpenRoom;
@@ -8,14 +10,30 @@ use sunset_sync::MultiTransport;
 
 use crate::client::{RtcT, WsT};
 
+pub(crate) type OpenRoomT = OpenRoom<MemoryStore, MultiTransport<WsT, RtcT>>;
+
 #[wasm_bindgen]
 pub struct RoomHandle {
-    inner: OpenRoom<MemoryStore, MultiTransport<WsT, RtcT>>,
+    /// Rc-wrapped so the voice subsystem can hold a clone without
+    /// requiring `RoomHandle` to outlive the voice session.
+    inner: Rc<OpenRoomT>,
 }
 
 impl RoomHandle {
-    pub(crate) fn new(inner: OpenRoom<MemoryStore, MultiTransport<WsT, RtcT>>) -> Self {
-        Self { inner }
+    pub(crate) fn new(inner: OpenRoomT) -> Self {
+        Self {
+            inner: Rc::new(inner),
+        }
+    }
+
+    /// Clone the inner `Rc<OpenRoom>` for the voice dialer.
+    pub(crate) fn open_room_rc(&self) -> Rc<OpenRoomT> {
+        self.inner.clone()
+    }
+
+    /// Extract the `Rc<Room>` from the inner `OpenRoom`.
+    pub(crate) fn room_rc(&self) -> Rc<sunset_core::crypto::room::Room> {
+        self.inner.room()
     }
 }
 

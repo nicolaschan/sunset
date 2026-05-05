@@ -42,6 +42,11 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         self.inner.room.fingerprint()
     }
 
+    /// Return a reference-counted handle to the `Room` key material.
+    pub fn room(&self) -> Rc<Room> {
+        self.inner.room.clone()
+    }
+
     pub async fn send_text(
         &self,
         body: String,

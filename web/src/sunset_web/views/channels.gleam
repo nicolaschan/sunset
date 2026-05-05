@@ -11,7 +11,7 @@ import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
   type Channel, type ChannelId, type ConnStatus, type Member, type Relay,
-  type Room, type Viewport, Connected, Desktop, MutedP, Offline, Phone,
+  type Room, type Viewport, Connected, Desktop, MemberId, MutedP, Offline, Phone,
   Reconnecting, Speaking, TextChannel, Voice,
 }
 import sunset_web/theme.{type Palette}
@@ -29,6 +29,13 @@ pub fn view(
   on_open_voice_popover on_open_voice_popover: fn(String) -> msg,
   viewport viewport: Viewport,
   on_open_rooms on_open_rooms: msg,
+  on_join_voice on_join_voice: msg,
+  on_leave_voice on_leave_voice: msg,
+  on_mute_self on_mute_self: msg,
+  on_deafen_self on_deafen_self: msg,
+  self_in_call self_in_call: Bool,
+  self_muted self_muted: Bool,
+  self_deafened self_deafened: Bool,
   relays relays: List(Relay),
   on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
@@ -88,6 +95,9 @@ pub fn view(
                   in_call,
                   voice_popover_open,
                   on_open_voice_popover,
+                  on_join_voice,
+                  on_leave_voice,
+                  self_in_call,
                 )
               }),
             ]),
@@ -100,7 +110,18 @@ pub fn view(
         ],
       ),
       case viewport, active_voice {
-        Desktop, Some(c) -> self_control_bar(p, c.name)
+        Desktop, Some(c) ->
+          self_control_bar(
+            p,
+            c.name,
+            on_leave_voice,
+            on_join_voice,
+            on_mute_self,
+            on_deafen_self,
+            self_in_call,
+            self_muted,
+            self_deafened,
+          )
         _, _ -> element.fragment([])
       },
     ],
@@ -309,10 +330,13 @@ fn voice_block(
   in_call_members: List(Member),
   popover_open: Option(String),
   on_open_voice_popover: fn(String) -> msg,
+  on_join: msg,
+  on_leave: msg,
+  self_in_call: Bool,
 ) -> Element(msg) {
   let is_live = c.in_call > 0
   case is_live {
-    False -> idle_voice_row(p, c)
+    False -> idle_voice_row(p, c, on_join)
     True ->
       live_voice_block(
         p,
@@ -320,13 +344,19 @@ fn voice_block(
         in_call_members,
         popover_open,
         on_open_voice_popover,
+        on_join,
+        on_leave,
+        self_in_call,
       )
   }
 }
 
-fn idle_voice_row(p: Palette, c: Channel) -> Element(msg) {
-  html.div(
+fn idle_voice_row(p: Palette, c: Channel, on_join: msg) -> Element(msg) {
+  html.button(
     [
+      attribute.attribute("data-testid", "voice-channel-row"),
+      attribute.attribute("aria-label", "Join " <> c.name),
+      event.on_click(on_join),
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),
@@ -335,6 +365,12 @@ fn idle_voice_row(p: Palette, c: Channel) -> Element(msg) {
         #("font-size", "16.25px"),
         #("color", p.text),
         #("border-radius", "6px"),
+        #("border", "none"),
+        #("background", "transparent"),
+        #("font-family", "inherit"),
+        #("text-align", "left"),
+        #("cursor", "pointer"),
+        #("width", "100%"),
       ]),
     ],
     [
@@ -364,7 +400,14 @@ fn live_voice_block(
   ms: List(Member),
   popover_open: Option(String),
   on_open_voice_popover: fn(String) -> msg,
+  on_join: msg,
+  on_leave: msg,
+  self_in_call: Bool,
 ) -> Element(msg) {
+  let toggle_msg = case self_in_call {
+    True -> on_leave
+    False -> on_join
+  }
   html.div(
     [
       ui.css([
@@ -374,8 +417,14 @@ fn live_voice_block(
       ]),
     ],
     [
-      html.div(
+      html.button(
         [
+          attribute.attribute("data-testid", "voice-channel-row"),
+          attribute.attribute("aria-label", case self_in_call {
+            True -> "Leave " <> c.name
+            False -> "Join " <> c.name
+          }),
+          event.on_click(toggle_msg),
           ui.css([
             #("display", "flex"),
             #("align-items", "center"),
@@ -384,6 +433,12 @@ fn live_voice_block(
             #("font-size", "16.25px"),
             #("font-weight", "600"),
             #("color", p.accent_deep),
+            #("border", "none"),
+            #("background", "transparent"),
+            #("font-family", "inherit"),
+            #("text-align", "left"),
+            #("cursor", "pointer"),
+            #("width", "100%"),
           ]),
         ],
         [
@@ -451,6 +506,7 @@ fn voice_member_row(
   popover_open: Option(String),
   on_open_voice_popover: fn(String) -> msg,
 ) -> Element(msg) {
+  let MemberId(id_str) = m.id
   let dot_color = case m.status {
     MutedP -> p.text_faint
     Speaking -> p.live
@@ -459,7 +515,7 @@ fn voice_member_row(
   let speaking = m.status == Speaking
   let muted = m.status == MutedP
   let active = case popover_open {
-    Some(name) -> name == m.name
+    Some(open_id) -> open_id == id_str
     None -> False
   }
   let bg = case active {
@@ -470,7 +526,7 @@ fn voice_member_row(
     [
       attribute.attribute("data-testid", "voice-member"),
       attribute.attribute("data-voice-name", m.name),
-      event.on_click(on_open_voice_popover(m.name)),
+      event.on_click(on_open_voice_popover(id_str)),
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),
@@ -600,11 +656,21 @@ fn you_tag(p: Palette) -> Element(msg) {
 }
 
 /// Self-controls bar — pinned to the bottom of the channels column when
-/// the user is in a call. Shows what voice channel they're connected to
-/// on the left, with three small icon-only buttons (mic / headphones /
-/// leave) on the right. The leave button is the only red affordance and
-/// uses a phone-handset glyph instead of a text label.
-fn self_control_bar(p: Palette, channel_name: String) -> Element(msg) {
+/// the user is in a call (or there is an active voice channel to join).
+/// Shows what voice channel they're connected to on the left, with three
+/// small icon-only buttons (mic / headphones / leave) on the right.
+fn self_control_bar(
+  p: Palette,
+  channel_name: String,
+  on_leave: msg,
+  on_join: msg,
+  on_mute: msg,
+  on_deafen: msg,
+  self_in_call: Bool,
+  self_muted: Bool,
+  self_deafened: Bool,
+) -> Element(msg) {
+  let _ = on_join
   // Fixed 64px height with a 1px border-top so this row aligns visually
   // with the rooms-rail you_row and the main-panel composer (their
   // top borders sit on the same y-coordinate across the seam).
@@ -675,9 +741,30 @@ fn self_control_bar(p: Palette, channel_name: String) -> Element(msg) {
           ),
         ],
       ),
-      self_btn(p, "Mute mic", mic_icon(), False),
-      self_btn(p, "Deafen", headphones_icon(), False),
-      leave_btn(p),
+      self_btn(
+        p,
+        case self_muted {
+          True -> "Unmute mic"
+          False -> "Mute mic"
+        },
+        mic_icon(),
+        self_muted,
+        Some(on_mute),
+      ),
+      self_btn(
+        p,
+        case self_deafened {
+          True -> "Undeafen"
+          False -> "Deafen"
+        },
+        headphones_icon(),
+        self_deafened,
+        Some(on_deafen),
+      ),
+      case self_in_call {
+        True -> leave_btn(p, on_leave)
+        False -> element.fragment([])
+      },
     ],
   )
 }
@@ -686,44 +773,54 @@ fn self_btn(
   p: Palette,
   title: String,
   icon: Element(msg),
-  danger: Bool,
+  active: Bool,
+  on_click: Option(msg),
 ) -> Element(msg) {
-  let bg = case danger {
+  let bg = case active {
     True -> p.warn_soft
     False -> p.surface_alt
   }
-  let color = case danger {
+  let color = case active {
     True -> p.warn
     False -> p.text
   }
+  let click_attr = case on_click {
+    Some(msg) -> [event.on_click(msg)]
+    None -> []
+  }
   html.button(
-    [
-      attribute.title(title),
-      ui.css([
-        #("width", "32px"),
-        #("height", "32px"),
-        #("display", "inline-flex"),
-        #("align-items", "center"),
-        #("justify-content", "center"),
-        #("padding", "0"),
-        #("border", "1px solid " <> p.border_soft),
-        #("background", bg),
-        #("color", color),
-        #("border-radius", "6px"),
-        #("cursor", "pointer"),
-        #("font-family", "inherit"),
-        #("flex-shrink", "0"),
-      ]),
-    ],
+    list.flatten([
+      [
+        attribute.title(title),
+        ui.css([
+          #("width", "32px"),
+          #("height", "32px"),
+          #("display", "inline-flex"),
+          #("align-items", "center"),
+          #("justify-content", "center"),
+          #("padding", "0"),
+          #("border", "1px solid " <> p.border_soft),
+          #("background", bg),
+          #("color", color),
+          #("border-radius", "6px"),
+          #("cursor", "pointer"),
+          #("font-family", "inherit"),
+          #("flex-shrink", "0"),
+        ]),
+      ],
+      click_attr,
+    ]),
     [icon],
   )
 }
 
-fn leave_btn(p: Palette) -> Element(msg) {
+fn leave_btn(p: Palette, on_click: msg) -> Element(msg) {
   let _ = p
   html.button(
     [
       attribute.title("Leave call"),
+      attribute.attribute("data-testid", "voice-leave"),
+      event.on_click(on_click),
       ui.css([
         #("width", "32px"),
         #("height", "32px"),

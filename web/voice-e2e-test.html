@@ -10,12 +10,15 @@
     <script type="module">
       import init, { Client } from "/sunset_web_wasm.js";
 
-      const incoming = new Map();
       const voiceState = new Map();
       const connState = new Map();
 
       function hex(uint8) {
         return Array.from(uint8).map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+
+      function hexBytes(s) {
+        return new Uint8Array(s.match(/.{2}/g).map((b) => parseInt(b, 16)));
       }
 
       window.__voice = {
@@ -39,32 +42,39 @@
           return { publicKey: window.__voice.publicKeyHex };
         },
         startVoice() {
+          // Start voice first, then install recorder so all frames are captured.
           window.__voice.client.voice_start(
-            window.__voice.room,
-            (fromPeerId, pcm) => {
-              const k = hex(new Uint8Array(fromPeerId));
-              if (!incoming.has(k)) incoming.set(k, []);
-              incoming.get(k).push(new Float32Array(pcm));
+            window.__voice.roomHandle,
+            // on_pcm: ignored in harness — recorder captures via frame recorder
+            () => {},
+            // on_drop_peer: ignored
+            () => {},
+            // on_voice_peer_state
+            (peerId, in_call, talking, is_muted) => {
+              const k = hex(new Uint8Array(peerId));
+              voiceState.set(k, { in_call, talking, is_muted });
             },
-            (peerId, in_call, talking) => {
-              voiceState.set(hex(new Uint8Array(peerId)), { in_call, talking });
-            },
+            // on_set_peer_volume: ignored in harness
+            () => {},
           );
+          // Install recorder after start so the runtime's frame sink can be wrapped.
+          window.__voice.client.voice_install_frame_recorder();
         },
-        framesFor(hexPeerId) {
-          return incoming.get(hexPeerId) ?? [];
+        recordedFor(hexPeerId) {
+          const bytes = hexBytes(hexPeerId);
+          return window.__voice.client.voice_recorded_frames(bytes);
+        },
+        stop() {
+          window.__voice.client.voice_stop();
+        },
+        injectPcm(samples) {
+          window.__voice.client.voice_inject_pcm(new Float32Array(samples));
         },
         voiceStateFor(hexPeerId) {
           return voiceState.get(hexPeerId) ?? null;
         },
         connStateForAddr(addr) {
           return connState.get(addr) ?? null;
-        },
-        async connectDirect(peerHex) {
-          const bytes = new Uint8Array(peerHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
-          // Multi-room API: connect_direct moved from Client to RoomHandle
-          // (signaling rides on the room's <fp>/webrtc/ namespace).
-          await window.__voice.roomHandle.connect_direct(bytes);
         },
         peerMode(peerHex) {
           const bytes = new Uint8Array(peerHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
@@ -73,14 +83,7 @@
         async startPresence() {
           // Tight intervals so the membership tracker converges quickly
           // in the test (real Gleam UI uses 30s/60s/5s defaults).
-          // start_presence moved from Client to RoomHandle in multi-room.
           await window.__voice.roomHandle.start_presence(300, 1500, 100);
-        },
-        sendFrame(samples) {
-          window.__voice.client.voice_input(new Float32Array(samples));
-        },
-        stop() {
-          window.__voice.client.voice_stop();
         },
       };
     </script>

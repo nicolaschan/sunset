@@ -10,6 +10,10 @@ workspace = true
 
 [features]
 test-helpers = ["sunset-store/test-helpers", "sunset-sync/test-helpers"]
+## Exposes diagnostic accessors used by Playwright e2e tests in
+## sunset-web-wasm (e.g. `Peer::engine_handle` for layered failure
+## introspection). No production cost when disabled.
+test-hooks = []
 
 [dependencies]
 argon2.workspace = true

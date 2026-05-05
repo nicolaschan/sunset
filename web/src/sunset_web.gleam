@@ -14,6 +14,7 @@
 
 import gleam/dict.{type Dict}
 import gleam/float
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -27,7 +28,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Reaction, type Room, ChannelId, Reaction, Room, RoomId,
+  type ChannelId, type Reaction, type Room, ChannelId, MemberId, Reaction, Room,
+  RoomId, VoiceModel, VoicePeerStateUI,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -54,8 +56,10 @@ import sunset_web/views/rooms
 import sunset_web/views/settings_popover
 import sunset_web/views/shell
 import sunset_web/views/touch_drag
+import sunset_web/views/voice_error_toast
 import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
+import sunset_web/voice
 
 /// Relays the client dials at startup when the URL has no
 /// `?relay=…` query parameter. Each entry is fed through
@@ -184,6 +188,8 @@ pub type Model {
     /// (draft, selected message, revealed spoilers) so it resets
     /// naturally when the user navigates to a different room.
     rooms: Dict(String, RoomState),
+    /// Voice subsystem state: self_in_call, mute, deafen, per-peer live state.
+    voice: domain.VoiceModel,
     /// IntentId of the relay whose popover is currently open. Client-wide
     /// (not per-room) because relays are a client-level concept.
     relays_popover: option.Option(Float),
@@ -272,6 +278,26 @@ pub type Msg {
     after: String,
     caret_at_between: Bool,
   )
+  // Voice control msgs:
+  JoinVoice(domain.RoomId)
+  /// Dispatched from the FFI's success callback once `voice_start()` resolves
+  /// `Ok` on the WASM side. Only at this point is `self_in_call` set, so the
+  /// minibar appears exactly when the runtime is ready to accept input —
+  /// callers that observe the minibar can safely call `voice_inject_pcm` etc.
+  VoiceStarted(domain.RoomId)
+  LeaveVoice
+  ToggleSelfMute
+  ToggleSelfDeafen
+  VoicePeerStateChanged(
+    peer_hex: String,
+    in_call: Bool,
+    talking: Bool,
+    is_muted: Bool,
+  )
+  SetPeerVolume(peer_hex: String, gain: Float)
+  ToggleMuteForPeer(peer_hex: String)
+  VoicePermissionDenied(message: String)
+  ResetVoiceError
   UpdateSelfName(String)
   SelfNameCommit(String, Int)
 }
@@ -340,6 +366,13 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       drawer: None,
       now_ms: 0,
       rooms: dict.new(),
+      voice: VoiceModel(
+        self_in_call: None,
+        self_muted: False,
+        self_deafened: False,
+        peers: dict.new(),
+        permission_error: None,
+      ),
       relays_popover: None,
       name_map: dict.new(),
       self_name: storage.read_self_name(),
@@ -409,6 +442,13 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       composer.attach_shortcut_prevent_default("composer-textarea")
     })
 
+  let install_voice_handler_eff =
+    effect.from(fn(dispatch) {
+      voice.install_voice_state_handler(fn(hex, in_call, talking, is_muted) {
+        dispatch(VoicePeerStateChanged(hex, in_call, talking, is_muted))
+      })
+    })
+
   // On first paint, force the composer textarea back to its single-row
   // height. The autoGrow effect only fires on `input`, so without an
   // explicit reset the textarea can render as a doubled-up 2-line
@@ -428,6 +468,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       subscribe_touch_drag,
       ticker_eff,
       attach_shortcuts_eff,
+      install_voice_handler_eff,
       initial_compose_reset_eff,
     ]),
   )
@@ -461,6 +502,25 @@ fn member_voice_settings(
       domain.VoiceSettings(volume: 100, denoise: True, deafened: False)
   }
 }
+
+/// Convert a linear gain float (0.0–2.0) to an integer volume percent (0–200).
+fn float_to_volume_int(gain: Float) -> Int {
+  let clamped = case gain <. 0.0 {
+    True -> 0.0
+    False ->
+      case gain >. 2.0 {
+        True -> 2.0
+        False -> gain
+      }
+  }
+  // Truncate to int by flooring: multiply, convert via string parse as fallback.
+  // Using integer division as the JS target represents floats precisely enough.
+  // `int.to_float(x) == f` isn't available directly; nearest: truncate via cast.
+  float_truncate(clamped *. 100.0)
+}
+
+@external(javascript, "./sunset_web/sunset.ffi.mjs", "truncFloat")
+fn float_truncate(f: Float) -> Int
 
 /// Add `name` to `existing` if it isn't already present (prepending
 /// at the head, which is where new rooms appear). If `name` is
@@ -1338,17 +1398,21 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, volume: value)
+      // Also forward to FFI so real peers (when name == peer_hex) get updated.
+      let gain = int.to_float(value) /. 100.0
+      let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
         Model(
           ..model,
           voice_settings: dict.insert(model.voice_settings, name, next),
         ),
-        effect.none(),
+        eff,
       )
     }
     ToggleMemberDenoise(name) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, denoise: !settings.denoise)
+      // Denoise is cosmetic in C2c — no FFI wiring yet.
       #(
         Model(
           ..model,
@@ -1359,26 +1423,37 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     ToggleMemberDeafen(name) -> {
       let settings = member_voice_settings(model.voice_settings, name)
-      let next = domain.VoiceSettings(..settings, deafened: !settings.deafened)
+      let new_deafened = !settings.deafened
+      let next = domain.VoiceSettings(..settings, deafened: new_deafened)
+      // Mute-for-me: set GainNode to 0 or restore prior volume via FFI.
+      let gain = case new_deafened {
+        True -> 0.0
+        False -> int.to_float(settings.volume) /. 100.0
+      }
+      let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
         Model(
           ..model,
           voice_settings: dict.insert(model.voice_settings, name, next),
         ),
-        effect.none(),
+        eff,
       )
     }
-    ResetMemberVoice(name) -> #(
-      Model(
-        ..model,
-        voice_settings: dict.insert(
-          model.voice_settings,
-          name,
-          domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
+    ResetMemberVoice(name) -> {
+      // Reset volume to 100% and restore GainNode via FFI.
+      let eff = effect.from(fn(_) { voice.set_peer_volume(name, 1.0) })
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(
+            model.voice_settings,
+            name,
+            domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
+          ),
         ),
-      ),
-      effect.none(),
-    )
+        eff,
+      )
+    }
     ViewportChanged(v) -> {
       // Crossing the boundary in either direction closes any open drawer.
       // Sheets intentionally survive: DetailsSheet and VoiceSheet render
@@ -1460,6 +1535,169 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(Model(..next_model, rooms: rooms), send_eff)
     }
     ReactionSent(_) -> #(model, effect.none())
+
+    // ---- Voice control handlers ----
+    JoinVoice(room_id) -> {
+      let active_name = active_room_name(model)
+      case model.client, dict.get(model.rooms, active_name) {
+        Some(client), Ok(state) ->
+          case state.handle {
+            Some(handle) -> {
+              // Don't set self_in_call yet — wait for VoiceStarted from the
+              // FFI's Ok callback. Otherwise the minibar appears before the
+              // WASM voice runtime is ready, leading callers (UI clicks,
+              // tests) to act on a half-initialised pipeline. On Error we
+              // dispatch VoicePermissionDenied which surfaces a toast.
+              let eff =
+                effect.from(fn(dispatch) {
+                  voice.voice_start(client, handle, fn(result) {
+                    case result {
+                      Ok(_) -> dispatch(VoiceStarted(room_id))
+                      Error(msg) -> dispatch(VoicePermissionDenied(msg))
+                    }
+                  })
+                })
+              #(model, eff)
+            }
+            None -> {
+              let new_voice =
+                VoiceModel(
+                  ..model.voice,
+                  permission_error: Some(
+                    "Voice not ready, try again in a moment.",
+                  ),
+                )
+              #(Model(..model, voice: new_voice), effect.none())
+            }
+          }
+        _, _ -> {
+          let new_voice =
+            VoiceModel(
+              ..model.voice,
+              permission_error: Some("Voice not ready, try again in a moment."),
+            )
+          #(Model(..model, voice: new_voice), effect.none())
+        }
+      }
+    }
+
+    VoiceStarted(room_id) -> {
+      let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    LeaveVoice -> {
+      let new_voice =
+        VoiceModel(
+          ..model.voice,
+          self_in_call: None,
+          self_muted: False,
+          self_deafened: False,
+        )
+      let eff = case model.client {
+        Some(client) -> effect.from(fn(_) { voice.voice_stop(client) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    ToggleSelfMute -> {
+      let new_muted = !model.voice.self_muted
+      let new_voice = VoiceModel(..model.voice, self_muted: new_muted)
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) { voice.voice_set_muted(client, new_muted) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    ToggleSelfDeafen -> {
+      let new_deafened = !model.voice.self_deafened
+      let new_voice = VoiceModel(..model.voice, self_deafened: new_deafened)
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) { voice.voice_set_deafened(client, new_deafened) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    VoicePeerStateChanged(hex, in_call, talking, is_muted) -> {
+      let new_peers =
+        dict.insert(
+          model.voice.peers,
+          hex,
+          VoicePeerStateUI(
+            in_call: in_call,
+            talking: talking,
+            is_muted: is_muted,
+          ),
+        )
+      let new_voice = VoiceModel(..model.voice, peers: new_peers)
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    SetPeerVolume(peer_hex, gain) -> {
+      let eff = effect.from(fn(_) { voice.set_peer_volume(peer_hex, gain) })
+      // Also store in voice_settings (by hex) for display.
+      let vol = float_to_volume_int(gain)
+      let settings = member_voice_settings(model.voice_settings, peer_hex)
+      let new_settings = domain.VoiceSettings(..settings, volume: vol)
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(
+            model.voice_settings,
+            peer_hex,
+            new_settings,
+          ),
+        ),
+        eff,
+      )
+    }
+
+    ToggleMuteForPeer(peer_hex) -> {
+      let settings = member_voice_settings(model.voice_settings, peer_hex)
+      // `deafened` in VoiceSettings = "muted for me" for this peer.
+      let new_muted_for_me = !settings.deafened
+      let gain = case new_muted_for_me {
+        True -> 0.0
+        False -> int.to_float(settings.volume) /. 100.0
+      }
+      let new_settings =
+        domain.VoiceSettings(..settings, deafened: new_muted_for_me)
+      let eff = effect.from(fn(_) { voice.set_peer_volume(peer_hex, gain) })
+      #(
+        Model(
+          ..model,
+          voice_settings: dict.insert(
+            model.voice_settings,
+            peer_hex,
+            new_settings,
+          ),
+        ),
+        eff,
+      )
+    }
+
+    VoicePermissionDenied(msg) -> {
+      let new_voice =
+        VoiceModel(
+          ..model.voice,
+          self_in_call: None,
+          permission_error: Some(
+            "Microphone access required to join voice. (" <> msg <> ")",
+          ),
+        )
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    ResetVoiceError -> {
+      let new_voice = VoiceModel(..model.voice, permission_error: None)
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
     OpenFullEmojiPicker(target, anchor) -> {
       // Closing the per-room quick-picker prevents both pickers from
       // rendering at once; full picker takes over.
@@ -1746,6 +1984,27 @@ fn room_view_with_state(
     None -> element.fragment([])
   }
 
+  // Derive in_call status from real voice state: a member is in_call if
+  // their id (short pubkey hex) appears as a key in model.voice.peers with
+  // in_call = True. Self is in_call if model.voice.self_in_call is Some.
+  // Falls back to fixture.members() when state.members is empty (pre-connect).
+  let members_for_channels = case state.members {
+    [] -> fixture.members()
+    ms ->
+      list.map(ms, fn(m) {
+        let MemberId(id_str) = m.id
+        let in_call_from_voice = case m.you {
+          True -> option.is_some(model.voice.self_in_call)
+          False ->
+            case dict.get(model.voice.peers, id_str) {
+              Ok(ps) -> ps.in_call
+              Error(_) -> False
+            }
+        }
+        domain.Member(..m, in_call: in_call_from_voice)
+      })
+  }
+
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
       case find_message(resolved_messages, id) {
@@ -1771,8 +2030,8 @@ fn room_view_with_state(
   }
 
   let voice_sheet_el = case model.viewport, state.sheet {
-    domain.Phone, Some(domain.VoiceSheet(member_name: name)) ->
-      case list.find(fixture.members(), fn(m) { m.name == name }) {
+    domain.Phone, Some(domain.VoiceSheet(member_name: id_str)) ->
+      case list.find(members_for_channels, fn(m) { m.id == MemberId(id_str) }) {
         Ok(m) ->
           bottom_sheet.view(
             palette: palette,
@@ -1783,12 +2042,14 @@ fn room_view_with_state(
               palette: palette,
               placement: voice_popover.InSheet,
               member: m,
-              settings: member_voice_settings(model.voice_settings, name),
+              settings: member_voice_settings(model.voice_settings, id_str),
               on_close: CloseVoicePopover,
-              on_set_volume: fn(v) { SetMemberVolume(name, v) },
-              on_toggle_denoise: ToggleMemberDenoise(name),
-              on_toggle_deafen: ToggleMemberDeafen(name),
-              on_reset: ResetMemberVoice(name),
+              on_set_volume: fn(v) {
+                SetPeerVolume(id_str, int.to_float(v) /. 100.0)
+              },
+              on_toggle_denoise: ToggleMemberDenoise(id_str),
+              on_toggle_deafen: ToggleMuteForPeer(id_str),
+              on_reset: ResetMemberVoice(id_str),
             ),
           )
         Error(_) -> element.fragment([])
@@ -1842,21 +2103,27 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
-  let user_in_call = list.any(fixture.members(), fn(m) { m.you && m.in_call })
+  // Use real voice model state: show minibar when user is in call.
+  let user_in_call = option.is_some(model.voice.self_in_call)
 
   let active_voice_channel_name =
     list.find(fixture.channels(), fn(c) {
       c.kind == domain.Voice && c.in_call > 0
     })
     |> result.map(fn(c) { c.name })
-    |> result.unwrap("")
+    |> result.unwrap("voice")
 
   let voice_minibar_el = case model.viewport, user_in_call {
     domain.Phone, True ->
       voice_minibar.view(
         palette: palette,
         channel_name: active_voice_channel_name,
-        on_open: OpenVoicePopover("you"),
+        on_open: OpenVoicePopover("u3"),
+        on_mute: ToggleSelfMute,
+        on_deafen: ToggleSelfDeafen,
+        on_leave: LeaveVoice,
+        self_muted: model.voice.self_muted,
+        self_deafened: model.voice.self_deafened,
       )
     _, _ -> element.fragment([])
   }
@@ -1895,12 +2162,11 @@ fn room_view_with_state(
       members: state.members,
       on_open_settings: OpenSettings,
     ),
-    // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
     channels.view(
       palette: palette,
       room: active_room,
       channels: fixture.channels(),
-      members: fixture.members(),
+      members: members_for_channels,
       current_channel: state.current_channel,
       voice_popover_open: case state.sheet {
         Some(domain.VoiceSheet(member_name: name)) -> Some(name)
@@ -1910,6 +2176,13 @@ fn room_view_with_state(
       on_open_voice_popover: OpenVoicePopover,
       viewport: model.viewport,
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
+      on_join_voice: JoinVoice(active_room.id),
+      on_leave_voice: LeaveVoice,
+      on_mute_self: ToggleSelfMute,
+      on_deafen_self: ToggleSelfDeafen,
+      self_in_call: option.is_some(model.voice.self_in_call),
+      self_muted: model.voice.self_muted,
+      self_deafened: model.voice.self_deafened,
       relays: relays_view.relays_for_view(model.intents),
       on_open_relay: OpenRelayPopover,
     ),
@@ -1963,11 +2236,20 @@ fn room_view_with_state(
         )
     },
     element.fragment([
-      voice_popover_overlay(palette, model, state),
+      voice_popover_overlay(palette, model, state, members_for_channels),
       peer_status_popover_overlay(palette, model, state),
       relay_popover_overlay(palette, model),
       full_picker_backdrop_el,
       full_picker_overlay_el,
+      case model.voice.permission_error {
+        Some(msg) ->
+          voice_error_toast.view(
+            palette: palette,
+            message: msg,
+            on_close: ResetVoiceError,
+          )
+        None -> element.fragment([])
+      },
       settings_overlay_el,
     ]),
     phone_header.view(
@@ -1991,23 +2273,25 @@ fn voice_popover_overlay(
   palette,
   model: Model,
   state: RoomState,
+  members_for_channels: List(domain.Member),
 ) -> Element(Msg) {
   case model.viewport, state.sheet {
-    domain.Desktop, Some(domain.VoiceSheet(member_name: name)) ->
-      // Voice path stays fixture-backed (in-call counts) — real voice presence is V3.
-      case list.find(fixture.members(), fn(m) { m.name == name }) {
+    domain.Desktop, Some(domain.VoiceSheet(member_name: id_str)) ->
+      case list.find(members_for_channels, fn(m) { m.id == MemberId(id_str) }) {
         Error(_) -> element.fragment([])
         Ok(m) ->
           voice_popover.view(
             palette: palette,
             placement: voice_popover.Floating,
             member: m,
-            settings: member_voice_settings(model.voice_settings, name),
+            settings: member_voice_settings(model.voice_settings, id_str),
             on_close: CloseVoicePopover,
-            on_set_volume: fn(v) { SetMemberVolume(name, v) },
-            on_toggle_denoise: ToggleMemberDenoise(name),
-            on_toggle_deafen: ToggleMemberDeafen(name),
-            on_reset: ResetMemberVoice(name),
+            on_set_volume: fn(v) {
+              SetPeerVolume(id_str, int.to_float(v) /. 100.0)
+            },
+            on_toggle_denoise: ToggleMemberDenoise(id_str),
+            on_toggle_deafen: ToggleMuteForPeer(id_str),
+            on_reset: ResetMemberVoice(id_str),
           )
       }
     _, _ -> element.fragment([])

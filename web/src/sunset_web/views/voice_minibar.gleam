@@ -21,12 +21,15 @@ pub fn view(
   palette p: Palette,
   channel_name channel_name: String,
   on_open on_open: msg,
+  on_mute on_mute: msg,
+  on_deafen on_deafen: msg,
+  on_leave on_leave: msg,
+  self_muted self_muted: Bool,
+  self_deafened self_deafened: Bool,
 ) -> Element(msg) {
-  html.button(
+  html.div(
     [
       attribute.attribute("data-testid", "voice-minibar"),
-      attribute.attribute("aria-label", "Voice controls for " <> channel_name),
-      event.on_click(on_open),
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),
@@ -36,28 +39,44 @@ pub fn view(
         #("padding", "8px 12px"),
         #("background", p.accent),
         #("color", p.accent_ink),
-        #("border", "none"),
         #("border-bottom", "1px solid " <> p.border),
-        #("font-family", "inherit"),
         #("font-size", "14px"),
         #("font-weight", "600"),
-        #("text-align", "left"),
-        #("cursor", "pointer"),
         #("flex-shrink", "0"),
       ]),
     ],
     [
-      label(channel_name),
-      icon_button("Mute mic", mic_icon()),
-      icon_button("Deafen", headphones_icon()),
-      leave_button(),
+      label_button(p, channel_name, on_open),
+      icon_button(
+        case self_muted {
+          True -> "Unmute mic"
+          False -> "Mute mic"
+        },
+        mic_icon(self_muted),
+        on_mute,
+        p,
+        False,
+      ),
+      icon_button(
+        case self_deafened {
+          True -> "Undeafen"
+          False -> "Deafen"
+        },
+        headphones_icon(),
+        on_deafen,
+        p,
+        self_deafened,
+      ),
+      leave_button(on_leave),
     ],
   )
 }
 
-fn label(channel_name: String) -> Element(msg) {
-  html.span(
+fn label_button(_p: Palette, channel_name: String, on_open: msg) -> Element(msg) {
+  html.button(
     [
+      attribute.attribute("aria-label", "Voice controls for " <> channel_name),
+      event.on_click(on_open),
       ui.css([
         #("flex", "1"),
         #("min-width", "0"),
@@ -67,6 +86,15 @@ fn label(channel_name: String) -> Element(msg) {
         #("white-space", "nowrap"),
         #("overflow", "hidden"),
         #("text-overflow", "ellipsis"),
+        #("border", "none"),
+        #("background", "transparent"),
+        #("color", "currentColor"),
+        #("font-family", "inherit"),
+        #("font-size", "inherit"),
+        #("font-weight", "inherit"),
+        #("padding", "0"),
+        #("cursor", "pointer"),
+        #("text-align", "left"),
       ]),
     ],
     [
@@ -91,49 +119,72 @@ fn live_dot() -> Element(msg) {
   )
 }
 
-/// Icon affordance — visual only. The whole row is the click target;
-/// these are rendered inside the row's <button> as styled spans.
-fn icon_button(title: String, icon: Element(msg)) -> Element(msg) {
-  html.span(
+fn icon_button(
+  title: String,
+  icon: Element(msg),
+  on_click: msg,
+  _p: Palette,
+  active: Bool,
+) -> Element(msg) {
+  let bg = case active {
+    True -> "rgba(255, 255, 255, 0.35)"
+    False -> "rgba(255, 255, 255, 0.18)"
+  }
+  html.button(
     [
       attribute.title(title),
+      attribute.attribute("aria-pressed", case active {
+        True -> "true"
+        False -> "false"
+      }),
+      event.on_click(on_click),
       ui.css([
         #("width", "30px"),
         #("height", "30px"),
         #("display", "inline-flex"),
         #("align-items", "center"),
         #("justify-content", "center"),
+        #("padding", "0"),
+        #("border", "none"),
         #("border-radius", "6px"),
-        #("background", "rgba(255, 255, 255, 0.18)"),
+        #("background", bg),
         #("color", "currentColor"),
         #("flex-shrink", "0"),
+        #("cursor", "pointer"),
+        #("font-family", "inherit"),
       ]),
     ],
     [icon],
   )
 }
 
-fn leave_button() -> Element(msg) {
-  html.span(
+fn leave_button(on_click: msg) -> Element(msg) {
+  html.button(
     [
       attribute.title("Leave call"),
+      attribute.attribute("data-testid", "voice-leave"),
+      event.on_click(on_click),
       ui.css([
         #("width", "30px"),
         #("height", "30px"),
         #("display", "inline-flex"),
         #("align-items", "center"),
         #("justify-content", "center"),
+        #("padding", "0"),
+        #("border", "none"),
         #("border-radius", "6px"),
         #("background", "#a8242c"),
         #("color", "#ffffff"),
         #("flex-shrink", "0"),
+        #("cursor", "pointer"),
+        #("font-family", "inherit"),
       ]),
     ],
     [phone_hangup_icon()],
   )
 }
 
-fn mic_icon() -> Element(msg) {
+fn mic_icon(_muted: Bool) -> Element(msg) {
   element.namespaced(
     "http://www.w3.org/2000/svg",
     "svg",

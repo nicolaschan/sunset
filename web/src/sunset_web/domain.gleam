@@ -7,6 +7,7 @@
 //// lands these become aliases over the real `(verifying_key, name)`
 //// pairs, and the field shapes shouldn't shift.
 
+import gleam/dict.{type Dict}
 import gleam/option
 
 pub type RoomId {
@@ -210,6 +211,26 @@ pub type Drawer {
 pub type Sheet {
   DetailsSheet(message_id: String)
   VoiceSheet(member_name: String)
+}
+
+/// Live peer state emitted by the voice runtime's PeerStateSink, keyed
+/// by peer pubkey hex. Updated from `on_voice_peer_state` callbacks.
+pub type VoicePeerStateUI {
+  VoicePeerStateUI(in_call: Bool, talking: Bool, is_muted: Bool)
+}
+
+/// Top-level voice subsystem state on the Lustre model.
+pub type VoiceModel {
+  VoiceModel(
+    /// `None` = not in call; `Some(room_id)` = active voice session for that room.
+    self_in_call: option.Option(RoomId),
+    self_muted: Bool,
+    self_deafened: Bool,
+    /// Per-peer state keyed by pubkey hex string.
+    peers: Dict(String, VoicePeerStateUI),
+    /// Set when mic permission is denied; cleared by `ResetVoiceError`.
+    permission_error: option.Option(String),
+  )
 }
 
 pub type RelayConnState {

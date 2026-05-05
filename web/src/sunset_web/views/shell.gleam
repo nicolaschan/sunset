@@ -55,6 +55,7 @@ pub fn view(
         channels,
         main,
         right_rail,
+        overlay,
         phone_header_el,
         details_sheet,
         voice_sheet,
@@ -73,6 +74,7 @@ fn phone_view(
   channels: Element(msg),
   main: Element(msg),
   right_rail: Element(msg),
+  overlay: Element(msg),
   phone_header_el: Element(msg),
   details_sheet: Element(msg),
   voice_sheet: Element(msg),
@@ -160,6 +162,7 @@ fn phone_view(
       voice_sheet,
       peer_status_sheet,
       reaction_sheet,
+      overlay,
     ],
   )
 }

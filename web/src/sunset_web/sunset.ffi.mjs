@@ -411,6 +411,8 @@ export function registerEmojiPicker() {
   return emojiPickerLoaded;
 }
 
+export function truncFloat(f) { return Math.trunc(f); }
+
 /// Read `?heartbeat_interval_ms=NNN` from the current URL. Returns 0
 /// when absent or unparseable, signalling Client::new to use the
 /// SyncConfig default (15 s). e2e-only knob.

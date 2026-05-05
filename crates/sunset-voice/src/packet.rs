@@ -31,6 +31,7 @@ pub enum VoicePacket {
     },
     Heartbeat {
         sent_at_ms: u64,
+        is_muted: bool,
     },
 }
 
@@ -135,6 +136,7 @@ mod tests {
     fn fixed_heartbeat() -> VoicePacket {
         VoicePacket::Heartbeat {
             sent_at_ms: 1_700_000_000_000,
+            is_muted: false,
         }
     }
 
@@ -194,6 +196,24 @@ mod tests {
         let id = Identity::generate(&mut OsRng);
         let res = encrypt(&room, 999, &id.public(), &fixed_heartbeat(), &mut OsRng);
         assert!(matches!(res, Err(Error::EpochMissing(999))));
+    }
+
+    #[test]
+    fn heartbeat_is_muted_round_trips() {
+        let p = VoicePacket::Heartbeat {
+            sent_at_ms: 12345,
+            is_muted: true,
+        };
+        let bytes = postcard::to_stdvec(&p).unwrap();
+        let p2: VoicePacket = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(p, p2);
+        assert!(matches!(
+            p2,
+            VoicePacket::Heartbeat {
+                is_muted: true,
+                sent_at_ms: 12345
+            }
+        ));
     }
 
     /// Frozen vector for `derive_voice_key`. If this fails, the per-voice

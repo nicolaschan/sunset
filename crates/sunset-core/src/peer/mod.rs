@@ -254,6 +254,16 @@ where
         &self.engine
     }
 
+    /// Public accessor for the engine. Used by e2e test diagnostics
+    /// (e.g. `voice_engine_connected_peers` in sunset-web-wasm) to read
+    /// connected-peer state for layered failure analysis. Gated behind
+    /// `test-hooks` so the engine surface stays out of the production
+    /// API; production callers go through `Peer`'s curated methods.
+    #[cfg(feature = "test-hooks")]
+    pub fn engine_handle(&self) -> &Rc<SyncEngine<St, T>> {
+        &self.engine
+    }
+
     pub(crate) fn supervisor(&self) -> &Rc<PeerSupervisor<St, T>> {
         &self.supervisor
     }

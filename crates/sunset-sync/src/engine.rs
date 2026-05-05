@@ -62,6 +62,52 @@ fn spawn_run_peer<C: crate::transport::TransportConnection + 'static>(
     ));
 }
 
+/// Long-running accept loop. Spawned by `SyncEngine::run` once at
+/// startup, lives for the engine's lifetime. Owns its own clones of the
+/// `Arc<T>` transport and the `next_conn_id` counter, and a clone of
+/// the `inbound_tx` sender that per-peer tasks fan into.
+///
+/// Why this exists as a separate task instead of a `select!` arm: the
+/// secondary transport's `accept()` (e.g. `NoiseTransport::accept`)
+/// internally awaits a multi-RTT cryptographic handshake on the raw
+/// connection it just dequeued. Dropping that future mid-handshake
+/// drops the dequeued connection; the connection cannot be reclaimed
+/// (it's already off the per-transport completed channel). Running
+/// here means cancellation only happens on engine shutdown.
+fn spawn_accept_loop<T: crate::transport::Transport + 'static>(
+    transport: Arc<T>,
+    next_conn_id: Arc<Mutex<u64>>,
+    env: crate::peer::PeerEnv,
+    inbound_tx: mpsc::UnboundedSender<InboundEvent>,
+) where
+    T::Connection: 'static,
+{
+    crate::spawn::spawn_local(async move {
+        loop {
+            match transport.accept().await {
+                Ok(conn) => {
+                    let conn_id = {
+                        let mut n = next_conn_id.lock().await;
+                        let id = *n;
+                        *n += 1;
+                        ConnectionId(id)
+                    };
+                    spawn_run_peer(conn, env.clone(), conn_id, inbound_tx.clone(), None);
+                }
+                Err(e) => {
+                    // A single accept failure (e.g. an upstream pump
+                    // that's shutting down) must not tear down the
+                    // engine — log and keep accepting. If the channel
+                    // underneath has truly closed, every subsequent
+                    // accept will return an error too; that's fine —
+                    // eventually the engine task is aborted by the host.
+                    tracing::warn!(error = %e, "transport accept failed; continuing");
+                }
+            }
+        }
+    });
+}
+
 /// A command sent from the public API into the running engine.
 pub(crate) enum EngineCommand {
     AddPeer {
@@ -158,6 +204,16 @@ pub struct SyncEngine<S: Store, T: Transport> {
     /// (`?Send`); a `RefCell<u64>` would also work, but `Arc<Mutex<…>>` keeps
     /// the same shape as the rest of the engine state.
     pub(crate) next_conn_id: Arc<Mutex<u64>>,
+    /// All filters that the local peer has called `publish_subscription`
+    /// with, deduped by `PartialEq`. The engine writes the **union** of
+    /// these as the single per-peer SUBSCRIBE_NAME entry, so a client
+    /// that subscribes to multiple disjoint namespaces (e.g. chat
+    /// `<fp>/`, voice frames `voice/<fp>/`, voice presence
+    /// `voice-presence/<fp>/`) gets all of them routed by the relay's
+    /// registry. Without this accumulation, each call would clobber the
+    /// previous (HashMap-per-peer in `SubscriptionRegistry`), silently
+    /// breaking sync for every prior subscription.
+    pub(crate) own_filters: Arc<Mutex<Vec<Filter>>>,
 }
 
 impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T>
@@ -189,6 +245,7 @@ where
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
             next_conn_id: Arc::new(Mutex::new(0)),
+            own_filters: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -378,22 +435,36 @@ where
         // isn't duplicated immediately after PeerHello.
         anti_entropy.tick().await;
 
+        // Spawn the accept loop in its own task so its in-flight
+        // post-accept work (e.g. NoiseTransport's IK handshake on the
+        // raw connection that `transport.accept().await` just returned)
+        // is NOT a `tokio::select!` arm in the engine's main loop.
+        //
+        // Why this matters: `select!` cancels every other branch the
+        // moment any one branch returns Ready. If the accept arm sat in
+        // `select!`, then any unrelated wakeup (a peer's PeerHello
+        // landing on `inbound_rx`, an outbound command on `cmd_rx`, an
+        // anti-entropy tick) while the secondary transport's Noise
+        // responder was awaiting msg1 would cancel the accept future
+        // mid-handshake. The dequeued `WebRtcRawConnection` (already
+        // taken off the per-transport `completed_rx`) would be dropped
+        // along with it, and that connection is gone for good — the
+        // remote peer's dial sits in `Connecting` until its
+        // `engine.add_peer` await eventually times out (or, for
+        // `WebRtcRawTransport::connect`, never).
+        //
+        // Running accept in its own task isolates it from the select!:
+        // dequeue + Noise + run_peer spawn all happen without competing
+        // for poll cycles with the engine's other branches.
+        spawn_accept_loop(
+            self.transport.clone(),
+            self.next_conn_id.clone(),
+            self.peer_env(),
+            inbound_tx.clone(),
+        );
+
         loop {
             tokio::select! {
-                accept_res = self.transport.accept() => {
-                    match accept_res {
-                        Ok(conn) => self.spawn_peer(conn, inbound_tx.clone()).await,
-                        Err(e) => {
-                            // A single accept failure (e.g. an upstream pump that's
-                            // shutting down) must not tear down the engine — log and
-                            // keep accepting. If the channel underneath has truly
-                            // closed, every subsequent accept will return an error
-                            // too; that's fine — eventually the engine task is
-                            // aborted by the host.
-                            tracing::warn!(error = %e, "transport accept failed; continuing");
-                        }
-                    }
-                }
                 Some(cmd) = cmd_rx.recv() => {
                     self.handle_command(cmd, &inbound_tx).await;
                 }
@@ -487,15 +558,6 @@ where
                 let _ = ack.send(Ok(()));
             }
         }
-    }
-
-    async fn spawn_peer(
-        &self,
-        conn: T::Connection,
-        inbound_tx: mpsc::UnboundedSender<InboundEvent>,
-    ) {
-        let conn_id = self.alloc_conn_id().await;
-        spawn_run_peer(conn, self.peer_env(), conn_id, inbound_tx, None);
     }
 
     async fn handle_inbound_event(&self, event: InboundEvent) {
@@ -1085,7 +1147,30 @@ where
         use sunset_store::canonical::signing_payload;
         use sunset_store::{ContentBlock, SignedKvEntry};
 
-        let value = postcard::to_stdvec(&filter)
+        // Accumulate this filter into the local per-engine set, then
+        // publish the union of all locally-published filters. The
+        // SUBSCRIBE_NAME entry carries one filter per peer (LWW); without
+        // accumulation, a second `publish_subscription(other_filter)`
+        // would silently clobber the first peer's prior interest at the
+        // relay, breaking every higher-layer subsystem (chat / voice /
+        // signaling) that has its own subscribe call.
+        let union_filter = {
+            let mut filters = self.own_filters.lock().await;
+            if !filters.iter().any(|f| f == &filter) {
+                filters.push(filter.clone());
+            }
+            // Single-element optimization: avoid wrapping in Union when
+            // unnecessary, so the wire format stays identical to the
+            // pre-accumulation behavior in the common one-subsystem case
+            // and the existing test vectors aren't disturbed.
+            if filters.len() == 1 {
+                filters[0].clone()
+            } else {
+                Filter::Union(filters.clone())
+            }
+        };
+
+        let value = postcard::to_stdvec(&union_filter)
             .map_err(|e| Error::Decode(format!("encode filter: {e}")))?;
         let block = ContentBlock {
             data: Bytes::from(value),
@@ -2034,6 +2119,125 @@ mod tests {
                 assert!(
                     saw_filter_digest,
                     "publish_subscription must send a DigestExchange over the new filter to each connected peer so the peer can backfill matching entries we're missing"
+                );
+            })
+            .await;
+    }
+
+    /// Helper: fetch the SUBSCRIBE_NAME entry written by `vk_bytes` from an
+    /// engine's store and decode its payload as a `Filter`.
+    async fn read_stored_filter(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        vk_bytes: &[u8],
+    ) -> Filter {
+        use sunset_store::Store as _;
+
+        let verifying_key = vk(vk_bytes);
+        let entry = engine
+            .store
+            .get_entry(&verifying_key, reserved::SUBSCRIBE_NAME)
+            .await
+            .expect("get_entry")
+            .expect("SUBSCRIBE_NAME entry must exist");
+        let block = engine
+            .store
+            .get_content(&entry.value_hash)
+            .await
+            .expect("get_content")
+            .expect("blob for SUBSCRIBE_NAME entry must be present");
+        postcard::from_bytes::<Filter>(&block.data)
+            .expect("SUBSCRIBE_NAME blob must decode as Filter")
+    }
+
+    /// Calling `publish_subscription` once stores the bare filter (not
+    /// wrapped in `Filter::Union`) in the SUBSCRIBE_NAME entry. This
+    /// preserves wire-format compatibility with pre-accumulation clients
+    /// in the common single-subsystem case.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_subscription_single_filter_writes_bare_filter() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = make_engine("alice", b"alice");
+
+                let f = Filter::NamePrefix(Bytes::from_static(b"chat/"));
+                engine
+                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("publish_subscription must succeed");
+
+                let stored = read_stored_filter(&engine, b"alice").await;
+                assert_eq!(
+                    stored, f,
+                    "single publish_subscription must store the bare filter, not Filter::Union([f])"
+                );
+            })
+            .await;
+    }
+
+    /// Calling `publish_subscription` twice with distinct filters stores a
+    /// `Filter::Union` that contains both filters. This ensures neither
+    /// subsystem's interest is silently clobbered by the other's call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_subscription_two_filters_writes_union() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = make_engine("alice", b"alice");
+
+                let f1 = Filter::NamePrefix(Bytes::from_static(b"chat/"));
+                let f2 = Filter::NamePrefix(Bytes::from_static(b"voice/"));
+                engine
+                    .do_publish_subscription(f1.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("first publish_subscription must succeed");
+                engine
+                    .do_publish_subscription(f2.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("second publish_subscription must succeed");
+
+                let stored = read_stored_filter(&engine, b"alice").await;
+                match &stored {
+                    Filter::Union(filters) => {
+                        assert!(
+                            filters.contains(&f1),
+                            "union must contain first filter; got {filters:?}"
+                        );
+                        assert!(
+                            filters.contains(&f2),
+                            "union must contain second filter; got {filters:?}"
+                        );
+                    }
+                    other => panic!("expected Filter::Union, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// Calling `publish_subscription` twice with the same filter must
+    /// deduplicate — the stored result must be the bare filter (not
+    /// `Filter::Union([f, f])`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_subscription_dedupe_same_filter() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = make_engine("alice", b"alice");
+
+                let f = Filter::NamePrefix(Bytes::from_static(b"chat/"));
+                engine
+                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("first publish_subscription must succeed");
+                engine
+                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
+                    .await
+                    .expect("second publish_subscription (same filter) must succeed");
+
+                let stored = read_stored_filter(&engine, b"alice").await;
+                assert_eq!(
+                    stored, f,
+                    "duplicate publish_subscription must not wrap in Union; got {stored:?}"
                 );
             })
             .await;
