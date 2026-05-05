@@ -195,6 +195,12 @@ test("composer regains focus after a channel switch", async ({
   await page.getByTestId("new-channel-input").fill("links");
   await page.getByTestId("new-channel-input").press("Enter");
 
+  // NewChannel triggers an async focus-composer effect; wait for it to
+  // settle before blurring so we don't race it. Without this wait, the
+  // blur lands first and the focus effect refocuses the composer right
+  // after, leaving toBeNotFocused racing forever.
+  await expect(composer).toBeFocused({ timeout: 5_000 });
+
   await page.evaluate(() => {
     const el = document.activeElement;
     if (el && typeof el.blur === "function") el.blur();
