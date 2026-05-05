@@ -9,9 +9,11 @@
     <p>This page is exercised by Playwright; do not load it manually.</p>
     <script type="module">
       import init, { Client } from "/sunset_web_wasm.js";
+      import { CaptureCodec } from "/audio/voice-codec.js";
 
       const voiceState = new Map();
       const connState = new Map();
+      let captureCodec = null;
 
       function hex(uint8) {
         return Array.from(uint8).map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -41,34 +43,65 @@
           });
           return { publicKey: window.__voice.publicKeyHex };
         },
-        startVoice() {
-          // Start voice first, then install recorder so all frames are captured.
+        async startVoice() {
+          // The protocol-regression test (voice_protocol.spec.js) injects
+          // synthetic PCM via voice_inject_pcm, which bypasses the capture
+          // worklet and the JS-side encoder. We still construct the
+          // CaptureCodec so any future test can route real PCM through
+          // it; for the current tests it just sits idle.
+          captureCodec = new CaptureCodec({
+            onEncoded: (payload, codecId) => {
+              try {
+                window.__voice.client.voice_input(payload, codecId);
+              } catch (err) {
+                console.warn("voice_input failed", err);
+              }
+            },
+          });
+          await captureCodec.start();
           window.__voice.client.voice_start(
             window.__voice.roomHandle,
-            // on_pcm: ignored in harness — recorder captures via frame recorder
+            // on_frame: ignored in harness — the recorder captures via
+            // the test-only frame recorder installed below.
             () => {},
-            // on_drop_peer: ignored
+            // on_drop_peer: ignored.
             () => {},
-            // on_voice_peer_state
+            // on_voice_peer_state.
             (peerId, in_call, talking, is_muted) => {
               const k = hex(new Uint8Array(peerId));
               voiceState.set(k, { in_call, talking, is_muted });
             },
-            // on_set_peer_volume: ignored in harness
-            () => {},
           );
-          // Install recorder after start so the runtime's frame sink can be wrapped.
+          // Install recorder after start so the runtime's frame sink can
+          // be wrapped.
           window.__voice.client.voice_install_frame_recorder();
         },
         recordedFor(hexPeerId) {
           const bytes = hexBytes(hexPeerId);
           return window.__voice.client.voice_recorded_frames(bytes);
         },
+        captureCodecId() {
+          return captureCodec ? captureCodec.codecId : null;
+        },
         stop() {
+          if (captureCodec) {
+            captureCodec.stop();
+            captureCodec = null;
+          }
           window.__voice.client.voice_stop();
         },
         injectPcm(samples) {
           window.__voice.client.voice_inject_pcm(new Float32Array(samples));
+        },
+        // Run a Float32Array through the local capture codec — the same
+        // path real microphone audio takes. Frames flow through
+        // voice_input(payload, codec_id), so the wire format actually
+        // exercises the WebCodecs Opus encoder when present.
+        sendFrame(samples) {
+          if (!captureCodec) {
+            throw new Error("call startVoice before sendFrame");
+          }
+          captureCodec.encode(new Float32Array(samples));
         },
         voiceStateFor(hexPeerId) {
           return voiceState.get(hexPeerId) ?? null;

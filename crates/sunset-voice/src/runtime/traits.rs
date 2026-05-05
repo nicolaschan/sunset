@@ -29,12 +29,19 @@ pub trait Dialer {
     async fn ensure_direct(&self, peer: PeerId);
 }
 
-/// Sink for decoded PCM frames the runtime hands out at the jitter
-/// pump cadence. PCM is `FRAME_SAMPLES` (960) f32 mono @ 48 kHz.
+/// Sink for codec-encoded voice frames the runtime hands out at the
+/// jitter pump cadence. The runtime is codec-agnostic — it forwards
+/// `(payload, codec_id)` tuples opaquely; decoding to PCM is the host's
+/// responsibility.
+///
+/// `codec_id` matches the `VoicePacket::Frame.codec_id` from the wire
+/// (e.g. `"opus"` for WebCodecs Opus, `"pcm-f32-le"` for the
+/// uncompressed fallback). Hosts should be tolerant of unknown
+/// codec IDs (treat as drop / skip rather than panic).
 pub trait FrameSink {
-    fn deliver(&self, peer: &PeerId, pcm: &[f32]);
+    fn deliver(&self, peer: &PeerId, payload: &[u8], codec_id: &str);
     /// Peer transitioned from in-call to gone. Host should release
-    /// per-peer playback resources (worklet node, gain node, etc.).
+    /// per-peer playback resources (worklet node, gain node, decoder, etc.).
     fn drop_peer(&self, peer: &PeerId);
 }
 

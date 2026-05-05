@@ -22,11 +22,33 @@ use sunset_voice::runtime::{
 };
 
 /// Type alias to avoid clippy::type_complexity.
-type DeliveredSink = Rc<RefCell<Vec<(PeerId, Vec<f32>)>>>;
+type DeliveredSink = Rc<RefCell<Vec<(PeerId, Vec<u8>, String)>>>;
 /// Type alias to avoid clippy::type_complexity.
 type DroppedSink = Rc<RefCell<Vec<PeerId>>>;
 /// Type alias to avoid clippy::type_complexity.
 type EventSink = Rc<RefCell<Vec<VoicePeerState>>>;
+
+/// Helper: encode `pcm` as little-endian f32 bytes (the `pcm-f32-le`
+/// codec). Used by tests that build `VoicePacket::Frame` payloads
+/// inline; the production path runs through JS WebCodecs.
+fn pcm_to_bytes(pcm: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pcm.len() * 4);
+    for s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Helper: decode `pcm-f32-le` bytes back to PCM samples. Mirror of
+/// `pcm_to_bytes` for use in test assertions.
+fn pcm_from_bytes(bytes: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact yields [u8; 4]");
+        out.push(f32::from_le_bytes(arr));
+    }
+    out
+}
 
 /// Minimal in-memory `DynBus` for tests. Supports ephemeral and durable
 /// publish + subscribe. Loopback is included (publishes are visible to
@@ -169,10 +191,10 @@ struct RecordingFrameSink {
     dropped: DroppedSink,
 }
 impl FrameSink for RecordingFrameSink {
-    fn deliver(&self, peer: &PeerId, pcm: &[f32]) {
+    fn deliver(&self, peer: &PeerId, payload: &[u8], codec_id: &str) {
         self.delivered
             .borrow_mut()
-            .push((peer.clone(), pcm.to_vec()));
+            .push((peer.clone(), payload.to_vec(), codec_id.to_string()));
     }
     fn drop_peer(&self, peer: &PeerId) {
         self.dropped.borrow_mut().push(peer.clone());
@@ -371,12 +393,15 @@ async fn send_pcm_publishes_frame_when_unmuted() {
                 postcard::from_bytes(&frame.payload).unwrap();
             let pkt = sunset_voice::packet::decrypt(&room, 0, &alice.public(), &ev).unwrap();
             let bytes = match pkt {
-                sunset_voice::packet::VoicePacket::Frame { payload, .. } => payload,
+                sunset_voice::packet::VoicePacket::Frame {
+                    payload, codec_id, ..
+                } => {
+                    assert_eq!(codec_id, sunset_voice::CODEC_ID);
+                    payload
+                }
                 _ => panic!("expected Frame"),
             };
-            let mut decoder = sunset_voice::VoiceDecoder::new().unwrap();
-            let decoded = decoder.decode(&bytes).unwrap();
-            assert_eq!(decoded, pcm);
+            assert_eq!(pcm_from_bytes(&bytes), pcm);
         })
         .await;
 }
@@ -472,8 +497,7 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
 
             // Alice publishes one Frame as if she were on the network.
             let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
-            let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
-            let bytes = enc.encode(&pcm).unwrap();
+            let bytes = pcm_to_bytes(&pcm);
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
                 seq: 1,
@@ -638,8 +662,7 @@ async fn combiner_evicts_peer_seen_only_via_frames() {
 
             // Inject one frame from alice — no heartbeat ever.
             let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
-            let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
-            let bytes = enc.encode(&pcm).unwrap();
+            let bytes = pcm_to_bytes(&pcm);
             let now_ms: u64 = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -879,7 +902,13 @@ async fn voice_presence_publisher_emits_periodically() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
+async fn jitter_pump_delivers_real_frames_only() {
+    // Contract: the runtime is codec-agnostic and forwards each queued
+    // frame to the host exactly once. It does NOT synthesise repeat-last
+    // or silence frames on underrun — that responsibility moved to the
+    // host (browser playback worklet pads silence on its own underflow,
+    // and re-feeding the same opus packet to a stateful AudioDecoder
+    // would have undefined output).
     tokio::task::LocalSet::new()
         .run_until(async {
             let (alice, room) = make_identity_and_room(10);
@@ -910,26 +939,13 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
             let frame2: Vec<f32> = (0..960).map(|i| i as f32 * 0.002).collect();
 
             // Push two frames directly into the jitter buffer.
-            runtime.test_push_frame(peer.clone(), frame1.clone());
-            runtime.test_push_frame(peer.clone(), frame2.clone());
+            runtime.test_push_frame(peer.clone(), &frame1);
+            runtime.test_push_frame(peer.clone(), &frame2);
 
             tokio::task::spawn_local(tasks.jitter_pump);
 
-            // Poll for 1st delivery (frame1).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if !delivered.borrow().is_empty() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("1st frame delivered");
-            assert_eq!(delivered.borrow()[0].1, frame1);
-
-            // Poll for 2nd delivery (frame2).
-            tokio::time::timeout(Duration::from_millis(100), async {
+            // Poll until both frames have been delivered.
+            tokio::time::timeout(Duration::from_millis(200), async {
                 loop {
                     if delivered.borrow().len() >= 2 {
                         return;
@@ -938,10 +954,25 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
                 }
             })
             .await
-            .expect("2nd frame delivered");
-            assert_eq!(delivered.borrow()[1].1, frame2);
+            .expect("both queued frames delivered within 200ms");
+            assert_eq!(pcm_from_bytes(&delivered.borrow()[0].1), frame1);
+            assert_eq!(pcm_from_bytes(&delivered.borrow()[1].1), frame2);
+            assert_eq!(delivered.borrow()[0].2, sunset_voice::CODEC_ID);
+            assert_eq!(delivered.borrow()[1].2, sunset_voice::CODEC_ID);
 
-            // Poll for 3rd delivery (repeat-last = frame2, first underrun).
+            // Wait long enough for several pump cycles (20ms each); no
+            // additional deliveries should arrive while the buffer is
+            // empty.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert_eq!(
+                delivered.borrow().len(),
+                2,
+                "underrun must not synthesise repeat-last or silence frames"
+            );
+
+            // Push a third frame — pump picks it up on the next 20ms tick.
+            let frame3: Vec<f32> = (0..960).map(|i| i as f32 * 0.003).collect();
+            runtime.test_push_frame(peer.clone(), &frame3);
             tokio::time::timeout(Duration::from_millis(100), async {
                 loop {
                     if delivered.borrow().len() >= 3 {
@@ -951,56 +982,8 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
                 }
             })
             .await
-            .expect("3rd frame delivered (repeat last)");
-            assert_eq!(
-                delivered.borrow()[2].1,
-                frame2,
-                "first underrun = repeat last"
-            );
-
-            // Poll for 4th delivery (silence, second underrun).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() >= 4 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("4th frame delivered (silence)");
-            let silence = vec![0.0_f32; 960];
-            assert_eq!(
-                delivered.borrow()[3].1,
-                silence,
-                "second underrun = silence"
-            );
-
-            // Push a new frame — next pump cycle delivers it normally.
-            // We track how many frames have been delivered so far to find frame3's position.
-            let frame3: Vec<f32> = (0..960).map(|i| i as f32 * 0.003).collect();
-            // Push frame3 immediately after observing the silence delivery.
-            // The next pump tick will pick it up and deliver it normally.
-            runtime.test_push_frame(peer.clone(), frame3.clone());
-            let base_len = delivered.borrow().len();
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() > base_len {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
             .expect("frame3 delivered");
-            // Find frame3 in the delivered list — it may not be at index 4 if extra
-            // silence frames were pumped before we pushed it.
-            let deliveries = delivered.borrow();
-            let frame3_pos = deliveries
-                .iter()
-                .position(|(_, f)| f == &frame3)
-                .expect("frame3 must appear in delivered list");
-            assert_eq!(deliveries[frame3_pos].1, frame3);
+            assert_eq!(pcm_from_bytes(&delivered.borrow()[2].1), frame3);
         })
         .await;
 }

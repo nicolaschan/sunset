@@ -13,9 +13,12 @@ use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
-use crate::VoiceEncoder;
 use crate::runtime::dyn_bus::DynBus;
 use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink};
+
+/// One queued frame: opaque codec-encoded payload + codec identifier.
+/// The runtime never decodes; the host's `FrameSink::deliver` does.
+pub(crate) type QueuedFrame = (Vec<u8>, String);
 
 pub(crate) struct RuntimeInner {
     pub identity: Identity,
@@ -27,7 +30,6 @@ pub(crate) struct RuntimeInner {
     pub frame_sink: RefCell<Rc<dyn FrameSink>>,
     pub peer_state_sink: Rc<dyn PeerStateSink>,
 
-    pub encoder: RefCell<VoiceEncoder>,
     pub seq: RefCell<u64>,
     pub rng: RefCell<ChaCha20Rng>,
 
@@ -37,17 +39,13 @@ pub(crate) struct RuntimeInner {
     pub frame_liveness: Arc<Liveness>,
     pub membership_liveness: Arc<Liveness>,
 
-    /// Per-peer jitter buffers (`VecDeque<Vec<f32>>`). Used by the
-    /// subscribe loop (push) and the jitter pump (pop).
-    pub jitter: RefCell<HashMap<PeerId, VecDeque<Vec<f32>>>>,
-    pub last_delivered: RefCell<HashMap<PeerId, LastDelivered>>,
+    /// Per-peer jitter buffers of opaque encoded frames. Used by the
+    /// subscribe loop (push) and the jitter pump (pop). The runtime
+    /// does not decode — `(payload, codec_id)` flows through to
+    /// `FrameSink::deliver` unchanged.
+    pub jitter: RefCell<HashMap<PeerId, VecDeque<QueuedFrame>>>,
     pub auto_connect_state: RefCell<HashMap<PeerId, AutoConnectState>>,
     pub last_emitted: RefCell<HashMap<PeerId, EmittedState>>,
-}
-
-pub(crate) struct LastDelivered {
-    pub pcm: Vec<f32>,
-    pub underruns: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

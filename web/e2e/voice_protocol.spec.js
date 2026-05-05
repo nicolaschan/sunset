@@ -181,11 +181,16 @@ test("alice injectPcm arrives at bob byte-equal (checksum match)", async ({ brow
   expect(receivedFrames, "bob should receive at least one recorded frame from alice").not.toBeNull();
   expect(receivedFrames.length).toBeGreaterThan(0);
 
-  // Verify the frame length and that the checksum matches.
-  // Byte-equal PCM from Alice → encryption → transport → decryption → Bob
-  // means the SHA-256 of the received f32 bytes is identical to the sent bytes.
+  // Verify the frame's wire-format codec, byte length, and checksum.
+  // `voice_inject_pcm` takes the test-only `pcm-f32-le` path, which
+  // wraps each 960-sample frame as 3840 bytes of little-endian f32 and
+  // forwards them through the runtime opaquely. Bob's recorder hashes
+  // the raw payload bytes, so SHA-256(payload) == SHA-256(pcm-f32-bytes)
+  // == `expectedChecksum`. Real-mic capture uses WebCodecs Opus and a
+  // smaller / lossy payload — exercised by voice_real_mic.spec.js.
   const frame = receivedFrames[0];
-  expect(frame.len).toBe(960);
+  expect(frame.codec_id).toBe("pcm-f32-le");
+  expect(frame.len).toBe(3840);
   expect(frame.checksum).toBe(expectedChecksum);
 
   await aliceCtx.close();

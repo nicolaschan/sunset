@@ -121,7 +121,6 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                         inner.frame_sink.borrow().drop_peer(&ev.peer);
                         // Drop per-peer jitter buffer so re-entry starts fresh.
                         inner.jitter.borrow_mut().remove(&ev.peer);
-                        inner.last_delivered.borrow_mut().remove(&ev.peer);
                     }
                 }
                 else => return,

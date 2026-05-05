@@ -1,17 +1,49 @@
 // JS-side voice wiring. Owns:
 // - the AudioContext (created lazily on first start)
-// - per-peer { workletNode, gainNode } table
-// - capture worklet stream
+// - per-peer { workletNode, gainNode, decoder } table
+// - capture worklet stream + a shared CaptureCodec (WebCodecs Opus
+//   encoder when supported, PCM passthrough otherwise)
 // - per-peer GainNode updates (setPeerVolume), called directly from
 //   the Gleam UI; not threaded through Rust (the GainNode is a
 //   browser-shaped concept — see voice/mod.rs for the spec rationale).
+//
+// The runtime is codec-agnostic: `client.voice_input(payload, codec_id)`
+// accepts opaque encoded bytes plus a `codec_id` string. The capture
+// codec produces one `(payload, codec_id)` tuple per 20 ms PCM frame
+// from the worklet; the receive callback hands `(peer_id, payload,
+// codec_id)` back to JS so a per-peer `PlaybackCodec` can decode it
+// and feed PCM to the per-peer `voice-playback` worklet.
 
 import { Ok, Error as GError } from "../../prelude.mjs";
 
+// Load the codec wrapper lazily at runtime — the dev/prod web server
+// serves it from `/audio/voice-codec.js` but Lustre's bundler (esbuild
+// /bun) tries to resolve any `import(...)` whose argument is a string
+// literal at build time, which fails for absolute URLs. Building the
+// URL through a non-literal expression hides it from the bundler so
+// the import is left as a runtime-evaluated dynamic import. (Same
+// trick as the worklet `addModule` calls below — those use string
+// literals because `addModule` is a runtime API the bundler ignores.)
+let _codecModulePromise = null;
+function codecModuleUrl() {
+  // Concatenated at runtime so the bundler can't statically constant-fold it.
+  const root = "/audio/";
+  const file = "voice-codec.js";
+  return root + file;
+}
+function loadCodecModule() {
+  if (!_codecModulePromise) {
+    _codecModulePromise = import(/* @vite-ignore */ codecModuleUrl());
+  }
+  return _codecModulePromise;
+}
+
 let ctx = null;
-const peers = new Map(); // peerHex -> { worklet, gain }
+const peers = new Map(); // peerHex -> { worklet, gain, codec }
 let captureNode = null;
 let captureStream = null;
+let captureCodec = null;
+let PlaybackCodecCtor = null;
 
 // Test-only handle. The bundled module is otherwise unreachable from
 // page.evaluate() because Lustre's prod build inlines it into sunset_web.js
@@ -26,6 +58,7 @@ if (typeof window !== "undefined" && window.SUNSET_TEST) {
     setPeerVolume: (peerHex, gain) => setPeerVolume(peerHex, gain),
     getPeerGain: (peerHex) => getPeerGain(peerHex),
     stopCaptureSource: () => stopCaptureSource(),
+    activeCodecId: () => (captureCodec ? captureCodec.codecId : null),
   };
 }
 
@@ -48,12 +81,28 @@ export async function startCapture(client) {
   });
   const src = ctx.createMediaStreamSource(captureStream);
   captureNode = new AudioWorkletNode(ctx, "voice-capture");
+
+  // Build the encoder before wiring the worklet so the first PCM frame
+  // doesn't race the async configure() inside CaptureCodec.start().
+  const codecModule = await loadCodecModule();
+  PlaybackCodecCtor = codecModule.PlaybackCodec;
+  captureCodec = new codecModule.CaptureCodec({
+    onEncoded: (payload, codecId) => {
+      try {
+        client.voice_input(payload, codecId);
+      } catch (err) {
+        console.warn("voice_input failed", err);
+      }
+    },
+  });
+  await captureCodec.start();
+
   captureNode.port.onmessage = (e) => {
     if (e.data instanceof Float32Array && e.data.length === 960) {
       try {
-        client.voice_input(e.data);
+        captureCodec.encode(e.data);
       } catch (err) {
-        console.warn("voice_input failed", err);
+        console.warn("captureCodec.encode failed", err);
       }
     }
   };
@@ -66,6 +115,10 @@ export function stopCapture() {
     captureStream = null;
   }
   captureNode = null;
+  if (captureCodec) {
+    captureCodec.stop();
+    captureCodec = null;
+  }
   for (const [_peer, slot] of peers) {
     try {
       slot.worklet.disconnect();
@@ -73,6 +126,7 @@ export function stopCapture() {
     } catch (_e) {
       // ignore disconnect errors
     }
+    if (slot.codec) slot.codec.stop();
   }
   peers.clear();
 }
@@ -98,18 +152,41 @@ function stopCaptureSource() {
   }
 }
 
-export function deliverFrame(peerHex, pcm) {
-  if (!ctx) return;
+// Per-peer slot accessor that lazily builds the per-peer playback
+// chain (GainNode + AudioWorkletNode + PlaybackCodec) on first frame.
+// Decoders are per-peer because Opus is stateful across packets;
+// sharing one decoder between peers would interleave their states and
+// corrupt every output.
+function ensurePeerSlot(peerHex) {
   let slot = peers.get(peerHex);
-  if (!slot) {
-    const w = new AudioWorkletNode(ctx, "voice-playback");
-    const g = ctx.createGain();
-    g.gain.value = 1.0;
-    w.connect(g).connect(ctx.destination);
-    slot = { worklet: w, gain: g };
-    peers.set(peerHex, slot);
-  }
-  slot.worklet.port.postMessage(pcm, [pcm.buffer]);
+  if (slot) return slot;
+  const w = new AudioWorkletNode(ctx, "voice-playback");
+  const g = ctx.createGain();
+  g.gain.value = 1.0;
+  w.connect(g).connect(ctx.destination);
+  // PlaybackCodecCtor is set during startCapture's async codec module
+  // load. If a frame arrives before startCapture completed (race during
+  // a fast reconnect, say) we'd be left without a decoder; guard with
+  // a defensive null check so the audio path silently drops the frame
+  // rather than throwing.
+  const codec = PlaybackCodecCtor
+    ? new PlaybackCodecCtor({
+        onPcm: (pcm) => {
+          // Transfer the buffer to the worklet to avoid a copy.
+          w.port.postMessage(pcm, [pcm.buffer]);
+        },
+      })
+    : null;
+  slot = { worklet: w, gain: g, codec };
+  peers.set(peerHex, slot);
+  return slot;
+}
+
+export function deliverFrame(peerHex, payload, codecId) {
+  if (!ctx) return;
+  const slot = ensurePeerSlot(peerHex);
+  if (!slot.codec) return; // codec module not yet loaded (race) — drop
+  slot.codec.decode(payload, codecId);
 }
 
 export function dropPeer(peerHex) {
@@ -121,6 +198,7 @@ export function dropPeer(peerHex) {
   } catch (_e) {
     // ignore disconnect errors
   }
+  if (slot.codec) slot.codec.stop();
   peers.delete(peerHex);
 }
 
@@ -152,9 +230,13 @@ export function wasmVoiceStart(client, roomHandle, callback) {
       try {
         client.voice_start(
           roomHandle,
-          (peerId, pcm) => {
+          (peerId, payload, codecId) => {
             const hex = uint8ToHex(new Uint8Array(peerId));
-            deliverFrame(hex, new Float32Array(pcm));
+            // payload is a wasm-bindgen Uint8Array view; copy into a
+            // detached Uint8Array because the buffer may be reused.
+            const copy = new Uint8Array(payload.length);
+            copy.set(payload);
+            deliverFrame(hex, copy, codecId);
           },
           (peerId) => {
             const hex = uint8ToHex(new Uint8Array(peerId));
