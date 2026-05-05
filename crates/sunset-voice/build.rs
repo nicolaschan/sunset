@@ -2,6 +2,16 @@
 //! `sunset-voice` and any downstream crate (e.g. `sunset-web-wasm`)
 //! can link against.
 //!
+//! ## Where libopus comes from
+//!
+//! `flake.nix` declares `libopus` as a flake input pinned by rev to
+//! v1.5.2 (the canonical version pin lives in `flake.lock`). The
+//! dev shell's `shellHook` plants a symlink at `vendor/libopus`
+//! pointing into that input, and the `srcWithLibopus` derivation
+//! does the equivalent paste for `nix build` outputs. Either path
+//! lands the libopus tree at the relative path this script reads
+//! below; building outside `nix develop` is unsupported.
+//!
 //! ## Why a build script lives here
 //!
 //! The codec FFI lives in `sunset-voice` (the layered home for
@@ -42,7 +52,12 @@ fn main() {
         .join("vendor")
         .join("libopus")
         .canonicalize()
-        .expect("vendor/libopus must be a checked-out git submodule");
+        .expect(
+            "vendor/libopus is missing — enter the dev shell so the libopus \
+             flake input is symlinked into place (`nix develop`, or any direnv \
+             shell with `use flake`). Direct `cargo build` outside the flake \
+             is not supported.",
+        );
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let is_wasm = target_arch == "wasm32";

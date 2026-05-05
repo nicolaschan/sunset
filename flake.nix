@@ -401,6 +401,13 @@
             # not the host CC=gcc that Nix's stdenv exports.
             export CC_wasm32_unknown_unknown=${clangForWasm}/bin/clang
             export AR_wasm32_unknown_unknown=${llvmArForWasm}/bin/llvm-ar
+            # `sunset-voice/build.rs` reads vendored libopus C source
+            # from `vendor/libopus`. The flake's `libopus` input is
+            # the canonical pin (rev tracked in `flake.lock`); we
+            # plant a symlink to it here so `cargo build` from inside
+            # `nix develop` works. The directory is git-ignored.
+            mkdir -p vendor
+            ln -sfn ${libopus} vendor/libopus
             # Default SUNSET_WEB_DIST to the voice-test dist (test-hooks WASM +
             # harness HTML + audio worklets). This lets `npx playwright test`
             # run voice_protocol.spec.js from the dev shell without a separate
