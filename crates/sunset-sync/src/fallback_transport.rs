@@ -51,7 +51,10 @@ where
         if s.starts_with("wt://") || s.starts_with("wts://") {
             // Primary scheme — try WT, then WS on failure.
             let primary_err = match self.primary.connect(addr.clone()).await {
-                Ok(c) => return Ok(FallbackConnection::Primary(c)),
+                Ok(c) => {
+                    tracing::info!(url = %s, "fallback: primary (WT) connected");
+                    return Ok(FallbackConnection::Primary(c));
+                }
                 Err(e) => e,
             };
             let fallback_addr = fallback_addr_for(&addr).map_err(|e| {
@@ -59,8 +62,16 @@ where
                     "fallback: primary failed ({primary_err}) and fallback addr derivation failed: {e}"
                 ))
             })?;
+            tracing::warn!(
+                primary_url = %s,
+                error = %primary_err,
+                "fallback: primary (WT) failed, trying fallback (WS)"
+            );
             match self.fallback.connect(fallback_addr).await {
-                Ok(c) => Ok(FallbackConnection::Fallback(c)),
+                Ok(c) => {
+                    tracing::info!("fallback: WS fallback connected after WT failure");
+                    Ok(FallbackConnection::Fallback(c))
+                }
                 Err(fb_err) => Err(Error::Transport(format!(
                     "fallback: primary failed ({primary_err}); fallback also failed ({fb_err})"
                 ))),
@@ -68,6 +79,7 @@ where
         } else if s.starts_with("ws://") || s.starts_with("wss://") {
             // No primary URL at all — relay didn't advertise WT. Just
             // dial the fallback (WS) directly.
+            tracing::info!(url = %s, "fallback: only WS URL available, dialing WS directly");
             self.fallback
                 .connect(addr)
                 .await

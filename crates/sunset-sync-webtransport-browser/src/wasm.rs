@@ -77,6 +77,10 @@ impl RawTransport for WebTransportRawTransport {
         JsFuture::from(ready)
             .await
             .map_err(|e| Error::Transport(format!("WebTransport ready: {e:?}")))?;
+        tracing::info!(
+            url = %parsed.https_url(),
+            "webtransport: session ready (browser)"
+        );
 
         // Open the persistent bidi stream. Server-side mirrors with
         // `accept_bi`. Both sides must be set up before we hand back a
