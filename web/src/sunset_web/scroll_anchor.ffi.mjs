@@ -88,9 +88,19 @@ function attach(el) {
     }
     if (!wasAtBottom) return;
     // Defer one frame so layout has settled — otherwise scrollHeight
-    // can be stale on the same tick the message lands.
+    // can be stale on the same tick the message lands. Re-check
+    // `wasAtBottom` inside the rAF too: between scheduling and the
+    // frame firing, a wheel/touch can flip the user out of "at
+    // bottom" (e.g. they scroll up to read history right as a new
+    // message arrives), and the deferred scroll would yank them back
+    // down. Without this re-check, `scroll_anchor.spec.js` flaked
+    // intermittently — programmatic `scrollTop = 0; dispatch wheel`
+    // would lose to a pending rAF scheduled from a still-arriving
+    // receipt mutation.
     requestAnimationFrame(() => {
-      if (attachedEl === el) el.scrollTop = el.scrollHeight;
+      if (attachedEl === el && wasAtBottom) {
+        el.scrollTop = el.scrollHeight;
+      }
     });
   });
   innerObserver.observe(el, { childList: true, subtree: true });
