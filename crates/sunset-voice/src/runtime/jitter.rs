@@ -1,14 +1,18 @@
-//! Per-peer jitter buffer pump. Every 20 ms, for every peer with a
-//! non-empty buffer (or a `last_delivered`), pop one frame and call
-//! FrameSink::deliver. Underrun → repeat last → silence.
+//! Per-peer jitter pump. Every 20 ms, for every peer with a non-empty
+//! buffer, pop one frame and call `FrameSink::deliver`. The runtime is
+//! codec-agnostic — `(payload, codec_id)` flows through unchanged.
+//!
+//! Underrun policy: deliver nothing. The codec moved to the host
+//! (browser WebCodecs) and re-feeding a stateful decoder the same Opus
+//! packet has undefined output; the host's playback worklet pads
+//! silence on its own underflow, which covers the gap acceptably.
 
 use std::rc::Weak;
 
 use futures::FutureExt;
 
 use super::JITTER_PUMP_INTERVAL;
-use super::state::{LastDelivered, RuntimeInner};
-use crate::FRAME_SAMPLES;
+use super::state::RuntimeInner;
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
@@ -25,36 +29,19 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 }
                 continue;
             }
-            // Snapshot peers to deliver, then deliver outside the borrow.
-            let mut to_deliver: Vec<(sunset_sync::PeerId, Vec<f32>)> = Vec::new();
+            // Snapshot frames to deliver, then deliver outside the borrow.
+            let mut to_deliver: Vec<(sunset_sync::PeerId, Vec<u8>, String)> = Vec::new();
             {
                 let mut jitter = inner.jitter.borrow_mut();
-                let mut last = inner.last_delivered.borrow_mut();
                 for (peer, q) in jitter.iter_mut() {
-                    if let Some(frame) = q.pop_front() {
-                        // Real frame delivered — reset underrun counter.
-                        let rec = last.entry(peer.clone()).or_insert(LastDelivered {
-                            pcm: frame.clone(),
-                            underruns: 0,
-                        });
-                        rec.pcm = frame.clone();
-                        rec.underruns = 0;
-                        to_deliver.push((peer.clone(), frame));
-                    } else if let Some(rec) = last.get_mut(peer) {
-                        // Underrun: repeat once, then silence.
-                        rec.underruns = rec.underruns.saturating_add(1);
-                        let pcm = if rec.underruns == 1 {
-                            rec.pcm.clone()
-                        } else {
-                            vec![0.0_f32; FRAME_SAMPLES]
-                        };
-                        to_deliver.push((peer.clone(), pcm));
+                    if let Some((payload, codec_id)) = q.pop_front() {
+                        to_deliver.push((peer.clone(), payload, codec_id));
                     }
                 }
             }
             let sink = inner.frame_sink.borrow().clone();
-            for (peer, pcm) in to_deliver {
-                sink.deliver(&peer, &pcm);
+            for (peer, payload, codec_id) in to_deliver {
+                sink.deliver(&peer, &payload, &codec_id);
             }
         }
     }

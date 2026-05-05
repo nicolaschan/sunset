@@ -116,6 +116,7 @@
             cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm_bg.wasm $out/sunset_web_wasm_bg.wasm
             cp audio/voice-capture-worklet.js $out/audio/
             cp audio/voice-playback-worklet.js $out/audio/
+            cp audio/voice-codec.js $out/audio/
             runHook postInstall
           '';
         };
@@ -182,6 +183,10 @@
             mkdir -p $out/audio
             cp ${./web/audio/voice-capture-worklet.js} $out/audio/voice-capture-worklet.js
             cp ${./web/audio/voice-playback-worklet.js} $out/audio/voice-playback-worklet.js
+            # WebCodecs Opus encode/decode wrapper. voice.ffi.mjs dynamic-imports
+            # this from `/audio/voice-codec.js` at runtime so the Lustre
+            # bundler doesn't try to resolve the absolute URL at build time.
+            cp ${./web/audio/voice-codec.js} $out/audio/voice-codec.js
             # Lustre emits an absolute `/sunset_web.js` script src which only
             # works at site root. Rewrite to a relative path so the artefact
             # serves correctly under any GitHub Pages sub-path.
@@ -227,6 +232,7 @@
             cp ${./web/voice-e2e-test.html} $out/voice-e2e-test.html
             cp audio/voice-capture-worklet.js $out/audio/
             cp audio/voice-playback-worklet.js $out/audio/
+            cp audio/voice-codec.js $out/audio/
             # Generate a 5-second 440 Hz sine sweep WAV for the real-mic test.
             ${pkgs.sox}/bin/sox -n -r 48000 -c 1 -e signed-integer -b 16 \
               $out/audio/test-fixtures/sweep.wav synth 5 sine 440

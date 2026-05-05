@@ -14,14 +14,14 @@ impl Dialer for RecordingDialer {
 }
 
 struct RecordingFrameSink {
-    delivered: RefCell<Vec<(PeerId, Vec<f32>)>>,
+    delivered: RefCell<Vec<(PeerId, Vec<u8>, String)>>,
     dropped: RefCell<Vec<PeerId>>,
 }
 impl FrameSink for RecordingFrameSink {
-    fn deliver(&self, peer: &PeerId, pcm: &[f32]) {
+    fn deliver(&self, peer: &PeerId, payload: &[u8], codec_id: &str) {
         self.delivered
             .borrow_mut()
-            .push((peer.clone(), pcm.to_vec()));
+            .push((peer.clone(), payload.to_vec(), codec_id.to_string()));
     }
     fn drop_peer(&self, peer: &PeerId) {
         self.dropped.borrow_mut().push(peer.clone());
@@ -54,7 +54,7 @@ async fn traits_are_object_safe_and_implementable() {
         &[0u8; 32],
     )));
     d.ensure_direct(dummy.clone()).await;
-    f.deliver(&dummy, &[0.0_f32; 960]);
+    f.deliver(&dummy, b"opaque-payload", sunset_voice::CODEC_ID);
     f.drop_peer(&dummy);
     p.emit(&VoicePeerState {
         peer: dummy,

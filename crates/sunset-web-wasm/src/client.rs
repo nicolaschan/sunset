@@ -258,7 +258,11 @@ impl Client {
     /// protocol tasks. Only one active voice session per `Client`.
     ///
     /// JS callback signatures:
-    /// - `on_pcm(peer_id: Uint8Array, pcm: Float32Array)` — per-frame delivery
+    /// - `on_frame(peer_id: Uint8Array, payload: Uint8Array, codec_id: string)` —
+    ///   per-frame delivery of a codec-encoded payload (typically `"opus"` from
+    ///   browser WebCodecs, or `"pcm-f32-le"` for the uncompressed fallback);
+    ///   JS feeds `payload` into the matching `AudioDecoder` and routes the
+    ///   resulting PCM to the per-peer playback worklet.
     /// - `on_drop_peer(peer_id: Uint8Array)` — peer left the call
     /// - `on_voice_peer_state(peer_id, in_call, talking, is_muted)` — state change
     ///
@@ -269,7 +273,7 @@ impl Client {
     pub fn voice_start(
         &self,
         room_handle: &crate::room_handle::RoomHandle,
-        on_pcm: js_sys::Function,
+        on_frame: js_sys::Function,
         on_drop_peer: js_sys::Function,
         on_voice_peer_state: js_sys::Function,
     ) -> Result<(), JsError> {
@@ -278,7 +282,7 @@ impl Client {
             &self.identity,
             room_handle,
             &self.bus,
-            on_pcm,
+            on_frame,
             on_drop_peer,
             on_voice_peer_state,
         )
@@ -290,10 +294,15 @@ impl Client {
         crate::voice::voice_stop(&self.voice)
     }
 
-    /// Forward PCM from the browser capture worklet to the runtime's
-    /// encode + publish path. Called once per 20 ms audio frame.
-    pub fn voice_input(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
-        crate::voice::voice_input(&self.voice, pcm)
+    /// Forward a codec-encoded voice frame from JS to the runtime's
+    /// publish path. Called once per 20 ms audio frame after the JS
+    /// layer (browser WebCodecs `AudioEncoder` for Opus, or a raw
+    /// little-endian f32 byte view for the `pcm-f32-le` fallback) has
+    /// produced the encoded bytes. The runtime treats `payload` as
+    /// opaque and ferries `(payload, codec_id)` through to receivers
+    /// via `VoicePacket::Frame`.
+    pub fn voice_input(&self, payload: &js_sys::Uint8Array, codec_id: &str) -> Result<(), JsError> {
+        crate::voice::voice_input(&self.voice, payload, codec_id)
     }
 
     /// Toggle microphone mute. When muted, `send_pcm` drops frames and
@@ -313,10 +322,14 @@ impl Client {
 
     /// Bypass the capture worklet and inject PCM directly into the
     /// runtime's encode + publish path. Used by Playwright tests to
-    /// generate deterministic synthetic frames.
+    /// generate deterministic synthetic frames whose embedded counter
+    /// the receiver can read back through `voice_recorded_frames`.
+    /// Wraps the PCM in the `pcm-f32-le` codec ID (uncompressed
+    /// little-endian f32) so the receiver's `RecordingFrameSink` can
+    /// decode the counter without running a real codec.
     #[cfg(feature = "test-hooks")]
     pub fn voice_inject_pcm(&self, pcm: &js_sys::Float32Array) -> Result<(), JsError> {
-        crate::voice::voice_input(&self.voice, pcm)
+        crate::voice::voice_inject_pcm(&self.voice, pcm)
     }
 
     /// Wrap the current `FrameSink` in a recording adapter that captures

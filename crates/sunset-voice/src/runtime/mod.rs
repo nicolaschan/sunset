@@ -3,8 +3,14 @@
 //! `VoiceRuntime` owns the protocol state (heartbeat + subscribe +
 //! liveness + auto-connect + jitter buffer + mute/deafen). Hosts
 //! provide three traits: `Dialer` (ensure direct WebRTC connection),
-//! `FrameSink` (deliver decoded PCM to the audio output), and
+//! `FrameSink` (deliver codec-encoded frames to the audio output), and
 //! `PeerStateSink` (receive `VoicePeerState` change events).
+//!
+//! The runtime is **codec-agnostic** — it ferries opaque
+//! `(payload, codec_id)` tuples between the wire and `FrameSink`.
+//! Decoding lives at the host boundary so the browser can use
+//! WebCodecs `AudioEncoder` / `AudioDecoder` for Opus without a
+//! WASM-side codec at all.
 //!
 //! `?Send` throughout — single-threaded, matches the project's WASM
 //! constraint. Hosts spawn the returned futures with whatever
@@ -26,8 +32,6 @@ use rand_core::SeedableRng;
 
 use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
-
-use crate::VoiceEncoder;
 
 pub use dyn_bus::DynBus;
 pub use traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
@@ -85,9 +89,6 @@ impl VoiceRuntime {
             dialer,
             frame_sink: RefCell::new(frame_sink),
             peer_state_sink,
-            encoder: RefCell::new(
-                VoiceEncoder::new().expect("passthrough encoder construction is infallible"),
-            ),
             seq: RefCell::new(0),
             rng: RefCell::new(ChaCha20Rng::seed_from_u64(now_nanos)),
             muted: RefCell::new(false),
@@ -95,7 +96,6 @@ impl VoiceRuntime {
             frame_liveness,
             membership_liveness,
             jitter: RefCell::new(Default::default()),
-            last_delivered: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
             last_emitted: RefCell::new(Default::default()),
         });
@@ -112,28 +112,17 @@ impl VoiceRuntime {
         (VoiceRuntime { inner }, tasks)
     }
 
-    /// Capture-path entry. Encodes one frame, encrypts, publishes via
-    /// `Bus::publish_ephemeral`. Drops the frame silently if `muted`.
-    pub fn send_pcm(&self, pcm: &[f32]) {
+    /// Capture-path entry. Wraps a codec-encoded frame in
+    /// `VoicePacket::Frame { codec_id, payload, .. }`, encrypts, and
+    /// publishes via `Bus::publish_ephemeral`. Drops the frame silently
+    /// if `muted`. The runtime never calls a codec — `payload` must
+    /// already be encoded by the host (browser WebCodecs).
+    pub fn send_encoded(&self, payload: Vec<u8>, codec_id: String) {
         if *self.inner.muted.borrow() {
             return;
         }
-        if pcm.len() != crate::FRAME_SAMPLES {
-            return;
-        }
-
         let inner = self.inner.clone();
-        let pcm = pcm.to_vec();
-        // Spawn the publish — Bus::publish_ephemeral is async. We
-        // can't .await synchronously here.
         spawn_local(async move {
-            let encoded = match inner.encoder.borrow_mut().encode(&pcm) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(error = %e, "encode failed");
-                    return;
-                }
-            };
             let now_ms = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -145,10 +134,10 @@ impl VoiceRuntime {
                 v
             };
             let pkt = crate::packet::VoicePacket::Frame {
-                codec_id: crate::CODEC_ID.to_string(),
+                codec_id,
                 seq,
                 sender_time_ms: now_ms,
-                payload: encoded,
+                payload,
             };
             let public = inner.identity.public();
             let ev = match crate::packet::encrypt(
@@ -179,6 +168,22 @@ impl VoiceRuntime {
                 .publish_ephemeral(name, bytes::Bytes::from(payload))
                 .await;
         });
+    }
+
+    /// Native-test convenience: encode `pcm` as little-endian f32 bytes
+    /// (the `pcm-f32-le` codec ID) and forward to `send_encoded`. The
+    /// browser path goes straight to `send_encoded` after WebCodecs
+    /// runs in JS; this helper exists for native unit/integration tests
+    /// that don't want to allocate the byte view themselves.
+    pub fn send_pcm(&self, pcm: &[f32]) {
+        if pcm.len() != crate::FRAME_SAMPLES {
+            return;
+        }
+        let mut buf = Vec::with_capacity(pcm.len() * 4);
+        for s in pcm {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        self.send_encoded(buf, crate::CODEC_ID.to_string());
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -213,15 +218,27 @@ impl VoiceRuntime {
             .unwrap_or(0)
     }
 
-    /// Test-only: push a PCM frame directly into the jitter buffer.
+    /// Test-only: push an encoded frame directly into the jitter
+    /// buffer, bypassing the wire path.
     #[cfg(feature = "test-hooks")]
-    pub fn test_push_frame(&self, peer: sunset_sync::PeerId, pcm: Vec<f32>) {
+    pub fn test_push_encoded(&self, peer: sunset_sync::PeerId, payload: Vec<u8>, codec_id: String) {
         self.inner
             .jitter
             .borrow_mut()
             .entry(peer)
             .or_default()
-            .push_back(pcm);
+            .push_back((payload, codec_id));
+    }
+
+    /// Test-only: PCM-shaped wrapper around `test_push_encoded` for
+    /// native tests that want to think in terms of raw f32 samples.
+    #[cfg(feature = "test-hooks")]
+    pub fn test_push_frame(&self, peer: sunset_sync::PeerId, pcm: &[f32]) {
+        let mut buf = Vec::with_capacity(pcm.len() * 4);
+        for s in pcm {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        self.test_push_encoded(peer, buf, crate::CODEC_ID.to_string());
     }
 
     /// Test-only: swap the `FrameSink` with a new implementation (e.g.

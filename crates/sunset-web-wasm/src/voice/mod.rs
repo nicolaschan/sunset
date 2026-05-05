@@ -13,7 +13,7 @@ pub(crate) mod test_hooks;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use js_sys::{Float32Array, Function};
+use js_sys::{Function, Uint8Array};
 use wasm_bindgen::prelude::*;
 
 use sunset_core::bus::BusImpl;
@@ -52,7 +52,7 @@ pub(crate) fn voice_start(
     identity: &sunset_core::Identity,
     room_handle: &RoomHandle,
     bus: &BusArc,
-    on_pcm: Function,
+    on_frame: Function,
     on_drop_peer: Function,
     on_voice_peer_state: Function,
 ) -> Result<(), JsError> {
@@ -60,12 +60,12 @@ pub(crate) fn voice_start(
         return Err(JsError::new("voice already started"));
     }
 
-    let on_pcm_rc = Rc::new(RefCell::new(Some(on_pcm)));
+    let on_frame_rc = Rc::new(RefCell::new(Some(on_frame)));
     let on_drop_rc = Rc::new(RefCell::new(Some(on_drop_peer)));
     let on_state_rc = Rc::new(RefCell::new(Some(on_voice_peer_state)));
 
     let web_frame_sink: Rc<dyn FrameSink> = Rc::new(frame_sink::WebFrameSink {
-        on_pcm: on_pcm_rc,
+        on_frame: on_frame_rc,
         on_drop: on_drop_rc,
     });
     let dialer: Rc<dyn sunset_voice::Dialer> = Rc::new(dialer::WebDialer {
@@ -112,14 +112,36 @@ pub(crate) fn voice_stop(cell: &VoiceCell) -> Result<(), JsError> {
     Ok(())
 }
 
-pub(crate) fn voice_input(cell: &VoiceCell, pcm: &Float32Array) -> Result<(), JsError> {
+pub(crate) fn voice_input(
+    cell: &VoiceCell,
+    payload: &Uint8Array,
+    codec_id: &str,
+) -> Result<(), JsError> {
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    if codec_id.is_empty() {
+        return Err(JsError::new("voice_input: codec_id must not be empty"));
+    }
+    let mut buf = vec![0_u8; payload.length() as usize];
+    payload.copy_to(&mut buf);
+    v.runtime.send_encoded(buf, codec_id.to_string());
+    Ok(())
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn voice_inject_pcm(
+    cell: &VoiceCell,
+    pcm: &js_sys::Float32Array,
+) -> Result<(), JsError> {
     let slot = cell.borrow();
     let v = slot
         .as_ref()
         .ok_or_else(|| JsError::new("voice not started"))?;
     if pcm.length() as usize != sunset_voice::FRAME_SAMPLES {
         return Err(JsError::new(&format!(
-            "voice_input: expected {} samples, got {}",
+            "voice_inject_pcm: expected {} samples, got {}",
             sunset_voice::FRAME_SAMPLES,
             pcm.length()
         )));
@@ -193,6 +215,12 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
             &obj,
             &JsValue::from_str("len"),
             &JsValue::from_f64(frame.len as f64),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("codec_id"),
+            &JsValue::from_str(&frame.codec_id),
         )
         .unwrap();
         js_sys::Reflect::set(

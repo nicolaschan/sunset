@@ -110,6 +110,24 @@ test("real-mic capture: bob receives ≥ 40 frames from alice within 5 s", async
   const frames = await handle.jsonValue();
   expect(frames.length).toBeGreaterThanOrEqual(40);
 
+  // Codec assertion: in Chromium the capture path runs through
+  // WebCodecs `AudioEncoder` so frames must arrive marked `"opus"`
+  // (not the `"pcm-f32-le"` test-only fallback). Each Opus frame is
+  // typically ~50–80 bytes vs 3840 for raw PCM, so the size check
+  // doubles as a sanity guard against silent fallback. If WebCodecs
+  // ever gets pulled out the codec_id reverts to `"pcm-f32-le"` and
+  // this assertion fires immediately — that is the desired regression
+  // signal, not a flake.
+  const opusFrames = frames.filter((f) => f.codec_id === "opus");
+  expect(opusFrames.length, "expected real-mic capture to run through WebCodecs Opus")
+    .toBeGreaterThanOrEqual(1);
+  for (const f of opusFrames) {
+    expect(
+      f.len,
+      `opus frame should be smaller than PCM (3840 B); got ${f.len}`,
+    ).toBeLessThan(3840);
+  }
+
   // Bob's voice_active_peers should show alice talking within 3 s.
   // voice_active_peers() returns [{ peer_id: Uint8Array, in_call, talking, is_muted }]
   await bob.page.waitForFunction(
