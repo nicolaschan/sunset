@@ -618,6 +618,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn on_channels_changed_callback_can_re_register_without_panicking() {
+        // Regression test for the re-entrancy footgun in
+        // OpenRoom::on_channels_changed: the immediate-fire path used
+        // to invoke the user callback while a `RefCell` borrow on
+        // RoomState::callbacks was still live, so a callback that
+        // synchronously called back into any `on_*` registration would
+        // panic with `BorrowMutError`. Construct that exact scenario:
+        // from inside the on_channels_changed callback, register
+        // on_message via a second `OpenRoom` handle built off the same
+        // inner `Rc<RoomState>`. The fix boxes the callback first and
+        // fires it before any borrow is held; without the fix, this
+        // test would panic.
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(45)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                // OpenRoom isn't Clone; rebuild a handle off the same
+                // inner Rc so the callback can call on_message on it.
+                let room_for_cb = OpenRoom {
+                    inner: room.inner.clone(),
+                };
+                let nested_registered: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+                let nested_registered_cb = nested_registered.clone();
+                room.on_channels_changed(move |_chans| {
+                    // Register on_message from inside the on_channels
+                    // immediate-fire callback. Pre-fix: panics with
+                    // BorrowMutError. Post-fix: succeeds.
+                    room_for_cb.on_message(|_, _| {});
+                    *nested_registered_cb.borrow_mut() = true;
+                });
+                assert!(
+                    *nested_registered.borrow(),
+                    "nested on_message registration must run inside the immediate-fire callback"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn observed_channels_includes_new_channel_after_send() {
         let local = tokio::task::LocalSet::new();
         local
