@@ -305,6 +305,19 @@ fn message_view(
   // so clicks on action buttons bubble to .msg-row but never through
   // the body wrapper — the React/Info buttons can't accidentally
   // toggle the selection.
+  //
+  // The pending-state opacity is applied to the inner clickable wrapper
+  // (header + body + reactions), NOT to .msg-row itself. `opacity < 1`
+  // creates a CSS stacking context, and putting it on .msg-row would
+  // trap the reaction picker's `z-index: 5` inside that row's context —
+  // which would let the *next* row's body paint on top of the picker
+  // (the picker is taller than a single-line row, so it spills into
+  // the next row's bounds). Keeping .msg-row free of opacity lets the
+  // picker's z-index escape to the messages_list stacking context, so
+  // it sits above every following row regardless of those rows'
+  // pending-state stacking contexts. The actions toolbar / picker
+  // staying at full opacity is also a UX improvement: the controls a
+  // user reaches for stay legible while the still-unacked body fades.
   html.div([], [
     html.div(
       [
@@ -314,8 +327,14 @@ fn message_view(
           #("padding", "2px " <> bleed_h),
           #("margin-left", "-" <> bleed_h),
           #("margin-right", "-" <> bleed_h),
-          #("opacity", opacity),
-          #("transition", "opacity 220ms ease, background-color 120ms ease"),
+          // No bg transition: the .is-active / :hover background change
+          // must apply synchronously so a test (or a screen reader, or
+          // a user that takes a screenshot at the wrong moment) reads
+          // the highlighted state immediately. A 120 ms ease-in raced
+          // with `getComputedStyle` polling — the property's "current
+          // value" at t=0 is the transition's *from* value (transparent),
+          // not the *to* value, so the row would intermittently report
+          // `rgba(0,0,0,0)` even with `is-active` already on it.
           #("margin-top", margin_top),
         ]),
       ],
@@ -326,6 +345,8 @@ fn message_view(
             ui.css([
               #("display", "flex"),
               #("flex-direction", "column"),
+              #("opacity", opacity),
+              #("transition", "opacity 220ms ease"),
             ]),
           ],
           [

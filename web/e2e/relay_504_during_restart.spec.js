@@ -249,6 +249,25 @@ class Fake504Proxy {
   }
 
   close() {
+    // Destroy in-flight forwards before closing the server. Node's
+    // `http.Server.close()` only stops accepting new connections; it
+    // waits indefinitely for established connections (both keep-alive
+    // HTTP and upgraded WebSocket forwards) to drain. By the end of
+    // the test the browsers have closed via `ctx.close()` and the
+    // relay has been killed in afterAll, but the FIN/close
+    // propagation through `pipe()` doesn't always complete in time
+    // for the 30 s hook timeout — especially for the half-open pairs
+    // created during the 504 window. Force them down here so close()
+    // returns promptly. `closeAllConnections()` (Node 18.2+) catches
+    // any HTTP-keep-alive sockets we didn't track in `activeForwards`.
+    for (const { clientSocket, upstreamSocket } of this.activeForwards) {
+      clientSocket.destroy();
+      upstreamSocket.destroy();
+    }
+    this.activeForwards.clear();
+    if (typeof this.server.closeAllConnections === "function") {
+      this.server.closeAllConnections();
+    }
     return new Promise((resolve) => this.server.close(resolve));
   }
 }

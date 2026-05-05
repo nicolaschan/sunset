@@ -339,7 +339,7 @@
             config = {
               Entrypoint = [ "/bin/sunset-relay" ];
               ExposedPorts."8443/tcp" = {};
-              Env = [ "RUST_LOG=sunset_relay=info" ];
+              Env = [ "RUST_LOG=sunset_relay=info,sunset_sync=info" ];
               Volumes."/var/lib/sunset-relay" = {};
             };
           };

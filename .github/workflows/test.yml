@@ -28,7 +28,11 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      # Pure performance optimization (warm Nix cache); intermittent
+      # `socket hang up` from install.determinate.systems must not fail
+      # the job — the actual build/test steps run cleanly without it.
       - uses: DeterminateSystems/magic-nix-cache-action@v2
+        continue-on-error: true
       - name: cargo fmt --all --check
         run: |
           nix develop --command cargo fmt --all --check
@@ -52,7 +56,11 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      # Pure performance optimization (warm Nix cache); intermittent
+      # `socket hang up` from install.determinate.systems must not fail
+      # the job — the actual build/test steps run cleanly without it.
       - uses: DeterminateSystems/magic-nix-cache-action@v2
+        continue-on-error: true
       - name: gleam format --check
         run: |
           nix develop --command bash -c 'cd web && gleam format --check src test'
@@ -70,7 +78,11 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = true
+      # Pure performance optimization (warm Nix cache); intermittent
+      # `socket hang up` from install.determinate.systems must not fail
+      # the job — the actual build/test steps run cleanly without it.
       - uses: DeterminateSystems/magic-nix-cache-action@v2
+        continue-on-error: true
       - name: Build web bundle
         run: nix build .#web
       - name: Run Playwright suite
