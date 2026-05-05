@@ -107,10 +107,11 @@ impl RoomHandle {
     }
 
     pub fn on_reactions_changed(&self, callback: js_sys::Function) {
-        self.inner.on_reactions_changed(move |target, snapshot| {
-            let payload = crate::reactions::snapshot_to_js(target, snapshot);
-            let _ = callback.call1(&JsValue::NULL, &payload);
-        });
+        self.inner
+            .on_reactions_changed(move |target, _channel, snapshot| {
+                let payload = crate::reactions::snapshot_to_js(target, snapshot);
+                let _ = callback.call1(&JsValue::NULL, &payload);
+            });
     }
 
     pub async fn send_reaction(

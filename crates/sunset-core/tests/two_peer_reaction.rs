@@ -30,7 +30,7 @@ async fn reaction_round_trip_between_two_identities() {
             let observed: Rc<RefCell<Vec<ReactionSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
             let observed_cb = observed.clone();
             *bob_handles.on_reactions_changed.borrow_mut() =
-                Some(Box::new(move |_target, snapshot| {
+                Some(Box::new(move |_target, _channel, snapshot| {
                     observed_cb.borrow_mut().push(snapshot.clone());
                 }));
             spawn_reaction_tracker(

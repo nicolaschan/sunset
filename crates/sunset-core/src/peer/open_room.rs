@@ -314,7 +314,8 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
     /// state" behaviour by clearing per-target debounce signatures so
     /// the next event refires the snapshot.
     pub fn on_reactions_changed<
-        F: Fn(&sunset_store::Hash, &crate::reactions::ReactionSnapshot) + 'static,
+        F: Fn(&sunset_store::Hash, &crate::ChannelLabel, &crate::reactions::ReactionSnapshot)
+            + 'static,
     >(
         &self,
         cb: F,
