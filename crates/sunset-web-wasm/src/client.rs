@@ -248,8 +248,8 @@ impl Client {
     /// Update the display name carried in every open room's presence
     /// heartbeats. Persists for the lifetime of the Client (the Gleam
     /// layer is responsible for localStorage). Idempotent.
-    pub fn set_self_name(&self, name: String) {
-        self.inner.set_self_name(&name);
+    pub fn set_self_name(&self, name: &str) {
+        self.inner.set_self_name(name);
     }
 
     /// Start voice in the given room. The `room_handle` must have been
