@@ -263,9 +263,7 @@ pub fn reactions_snapshot_target_hex(
 /// tracker keys per-`(target, channel)`, so this is what the UI must
 /// match against the active channel filter.
 @external(javascript, "./sunset.ffi.mjs", "reactionsSnapshotChannel")
-pub fn reactions_snapshot_channel(
-  snapshot: IncomingReactionsSnapshot,
-) -> String
+pub fn reactions_snapshot_channel(snapshot: IncomingReactionsSnapshot) -> String
 
 /// Returns the snapshot as a `List(#(emoji, List(#(author_pubkey_hex, sent_at_ms))))`.
 /// The FFI side flattens the JS Map<emoji, Map<author_hex, sent_at_ms>> into

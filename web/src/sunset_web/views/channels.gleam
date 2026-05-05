@@ -2,9 +2,11 @@
 //// channels (with grouped live detail for the active Lounge), and
 //// bridge channels.
 
+import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
@@ -26,6 +28,8 @@ pub fn view(
   current_channel cur: ChannelId,
   voice_popover_open voice_popover_open: Option(String),
   on_select_channel sel: fn(ChannelId) -> msg,
+  on_new_channel on_new_channel: fn(String) -> msg,
+  noop noop: msg,
   on_open_voice_popover on_open_voice_popover: fn(String) -> msg,
   viewport viewport: Viewport,
   on_open_rooms on_open_rooms: msg,
@@ -82,7 +86,10 @@ pub fn view(
           section(
             p,
             "Channels",
-            list.map(text_channels, fn(c) { text_channel_row(p, c, cur, sel) }),
+            list.append(
+              list.map(text_channels, fn(c) { text_channel_row(p, c, cur, sel) }),
+              [new_channel_input(p, noop, on_new_channel)],
+            ),
           ),
           section(
             p,
@@ -322,6 +329,80 @@ fn text_channel_row(
       },
     ],
   )
+}
+
+/// Bottom-of-section input that lets the user type a fresh channel
+/// name and press Enter to switch into it. The new channel is added
+/// to the rail locally even before any traffic is observed, so the
+/// composer can route a SubmitDraft into a brand-new channel without
+/// waiting for someone else to post first.
+fn new_channel_input(
+  p: Palette,
+  noop: msg,
+  on_new_channel: fn(String) -> msg,
+) -> Element(msg) {
+  html.div(
+    [
+      ui.css([
+        #("padding", "4px 12px 0 12px"),
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("gap", "6px"),
+      ]),
+    ],
+    [
+      html.span(
+        [
+          ui.css([
+            #("color", p.text_faint),
+            #("font-size", "16.25px"),
+          ]),
+        ],
+        [html.text("+")],
+      ),
+      html.input([
+        attribute.attribute("data-testid", "new-channel-input"),
+        attribute.placeholder("new channel"),
+        on_enter_with_value(noop, on_new_channel),
+        ui.css([
+          #("flex", "1"),
+          #("min-width", "0"),
+          #("box-sizing", "border-box"),
+          #("background", "transparent"),
+          #("border", "none"),
+          #("padding", "4px 0"),
+          #("font-family", "inherit"),
+          #("font-size", "16.25px"),
+          #("color", p.text),
+          #("outline", "none"),
+        ]),
+      ]),
+    ],
+  )
+}
+
+/// Enter on the new-channel input fires `on_new_channel(trimmed_value)`
+/// and preventDefaults so the keystroke can't bleed through to a
+/// different focused element after Lustre's re-render. Non-Enter keys
+/// dispatch `noop` so we don't run the new-channel reducer on every
+/// keystroke. Mirrors the rooms-rail pattern.
+fn on_enter_with_value(
+  noop: msg,
+  on_new_channel: fn(String) -> msg,
+) -> attribute.Attribute(msg) {
+  event.advanced("keydown", {
+    use key <- decode.subfield(["key"], decode.string)
+    use value <- decode.subfield(["target", "value"], decode.string)
+    decode.success(case key {
+      "Enter" ->
+        event.handler(
+          on_new_channel(string.trim(value)),
+          prevent_default: True,
+          stop_propagation: False,
+        )
+      _ -> event.handler(noop, prevent_default: False, stop_propagation: False)
+    })
+  })
 }
 
 fn voice_block(
