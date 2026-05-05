@@ -2374,6 +2374,7 @@ dependencies = [
  "sunset-store-fs",
  "sunset-store-memory",
  "sunset-sync",
+ "sunset-sync-webtransport-native",
  "sunset-sync-ws-native",
  "tempfile",
  "thiserror 2.0.18",
@@ -2383,6 +2384,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "web-time",
+ "wtransport",
  "zeroize",
 ]
 

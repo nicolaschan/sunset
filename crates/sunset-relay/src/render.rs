@@ -115,14 +115,26 @@ pub fn render_dashboard(snap: &DashboardSnapshot) -> String {
     out
 }
 
-/// JSON identity. Hex-only field values, no escaping needed.
+/// JSON identity. Hex-only field values, no escaping needed. The
+/// optional `webtransport_address` field appears only when the relay
+/// successfully bound a WT listener; old clients (which don't know
+/// about the field) keep working off `address` (the legacy WS URL).
 pub fn render_identity(snap: &IdentitySnapshot) -> String {
-    format!(
-        "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"{}\"}}\n",
-        hex::encode(snap.ed25519_public),
-        hex::encode(snap.x25519_public),
-        snap.dial_url,
-    )
+    let mut out = String::from("{");
+    out.push_str(&format!(
+        "\"ed25519\":\"{}\",",
+        hex::encode(snap.ed25519_public)
+    ));
+    out.push_str(&format!(
+        "\"x25519\":\"{}\",",
+        hex::encode(snap.x25519_public)
+    ));
+    out.push_str(&format!("\"address\":\"{}\"", snap.dial_url));
+    if let Some(wt) = &snap.webtransport_address {
+        out.push_str(&format!(",\"webtransport_address\":\"{wt}\""));
+    }
+    out.push_str("}\n");
+    out
 }
 
 // --- helpers ---
@@ -229,6 +241,7 @@ mod tests {
             ed25519_public: [0xab; 32],
             x25519_public: [0xcd; 32],
             dial_url: "ws://relay.example:8443".into(),
+            webtransport_address: None,
         };
         let json = render_identity(&snap);
         assert_eq!(
@@ -236,6 +249,23 @@ mod tests {
             "{\"ed25519\":\"abababababababababababababababababababababababababababababababab\",\
              \"x25519\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\
              \"address\":\"ws://relay.example:8443\"}\n"
+        );
+    }
+
+    #[test]
+    fn identity_json_includes_webtransport_when_present() {
+        let cert_hex = "ee".repeat(32);
+        let wt_url = format!("wt://relay.example:8443#cert-sha256={cert_hex}");
+        let snap = IdentitySnapshot {
+            ed25519_public: [0xab; 32],
+            x25519_public: [0xcd; 32],
+            dial_url: "ws://relay.example:8443".into(),
+            webtransport_address: Some(wt_url.clone()),
+        };
+        let json = render_identity(&snap);
+        assert!(
+            json.contains(&format!("\"webtransport_address\":\"{wt_url}\"")),
+            "missing wt field in: {json}"
         );
     }
 

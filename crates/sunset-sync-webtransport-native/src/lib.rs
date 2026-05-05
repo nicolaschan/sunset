@@ -17,9 +17,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use wtransport::{Endpoint, RecvStream, SendStream, ServerConfig};
 use wtransport::config::ClientConfig;
 use wtransport::tls::Sha256Digest;
+use wtransport::{Endpoint, RecvStream, SendStream, ServerConfig};
 
 use sunset_sync::{
     Error as SyncError, PeerAddr, RawConnection, RawTransport, Result as SyncResult,
@@ -117,12 +117,14 @@ impl RawTransport for WebTransportRawTransport {
             }
             TransportMode::Serving { rx } => {
                 let mut rx = rx.lock().await;
-                let connection = rx.recv().await.ok_or_else(|| {
-                    SyncError::Transport("wt serving channel closed".into())
-                })?;
-                let (send, recv) = connection.accept_bi().await.map_err(|e| {
-                    SyncError::Transport(format!("wt accept_bi: {e}"))
-                })?;
+                let connection = rx
+                    .recv()
+                    .await
+                    .ok_or_else(|| SyncError::Transport("wt serving channel closed".into()))?;
+                let (send, recv) = connection
+                    .accept_bi()
+                    .await
+                    .map_err(|e| SyncError::Transport(format!("wt accept_bi: {e}")))?;
                 Ok(WebTransportRawConnection::new(connection, send, recv))
             }
         }
@@ -133,7 +135,9 @@ impl RawTransport for WebTransportRawTransport {
 /// via SHA-256 SPKI hashes (matching the W3C WebTransport
 /// `serverCertificateHashes` semantics). Empty hash list falls back to
 /// the system's native CA roots.
-fn build_client_endpoint(hashes: &[Sha256Digest]) -> SyncResult<Endpoint<wtransport::endpoint::endpoint_side::Client>> {
+fn build_client_endpoint(
+    hashes: &[Sha256Digest],
+) -> SyncResult<Endpoint<wtransport::endpoint::endpoint_side::Client>> {
     let builder = ClientConfig::builder().with_bind_default();
     let cfg = if hashes.is_empty() {
         builder.with_native_certs().build()
@@ -159,7 +163,8 @@ pub fn build_server_endpoint(
     if let Some(ka) = keep_alive {
         builder = builder.keep_alive_interval(Some(ka));
     }
-    Endpoint::server(builder.build()).map_err(|e| SyncError::Transport(format!("wt server endpoint: {e}")))
+    Endpoint::server(builder.build())
+        .map_err(|e| SyncError::Transport(format!("wt server endpoint: {e}")))
 }
 
 pub struct WebTransportRawConnection {
@@ -248,7 +253,8 @@ impl RawConnection for WebTransportRawConnection {
         // wtransport closes when the Connection drops; explicit close
         // sends an APP_CLOSE with code 0. We don't surface failures
         // because there's nothing useful for callers to do.
-        self.session.close(wtransport::VarInt::from_u32(0), b"closed");
+        self.session
+            .close(wtransport::VarInt::from_u32(0), b"closed");
         Ok(())
     }
 }

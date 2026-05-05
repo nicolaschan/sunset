@@ -56,6 +56,11 @@ pub struct IdentitySnapshot {
     pub ed25519_public: [u8; 32],
     pub x25519_public: [u8; 32],
     pub dial_url: String,
+    /// `wt://` or `wts://` URL the relay accepts WebTransport sessions
+    /// on, with `cert-sha256=<hex>` fragment(s) for self-signed cert
+    /// pinning. `None` when the relay didn't manage to bind a WT
+    /// listener (e.g. UDP blocked on this host).
+    pub webtransport_address: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]

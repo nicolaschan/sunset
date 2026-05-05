@@ -27,6 +27,10 @@ use sunset_noise::{
 use sunset_store::{Filter, VerifyingKey};
 use sunset_store_fs::FsStore;
 use sunset_sync::{PeerAddr, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine};
+use sunset_sync_webtransport_native::{
+    WebTransportRawConnection, WebTransportRawTransport, build_server_endpoint,
+    sha256_digest_to_hex,
+};
 use sunset_sync_ws_native::WebSocketRawTransport;
 
 use crate::app::{AppState, build_app};
@@ -35,33 +39,49 @@ use crate::config::{Config, InterestFilter};
 use crate::error::Result;
 use crate::identity;
 use crate::snapshot::{build_dashboard_snapshot, build_identity_snapshot};
+use crate::wt_combinator::DualInboundTransport;
 
 /// Concrete inbound-side `Transport` the engine sees. Kept private —
 /// callers interact with `RelayHandle`, not this type.
-type InboundTransport = SpawningAcceptor<
+type InboundTransport = DualInboundTransport<WsAcceptor, WtAcceptor>;
+
+/// WebSocket half. Same shape as before WT was added.
+type WsAcceptor = SpawningAcceptor<
     WebSocketRawTransport,
     NoiseTransport<WebSocketRawTransport>,
-    InboundPromote,
-    NoiseHandshakeFuture,
+    WsPromote,
+    WsHandshakeFuture,
     NoiseConnection<sunset_sync_ws_native::WebSocketRawConnection>,
 >;
 
-/// Type-erased pieces of the `SpawningAcceptor`'s generic parameters.
-/// Defining the closure as a concrete `fn` is impossible (it captures
-/// `Arc<dyn NoiseIdentity>`); we surface it via a boxed trait object
-/// shape on the engine side.
-type InboundPromote =
-    Box<dyn Fn(sunset_sync_ws_native::WebSocketRawConnection) -> NoiseHandshakeFuture + 'static>;
+type WsPromote =
+    Box<dyn Fn(sunset_sync_ws_native::WebSocketRawConnection) -> WsHandshakeFuture + 'static>;
 
-/// The future returned by the promote callback. `Pin<Box<dyn Future>>`
-/// because the closure body captures `Arc<dyn NoiseIdentity>`, so the
-/// concrete future type is unnameable; we erase it here.
-type NoiseHandshakeFuture = std::pin::Pin<
+type WsHandshakeFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = sunset_sync::Result<
                     NoiseConnection<sunset_sync_ws_native::WebSocketRawConnection>,
                 >,
+            > + 'static,
+    >,
+>;
+
+/// WebTransport half. Mirrors the WS shape.
+type WtAcceptor = SpawningAcceptor<
+    WebTransportRawTransport,
+    NoiseTransport<WebTransportRawTransport>,
+    WtPromote,
+    WtHandshakeFuture,
+    NoiseConnection<WebTransportRawConnection>,
+>;
+
+type WtPromote = Box<dyn Fn(WebTransportRawConnection) -> WtHandshakeFuture + 'static>;
+
+type WtHandshakeFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = sunset_sync::Result<NoiseConnection<WebTransportRawConnection>>,
             > + 'static,
     >,
 >;
@@ -101,6 +121,10 @@ struct CommandContext {
     x25519_public: [u8; 32],
     listen_addr: SocketAddr,
     dial_url: String,
+    /// `wt://`/`wts://` URL with `cert-sha256=…` fragment. `None` when
+    /// the relay couldn't bind a UDP listener (logs the failure and
+    /// degrades to WS-only without aborting).
+    webtransport_address: Option<String>,
     configured_peers: Vec<String>,
 }
 
@@ -149,17 +173,15 @@ impl Relay {
         let bound = listener.local_addr().unwrap_or(config.listen_addr);
         let local_address = format!("ws://{}#x25519={}", bound, hex::encode(x25519_public));
 
-        // 4. Inbound side: serving() exposes a Send sender for axum and a
-        //    drainable RawTransport. Outbound side: dial_only.
-        let (raw_inbound, ws_tx) = WebSocketRawTransport::serving();
-        let raw_outbound = WebSocketRawTransport::dial_only();
+        // 4. WebSocket inbound + outbound (existing path).
+        let (ws_raw_inbound, ws_tx) = WebSocketRawTransport::serving();
+        let ws_raw_outbound = WebSocketRawTransport::dial_only();
         let noise_id: Arc<dyn NoiseIdentity> = Arc::new(IdentityNoiseAdapter(identity.clone()));
-        let connector = NoiseTransport::new(raw_outbound, noise_id.clone());
+        let ws_connector = NoiseTransport::new(ws_raw_outbound, noise_id.clone());
 
-        // 5. SpawningAcceptor — every inbound connection's Noise IK runs
-        //    on its own task, bounded by the configured handshake timeout.
+        // 5. WebSocket SpawningAcceptor — Noise IK on its own task.
         let handshake_timeout = Duration::from_secs(config.accept_handshake_timeout_secs);
-        let promote: InboundPromote = {
+        let ws_promote: WsPromote = {
             let identity = noise_id.clone();
             Box::new(move |raw_conn| {
                 let identity = identity.clone();
@@ -170,9 +192,75 @@ impl Relay {
                 })
             })
         };
-        let transport = SpawningAcceptor::new(raw_inbound, connector, promote, handshake_timeout);
+        let ws_transport =
+            SpawningAcceptor::new(ws_raw_inbound, ws_connector, ws_promote, handshake_timeout);
 
-        // 6. Engine.
+        // 6. WebTransport listener. `Identity::self_signed` produces an
+        //    ECDSA-P256 cert with 14-day validity — exactly what the
+        //    `serverCertificateHashes` API expects. Bind UDP on the same
+        //    `listen_addr` (UDP and TCP have separate socket spaces, so
+        //    this doesn't conflict with the WS listener). On bind
+        //    failure, degrade to WS-only with a warning rather than
+        //    aborting startup.
+        let (wt_raw_inbound, wt_accept_tx) = WebTransportRawTransport::serving();
+        let wt_raw_outbound = WebTransportRawTransport::dial_only();
+        let wt_connector = NoiseTransport::new(wt_raw_outbound, noise_id.clone());
+        let wt_promote: WtPromote = {
+            let identity = noise_id.clone();
+            Box::new(move |raw_conn| {
+                let identity = identity.clone();
+                Box::pin(async move {
+                    do_handshake_responder(raw_conn, identity)
+                        .await
+                        .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
+                })
+            })
+        };
+        let wt_transport =
+            SpawningAcceptor::new(wt_raw_inbound, wt_connector, wt_promote, handshake_timeout);
+
+        // The dial-host SAN list determines which hostnames can be used
+        // to reach this WT listener. Tests dial 127.0.0.1; production
+        // dials by external hostname (set via the relay config's
+        // listen_addr or — eventually — a dedicated `webtransport_san`
+        // setting). For now we always include `127.0.0.1` and
+        // `localhost` plus the listen address's literal IP if it's not
+        // already in that list.
+        let mut wt_sans: Vec<String> = vec!["127.0.0.1".into(), "localhost".into()];
+        let listen_ip = bound.ip().to_string();
+        if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
+            wt_sans.push(listen_ip);
+        }
+        let wt_addr_opt = match wtransport::Identity::self_signed(&wt_sans) {
+            Ok(wt_identity) => {
+                let cert_hash = wt_identity.certificate_chain().as_slice()[0].hash();
+                let cert_hex = sha256_digest_to_hex(&cert_hash);
+                let wt_bind: SocketAddr = bound;
+                match build_server_endpoint(wt_bind, wt_identity, Some(Duration::from_secs(15))) {
+                    Ok(endpoint) => {
+                        let wt_url = format!(
+                            "wt://{bound}#x25519={}&cert-sha256={cert_hex}",
+                            hex::encode(x25519_public),
+                        );
+                        spawn_wt_accept_loop(endpoint, wt_accept_tx);
+                        Some(wt_url)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "wt: server endpoint bind failed; degrading to WS-only");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "wt: self-signed identity failed; degrading to WS-only");
+                None
+            }
+        };
+
+        // 7. Combine WS + WT into the engine's inbound transport.
+        let transport = DualInboundTransport::new(ws_transport, wt_transport);
+
+        // 8. Engine.
         let local_peer = PeerId(VerifyingKey::new(Bytes::copy_from_slice(&ed25519_public)));
         let signer: Arc<dyn Signer> = Arc::new(identity.clone());
         let engine = Rc::new(SyncEngine::new(
@@ -183,15 +271,15 @@ impl Relay {
             signer,
         ));
 
-        // 7. Subscription filter for the relay's broad ingestion.
+        // 9. Subscription filter for the relay's broad ingestion.
         let subscription_filter = match config.interest_filter {
             InterestFilter::All => Filter::NamePrefix(Bytes::new()),
         };
 
-        // 8. Bridge channels.
+        // 10. Bridge channels.
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RelayCommand>();
 
-        // 9. Command pump context + task.
+        // 11. Command pump context + task.
         let cmd_ctx = Rc::new(CommandContext {
             engine: engine.clone(),
             store: store.clone(),
@@ -200,14 +288,20 @@ impl Relay {
             x25519_public,
             listen_addr: bound,
             dial_url: local_address.clone(),
+            webtransport_address: wt_addr_opt.clone(),
             configured_peers: config.peers.clone(),
         });
         spawn_command_pump(cmd_rx, cmd_ctx.clone());
 
-        // 10. Banner.
+        // 12. Banner.
         let mut banner = identity::format_address(&bound, &identity);
         banner.push_str(&format!("\n  dashboard: http://{bound}/dashboard"));
         banner.push_str(&format!("\n  identity:  http://{bound}/"));
+        if let Some(wt) = &wt_addr_opt {
+            banner.push_str(&format!("\n  wt:        {wt}"));
+        } else {
+            banner.push_str("\n  wt:        (disabled — UDP bind failed)");
+        }
         tracing::info!("\n{}", banner);
         println!("{banner}");
 
@@ -224,6 +318,46 @@ impl Relay {
             cmd_ctx,
         })
     }
+}
+
+/// Accept loop for inbound WebTransport sessions. Each accepted session
+/// is pushed onto `accept_tx` for the engine-side
+/// `WebTransportRawTransport::serving()` to drain. Failures inside one
+/// session don't break the loop; the relay tolerates malformed or
+/// half-completed handshakes by skipping them.
+///
+/// Runs as a `tokio::spawn` (Send) task because
+/// `wtransport::Endpoint::accept` is itself Send-friendly. The
+/// per-session `Connection` it produces is not Send, but it crosses to
+/// the engine LocalSet via the `accept_tx` channel and never gets
+/// touched from this task again.
+fn spawn_wt_accept_loop(
+    endpoint: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Server>,
+    accept_tx: mpsc::UnboundedSender<wtransport::Connection>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let incoming = endpoint.accept().await;
+            let session_request = match incoming.await {
+                Ok(req) => req,
+                Err(e) => {
+                    tracing::debug!(error = %e, "wt: incoming session rejected before request");
+                    continue;
+                }
+            };
+            let conn = match session_request.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(error = %e, "wt: session_request.accept failed");
+                    continue;
+                }
+            };
+            if accept_tx.send(conn).is_err() {
+                tracing::info!("wt: accept channel closed; loop exiting");
+                break;
+            }
+        }
+    });
 }
 
 fn spawn_command_pump(mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>, ctx: Rc<CommandContext>) {
@@ -247,6 +381,7 @@ fn spawn_command_pump(mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>, ctx: Rc
                         ctx.ed25519_public,
                         ctx.x25519_public,
                         &ctx.dial_url,
+                        ctx.webtransport_address.as_deref(),
                     );
                     let _ = reply.send(snap);
                 }

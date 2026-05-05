@@ -427,9 +427,8 @@ fn parse_addr(addr: &PeerAddr) -> Result<ParsedBrowserAddr> {
                 let mut bytes = [0u8; 32];
                 for (i, b) in bytes.iter_mut().enumerate() {
                     let pair = &hex.as_bytes()[i * 2..i * 2 + 2];
-                    let pair_str = std::str::from_utf8(pair).map_err(|_| {
-                        Error::Transport("wt addr: cert-sha256 non-utf8".into())
-                    })?;
+                    let pair_str = std::str::from_utf8(pair)
+                        .map_err(|_| Error::Transport("wt addr: cert-sha256 non-utf8".into()))?;
                     *b = u8::from_str_radix(pair_str, 16).map_err(|e| {
                         Error::Transport(format!("wt addr: cert-sha256 bad hex: {e}"))
                     })?;

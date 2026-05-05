@@ -58,16 +58,20 @@ pub fn parse_addr(addr: &PeerAddr) -> SyncResult<ParsedWebTransportAddr> {
         )));
     };
     if authority.is_empty() {
-        return Err(SyncError::Transport(format!("wt addr: empty authority in {s}")));
+        return Err(SyncError::Transport(format!(
+            "wt addr: empty authority in {s}"
+        )));
     }
 
     let mut cert_hashes = Vec::new();
     if let Some(fragment) = fragment {
         for part in fragment.split('&') {
             if let Some(hex) = part.strip_prefix("cert-sha256=") {
-                cert_hashes.push(parse_cert_hash_hex(hex).map_err(|e| {
-                    SyncError::Transport(format!("wt addr: bad cert-sha256: {e}"))
-                })?);
+                cert_hashes.push(
+                    parse_cert_hash_hex(hex).map_err(|e| {
+                        SyncError::Transport(format!("wt addr: bad cert-sha256: {e}"))
+                    })?,
+                );
             }
         }
     }
@@ -97,8 +101,9 @@ mod tests {
     #[test]
     fn parses_wts_with_cert_hash() {
         let hex = "ab".repeat(32);
-        let addr =
-            PeerAddr::new(Bytes::from(format!("wts://relay.example.com#cert-sha256={hex}")));
+        let addr = PeerAddr::new(Bytes::from(format!(
+            "wts://relay.example.com#cert-sha256={hex}"
+        )));
         let p = parse_addr(&addr).unwrap();
         assert_eq!(p.scheme, "wts");
         assert_eq!(p.authority, "relay.example.com");
