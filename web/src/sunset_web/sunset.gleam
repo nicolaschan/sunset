@@ -80,11 +80,15 @@ pub fn on_intent_changed(
   callback: fn(IntentSnapshot) -> Nil,
 ) -> Nil
 
-/// Compose + insert a message. `callback` receives the value-hash hex on
-/// success.
+/// Compose + insert a message into the named channel. `callback`
+/// receives the value-hash hex on success. `channel` must be a valid
+/// `ChannelLabel` (1..=64 ASCII printable bytes); the wasm side
+/// rejects anything outside that range with `Error("send_message
+/// channel: ...")`.
 @external(javascript, "./sunset.ffi.mjs", "sendMessage")
 pub fn send_message(
   room: RoomHandle,
+  channel: String,
   body: String,
   sent_at_ms: Int,
   callback: fn(Result(String, String)) -> Nil,
@@ -138,6 +142,12 @@ pub fn inc_value_hash_hex(msg: IncomingMessage) -> String
 
 @external(javascript, "./sunset.ffi.mjs", "incIsSelf")
 pub fn inc_is_self(msg: IncomingMessage) -> Bool
+
+/// Channel label this message was published to. The wasm decode loop
+/// guarantees this is a non-empty ASCII-printable string of <=64 bytes
+/// (defaults to `"general"` for legacy un-channeled sends).
+@external(javascript, "./sunset.ffi.mjs", "incChannel")
+pub fn inc_channel(msg: IncomingMessage) -> String
 
 pub type MemberJs
 
@@ -221,12 +231,39 @@ pub fn rec_from_pubkey(r: IncomingReceipt) -> BitArray
 @external(javascript, "./sunset.ffi.mjs", "recSentAtMs")
 pub fn rec_sent_at_ms(r: IncomingReceipt) -> Int
 
+/// Channel label of the Text this Receipt acknowledges. Mirrored from
+/// the receipt's `for_channel` field so the UI can route the receipt to
+/// the right channel column without consulting the message store.
+@external(javascript, "./sunset.ffi.mjs", "recChannel")
+pub fn rec_channel(r: IncomingReceipt) -> String
+
+/// Sorted snapshot of channels the decode loop has observed in this
+/// room so far. Always contains `"general"`.
+@external(javascript, "./sunset.ffi.mjs", "observedChannels")
+pub fn observed_channels(room: RoomHandle) -> List(String)
+
+/// Register a callback fired (immediately with the current sorted
+/// snapshot, then again on every change) with the live channel set.
+@external(javascript, "./sunset.ffi.mjs", "onChannelsChanged")
+pub fn on_channels_changed(
+  room: RoomHandle,
+  callback: fn(List(String)) -> Nil,
+) -> Nil
+
 /// Snapshot payload delivered to `on_reactions_changed`. Opaque on the
 /// Gleam side; accessors below extract the concrete fields.
 pub type IncomingReactionsSnapshot
 
 @external(javascript, "./sunset.ffi.mjs", "reactionsSnapshotTargetHex")
 pub fn reactions_snapshot_target_hex(
+  snapshot: IncomingReactionsSnapshot,
+) -> String
+
+/// Channel label the snapshot's target message belongs to. The reactions
+/// tracker keys per-`(target, channel)`, so this is what the UI must
+/// match against the active channel filter.
+@external(javascript, "./sunset.ffi.mjs", "reactionsSnapshotChannel")
+pub fn reactions_snapshot_channel(
   snapshot: IncomingReactionsSnapshot,
 ) -> String
 
@@ -248,11 +285,14 @@ pub fn on_reactions_changed(
   callback: fn(IncomingReactionsSnapshot) -> Nil,
 ) -> Nil
 
-/// Send a reaction event. `action` is "add" or "remove". The wasm
-/// side generates the entry's nonce and sent_at_ms internally.
+/// Send a reaction event into the named channel. `action` is "add" or
+/// "remove". `channel` must be a valid `ChannelLabel`; the wasm side
+/// rejects invalid labels with `Error("send_reaction channel: ...")`.
+/// The wasm side generates the entry's nonce and sent_at_ms internally.
 @external(javascript, "./sunset.ffi.mjs", "sendReaction")
 pub fn send_reaction(
   room: RoomHandle,
+  channel: String,
   target_hex: String,
   emoji: String,
   action: String,
