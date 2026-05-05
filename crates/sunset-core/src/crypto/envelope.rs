@@ -464,12 +464,23 @@ mod tests {
 
     #[test]
     fn channel_label_postcard_decode_validates() {
-        // Encode an empty string at the wire layer and verify deserialize rejects it.
+        // Encode an empty string at the wire layer. The asymmetry below
+        // proves the validator was invoked at decode time: postcard
+        // happily decodes the bytes as a `String`, but `ChannelLabel`
+        // must reject them. If a future change drops the custom
+        // Deserialize impl in favour of `#[derive(Deserialize)]`, both
+        // assertions would pass-through and an empty-string label would
+        // silently round-trip — surfacing as a bug only at some
+        // downstream consumer.
         let bad = postcard::to_stdvec(&"".to_owned()).unwrap();
-        let err = postcard::from_bytes::<ChannelLabel>(&bad).unwrap_err();
-        // postcard surfaces validation errors as `Error::DeserializeBadVarint`
-        // or as a custom serde error string; just assert it errored.
-        let _ = err;
+        assert!(
+            postcard::from_bytes::<String>(&bad).is_ok(),
+            "wire format itself must be valid for String"
+        );
+        assert!(
+            postcard::from_bytes::<ChannelLabel>(&bad).is_err(),
+            "ChannelLabel must reject empty at decode (validator must run)"
+        );
     }
 
     #[test]
