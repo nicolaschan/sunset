@@ -5,6 +5,7 @@
 
 mod connectable;
 pub mod digest;
+pub mod dual_inbound_transport;
 pub mod engine;
 pub mod error;
 pub mod fallback_transport;
@@ -28,6 +29,7 @@ pub mod test_transport;
 mod test_fixtures;
 
 pub use connectable::{Connectable, ResolveErr};
+pub use dual_inbound_transport::{DualConnection, DualInboundTransport};
 pub use engine::{EngineEvent, SyncEngine};
 pub use error::{Error, Result};
 pub use fallback_transport::{FallbackConnection, FallbackTransport, fallback_addr_for};

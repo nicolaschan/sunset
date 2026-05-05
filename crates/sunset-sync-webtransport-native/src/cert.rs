@@ -18,7 +18,10 @@ fn hex_nibble(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
         10..=15 => (b'a' + (n - 10)) as char,
-        _ => '?',
+        // Callers always feed us `b >> 4` or `b & 0x0f` of a `u8`, both
+        // of which are in 0..=15 by construction. A wider value would
+        // corrupt the hex output silently, so be loud instead.
+        _ => unreachable!("hex_nibble called with {n} > 15"),
     }
 }
 

@@ -44,6 +44,7 @@ web-time.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+filetime = "0.2"
 sunset-store-memory.workspace = true
 sunset-sync = { workspace = true, features = ["test-helpers"] }
 tempfile.workspace = true

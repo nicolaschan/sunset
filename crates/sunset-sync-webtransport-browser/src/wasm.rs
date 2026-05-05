@@ -236,9 +236,12 @@ impl RawTransport for WebTransportRawTransport {
 }
 
 pub struct WebTransportRawConnection {
-    /// Held alive so the WT session stays open. Drop tears the session
-    /// down, which the close-watcher spawn_local task observes and
-    /// short-circuits any in-flight `recv_*` via `close_rx`.
+    /// Held alive so the WT session stays open. The explicit `Drop`
+    /// impl below calls `wt.close()` so partial-failure paths (a dial
+    /// where one of the read pumps has already started but the caller
+    /// drops the `RawConnection` before the engine subscribes) get a
+    /// deterministic close-promise resolution rather than relying on
+    /// JS-side garbage collection of the WT object.
     wt: WebTransport,
     bidi_writer: WritableStreamDefaultWriter,
     dgram_writer: WritableStreamDefaultWriter,
@@ -249,6 +252,31 @@ pub struct WebTransportRawConnection {
     /// suspension point. Mirrors `sunset-sync-ws-browser`.
     close_rx: RefCell<Option<UnboundedReceiver<()>>>,
     closed: Rc<RefCell<bool>>,
+}
+
+impl Drop for WebTransportRawConnection {
+    fn drop(&mut self) {
+        // Close the WT session. The three `spawn_local` pumps started
+        // by `connect()` (close watcher, bidi reader, datagram reader)
+        // each await JsFutures backed by the underlying WT streams; on
+        // session close those resolve, the loops break, and the Bytes
+        // channels they hold drop. The structure mirrors the discipline
+        // documented in `sunset-sync-ws-browser/src/wasm.rs`'s Drop:
+        // best-effort close, no error surfaced (nothing useful for a
+        // Drop to do with one).
+        //
+        // We don't release / abort the writers explicitly: the WT
+        // session close cascades into the streams, which causes any
+        // outstanding writer holds to be released by the JS GC. Tested
+        // via `kill_relay.spec.js` (relay TCP/UDP both go away → WT
+        // session closes → close watcher drains close_rx →
+        // recv_reliable returns Err) and
+        // `webtransport_fallback.spec.js` (WT cert mismatch closes the
+        // session before any pump ever runs).
+        if !*self.closed.borrow() {
+            self.wt.close();
+        }
+    }
 }
 
 /// Read-side scratch space: an mpsc receiver of Bytes chunks (the WT

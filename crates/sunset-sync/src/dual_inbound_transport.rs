@@ -1,22 +1,31 @@
-//! Two-transport combinator for the relay's inbound side: race
+//! Two-transport combinator for relays' inbound side: race
 //! WebSocket-accept and WebTransport-accept; route outbound dials by
 //! URL scheme.
 //!
-//! Conceptually parallel to [`sunset_sync::MultiTransport`] (which the
+//! Conceptually parallel to [`crate::MultiTransport`] (which the
 //! browser uses to combine WebSocket-relay + WebRTC-direct), but with
-//! WebTransport-aware routing rather than WebRTC. We don't share the
-//! browser combinator here because its scheme-routing rule
-//! (ws/wss/webrtc) differs from what the relay needs (ws/wss/wt/wts).
+//! WebTransport-aware routing rather than WebRTC. The browser
+//! combinator's scheme-routing rule (`ws`/`wss`/`webrtc`) differs from
+//! what server hosts need (`ws`/`wss`/`wt`/`wts`), so they're separate
+//! types.
 //!
-//! Both halves are themselves [`sunset_sync::Transport`] implementations
-//! — typically `SpawningAcceptor<RawTransport, NoiseTransport<…>, …>`
-//! once the relay's existing wiring composes them.
+//! Both halves are themselves [`Transport`] implementations — typically
+//! [`crate::SpawningAcceptor`] wrappers around a raw transport, so the
+//! caller is responsible for ensuring per-connection handshakes
+//! complete on a side task rather than inside the `accept()` future
+//! `select!`'d below. (If someone passes a non-`SpawningAcceptor` half
+//! and the loser arm of the `accept` race held a half-finished
+//! handshake, the cancel would tear it down — see
+//! `project_engine_select_drop_handshakes` in the user's auto-memory
+//! for the prior incident.)
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::FutureExt;
 
-use sunset_sync::{Error, PeerAddr, PeerId, Result, Transport, TransportConnection};
+use crate::error::{Error, Result};
+use crate::transport::{Transport, TransportConnection, TransportKind};
+use crate::types::{PeerAddr, PeerId};
 
 /// Combines a WebSocket-side and WebTransport-side [`Transport`].
 pub struct DualInboundTransport<WsT: Transport, WtT: Transport> {
@@ -111,13 +120,13 @@ where
         }
     }
 
-    fn kind(&self) -> sunset_sync::TransportKind {
+    fn kind(&self) -> TransportKind {
         // Inbound connections never participate in a `MultiTransport`
         // discriminator, so reporting Unknown for both arms is fine —
         // the relay doesn't surface a per-connection transport kind in
         // its UI today (and the browser Client tags primary/secondary
         // separately).
-        sunset_sync::TransportKind::Unknown
+        TransportKind::Unknown
     }
 
     async fn close(&self) -> Result<()> {

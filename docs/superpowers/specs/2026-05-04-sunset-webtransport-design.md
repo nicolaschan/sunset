@@ -1,6 +1,10 @@
 # sunset-webtransport — design
 
-Date: 2026-05-04 · Author: Claude Opus 4.7 · Status: proposed
+Date: 2026-05-04 · Author: Claude Opus 4.7 · Status: implemented (PR #49)
+
+**Revision 2026-05-05** (post-review): cert persistence + fallback
+deadline + DualInboundTransport location were tightened in response to
+PR review feedback. Inline marks: 🔄 next to each amended section.
 
 ## Summary
 
@@ -41,7 +45,9 @@ Two new crates, parallel to the existing WS / WebRTC ones:
 - **`sunset-sync-webtransport-native`** — client + server-accept (uses `wtransport` ≈ quinn + h3). Used by the relay for inbound and for relay-to-relay outbound, and by future native CLI peers.
 - **`sunset-sync-webtransport-browser`** — WASM client (uses `web_sys::WebTransport`). Dial-only, like the WebSocket browser crate.
 
-Plus one new module in `sunset-sync` (or its own crate, decided in plan): **`FallbackTransport<Primary, Fallback>`** — a generic `Transport` adapter that tries the primary on `connect`, on connection failure (or after a 3 s deadline) falls back to the secondary, and surfaces `accept` from the primary only (relays never accept fallback connections, only initiate them; the server-side WS path comes through its own listener directly).
+🔄 Plus two new generic modules in `sunset-sync`:
+- **`FallbackTransport<Primary, Fallback>`** in `fallback_transport.rs` — tries primary on `connect`, on connection failure (or after a 3 s deadline) falls back to secondary, and surfaces `accept` from the primary only.
+- **`DualInboundTransport<WsT, WtT>`** in `dual_inbound_transport.rs` — used by relay-like hosts that accept on both WS and WT inbound. Routes outbound dials by URL scheme (ws/wss → WS half, wt/wts → WT half); races accept() on both halves. Documented as expecting `SpawningAcceptor`-style halves whose own accept loops complete the per-connection handshake on a side task — the loser arm of the `select!` here only forfeits its "wake on next ready connection" subscription, never an in-flight handshake.
 
 ## Wire layout
 
@@ -73,10 +79,10 @@ Old clients ignore the new field and connect via `address` (WS) — backward com
 
 ## Fallback strategy
 
-`FallbackTransport<P, F>` (where `P, F: Transport`):
+🔄 `FallbackTransport<P, F>` (where `P, F: Transport`) lives in `crates/sunset-sync/src/fallback_transport.rs`. The bounded primary deadline (`DEFAULT_PRIMARY_DEADLINE = 3s`) is configurable via `with_primary_deadline()` for tests; on wasm32 it routes through `wasmtimer::tokio::timeout`, on native through `tokio::time::timeout`.
 
 ```rust
-async fn connect(&self, addr: PeerAddr) -> Result<MultiConnection<P::Conn, F::Conn>> {
+async fn connect(&self, addr: PeerAddr) -> Result<FallbackConnection<P::Conn, F::Conn>> {
     // 1. If the addr starts with the primary's scheme, try primary with
     //    a bounded deadline (default 3 s). If it succeeds, return Primary.
     // 2. If primary fails (any reason — connect refused, cert mismatch,
@@ -86,7 +92,7 @@ async fn connect(&self, addr: PeerAddr) -> Result<MultiConnection<P::Conn, F::Co
 }
 ```
 
-The fallback URL is derived from the primary URL by scheme rewrite: `wt://` → `ws://`, `wts://` → `wss://`. Same host, same port. (The relay will be configured to listen on the *same* port for both UDP/QUIC and TCP/WS — they don't conflict.) When the descriptor only provides a `ws://` address, the resolver doesn't synthesize a `wt://` address; only WS is attempted.
+The fallback URL is derived from the primary URL by scheme rewrite: `wt://` → `ws://`, `wts://` → `wss://`. Same host, same port. The `cert-sha256=` fragment is dropped (WS doesn't pin certs); other fragment keys (e.g. `x25519=`) are preserved. When the descriptor only provides a `ws://` address, the resolver doesn't synthesize a `wt://` address; only WS is attempted.
 
 ## Relay changes
 
@@ -99,11 +105,11 @@ let wt_endpoint = WebTransportEndpoint::server(...).bind(config.listen_addr).awa
 
 Dual-stack on one port works because UDP and TCP have separate socket spaces.
 
-Self-signed cert generation lives in a new `cert.rs` module:
-- ECDSA-P256 key (browser cert-pinning constraint)
-- Validity = 13 days (Chrome's `serverCertificateHashes` requires ≤14)
+🔄 Self-signed cert generation lives in `crates/sunset-relay/src/wt_cert.rs`:
+- ECDSA-P256 key (browser cert-pinning constraint, enforced by `wtransport::Identity::self_signed`)
+- Validity = 14 days (the maximum `serverCertificateHashes` allows; `wtransport::Identity::self_signed`'s default)
 - SAN includes the configured listen host + `127.0.0.1` + `localhost`
-- Cert + key persisted to `<data_dir>/wt-cert.pem` + `wt-key.pem`; rotated automatically when within 24 h of expiry on startup
+- Cert + key persisted to `<data_dir>/wt-cert.pem` + `wt-key.pem`; key file mode 0600. Rotated when the on-disk cert file is older than 13 days (mtime-based), so the next-generation cert overlaps with the previous cert's remaining validity. Restart-stable so browsers' cached cert hashes remain valid across relay process restarts.
 
 The cert SPKI is hashed (SHA-256), the hex hash is exposed in the identity descriptor's `webtransport_address`. Production relays behind a CA-issued cert can set `webtransport_address` to a `wts://...` URL with no `cert-sha256=` fragment — browsers accept it via the normal CA chain.
 

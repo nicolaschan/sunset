@@ -26,7 +26,9 @@ use sunset_noise::{
 };
 use sunset_store::{Filter, VerifyingKey};
 use sunset_store_fs::FsStore;
-use sunset_sync::{PeerAddr, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine};
+use sunset_sync::{
+    DualInboundTransport, PeerAddr, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine,
+};
 use sunset_sync_webtransport_native::{
     WebTransportRawConnection, WebTransportRawTransport, build_server_endpoint,
     sha256_digest_to_hex,
@@ -39,7 +41,6 @@ use crate::config::{Config, InterestFilter};
 use crate::error::Result;
 use crate::identity;
 use crate::snapshot::{build_dashboard_snapshot, build_identity_snapshot};
-use crate::wt_combinator::DualInboundTransport;
 
 /// Concrete inbound-side `Transport` the engine sees. Kept private —
 /// callers interact with `RelayHandle`, not this type.
@@ -231,7 +232,7 @@ impl Relay {
         if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
             wt_sans.push(listen_ip);
         }
-        let wt_addr_opt = match wtransport::Identity::self_signed(&wt_sans) {
+        let wt_addr_opt = match crate::wt_cert::load_or_generate(&config.data_dir, &wt_sans).await {
             Ok(wt_identity) => {
                 let cert_hash = wt_identity.certificate_chain().as_slice()[0].hash();
                 let cert_hex = sha256_digest_to_hex(&cert_hash);
