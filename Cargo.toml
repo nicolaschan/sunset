@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-markdown", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-sync-webrtc-browser", "crates/sunset-voice", "crates/sunset-web-wasm", "crates/sunset-relay", "crates/sunset-relay-resolver"]
+members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-markdown", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-sync-webrtc-browser", "crates/sunset-sync-webtransport-native", "crates/sunset-sync-webtransport-browser", "crates/sunset-voice", "crates/sunset-web-wasm", "crates/sunset-relay", "crates/sunset-relay-resolver"]
 resolver = "2"
 
 [workspace.package]
@@ -53,6 +53,20 @@ web-sys = { version = "0.3", features = [
   "RequestInit",
   "Response",
   "Window",
+  "WebTransport",
+  "WebTransportOptions",
+  "WebTransportHash",
+  "WebTransportBidirectionalStream",
+  "WebTransportDatagramDuplexStream",
+  "WebTransportSendStream",
+  "WebTransportReceiveStream",
+  "WebTransportCloseInfo",
+  "WebTransportError",
+  "WebTransportErrorOptions",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "WritableStream",
+  "WritableStreamDefaultWriter",
 ] }
 zeroize = { version = "1", default-features = false, features = ["alloc", "derive"] }
 futures = "0.3"
@@ -87,8 +101,11 @@ sunset-core = { path = "crates/sunset-core" }
 sunset-sync-ws-native = { path = "crates/sunset-sync-ws-native" }
 sunset-sync-ws-browser = { path = "crates/sunset-sync-ws-browser" }
 sunset-sync-webrtc-browser = { path = "crates/sunset-sync-webrtc-browser" }
+sunset-sync-webtransport-native = { path = "crates/sunset-sync-webtransport-native" }
+sunset-sync-webtransport-browser = { path = "crates/sunset-sync-webtransport-browser" }
 sunset-relay-resolver = { path = "crates/sunset-relay-resolver" }
 sunset-voice = { path = "crates/sunset-voice" }
+wtransport = "0.7"
 proptest = "1"
 
 [workspace.lints.rust]

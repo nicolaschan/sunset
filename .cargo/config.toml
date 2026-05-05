@@ -1,2 +1,8 @@
 [target.wasm32-unknown-unknown]
-rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
+# `web_sys_unstable_apis` exposes WebTransport bindings (still considered
+# unstable in `web-sys` even though they're shipping in Chromium). We
+# need them for `sunset-sync-webtransport-browser`.
+rustflags = [
+    "--cfg", "getrandom_backend=\"wasm_js\"",
+    "--cfg", "web_sys_unstable_apis",
+]
