@@ -57,6 +57,7 @@ pub fn view(
   // clipping box on phone PWA mode and cover the iOS home indicator.
   html.aside(
     [
+      attribute.attribute("data-testid", "channels-rail"),
       ui.css([
         #("height", "100%"),
         #("min-height", "0"),
