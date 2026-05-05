@@ -413,6 +413,3 @@ pub fn messages() -> List(Message) {
 
 /// Identifier of the active room when the app first loads.
 pub const initial_room_id = "dusk-collective"
-
-/// Identifier of the active text channel when the app first loads.
-pub const initial_channel_id = "general"
