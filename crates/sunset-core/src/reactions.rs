@@ -51,9 +51,12 @@ pub struct ReactionEvent {
 /// In-memory per-tracker state. `target → emoji → author → entry`.
 pub(crate) type ReactionState = HashMap<Hash, HashMap<String, HashMap<IdentityKey, ReactionEntry>>>;
 
-/// Callback fired with `(target, snapshot)` whenever the snapshot for
-/// `target` changes (per `reactions_signature` debounce).
-pub type ReactionsCallback = Box<dyn Fn(&Hash, &ReactionSnapshot)>;
+/// Callback fired with `(target, channel, snapshot)` whenever the
+/// snapshot for `target` changes (per `reactions_signature` debounce).
+/// `channel` is the channel of the *target* message (the message being
+/// reacted to), captured the first time the tracker observes any
+/// decoded message with `value_hash == target`.
+pub type ReactionsCallback = Box<dyn Fn(&Hash, &crate::ChannelLabel, &ReactionSnapshot)>;
 
 pub type ReactionsCallbackSlot = Rc<RefCell<Option<ReactionsCallback>>>;
 
@@ -67,6 +70,26 @@ pub struct ReactionHandles {
     /// re-registers the callback so the next event refires the current
     /// state for that target.
     pub last_target_signatures: Rc<RefCell<HashMap<Hash, ReactionSig>>>,
+}
+
+/// Idempotently record the channel of a target message. Returns `true`
+/// iff the target's channel was newly recorded; `false` if it was
+/// already present (the existing channel wins). The reaction tracker
+/// uses this to surface the target message's channel alongside each
+/// reaction snapshot.
+pub(crate) fn record_target_channel(
+    channels: &mut std::collections::HashMap<Hash, crate::ChannelLabel>,
+    target: Hash,
+    channel: crate::ChannelLabel,
+) -> bool {
+    use std::collections::hash_map::Entry;
+    match channels.entry(target) {
+        Entry::Vacant(e) => {
+            e.insert(channel);
+            true
+        }
+        Entry::Occupied(_) => false,
+    }
 }
 
 /// Apply one event to in-memory state. The new entry replaces an
@@ -156,6 +179,8 @@ pub fn spawn_reaction_tracker<S: sunset_store::Store + 'static>(
         };
 
         let mut state = ReactionState::new();
+        let mut target_channels: std::collections::HashMap<Hash, crate::ChannelLabel> =
+            std::collections::HashMap::new();
 
         while let Some(ev) = sub.next().await {
             let entry = match ev {
@@ -179,6 +204,37 @@ pub fn spawn_reaction_tracker<S: sunset_store::Store + 'static>(
                 Ok(d) => d,
                 Err(_) => continue,
             };
+            // Record this message's channel against its own value_hash.
+            // This lets later reaction events on the same target know
+            // which channel to fire the snapshot under. If a Reaction
+            // arrives before its target Text, we hold off firing until
+            // the target's channel is known (see the Reaction arm
+            // below).
+            let was_first_observation = record_target_channel(
+                &mut target_channels,
+                decoded.value_hash,
+                decoded.channel.clone(),
+            );
+
+            if was_first_observation {
+                // If we already have a non-empty reaction snapshot for
+                // this target (because Reactions arrived before the
+                // Text), fire it now using the freshly-known channel —
+                // updating the per-target signature so the refire isn't
+                // debounced and so a future actual reaction event also
+                // re-signature-compares correctly.
+                let snapshot = derive_snapshot(&state, &decoded.value_hash);
+                if !snapshot.is_empty() {
+                    let new_sig = reactions_signature(&snapshot);
+                    let mut sigs = handles.last_target_signatures.borrow_mut();
+                    sigs.insert(decoded.value_hash, new_sig);
+                    drop(sigs);
+                    if let Some(cb) = handles.on_reactions_changed.borrow().as_ref() {
+                        cb(&decoded.value_hash, &decoded.channel, &snapshot);
+                    }
+                }
+            }
+
             let MessageBody::Reaction {
                 for_value_hash,
                 emoji,
@@ -200,6 +256,13 @@ pub fn spawn_reaction_tracker<S: sunset_store::Store + 'static>(
                 continue;
             }
             let snapshot = derive_snapshot(&state, &target);
+            let Some(channel) = target_channels.get(&target).cloned() else {
+                // Target Text not yet observed — defer fire until it
+                // arrives. The pre-fire path above will replay the
+                // snapshot under the freshly-known channel when the
+                // target lands.
+                continue;
+            };
             let new_sig = reactions_signature(&snapshot);
             let mut sigs = handles.last_target_signatures.borrow_mut();
             let prev = sigs.get(&target);
@@ -209,7 +272,7 @@ pub fn spawn_reaction_tracker<S: sunset_store::Store + 'static>(
             sigs.insert(target, new_sig);
             drop(sigs);
             if let Some(cb) = handles.on_reactions_changed.borrow().as_ref() {
-                cb(&target, &snapshot);
+                cb(&target, &channel, &snapshot);
             }
         }
     });
@@ -538,5 +601,43 @@ mod signature_tests {
         }
         let s2 = reactions_signature(&snap2);
         assert_eq!(s1, s2);
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    use crate::ChannelLabel;
+    use std::collections::HashMap;
+
+    #[test]
+    fn record_target_channel_inserts_first_observation() {
+        let mut channels: HashMap<Hash, ChannelLabel> = HashMap::new();
+        let target = Hash::from([1u8; 32]);
+        assert!(record_target_channel(
+            &mut channels,
+            target,
+            ChannelLabel::try_new("links").unwrap(),
+        ));
+        assert_eq!(channels[&target].as_str(), "links");
+    }
+
+    #[test]
+    fn record_target_channel_is_idempotent() {
+        let mut channels: HashMap<Hash, ChannelLabel> = HashMap::new();
+        let target = Hash::from([1u8; 32]);
+        let _ = record_target_channel(
+            &mut channels,
+            target,
+            ChannelLabel::try_new("links").unwrap(),
+        );
+        // A second observation under the same target must NOT change the channel.
+        // The first observation wins.
+        assert!(!record_target_channel(
+            &mut channels,
+            target,
+            ChannelLabel::try_new("off-topic").unwrap(),
+        ));
+        assert_eq!(channels[&target].as_str(), "links");
     }
 }

@@ -4,22 +4,37 @@
 //! the data shape so `Peer` can hold its registry of `Weak<RoomState>`.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::rc::{Rc, Weak};
 
 use sunset_store::Store;
 use sunset_sync::Transport;
 
+use crate::ChannelLabel;
 use crate::crypto::room::Room;
 use crate::membership::TrackerHandles;
 use crate::message::DecodedMessage;
 
 pub(crate) type MessageCallback = Box<dyn Fn(&DecodedMessage, bool /* is_self */)>;
-pub(crate) type ReceiptCallback = Box<dyn Fn(sunset_store::Hash, &crate::IdentityKey, u64)>;
+pub(crate) type ReceiptCallback =
+    Box<dyn Fn(sunset_store::Hash, &crate::IdentityKey, &ChannelLabel, u64)>;
+pub(crate) type ChannelsCallback = Box<dyn Fn(&[ChannelLabel])>;
 
 #[derive(Default)]
 pub(crate) struct RoomCallbacks {
     pub(crate) on_message: Option<MessageCallback>,
     pub(crate) on_receipt: Option<ReceiptCallback>,
+    pub(crate) on_channels: Option<ChannelsCallback>,
+}
+
+impl RoomCallbacks {
+    /// True iff no decode-loop-driven callbacks are registered. Used by
+    /// the `on_*` registration methods to decide whether *this*
+    /// registration should kick off the per-room decode loop. Adding a
+    /// new callback slot only needs one update here.
+    fn is_empty(&self) -> bool {
+        self.on_message.is_none() && self.on_receipt.is_none() && self.on_channels.is_none()
+    }
 }
 
 pub(crate) struct RoomState<St: Store + 'static, T: Transport + 'static> {
@@ -31,6 +46,11 @@ pub(crate) struct RoomState<St: Store + 'static, T: Transport + 'static> {
     pub(crate) reaction_handles: crate::reactions::ReactionHandles,
     pub(crate) cancel_decode: Rc<Cell<bool>>,
     pub(crate) callbacks: Rc<RefCell<RoomCallbacks>>,
+    /// Sorted set of channels observed in the decode loop. Always
+    /// contains `ChannelLabel::default_general()` (seeded at room
+    /// open). Mutations fire `on_channels` with the full sorted
+    /// snapshot.
+    pub(crate) observed_channels: Rc<RefCell<BTreeSet<ChannelLabel>>>,
 }
 
 pub struct OpenRoom<St: Store + 'static, T: Transport + 'static> {
@@ -47,13 +67,27 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         self.inner.room.clone()
     }
 
+    /// Convenience wrapper: sends a text message under the default
+    /// `general` channel. New callers that want explicit channel
+    /// routing should use [`OpenRoom::send_text_in_channel`].
     pub async fn send_text(
         &self,
         body: String,
         sent_at_ms: u64,
     ) -> crate::Result<sunset_store::Hash> {
-        use crate::MessageBody;
-        use crate::compose_message;
+        self.send_text_in_channel(ChannelLabel::default_general(), body, sent_at_ms)
+            .await
+    }
+
+    /// Compose and insert a Text message under `channel`. Returns the
+    /// composed entry's `value_hash`.
+    pub async fn send_text_in_channel(
+        &self,
+        channel: ChannelLabel,
+        body: String,
+        sent_at_ms: u64,
+    ) -> crate::Result<sunset_store::Hash> {
+        use crate::compose_text;
         use rand_chacha::ChaCha20Rng;
         use rand_core::SeedableRng;
 
@@ -64,12 +98,13 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             .ok_or_else(|| crate::Error::Other("peer dropped".into()))?;
 
         let mut rng = ChaCha20Rng::from_entropy();
-        let composed = compose_message(
+        let composed = compose_text(
             peer.identity(),
             &self.inner.room,
             crate::V1_EPOCH_ID,
             sent_at_ms,
-            MessageBody::Text(body),
+            channel,
+            &body,
             &mut rng,
         )?;
 
@@ -83,24 +118,70 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
 
     pub fn on_message<F: Fn(&DecodedMessage, bool) + 'static>(&self, cb: F) {
         let mut cbs = self.inner.callbacks.borrow_mut();
-        let was_unregistered = cbs.on_message.is_none() && cbs.on_receipt.is_none();
+        let was_unregistered = cbs.is_empty();
         cbs.on_message = Some(Box::new(cb));
         drop(cbs);
 
-        // First on_message/on_receipt call kicks off the decode loop.
+        // First on_message / on_receipt / on_channels_changed call
+        // kicks off the decode loop.
         if was_unregistered {
             self.spawn_decode_loop();
         }
     }
 
-    pub fn on_receipt<F: Fn(sunset_store::Hash, &crate::IdentityKey, u64) + 'static>(&self, cb: F) {
+    pub fn on_receipt<
+        F: Fn(sunset_store::Hash, &crate::IdentityKey, &ChannelLabel, u64) + 'static,
+    >(
+        &self,
+        cb: F,
+    ) {
         let mut cbs = self.inner.callbacks.borrow_mut();
-        let was_unregistered = cbs.on_message.is_none() && cbs.on_receipt.is_none();
+        let was_unregistered = cbs.is_empty();
         cbs.on_receipt = Some(Box::new(cb));
         drop(cbs);
         if was_unregistered {
             self.spawn_decode_loop();
         }
+    }
+
+    /// Register a callback that fires whenever the set of observed
+    /// channels in this room grows. The callback is fired *once
+    /// immediately* with the current sorted snapshot (so a host that
+    /// registers late doesn't sit on a quiet stream waiting for the
+    /// next message), then again every time a newly-observed channel
+    /// is added by the decode loop.
+    ///
+    /// The set always contains `ChannelLabel::default_general()`.
+    pub fn on_channels_changed<F: Fn(&[ChannelLabel]) + 'static>(&self, cb: F) {
+        // Box the callback once so we can both invoke it now and stash
+        // it for later. Fire immediately with the current snapshot
+        // *before any borrow is held* on `self.inner.callbacks`, so a
+        // user callback that synchronously re-registers any `on_*`
+        // handler can't deadlock on `RoomState`'s `RefCell` with a
+        // `BorrowMutError`.
+        let boxed: ChannelsCallback = Box::new(cb);
+        let snap = self.observed_channels();
+        boxed(&snap);
+
+        let mut cbs = self.inner.callbacks.borrow_mut();
+        let was_unregistered = cbs.is_empty();
+        cbs.on_channels = Some(boxed);
+        drop(cbs);
+
+        if was_unregistered {
+            self.spawn_decode_loop();
+        }
+    }
+
+    /// Sorted snapshot of channels observed in this room so far.
+    /// Always contains `ChannelLabel::default_general()`.
+    pub fn observed_channels(&self) -> Vec<ChannelLabel> {
+        self.inner
+            .observed_channels
+            .borrow()
+            .iter()
+            .cloned()
+            .collect()
     }
 
     fn spawn_decode_loop(&self) {
@@ -179,7 +260,12 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                         }
                         crate::MessageBody::Receipt { for_value_hash } => {
                             if let Some(cb) = cbs.on_receipt.as_ref() {
-                                cb(*for_value_hash, &decoded.author_key, decoded.sent_at_ms);
+                                cb(
+                                    *for_value_hash,
+                                    &decoded.author_key,
+                                    &decoded.channel,
+                                    decoded.sent_at_ms,
+                                );
                             }
                         }
                         // Reactions are handled by ReactionTracker
@@ -189,13 +275,39 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                     }
                 }
 
+                // Live channels rail: every successfully decoded
+                // message — Text, Receipt, or Reaction — contributes
+                // its channel. New channels fire on_channels with the
+                // full sorted snapshot.
+                let inserted = inner
+                    .observed_channels
+                    .borrow_mut()
+                    .insert(decoded.channel.clone());
+                if inserted {
+                    let snap: Vec<_> = inner.observed_channels.borrow().iter().cloned().collect();
+                    if let Some(cb) = callbacks.borrow().on_channels.as_ref() {
+                        cb(&snap);
+                    }
+                }
+
                 // Auto-ack: when a Text from another peer lands, write
                 // a Receipt back so the sender's UI can flip out of
                 // "pending". Skip self-Texts (no point acking your own)
                 // and dedupe per-session against Replay::All re-emits.
+                // The receipt inherits the target Text's channel so a
+                // sender filtering its UI to e.g. #links sees the ack
+                // arrive in the same channel.
                 if let crate::MessageBody::Text(_) = &decoded.body {
                     if !is_self && acked.insert(entry.value_hash) {
-                        send_receipt(&store, &room, &identity, entry.value_hash, &mut rng).await;
+                        send_receipt(
+                            &store,
+                            &room,
+                            &identity,
+                            entry.value_hash,
+                            decoded.channel.clone(),
+                            &mut rng,
+                        )
+                        .await;
                     }
                 }
             }
@@ -313,7 +425,8 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
     /// state" behaviour by clearing per-target debounce signatures so
     /// the next event refires the snapshot.
     pub fn on_reactions_changed<
-        F: Fn(&sunset_store::Hash, &crate::reactions::ReactionSnapshot) + 'static,
+        F: Fn(&sunset_store::Hash, &crate::ChannelLabel, &crate::reactions::ReactionSnapshot)
+            + 'static,
     >(
         &self,
         cb: F,
@@ -330,12 +443,37 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             .clear();
     }
 
-    /// Compose and insert a Reaction entry into the store. The
+    /// Convenience wrapper: sends a reaction under the default
+    /// `general` channel. New callers that want explicit channel
+    /// routing should use [`OpenRoom::send_reaction_in_channel`]. The
     /// reaction tracker (spawned in `Peer::open_room`) picks it up via
     /// its `<room_fp>/msg/` subscription and dispatches a snapshot
     /// change to `on_reactions_changed`. `action` is "add" or "remove".
     pub async fn send_reaction(
         &self,
+        target: sunset_store::Hash,
+        emoji: String,
+        action: crate::ReactionAction,
+        sent_at_ms: u64,
+    ) -> crate::Result<()> {
+        self.send_reaction_in_channel(
+            ChannelLabel::default_general(),
+            target,
+            emoji,
+            action,
+            sent_at_ms,
+        )
+        .await
+    }
+
+    /// Compose and insert a Reaction entry under `channel`. Reactions
+    /// inherit the channel of the message they target — callers of
+    /// this method are expected to pass the same channel as the
+    /// target Text. See [`OpenRoom::send_reaction`] for the
+    /// channel-defaulted convenience wrapper.
+    pub async fn send_reaction_in_channel(
+        &self,
+        channel: ChannelLabel,
         target: sunset_store::Hash,
         emoji: String,
         action: crate::ReactionAction,
@@ -356,6 +494,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             &self.inner.room,
             crate::V1_EPOCH_ID,
             sent_at_ms,
+            channel,
             &crate::ReactionPayload {
                 for_value_hash: target,
                 emoji: &emoji,
@@ -383,14 +522,17 @@ impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
 
 /// Compose and insert a delivery Receipt acknowledging
 /// `for_value_hash` (the value_hash of the original Text). Used by the
-/// auto-ack path in `spawn_decode_loop`. Errors are logged via
-/// `tracing` and swallowed — receipts are best-effort; failing to ack
-/// is not fatal.
-async fn send_receipt<St: Store + 'static>(
+/// auto-ack path in `spawn_decode_loop`; the `channel` argument is
+/// the target Text's channel so the receipt rides in the same channel
+/// as the message it acknowledges. Errors are logged via `tracing`
+/// and swallowed — receipts are best-effort; failing to ack is not
+/// fatal.
+pub(crate) async fn send_receipt<St: Store + 'static>(
     store: &std::sync::Arc<St>,
     room: &Room,
     identity: &crate::Identity,
     for_value_hash: sunset_store::Hash,
+    channel: ChannelLabel,
     rng: &mut rand_chacha::ChaCha20Rng,
 ) {
     let now_ms = web_time::SystemTime::now()
@@ -402,6 +544,7 @@ async fn send_receipt<St: Store + 'static>(
         room,
         crate::V1_EPOCH_ID,
         now_ms,
+        channel,
         for_value_hash,
         rng,
     ) {

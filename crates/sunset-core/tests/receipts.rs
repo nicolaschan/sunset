@@ -17,7 +17,16 @@ async fn receipt_round_trip_between_two_identities() {
     let bob_store = sunset_store_memory::MemoryStore::with_accept_all();
 
     // 1. Alice composes and inserts a Text.
-    let text = compose_text(&alice, &room, 0, 1, "hello bob", &mut OsRng).unwrap();
+    let text = compose_text(
+        &alice,
+        &room,
+        0,
+        1,
+        sunset_core::ChannelLabel::default_general(),
+        "hello bob",
+        &mut OsRng,
+    )
+    .unwrap();
     alice_store
         .insert(text.entry.clone(), Some(text.block.clone()))
         .await
@@ -33,7 +42,16 @@ async fn receipt_round_trip_between_two_identities() {
     //    Bob composes a Receipt referencing the text's value_hash.
     let decoded = decode_message(&room, &text.entry, &text.block).unwrap();
     assert!(matches!(decoded.body, MessageBody::Text(_)));
-    let receipt = compose_receipt(&bob, &room, 0, 2, decoded.value_hash, &mut OsRng).unwrap();
+    let receipt = compose_receipt(
+        &bob,
+        &room,
+        0,
+        2,
+        sunset_core::ChannelLabel::default_general(),
+        decoded.value_hash,
+        &mut OsRng,
+    )
+    .unwrap();
     bob_store
         .insert(receipt.entry.clone(), Some(receipt.block.clone()))
         .await

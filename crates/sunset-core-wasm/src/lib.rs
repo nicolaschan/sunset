@@ -8,8 +8,8 @@ use rand_core::SeedableRng;
 use wasm_bindgen::prelude::*;
 
 use sunset_core::{
-    ComposedMessage as CoreComposedMessage, Ed25519Verifier, Identity, MessageBody, Room,
-    compose_message as core_compose, decode_message as core_decode,
+    ChannelLabel, ComposedMessage as CoreComposedMessage, Ed25519Verifier, Identity, MessageBody,
+    Room, compose_message as core_compose, decode_message as core_decode,
 };
 use sunset_store::{ContentBlock, SignatureVerifier, SignedKvEntry};
 
@@ -146,6 +146,7 @@ pub fn compose_message(
         &room,
         epoch_id,
         sent_at_ms,
+        ChannelLabel::default_general(),
         MessageBody::Text(body.to_owned()),
         &mut rng,
     )

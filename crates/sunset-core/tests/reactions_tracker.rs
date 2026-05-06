@@ -9,7 +9,9 @@ use std::sync::Arc;
 use rand_core::OsRng;
 use sunset_core::crypto::constants::test_fast_params;
 use sunset_core::reactions::{ReactionHandles, ReactionSnapshot, spawn_reaction_tracker};
-use sunset_core::{Identity, ReactionAction, ReactionPayload, Room, compose_reaction};
+use sunset_core::{
+    Identity, ReactionAction, ReactionPayload, Room, compose_reaction, compose_text,
+};
 use sunset_store::Store as _;
 
 #[tokio::test(flavor = "current_thread")]
@@ -27,9 +29,10 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
             let observed: Rc<RefCell<Vec<(sunset_store::Hash, ReactionSnapshot)>>> =
                 Rc::new(RefCell::new(Vec::new()));
             let observed_cb = observed.clone();
-            *handles.on_reactions_changed.borrow_mut() = Some(Box::new(move |target, snapshot| {
-                observed_cb.borrow_mut().push((*target, snapshot.clone()));
-            }));
+            *handles.on_reactions_changed.borrow_mut() =
+                Some(Box::new(move |target, _channel, snapshot| {
+                    observed_cb.borrow_mut().push((*target, snapshot.clone()));
+                }));
             spawn_reaction_tracker(
                 store.clone(),
                 room.clone(),
@@ -37,14 +40,32 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
                 handles.clone(),
             );
 
-            // Alice composes a reaction targeting an arbitrary message hash.
-            let target: sunset_store::Hash = blake3::hash(b"target message").into();
+            // Alice composes a real Text first so the tracker can record
+            // the target's channel; then reacts on it. Reactions on
+            // unknown targets defer firing until the target's channel
+            // is observed.
+            let text = compose_text(
+                &alice,
+                &room,
+                0,
+                1,
+                sunset_core::ChannelLabel::default_general(),
+                "hi",
+                &mut OsRng,
+            )
+            .unwrap();
+            let target = text.entry.value_hash;
+            store
+                .insert(text.entry.clone(), Some(text.block.clone()))
+                .await
+                .unwrap();
 
             let composed_add = compose_reaction(
                 &alice,
                 &room,
                 0,
                 100,
+                sunset_core::ChannelLabel::default_general(),
                 &ReactionPayload {
                     for_value_hash: target,
                     emoji: "👍",
@@ -85,6 +106,7 @@ async fn tracker_fires_on_alice_reaction_then_remove() {
                 &room,
                 0,
                 200,
+                sunset_core::ChannelLabel::default_general(),
                 &ReactionPayload {
                     for_value_hash: target,
                     emoji: "👍",
@@ -142,7 +164,7 @@ async fn tracker_debounces_duplicate_state() {
             let observed: Rc<RefCell<Vec<sunset_store::Hash>>> = Rc::new(RefCell::new(Vec::new()));
             let observed_cb = observed.clone();
             *handles.on_reactions_changed.borrow_mut() =
-                Some(Box::new(move |target, _snapshot| {
+                Some(Box::new(move |target, _channel, _snapshot| {
                     observed_cb.borrow_mut().push(*target);
                 }));
             spawn_reaction_tracker(
@@ -152,12 +174,29 @@ async fn tracker_debounces_duplicate_state() {
                 handles.clone(),
             );
 
-            let target: sunset_store::Hash = blake3::hash(b"target").into();
+            // Insert a real Text first so the tracker has a known
+            // channel for the reaction's target.
+            let text = compose_text(
+                &alice,
+                &room,
+                0,
+                1,
+                sunset_core::ChannelLabel::default_general(),
+                "target",
+                &mut OsRng,
+            )
+            .unwrap();
+            let target = text.entry.value_hash;
+            store
+                .insert(text.entry.clone(), Some(text.block.clone()))
+                .await
+                .unwrap();
             let composed = compose_reaction(
                 &alice,
                 &room,
                 0,
                 100,
+                sunset_core::ChannelLabel::default_general(),
                 &ReactionPayload {
                     for_value_hash: target,
                     emoji: "👍",
@@ -184,6 +223,113 @@ async fn tracker_debounces_duplicate_state() {
                 observed.borrow().len(),
                 1,
                 "duplicate insert must not double-fire"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tracker_defers_reaction_until_target_channel_known() {
+    // A reaction arriving before its target Text must not fire (the
+    // tracker doesn't know the target's channel yet). Once the target
+    // Text arrives, the deferred snapshot fires under the freshly-known
+    // channel.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let alice = Identity::generate(&mut OsRng);
+            let room = Room::open_with_params("general", &test_fast_params()).unwrap();
+            let store = Arc::new(sunset_store_memory::MemoryStore::with_accept_all());
+
+            let handles = ReactionHandles::default();
+            let observed: Rc<RefCell<Vec<(sunset_store::Hash, String, ReactionSnapshot)>>> =
+                Rc::new(RefCell::new(Vec::new()));
+            let observed_cb = observed.clone();
+            *handles.on_reactions_changed.borrow_mut() =
+                Some(Box::new(move |target, channel, snapshot| {
+                    observed_cb.borrow_mut().push((
+                        *target,
+                        channel.as_str().to_owned(),
+                        snapshot.clone(),
+                    ));
+                }));
+            spawn_reaction_tracker(
+                store.clone(),
+                room.clone(),
+                room.fingerprint().to_hex(),
+                handles.clone(),
+            );
+
+            // Compose the target Text but DON'T insert it yet.
+            let text = compose_text(
+                &alice,
+                &room,
+                0,
+                1,
+                sunset_core::ChannelLabel::try_new("links").unwrap(),
+                "look at this",
+                &mut OsRng,
+            )
+            .unwrap();
+            let target = text.entry.value_hash;
+
+            // Insert a reaction targeting the (still-absent) text.
+            let composed_add = compose_reaction(
+                &alice,
+                &room,
+                0,
+                100,
+                sunset_core::ChannelLabel::try_new("links").unwrap(),
+                &ReactionPayload {
+                    for_value_hash: target,
+                    emoji: "👍",
+                    action: ReactionAction::Add,
+                },
+                &mut OsRng,
+            )
+            .unwrap();
+            store
+                .insert(composed_add.entry, Some(composed_add.block))
+                .await
+                .unwrap();
+
+            // Drain — no fire yet.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                observed.borrow().len(),
+                0,
+                "reaction must defer firing until target channel is known"
+            );
+
+            // Now insert the target Text.
+            store
+                .insert(text.entry.clone(), Some(text.block.clone()))
+                .await
+                .unwrap();
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+                if !observed.borrow().is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(
+                observed.borrow().len(),
+                1,
+                "tracker should fire the deferred snapshot once the target Text lands"
+            );
+            let (fired_target, fired_channel, fired_snapshot) = observed.borrow()[0].clone();
+            assert_eq!(fired_target, target);
+            assert_eq!(
+                fired_channel, "links",
+                "deferred fire must carry the target message's channel"
+            );
+            assert!(
+                fired_snapshot
+                    .get("👍")
+                    .unwrap()
+                    .contains_key(&alice.public())
             );
         })
         .await;

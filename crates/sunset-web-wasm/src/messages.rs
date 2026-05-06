@@ -3,7 +3,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use sunset_core::{DecodedMessage, IdentityKey};
+use sunset_core::{ChannelLabel, DecodedMessage, IdentityKey};
 
 /// JS-facing decoded text message.
 #[wasm_bindgen]
@@ -12,6 +12,10 @@ pub struct IncomingMessage {
     pub author_pubkey: Vec<u8>,
     pub epoch_id: u64,
     pub sent_at_ms: f64,
+    /// Channel this message was sent in (e.g. `"general"`). Always
+    /// present; defaults to `"general"` for un-channeled (legacy) sends.
+    #[wasm_bindgen(getter_with_clone)]
+    pub channel: String,
     #[wasm_bindgen(getter_with_clone)]
     pub body: String,
     #[wasm_bindgen(getter_with_clone)]
@@ -28,6 +32,9 @@ pub struct IncomingReceipt {
     /// Verifying key bytes of the peer who composed this receipt.
     #[wasm_bindgen(getter_with_clone)]
     pub from_pubkey: Vec<u8>,
+    /// Channel the acknowledged message was sent in.
+    #[wasm_bindgen(getter_with_clone)]
+    pub channel: String,
     /// Wall-clock unix-ms when the acknowledging peer composed this
     /// receipt. Surfaced in the message-details panel as the
     /// "delivered-at" stamp per recipient.
@@ -47,6 +54,7 @@ pub fn from_decoded_text(
         author_pubkey: decoded.author_key.as_bytes().to_vec(),
         epoch_id: decoded.epoch_id,
         sent_at_ms: decoded.sent_at_ms as f64,
+        channel: decoded.channel.as_str().to_owned(),
         body: text,
         value_hash_hex,
         is_self,
@@ -57,11 +65,13 @@ pub fn from_decoded_text(
 pub fn receipt_to_js(
     for_value_hash_hex: String,
     from_pubkey: &IdentityKey,
+    channel: &ChannelLabel,
     sent_at_ms: u64,
 ) -> IncomingReceipt {
     IncomingReceipt {
         for_value_hash_hex,
         from_pubkey: from_pubkey.as_bytes().to_vec(),
+        channel: channel.as_str().to_owned(),
         sent_at_ms: sent_at_ms as f64,
     }
 }

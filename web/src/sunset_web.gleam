@@ -92,6 +92,13 @@ pub type RoomState {
     receipts: Dict(String, Dict(String, Int)),
     reactions: Dict(String, List(Reaction)),
     current_channel: ChannelId,
+    /// Channels the rail draws for this room. Seeded with the default
+    /// text channel + a fixture voice channel; merged with the live
+    /// observed-channel set from the wasm side as `ChannelsObserved`
+    /// events arrive. Sort order: default text channel first, then
+    /// the rest of the observed text channels alphabetically, then
+    /// any voice channels at the end.
+    channels: List(domain.Channel),
     draft: String,
     selected_msg_id: Option(String),
     reacting_to: Option(String),
@@ -112,7 +119,8 @@ fn empty_room_state() -> RoomState {
     members: [],
     receipts: dict.new(),
     reactions: dict.new(),
-    current_channel: ChannelId(fixture.initial_channel_id),
+    current_channel: domain.default_channel_id(),
+    channels: initial_channels(),
     draft: "",
     selected_msg_id: None,
     reacting_to: None,
@@ -120,6 +128,30 @@ fn empty_room_state() -> RoomState {
     peer_status_popover: None,
     revealed_spoilers: set.new(),
   )
+}
+
+/// Initial channel list every room starts with: the default text
+/// channel (always present, even before any traffic is observed) plus
+/// the placeholder voice channel — voice is out of scope for the
+/// channels-within-rooms PR, but the rail still renders it from the
+/// fixture so the lounge interaction keeps working.
+fn initial_channels() -> List(domain.Channel) {
+  [
+    domain.Channel(
+      id: domain.default_channel_id(),
+      name: domain.default_channel_name,
+      kind: domain.TextChannel,
+      in_call: 0,
+      unread: 0,
+    ),
+    domain.Channel(
+      id: ChannelId("lounge"),
+      name: "Lounge",
+      kind: domain.Voice,
+      in_call: 3,
+      unread: 0,
+    ),
+  ]
 }
 
 pub type Model {
@@ -259,10 +291,26 @@ pub type Msg {
   /// A room's wasm-side handle is ready; register callbacks + start presence.
   RoomOpened(name: String, handle: RoomHandle)
   IncomingMsg(room: String, im: IncomingMessage)
+  /// Live channel set observed for the named room. Fired immediately on
+  /// callback registration with the current sorted snapshot, then
+  /// again on every change. The reducer merges these into
+  /// `state.channels` (preserving any existing per-channel UI state +
+  /// the Lounge voice placeholder).
+  ChannelsObserved(name: String, channels: List(String))
+  /// User typed a fresh channel name into the rail's "+ new channel"
+  /// input and pressed Enter. Inserts a local-only Channel into the
+  /// rail and switches `state.current_channel` to it so SubmitDraft
+  /// will route the next message into that channel.
+  NewChannel(name: String)
   IncomingReceipt(
     room: String,
     message_id: String,
     from_pubkey: String,
+    /// Channel label of the Text this Receipt acknowledges.
+    /// v1 ignores it (receipts apply per-message, not per-channel),
+    /// but it rides on the Msg so a future per-channel receipt view
+    /// has the data without changing the bridge plumbing.
+    channel: String,
     delivered_at_ms: Int,
   )
   SubmitDraft
@@ -612,6 +660,7 @@ pub fn resolve_messages(
       initials: m.initials,
       time: m.time,
       body: m.body,
+      channel: m.channel,
       seen_by: m.seen_by,
       you: m.you,
       pending: m.pending,
@@ -619,6 +668,77 @@ pub fn resolve_messages(
       details: m.details,
     )
   })
+}
+
+/// Merge a fresh observed-channel snapshot into the rail's existing
+/// channel list. Each observed string becomes (or reuses) a
+/// `TextChannel`; existing per-channel UI state (unread / in_call) is
+/// preserved by id-lookup. The default text channel is always
+/// included even if the snapshot doesn't carry it. Voice channels in
+/// the previous list are kept as-is — voice rail entries don't come
+/// from the wasm side. Output is sorted via `sort_channels`.
+pub fn merge_observed_channels(
+  existing: List(domain.Channel),
+  observed: List(String),
+) -> List(domain.Channel) {
+  let voice_existing = list.filter(existing, fn(c) { c.kind == domain.Voice })
+  let observed_text =
+    list.map(observed, fn(label) {
+      let id = ChannelId(label)
+      case list.find(existing, fn(c) { c.id == id }) {
+        Ok(prev) -> prev
+        Error(_) ->
+          domain.Channel(
+            id: id,
+            name: label,
+            kind: domain.TextChannel,
+            in_call: 0,
+            unread: 0,
+          )
+      }
+    })
+  let with_default = case
+    list.any(observed_text, fn(c) { c.id == domain.default_channel_id() })
+  {
+    True -> observed_text
+    False -> [
+      // Reuse the existing default-channel record (preserving unread,
+      // etc.) if we already have one in `existing`.
+      case list.find(existing, fn(c) { c.id == domain.default_channel_id() }) {
+        Ok(prev) -> prev
+        Error(_) ->
+          domain.Channel(
+            id: domain.default_channel_id(),
+            name: domain.default_channel_name,
+            kind: domain.TextChannel,
+            in_call: 0,
+            unread: 0,
+          )
+      },
+      ..observed_text
+    ]
+  }
+  sort_channels(list.append(with_default, voice_existing))
+}
+
+/// Canonical channel ordering for the rail:
+///   1. Default text channel first (if present).
+///   2. Other text channels alphabetically by name.
+///   3. Voice channels at the end, alphabetically by name.
+/// Stable for already-sorted input.
+pub fn sort_channels(cs: List(domain.Channel)) -> List(domain.Channel) {
+  let default_id = domain.default_channel_id()
+  let default_first =
+    list.filter(cs, fn(c) { c.id == default_id && c.kind == domain.TextChannel })
+  let other_text =
+    cs
+    |> list.filter(fn(c) { c.kind == domain.TextChannel && c.id != default_id })
+    |> list.sort(fn(a, b) { string.compare(a.name, b.name) })
+  let voice =
+    cs
+    |> list.filter(fn(c) { c.kind == domain.Voice })
+    |> list.sort(fn(a, b) { string.compare(a.name, b.name) })
+  list.flatten([default_first, other_text, voice])
 }
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortInitials")
@@ -1109,11 +1229,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let wire_eff =
         effect.from(fn(dispatch) {
           sunset.on_message(handle, fn(im) { dispatch(IncomingMsg(name, im)) })
+          sunset.on_channels_changed(handle, fn(chans) {
+            dispatch(ChannelsObserved(name, chans))
+          })
           sunset.on_receipt(handle, fn(r) {
             dispatch(IncomingReceipt(
               name,
               sunset.rec_for_value_hash_hex(r),
               hex_encode(sunset.rec_from_pubkey(r)),
+              sunset.rec_channel(r),
               sunset.rec_sent_at_ms(r),
             ))
           })
@@ -1145,6 +1269,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               initials: short_initials(sunset.inc_author_pubkey(im)),
               time: format_time_ms(sunset.inc_sent_at_ms(im)),
               body: sunset.inc_body(im),
+              channel: sunset.inc_channel(im),
               seen_by: 0,
               you: sunset.inc_is_self(im),
               pending: False,
@@ -1184,10 +1309,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               case body {
                 "" -> #(model, effect.none())
                 _ -> {
+                  let ChannelId(channel_str) = state.current_channel
                   let send_eff =
                     effect.from(fn(dispatch) {
                       sunset.send_message(
                         handle,
+                        channel_str,
                         body,
                         current_time_ms(),
                         fn(r) { dispatch(MessageSent(r)) },
@@ -1218,7 +1345,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     }
     MessageSent(_) -> #(model, effect.none())
-    IncomingReceipt(name, message_id, from_pubkey, delivered_at_ms) -> {
+    IncomingReceipt(name, message_id, from_pubkey, _channel, delivered_at_ms) -> {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
@@ -1237,6 +1364,48 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             effect.none(),
           )
         }
+      }
+    }
+    ChannelsObserved(name, chans) -> {
+      case dict.get(model.rooms, name) {
+        Error(_) -> #(model, effect.none())
+        Ok(state) -> {
+          let new_channels = merge_observed_channels(state.channels, chans)
+          let new_state = RoomState(..state, channels: new_channels)
+          #(
+            Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
+            effect.none(),
+          )
+        }
+      }
+    }
+    NewChannel(raw) -> {
+      let trimmed = string.trim(raw)
+      case trimmed {
+        "" -> #(model, effect.none())
+        _ ->
+          with_active_room(model, fn(state) {
+            let new_id = ChannelId(trimmed)
+            let new_channel =
+              domain.Channel(
+                id: new_id,
+                name: trimmed,
+                kind: domain.TextChannel,
+                in_call: 0,
+                unread: 0,
+              )
+            let merged = case
+              list.any(state.channels, fn(c) { c.id == new_id })
+            {
+              True -> state.channels
+              False -> [new_channel, ..state.channels]
+            }
+            let sorted = sort_channels(merged)
+            #(
+              RoomState(..state, channels: sorted, current_channel: new_id),
+              effect.from(fn(_) { composer.focus_textarea("composer-textarea") }),
+            )
+          })
       }
     }
     MembersUpdated(name, ms) -> {
@@ -1512,12 +1681,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let send_eff = case dict.get(model.rooms, active_name) {
         Ok(state) ->
           case state.handle {
-            Some(handle) ->
+            Some(handle) -> {
+              let ChannelId(channel_str) = state.current_channel
               effect.from(fn(dispatch) {
-                sunset.send_reaction(handle, target, emoji, action, fn(r) {
-                  dispatch(ReactionSent(r))
-                })
+                sunset.send_reaction(
+                  handle,
+                  channel_str,
+                  target,
+                  emoji,
+                  action,
+                  fn(r) { dispatch(ReactionSent(r)) },
+                )
               })
+            }
             None -> effect.none()
           }
         Error(_) -> effect.none()
@@ -1825,6 +2001,15 @@ fn room_view_with_state(
   let resolved_messages =
     resolve_messages(model.name_map, messages_with_live_reactions)
 
+  // Filter the message list down to the active channel before passing
+  // to main_panel. Reactions/details still index by message id so the
+  // hidden messages stay reachable through the details panel if it
+  // happens to point at one (rare in practice — the UI nearly always
+  // closes details when switching channels).
+  let ChannelId(active_channel_str) = state.current_channel
+  let filtered_resolved_messages =
+    list.filter(resolved_messages, fn(m) { m.channel == active_channel_str })
+
   let detail_msg = case state.sheet {
     Some(domain.DetailsSheet(message_id: id)) ->
       find_message(resolved_messages, id)
@@ -2107,9 +2292,7 @@ fn room_view_with_state(
   let user_in_call = option.is_some(model.voice.self_in_call)
 
   let active_voice_channel_name =
-    list.find(fixture.channels(), fn(c) {
-      c.kind == domain.Voice && c.in_call > 0
-    })
+    list.find(state.channels, fn(c) { c.kind == domain.Voice && c.in_call > 0 })
     |> result.map(fn(c) { c.name })
     |> result.unwrap("voice")
 
@@ -2165,7 +2348,7 @@ fn room_view_with_state(
     channels.view(
       palette: palette,
       room: active_room,
-      channels: fixture.channels(),
+      channels: state.channels,
       members: members_for_channels,
       current_channel: state.current_channel,
       voice_popover_open: case state.sheet {
@@ -2173,6 +2356,8 @@ fn room_view_with_state(
         _ -> None
       },
       on_select_channel: SelectChannel,
+      on_new_channel: NewChannel,
+      noop: NoOp,
       on_open_voice_popover: OpenVoicePopover,
       viewport: model.viewport,
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
@@ -2190,7 +2375,7 @@ fn room_view_with_state(
       palette: palette,
       viewport: model.viewport,
       current_channel: state.current_channel,
-      messages: resolved_messages,
+      messages: filtered_resolved_messages,
       draft: state.draft,
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,

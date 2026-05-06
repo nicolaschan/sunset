@@ -154,6 +154,14 @@ where
             reaction_handles.clone(),
         );
 
+        // Seed observed_channels with the default `general` channel so
+        // hosts that read it (or register on_channels_changed) before
+        // any traffic arrives still see ["general"]. The decode loop
+        // expands this set as new channels are observed.
+        let mut chans = std::collections::BTreeSet::new();
+        chans.insert(crate::ChannelLabel::default_general());
+        let observed_channels = Rc::new(std::cell::RefCell::new(chans));
+
         let state = Rc::new(open_room::RoomState {
             room,
             peer_weak: Rc::downgrade(self),
@@ -163,6 +171,7 @@ where
             reaction_handles,
             cancel_decode: cancel,
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
+            observed_channels,
         });
 
         open_rooms.insert(fp, Rc::downgrade(&state));
@@ -447,6 +456,7 @@ mod tests {
                     &room.inner.room,
                     crate::V1_EPOCH_ID,
                     1_700_000_000_000,
+                    crate::ChannelLabel::default_general(),
                     crate::MessageBody::Text("from-other".to_owned()),
                     &mut rng,
                 )
@@ -518,6 +528,291 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn send_text_in_channel_round_trips_channel() {
+        // The channel passed to send_text_in_channel must round-trip
+        // through the AEAD/sig envelope and surface in
+        // `decoded.channel` on the on_message callback.
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(50)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let received: Rc<RefCell<Vec<(String, String)>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+                let received_cb = received.clone();
+                room.on_message(move |decoded, _is_self| {
+                    if let crate::MessageBody::Text(t) = &decoded.body {
+                        received_cb
+                            .borrow_mut()
+                            .push((decoded.channel.as_str().to_owned(), t.clone()));
+                    }
+                });
+
+                let _ = room
+                    .send_text_in_channel(
+                        crate::ChannelLabel::try_new("links").expect("links label"),
+                        "hi".to_owned(),
+                        1,
+                    )
+                    .await
+                    .expect("send_text_in_channel");
+
+                for _ in 0..50 {
+                    if !received.borrow().is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let got = received.borrow().clone();
+                assert_eq!(got, vec![("links".to_owned(), "hi".to_owned())]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observed_channels_starts_with_default() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(51)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                let chans: Vec<String> = room
+                    .observed_channels()
+                    .iter()
+                    .map(|c| c.as_str().to_owned())
+                    .collect();
+                assert_eq!(chans, vec!["general".to_owned()]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_channels_changed_fires_with_default_immediately() {
+        // Registering on_channels_changed should fire once with the
+        // current snapshot (which always includes "general"), so a
+        // host that registers late doesn't sit empty waiting for the
+        // next channel-creating message.
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(52)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let snapshots: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+                let snapshots_cb = snapshots.clone();
+                room.on_channels_changed(move |chans| {
+                    snapshots_cb
+                        .borrow_mut()
+                        .push(chans.iter().map(|c| c.as_str().to_owned()).collect());
+                });
+
+                // Don't yield — the immediate snapshot should already
+                // be there synchronously.
+                let got = snapshots.borrow().clone();
+                assert_eq!(got, vec![vec!["general".to_owned()]]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_channels_changed_callback_can_re_register_without_panicking() {
+        // Regression test for the re-entrancy footgun in
+        // OpenRoom::on_channels_changed: the immediate-fire path used
+        // to invoke the user callback while a `RefCell` borrow on
+        // RoomState::callbacks was still live, so a callback that
+        // synchronously called back into any `on_*` registration would
+        // panic with `BorrowMutError`. Construct that exact scenario:
+        // from inside the on_channels_changed callback, register
+        // on_message via a second `OpenRoom` handle built off the same
+        // inner `Rc<RoomState>`. The fix boxes the callback first and
+        // fires it before any borrow is held; without the fix, this
+        // test would panic.
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(45)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                // OpenRoom isn't Clone; rebuild a handle off the same
+                // inner Rc so the callback can call on_message on it.
+                let room_for_cb = OpenRoom {
+                    inner: room.inner.clone(),
+                };
+                let nested_registered: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+                let nested_registered_cb = nested_registered.clone();
+                room.on_channels_changed(move |_chans| {
+                    // Register on_message from inside the on_channels
+                    // immediate-fire callback. Pre-fix: panics with
+                    // BorrowMutError. Post-fix: succeeds.
+                    room_for_cb.on_message(|_, _| {});
+                    *nested_registered_cb.borrow_mut() = true;
+                });
+                assert!(
+                    *nested_registered.borrow(),
+                    "nested on_message registration must run inside the immediate-fire callback"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observed_channels_includes_new_channel_after_send() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(53)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                // Register a no-op on_message so the decode loop spawns and
+                // observes the channel from the inserted Text.
+                room.on_message(|_, _| {});
+
+                let _ = room
+                    .send_text_in_channel(
+                        crate::ChannelLabel::try_new("links").expect("links label"),
+                        "hi".to_owned(),
+                        1,
+                    )
+                    .await
+                    .expect("send_text_in_channel");
+
+                // Poll observed_channels until "links" appears.
+                let mut got: Vec<String> = Vec::new();
+                for _ in 0..50 {
+                    got = room
+                        .observed_channels()
+                        .iter()
+                        .map(|c| c.as_str().to_owned())
+                        .collect();
+                    if got.contains(&"links".to_owned()) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                // BTreeSet sorts: "general" < "links".
+                assert_eq!(got, vec!["general".to_owned(), "links".to_owned()]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_channels_changed_fires_when_new_channel_arrives() {
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(54)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let snapshots: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+                let snapshots_cb = snapshots.clone();
+                room.on_channels_changed(move |chans| {
+                    snapshots_cb
+                        .borrow_mut()
+                        .push(chans.iter().map(|c| c.as_str().to_owned()).collect());
+                });
+
+                let _ = room
+                    .send_text_in_channel(
+                        crate::ChannelLabel::try_new("links").expect("links label"),
+                        "hi".to_owned(),
+                        1,
+                    )
+                    .await
+                    .expect("send_text_in_channel");
+
+                // Wait for a second snapshot containing "links".
+                for _ in 0..50 {
+                    let has_links = snapshots
+                        .borrow()
+                        .iter()
+                        .any(|s| s.contains(&"links".to_owned()));
+                    if has_links {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+
+                let got = snapshots.borrow().clone();
+                // First snapshot is the immediate-on-register one
+                // (default only). Some snapshot after that contains
+                // the newly observed "links" channel alongside
+                // "general" (sorted).
+                assert!(
+                    got.first() == Some(&vec!["general".to_owned()]),
+                    "first snapshot should be the default-only snapshot, got {got:?}"
+                );
+                assert!(
+                    got.iter()
+                        .any(|s| s == &vec!["general".to_owned(), "links".to_owned()]),
+                    "expected a snapshot of [general, links], got {got:?}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_ack_receipt_inherits_target_channel() {
+        // Drive the auto-ack helper directly with a non-default
+        // channel; decode the resulting Receipt and assert its
+        // `channel` matches what we passed in. The decode loop's
+        // auto-ack path always passes the target Text's channel
+        // through to `send_receipt`, so this exercises the contract.
+        use rand_core::SeedableRng;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(55)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let target: sunset_store::Hash = blake3::hash(b"target-text").into();
+                let mut rng = rand_chacha::ChaCha20Rng::from_seed([42; 32]);
+                let channel = crate::ChannelLabel::try_new("links").expect("links label");
+
+                open_room::send_receipt(
+                    peer.store(),
+                    &room.inner.room,
+                    peer.identity(),
+                    target,
+                    channel,
+                    &mut rng,
+                )
+                .await;
+
+                // Find the inserted Receipt and decode it.
+                use futures::StreamExt;
+                use sunset_store::{Replay, Store as _};
+                let filter = crate::filters::room_messages_filter(&room.inner.room);
+                let mut sub = peer
+                    .store()
+                    .subscribe(filter, Replay::All)
+                    .await
+                    .expect("subscribe");
+                let ev = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next())
+                    .await
+                    .expect("no event within 200ms")
+                    .expect("subscription closed");
+                let entry = match ev.expect("event err") {
+                    sunset_store::Event::Inserted(e) => e,
+                    other => panic!("unexpected event: {other:?}"),
+                };
+                let block = peer
+                    .store()
+                    .get_content(&entry.value_hash)
+                    .await
+                    .expect("get_content")
+                    .expect("block");
+                let decoded =
+                    crate::decode_message(&room.inner.room, &entry, &block).expect("decode");
+                assert!(matches!(decoded.body, crate::MessageBody::Receipt { .. }));
+                assert_eq!(decoded.channel.as_str(), "links");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn on_receipt_fires_for_inserted_receipt() {
         use rand_core::SeedableRng;
         use std::cell::RefCell;
@@ -534,9 +829,14 @@ mod tests {
                 // though we only care about receipts here. (The loop spawns on
                 // first on_message OR on_receipt registration — either works.)
                 room.on_message(|_, _| {});
-                room.on_receipt(move |for_hash, _from: &crate::IdentityKey, sent_at_ms| {
-                    received_clone.borrow_mut().push((for_hash, sent_at_ms));
-                });
+                room.on_receipt(
+                    move |for_hash,
+                          _from: &crate::IdentityKey,
+                          _channel: &crate::ChannelLabel,
+                          sent_at_ms| {
+                        received_clone.borrow_mut().push((for_hash, sent_at_ms));
+                    },
+                );
 
                 // Compose+insert a Receipt referencing some target hash.
                 let target: sunset_store::Hash = blake3::hash(b"target").into();
@@ -546,6 +846,7 @@ mod tests {
                     &room.inner.room,
                     0,
                     1_700_000_000_000,
+                    crate::ChannelLabel::default_general(),
                     target,
                     &mut rng,
                 )
