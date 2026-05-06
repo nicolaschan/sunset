@@ -2,10 +2,14 @@
 // transport.
 //
 // What this test asserts:
-//   1. The relay's identity descriptor advertises a `webtransport_address`
-//      whenever it successfully bound a UDP listener (loopback always works).
-//   2. The browser's `Client` resolves that descriptor and uses the WT URL
-//      as the canonical address.
+//   1. The relay's identity descriptor advertises a `webtransport_cert_sha256`
+//      hash whenever it successfully bound a UDP listener (loopback always
+//      works). The descriptor does NOT carry a fully-formed WT URL — that
+//      caused the prod-bug regression where the URL leaked the relay's
+//      `0.0.0.0` bind address.
+//   2. The browser's resolver builds the WT URL from the user-typed
+//      authority + the descriptor's cert hash, mirroring the WS path's
+//      long-standing discipline.
 //   3. The browser's `FallbackTransport` connects via WT (not via WS
 //      fallback). We verify this through the Rust-side tracing log
 //      `fallback: primary (WT) connected`, which Playwright captures from
@@ -16,8 +20,6 @@
 //   - WS fallback when WT is broken — see `webtransport_fallback.spec.js`.
 //   - QUIC datagrams on the wire — covered by the relay-side Rust
 //     integration test (`crates/sunset-relay/tests/webtransport_e2e.rs`).
-//     A datagram-aware browser e2e is a follow-up; this PR proves the
-//     wire path works end-to-end.
 
 import { test, expect } from "@playwright/test";
 import { spawn } from "child_process";
@@ -27,7 +29,7 @@ import { join } from "path";
 
 let relayProcess = null;
 let relayWsAddress = null; // ws://… (legacy address)
-let relayWtAddress = null; // wt://… with #x25519=&cert-sha256= fragment
+let relayCertHex = null; // SHA-256 hex of the WT cert (pulled from the banner)
 let relayDataDir = null;
 let configPath = null;
 
@@ -49,11 +51,11 @@ async function startRelay(listenAddr) {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  // Parse both the WS `address: ws://…` line and the new `wt: wt://…`
-  // line out of the startup banner. Both must arrive within the
-  // banner-print window; if WT bind failed, the banner says
-  // `wt: (disabled — UDP bind failed)` and we'll see that here too.
-  const { ws, wt } = await new Promise((resolve, reject) => {
+  // Parse the WS `address: ws://…` line and the new `wt: cert-sha256=…`
+  // line out of the startup banner. The banner intentionally does NOT
+  // print a full WT URL — see CommandContext.webtransport_cert_sha256
+  // in relay.rs.
+  const { ws, certHex } = await new Promise((resolve, reject) => {
     const timer = setTimeout(
       () =>
         reject(
@@ -65,16 +67,16 @@ async function startRelay(listenAddr) {
     );
     let buffer = "";
     let wsAddr = null;
-    let wtAddr = null;
+    let cert = null;
     proc.stdout.on("data", (chunk) => {
       buffer += chunk.toString();
       const wsMatch = buffer.match(/address:\s+(ws:\/\/[^\s]+)/);
-      const wtMatch = buffer.match(/wt:\s+(wt:\/\/[^\s]+)/);
+      const certMatch = buffer.match(/wt:\s+cert-sha256=([0-9a-f]{64})/);
       if (wsMatch) wsAddr = wsMatch[1];
-      if (wtMatch) wtAddr = wtMatch[1];
-      if (wsAddr && wtAddr) {
+      if (certMatch) cert = certMatch[1];
+      if (wsAddr && cert) {
         clearTimeout(timer);
-        resolve({ ws: wsAddr, wt: wtAddr });
+        resolve({ ws: wsAddr, certHex: cert });
       }
     });
     proc.stderr.on("data", (chunk) => {
@@ -92,17 +94,25 @@ async function startRelay(listenAddr) {
     });
   });
 
-  return { proc, ws, wt };
+  return { proc, ws, certHex };
 }
 
 test.beforeAll(async () => {
   relayDataDir = mkdtempSync(join(tmpdir(), "sunset-relay-wt-"));
   configPath = join(relayDataDir, "relay.toml");
 
-  const result = await startRelay("127.0.0.1:0");
+  // Bind `0.0.0.0` (not `127.0.0.1`) so the relay's `bound` matches the
+  // production shape that triggered the regression. The browser will
+  // still reach the relay via `127.0.0.1:<port>` because we bind on
+  // all interfaces, which proves the resolver constructs URLs from
+  // the user-typed authority and not the relay's bind address.
+  const result = await startRelay("0.0.0.0:0");
   relayProcess = result.proc;
   relayWsAddress = result.ws;
-  relayWtAddress = result.wt;
+  relayCertHex = result.certHex;
+  // Sanity: confirm the relay actually printed `0.0.0.0` (else this
+  // test isn't reproducing the prod shape).
+  expect(relayWsAddress).toMatch(/^ws:\/\/0\.0\.0\.0:\d+/);
 });
 
 test.afterAll(async () => {
@@ -116,25 +126,23 @@ test.afterAll(async () => {
 
 test.setTimeout(60_000);
 
-test("relay banner advertises a wt:// URL with cert-sha256 fragment", () => {
-  expect(relayWtAddress).toBeTruthy();
-  expect(relayWtAddress).toMatch(/^wt:\/\/127\.0\.0\.1:\d+/);
-  expect(relayWtAddress).toContain("#x25519=");
-  expect(relayWtAddress).toContain("&cert-sha256=");
+test("relay banner advertises a cert-sha256 hash and NOT a URL", () => {
+  // Sanity-check: 64 hex chars = SHA-256.
+  expect(relayCertHex).toMatch(/^[0-9a-f]{64}$/);
 });
 
 test("browser connects to relay via WebTransport (primary path) and chats", async ({
   browser,
 }) => {
-  // The web app reads `?relay=<url>` and feeds it to the resolver. We
-  // pass the WS host:port (no scheme) so the resolver fetches the
-  // descriptor JSON and picks `webtransport_address` as the primary —
-  // matching the real production flow where the user types a relay
-  // hostname.
-  const hostPort = relayWsAddress
-    .replace(/^ws:\/\//, "")
-    .split("#")[0];
-  const url = `/?relay=${encodeURIComponent(hostPort)}#sunset-wttest`;
+  // The web app reads `?relay=<url>` and feeds it to the resolver. The
+  // user types `127.0.0.1:<port>` (loopback), even though the relay is
+  // bound to `0.0.0.0:<port>`. The resolver must build the WT URL from
+  // the user-typed authority — using the descriptor's bind address
+  // would land us at `https://0.0.0.0:<port>/`, which is the prod-bug
+  // failure mode.
+  const port = relayWsAddress.match(/^ws:\/\/0\.0\.0\.0:(\d+)/)[1];
+  const userAuthority = `127.0.0.1:${port}`;
+  const url = `/?relay=${encodeURIComponent(userAuthority)}#sunset-wttest`;
 
   const ctxA = await browser.newContext();
   const ctxB = await browser.newContext();

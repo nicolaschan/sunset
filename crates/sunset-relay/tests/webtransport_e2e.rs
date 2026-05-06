@@ -81,7 +81,7 @@ fn extract_json_str_field(body: &str, field: &str) -> Option<String> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn relay_advertises_webtransport_address_and_accepts_wt_dial() {
+async fn relay_advertises_cert_sha256_and_accepts_wt_dial() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -89,12 +89,14 @@ async fn relay_advertises_webtransport_address_and_accepts_wt_dial() {
             let config = relay_config(dir.path(), "127.0.0.1:0");
             let mut relay = Relay::start(config).await.expect("relay start");
             let dial = relay.dial_address();
+            let x25519_hex = hex::encode(relay.x25519_public);
             let _engine_task = relay.run_for_test().await.expect("relay run");
 
             // 1. Read identity descriptor; it must include
-            //    `webtransport_address` because we always try to bind
-            //    UDP at startup, and 127.0.0.1:0 should always succeed
-            //    on test hosts.
+            //    `webtransport_cert_sha256` (the SPKI hash, not a URL),
+            //    and crucially it must NOT include any `webtransport_address`
+            //    field — that field caused the prod-bug regression where the
+            //    descriptor leaked the relay's `0.0.0.0` bind address.
             let host_port = dial
                 .strip_prefix("ws://")
                 .unwrap_or(&dial)
@@ -103,21 +105,26 @@ async fn relay_advertises_webtransport_address_and_accepts_wt_dial() {
                 .unwrap()
                 .to_owned();
             let body = fetch_identity_json(&host_port).await;
-            let wt_url = extract_json_str_field(&body, "webtransport_address")
-                .expect("identity descriptor lacks webtransport_address — UDP bind should have succeeded on 127.0.0.1");
-            assert!(
-                wt_url.starts_with("wt://"),
-                "expected wt:// URL, got: {wt_url}"
+            let cert_hex = extract_json_str_field(&body, "webtransport_cert_sha256")
+                .expect("identity descriptor lacks webtransport_cert_sha256 — UDP bind should have succeeded on 127.0.0.1");
+            assert_eq!(
+                cert_hex.len(),
+                64,
+                "expected 64 hex chars (SHA-256), got {} ({cert_hex:?})",
+                cert_hex.len()
             );
             assert!(
-                wt_url.contains("cert-sha256="),
-                "expected cert-sha256 fragment, got: {wt_url}"
+                !body.contains("webtransport_address"),
+                "descriptor must not ship the WT URL form (prod-bug): {body}"
             );
 
-            // 2. Dial the relay over WT with a fresh native peer
-            //    identity. The Noise IK responder runs server-side; if
-            //    the dial returns Ok, the WT path round-tripped through
-            //    the relay's accept loop and SpawningAcceptor.
+            // 2. Build the WT URL the way the resolver does — from the
+            //    *user-typed authority* + the descriptor's cert hash —
+            //    and dial it. The Noise IK responder runs server-side;
+            //    if the dial returns Ok, the WT path round-tripped
+            //    through the relay's accept loop and SpawningAcceptor.
+            let wt_url = format!("wt://{host_port}#x25519={x25519_hex}&cert-sha256={cert_hex}");
+
             let client_seed = [42u8; 32];
             let client_identity = Identity::from_secret_bytes(&client_seed);
             let store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
@@ -144,10 +151,6 @@ async fn relay_advertises_webtransport_address_and_accepts_wt_dial() {
                 .await
                 .expect("WT dial + Noise IK handshake to relay");
 
-            // 3. The relay should observe the new peer. We don't call
-            //    the dashboard endpoint to keep this test focused; the
-            //    successful add_peer above already proves
-            //    transport-level reachability.
             let _ = ed25519_seed_to_x25519_secret(&client_seed);
         })
         .await;

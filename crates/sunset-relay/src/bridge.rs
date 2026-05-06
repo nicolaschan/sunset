@@ -56,11 +56,16 @@ pub struct IdentitySnapshot {
     pub ed25519_public: [u8; 32],
     pub x25519_public: [u8; 32],
     pub dial_url: String,
-    /// `wt://` or `wts://` URL the relay accepts WebTransport sessions
-    /// on, with `cert-sha256=<hex>` fragment(s) for self-signed cert
-    /// pinning. `None` when the relay didn't manage to bind a WT
-    /// listener (e.g. UDP blocked on this host).
-    pub webtransport_address: Option<String>,
+    /// SHA-256 hex of the SPKI for the relay's self-signed WebTransport
+    /// cert (the `serverCertificateHashes` value the browser pins).
+    /// `None` when the relay didn't manage to bind its UDP listener.
+    ///
+    /// We deliberately ship *only the hash*, not a full URL — the relay
+    /// has no reliable way to know its own public hostname (it could
+    /// be behind any number of proxies, and binds `0.0.0.0` in
+    /// production), so the resolver builds the WT URL from the
+    /// user-typed authority instead.
+    pub webtransport_cert_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
