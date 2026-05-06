@@ -66,13 +66,13 @@ pub fn build_identity_snapshot(
     ed25519_public: [u8; 32],
     x25519_public: [u8; 32],
     dial_url: &str,
-    webtransport_address: Option<&str>,
+    webtransport_cert_sha256: Option<&str>,
 ) -> IdentitySnapshot {
     IdentitySnapshot {
         ed25519_public,
         x25519_public,
         dial_url: dial_url.to_owned(),
-        webtransport_address: webtransport_address.map(str::to_owned),
+        webtransport_cert_sha256: webtransport_cert_sha256.map(str::to_owned),
     }
 }
 
