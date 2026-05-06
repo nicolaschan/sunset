@@ -185,12 +185,6 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
         let obj = Object::new();
         js_sys::Reflect::set(
             &obj,
-            &JsValue::from_str("seq_in_frame"),
-            &JsValue::from_f64(frame.seq_in_frame as f64),
-        )
-        .unwrap();
-        js_sys::Reflect::set(
-            &obj,
             &JsValue::from_str("len"),
             &JsValue::from_f64(frame.len as f64),
         )
@@ -199,6 +193,12 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
             &obj,
             &JsValue::from_str("checksum"),
             &JsValue::from_str(&frame.checksum),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("rms"),
+            &JsValue::from_f64(frame.rms as f64),
         )
         .unwrap();
         arr.push(&obj);

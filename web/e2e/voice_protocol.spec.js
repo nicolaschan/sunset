@@ -1,10 +1,18 @@
-// Protocol regression: byte-equal voice frame round-trip.
+// Protocol regression: Opus voice frames flow Alice → Bob.
 //
 // Spawns a real sunset-relay, two Chromium pages each load
 // /voice-e2e-test.html, both join the same room, both call
-// startVoice, Alice injects a known synthetic PCM frame via
-// injectPcm, and asserts Bob's recorded frame checksum matches
-// the expected SHA-256 of the same PCM bytes.
+// startVoice, Alice injects a continuous 440 Hz sine via
+// `injectPcm`, and asserts Bob's recorder eventually accumulates a
+// frame attributed to Alice with non-trivial RMS (i.e. real decoded
+// audio, not silence / underrun padding).
+//
+// Opus is lossy: pre-codec this spec asserted byte-equal SHA-256 of
+// the f32 PCM Alice sent; post-codec we can't assert sample-level
+// fidelity any more (Opus does not preserve individual sample
+// values). The contract that matters to a real user is "frames get
+// through and contain real audio energy", which is what this spec
+// now checks.
 //
 // Auto-connect (VoiceRuntime auto_connect task) establishes the
 // WebRTC P2P connection; no manual connectDirect call is needed.
@@ -14,7 +22,6 @@ import { spawn } from "child_process";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createHash } from "crypto";
 
 let relayProcess = null;
 let relayAddress = null;
@@ -94,24 +101,25 @@ function freshSeedHex() {
 
 const ROOM = "voice-test-room";
 
-// Build a synthetic PCM frame matching synth_pcm_with_counter(counter) in Rust.
-// pcm[0] = counter / 1_000_000.0, remaining samples follow a deterministic pattern.
+// One 20 ms PCM frame of continuous 440 Hz sine at amplitude 0.5.
+// `counter` advances the phase by exactly one frame so consecutive
+// counters produce a continuous tone (which Opus is built to encode
+// efficiently and reproduce faithfully). Matches the Rust
+// `synth_pcm_with_counter`.
 function syntheticPcm(counter) {
-  const arr = new Float32Array(960);
-  arr[0] = counter / 1_000_000.0;
-  for (let i = 1; i < 960; i++) {
-    arr[i] = Math.sin((counter + i) / 1_000_000.0);
+  const FREQ_HZ = 440;
+  const SR = 48000;
+  const FRAME = 960;
+  const arr = new Float32Array(FRAME);
+  const offset = counter * FRAME;
+  for (let i = 0; i < FRAME; i++) {
+    const t = (offset + i) / SR;
+    arr[i] = 0.5 * Math.sin(2 * Math.PI * FREQ_HZ * t);
   }
   return arr;
 }
 
-// Compute SHA-256 of PCM as little-endian f32 bytes (matches Rust recorder).
-function pcmChecksum(samples) {
-  const buf = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
-  return createHash("sha256").update(buf).digest("hex");
-}
-
-test("alice injectPcm arrives at bob byte-equal (checksum match)", async ({ browser }) => {
+test("alice's opus frames arrive at bob with real audio energy", async ({ browser }) => {
   const aliceCtx = await browser.newContext();
   const bobCtx = await browser.newContext();
   const alice = await aliceCtx.newPage();
@@ -150,43 +158,53 @@ test("alice injectPcm arrives at bob byte-equal (checksum match)", async ({ brow
   await alice.evaluate(() => window.__voice.startVoice());
   await bob.evaluate(() => window.__voice.startVoice());
 
-  // Compute the expected synthetic PCM and its checksum in Node.js.
-  const counter = 0x4200; // arbitrary non-zero counter
-  const pcm = syntheticPcm(counter);
-  const expectedChecksum = pcmChecksum(pcm);
-  const sample = Array.from(pcm);
-
-  // Send frames repeatedly from alice so auto-connect + jitter buffer
-  // have time to establish P2P and deliver at least one frame.
-  // 3 s at 50 ms intervals = 60 frames.
-  for (let i = 0; i < 60; i++) {
-    await alice.evaluate((s) => window.__voice.injectPcm(s), sample);
+  // Stream frames from alice continuously so auto-connect + jitter
+  // buffer have time to establish P2P and Opus has a few frames of
+  // priming before a "real" frame is delivered to Bob's recorder.
+  // 5 s at 50 ms intervals = 100 frames.
+  for (let counter = 0; counter < 100; counter++) {
+    await alice.evaluate(
+      (s) => window.__voice.injectPcm(s),
+      Array.from(syntheticPcm(counter)),
+    );
     await alice.waitForTimeout(50);
   }
 
-  // Poll bob for a recorded frame from alice within 5 s.
+  // Poll bob for a recorded frame from alice with real audio energy
+  // within 5 s.
+  //
+  // Why an RMS threshold rather than just "any frame" — the jitter
+  // pump pads underruns with the previous PCM, then with silence,
+  // which would let the test pass even if Opus delivered nothing.
+  // A threshold of 0.05 catches Opus-decoded sine (≈ 0.35 RMS for a
+  // 0.5-amplitude input) while comfortably rejecting silence.
   const deadline = Date.now() + 5_000;
-  let receivedFrames = null;
+  let goodFrames = null;
   while (Date.now() < deadline) {
     const frames = await bob.evaluate(
       (k) => window.__voice.recordedFor(k),
       alicePk,
     );
     if (frames && frames.length > 0) {
-      receivedFrames = frames;
-      break;
+      const real = frames.filter((f) => f.rms >= 0.05);
+      if (real.length > 0) {
+        goodFrames = real;
+        break;
+      }
     }
     await bob.waitForTimeout(100);
   }
-  expect(receivedFrames, "bob should receive at least one recorded frame from alice").not.toBeNull();
-  expect(receivedFrames.length).toBeGreaterThan(0);
+  expect(goodFrames, "bob should receive at least one Opus-decoded frame from alice with non-trivial RMS").not.toBeNull();
+  expect(goodFrames.length).toBeGreaterThan(0);
 
-  // Verify the frame length and that the checksum matches.
-  // Byte-equal PCM from Alice → encryption → transport → decryption → Bob
-  // means the SHA-256 of the received f32 bytes is identical to the sent bytes.
-  const frame = receivedFrames[0];
+  // Verify the frame shape matches the contract: 960 samples (20 ms
+  // at 48 kHz mono). RMS is the energy check; checksum is just
+  // exposed so distinctness can be eyeballed across consecutive
+  // frames.
+  const frame = goodFrames[0];
   expect(frame.len).toBe(960);
-  expect(frame.checksum).toBe(expectedChecksum);
+  expect(typeof frame.checksum).toBe("string");
+  expect(frame.checksum).toHaveLength(64);
 
   await aliceCtx.close();
   await bobCtx.close();

@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# `links = "opus"` advertises that this crate vendors and statically
+# builds libopus. Cargo surfaces our build script's
+# `cargo:lib_dir=...` output to dependents as `DEP_OPUS_LIB_DIR`,
+# which `sunset-web-wasm/build.rs` reads to re-emit the static-archive
+# search-path + link-lib for its cdylib link step (see comment in
+# `crates/sunset-voice/build.rs`).
+links = "opus"
+build = "build.rs"
 
 [features]
 default = []
@@ -11,6 +19,9 @@ test-hooks = []
 
 [lints]
 workspace = true
+
+[build-dependencies]
+cc.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -36,6 +47,10 @@ tokio.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasmtimer.workspace = true
 wasm-bindgen-futures.workspace = true
+# Pure-Rust libm. Used by `codec::wasm_runtime` to satisfy libopus's
+# `<math.h>` undefined references (sin, cos, exp, log, sqrt, lrint,
+# frexp, …) when targeting wasm32-unknown-unknown.
+libm.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

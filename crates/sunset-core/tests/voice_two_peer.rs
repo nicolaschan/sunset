@@ -100,8 +100,11 @@ async fn alice_encrypts_voice_frame_bob_decrypts_and_observes_live() {
             // loop alongside polling for bob's first received event. This
             // exercises the actual user-visible contract (continuous stream
             // converges) without sleeping to mask the propagation race.
+            // This test exercises encrypt/decrypt + bus transport;
+            // the payload bytes here are an opaque fixture, not real
+            // Opus output. The codec_id pins the new codec name.
             let original = VoicePacket::Frame {
-                codec_id: "pcm-f32-le".to_string(),
+                codec_id: "opus".to_string(),
                 seq: 1,
                 sender_time_ms: 1_700_000_000_000,
                 payload: vec![0xAB; 3840],
