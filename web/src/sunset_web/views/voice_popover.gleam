@@ -521,10 +521,14 @@ fn quality_control(
                 #("align-items", "flex-start"),
                 #("gap", "8px"),
                 #("padding", "6px 8px"),
-                #("border", "1px solid " <> case checked {
-                  True -> p.accent
-                  False -> p.border
-                }),
+                #(
+                  "border",
+                  "1px solid "
+                    <> case checked {
+                    True -> p.accent
+                    False -> p.border
+                  },
+                ),
                 #("border-radius", "6px"),
                 #("cursor", "pointer"),
                 #("background", case checked {
