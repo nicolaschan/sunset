@@ -27,8 +27,11 @@
 use thiserror::Error;
 
 mod codec;
+mod denoise;
 
 use codec::{OpusFrameDecoder, OpusFrameEncoder};
+
+pub use denoise::Denoiser;
 
 /// Sample rate of every audio buffer that crosses the voice path.
 /// Opus's native rate; the browser AudioContext is created at this

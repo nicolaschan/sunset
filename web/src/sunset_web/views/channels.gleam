@@ -33,9 +33,11 @@ pub fn view(
   on_leave_voice on_leave_voice: msg,
   on_mute_self on_mute_self: msg,
   on_deafen_self on_deafen_self: msg,
+  on_toggle_denoise on_toggle_denoise: msg,
   self_in_call self_in_call: Bool,
   self_muted self_muted: Bool,
   self_deafened self_deafened: Bool,
+  denoise_on denoise_on: Bool,
   relays relays: List(Relay),
   on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
@@ -118,9 +120,11 @@ pub fn view(
             on_join_voice,
             on_mute_self,
             on_deafen_self,
+            on_toggle_denoise,
             self_in_call,
             self_muted,
             self_deafened,
+            denoise_on,
           )
         _, _ -> element.fragment([])
       },
@@ -666,9 +670,11 @@ fn self_control_bar(
   on_join: msg,
   on_mute: msg,
   on_deafen: msg,
+  on_toggle_denoise: msg,
   self_in_call: Bool,
   self_muted: Bool,
   self_deafened: Bool,
+  denoise_on: Bool,
 ) -> Element(msg) {
   let _ = on_join
   // Fixed 64px height with a 1px border-top so this row aligns visually
@@ -761,6 +767,21 @@ fn self_control_bar(
         self_deafened,
         Some(on_deafen),
       ),
+      // Denoise toggle. Defaults to on; the warn highlight fires when
+      // the user has explicitly turned RNNoise off (i.e. opted into
+      // raw audio), so it sits visually beside mute / deafen as another
+      // "you're in a non-default state" indicator.
+      self_btn_with_testid(
+        p,
+        case denoise_on {
+          True -> "Disable noise reduction"
+          False -> "Enable noise reduction"
+        },
+        denoise_icon(denoise_on),
+        !denoise_on,
+        Some(on_toggle_denoise),
+        "voice-denoise-toggle",
+      ),
       case self_in_call {
         True -> leave_btn(p, on_leave)
         False -> element.fragment([])
@@ -776,6 +797,17 @@ fn self_btn(
   active: Bool,
   on_click: Option(msg),
 ) -> Element(msg) {
+  self_btn_with_testid(p, title, icon, active, on_click, "")
+}
+
+fn self_btn_with_testid(
+  p: Palette,
+  title: String,
+  icon: Element(msg),
+  active: Bool,
+  on_click: Option(msg),
+  testid: String,
+) -> Element(msg) {
   let bg = case active {
     True -> p.warn_soft
     False -> p.surface_alt
@@ -787,6 +819,16 @@ fn self_btn(
   let click_attr = case on_click {
     Some(msg) -> [event.on_click(msg)]
     None -> []
+  }
+  let testid_attr = case testid {
+    "" -> []
+    id -> [
+      attribute.attribute("data-testid", id),
+      attribute.attribute("aria-pressed", case active {
+        True -> "true"
+        False -> "false"
+      }),
+    ]
   }
   html.button(
     list.flatten([
@@ -809,6 +851,7 @@ fn self_btn(
         ]),
       ],
       click_attr,
+      testid_attr,
     ]),
     [icon],
   )
@@ -932,6 +975,69 @@ fn headphones_icon() -> Element(msg) {
         [],
       ),
     ],
+  )
+}
+
+/// Denoise / "noise reduction" icon: a sparkle (RNNoise is ML, sparkles
+/// read as "smart filtering" in product UI), with a diagonal slash when
+/// the toggle is off so the disabled state reads at a glance.
+fn denoise_icon(on: Bool) -> Element(msg) {
+  let sparkle =
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "path",
+      [
+        attribute.attribute(
+          "d",
+          "M8 2.5l1.1 3.4 3.4 1.1-3.4 1.1L8 11.5l-1.1-3.4L3.5 7l3.4-1.1L8 2.5z",
+        ),
+        attribute.attribute("fill", "currentColor"),
+        attribute.attribute("fill-opacity", "0.85"),
+      ],
+      [],
+    )
+  let small_sparkle =
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "path",
+      [
+        attribute.attribute(
+          "d",
+          "M12.5 11l.5 1.5L14.5 13l-1.5.5L12.5 15l-.5-1.5L10.5 13l1.5-.5L12.5 11z",
+        ),
+        attribute.attribute("fill", "currentColor"),
+        attribute.attribute("fill-opacity", "0.65"),
+      ],
+      [],
+    )
+  let slash = case on {
+    True -> element.fragment([])
+    False ->
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "line",
+        [
+          attribute.attribute("x1", "2"),
+          attribute.attribute("y1", "14"),
+          attribute.attribute("x2", "14"),
+          attribute.attribute("y2", "2"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.6"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      )
+  }
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "14"),
+      attribute.attribute("height", "14"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [sparkle, small_sparkle, slash],
   )
 }
 

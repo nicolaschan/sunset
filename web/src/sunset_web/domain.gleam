@@ -226,6 +226,9 @@ pub type VoiceModel {
     self_in_call: option.Option(RoomId),
     self_muted: Bool,
     self_deafened: Bool,
+    /// Receiver-side RNNoise denoising. Default `True`; the runtime
+    /// starts with denoising on, so the UI toggle reflects that.
+    denoise: Bool,
     /// Per-peer state keyed by pubkey hex string.
     peers: Dict(String, VoicePeerStateUI),
     /// Set when mic permission is denied; cleared by `ResetVoiceError`.

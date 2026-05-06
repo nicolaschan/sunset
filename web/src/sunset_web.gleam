@@ -288,6 +288,7 @@ pub type Msg {
   LeaveVoice
   ToggleSelfMute
   ToggleSelfDeafen
+  ToggleSelfDenoise
   VoicePeerStateChanged(
     peer_hex: String,
     in_call: Bool,
@@ -370,6 +371,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         self_in_call: None,
         self_muted: False,
         self_deafened: False,
+        denoise: True,
         peers: dict.new(),
         permission_error: None,
       ),
@@ -1583,7 +1585,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     VoiceStarted(room_id) -> {
       let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
-      #(Model(..model, voice: new_voice), effect.none())
+      // Each voice_start spawns a fresh runtime that defaults to
+      // denoise on. Push the model's current value so a user who turned
+      // denoise off in a previous session sees the same state on rejoin.
+      let eff = case model.client, model.voice.denoise {
+        Some(client), False ->
+          effect.from(fn(_) { voice.voice_set_denoise(client, False) })
+        _, _ -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
     }
 
     LeaveVoice -> {
@@ -1618,6 +1628,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let eff = case model.client {
         Some(client) ->
           effect.from(fn(_) { voice.voice_set_deafened(client, new_deafened) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    ToggleSelfDenoise -> {
+      let new_denoise = !model.voice.denoise
+      let new_voice = VoiceModel(..model.voice, denoise: new_denoise)
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) { voice.voice_set_denoise(client, new_denoise) })
         None -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
@@ -2180,9 +2201,11 @@ fn room_view_with_state(
       on_leave_voice: LeaveVoice,
       on_mute_self: ToggleSelfMute,
       on_deafen_self: ToggleSelfDeafen,
+      on_toggle_denoise: ToggleSelfDenoise,
       self_in_call: option.is_some(model.voice.self_in_call),
       self_muted: model.voice.self_muted,
       self_deafened: model.voice.self_deafened,
+      denoise_on: model.voice.denoise,
       relays: relays_view.relays_for_view(model.intents),
       on_open_relay: OpenRelayPopover,
     ),
