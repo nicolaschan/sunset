@@ -2077,9 +2077,7 @@ fn room_view_with_state(
   let voice_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.VoiceSheet(member_name: id_str)) ->
       case
-        list.find(members_for_channels, fn(m) {
-          hex_encode(m.pubkey) == id_str
-        })
+        list.find(members_for_channels, fn(m) { hex_encode(m.pubkey) == id_str })
       {
         Ok(m) ->
           bottom_sheet.view(
@@ -2355,9 +2353,7 @@ fn voice_popover_overlay(
   case model.viewport, state.sheet {
     domain.Desktop, Some(domain.VoiceSheet(member_name: id_str)) ->
       case
-        list.find(members_for_channels, fn(m) {
-          hex_encode(m.pubkey) == id_str
-        })
+        list.find(members_for_channels, fn(m) { hex_encode(m.pubkey) == id_str })
       {
         Error(_) -> element.fragment([])
         Ok(m) ->

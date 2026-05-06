@@ -50,9 +50,7 @@ pub fn install_voice_state_handler(
 /// frame; the rail's waveform reads from it to reflect who is talking.
 /// Call once at app init via `effect.from`.
 @external(javascript, "./voice.ffi.mjs", "installVoicePeerLevelHandler")
-pub fn install_voice_peer_level_handler(
-  cb: fn(String, Float) -> Nil,
-) -> Nil
+pub fn install_voice_peer_level_handler(cb: fn(String, Float) -> Nil) -> Nil
 
 /// Install the global `window.__voiceSelfLevelHandler` callback so the
 /// local mic level fires into Lustre dispatch. Drives the self row's

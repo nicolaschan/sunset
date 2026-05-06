@@ -325,7 +325,10 @@ fn waveform_strip(
   html.div(
     [
       attribute.attribute("data-testid", "voice-popover-waveform"),
-      attribute.attribute("data-voice-level", level_to_attribute(effective_level)),
+      attribute.attribute(
+        "data-voice-level",
+        level_to_attribute(effective_level),
+      ),
       attribute.attribute("data-voice-speaking", case speaking {
         True -> "true"
         False -> "false"
@@ -357,12 +360,7 @@ fn bars(p: Palette, level: Float) -> Element(msg) {
   )
 }
 
-fn single_bar(
-  p: Palette,
-  level: Float,
-  i: Int,
-  n: Int,
-) -> Element(msg) {
+fn single_bar(p: Palette, level: Float, i: Int, n: Int) -> Element(msg) {
   // Each bar is shaped by a sinusoidal envelope (peak in the middle,
   // tapered at the edges) so the strip reads as a waveform — and the
   // whole envelope scales with the live audio level so it grows as the

@@ -86,10 +86,15 @@ test("voice channel roster: both peers visible, waveform tracks real audio", asy
   const bob = await openPeer(browser, relay.addr);
 
   // Channel header reads "Voice Channel" — the rename is part of the
-  // user-visible deliverable. Asserting on text catches a future
-  // fixture refresh that drops it back to "Lounge".
-  await expect(alice.page.getByText("Voice Channel")).toBeVisible();
-  await expect(bob.page.getByText("Voice Channel")).toBeVisible();
+  // user-visible deliverable. Scope to the voice-channel-row testid
+  // because the desktop self-controls bar at the bottom also renders
+  // the channel name (so a bare `getByText` would match twice).
+  await expect(
+    alice.page.locator('[data-testid="voice-channel-row"]'),
+  ).toContainText("Voice Channel");
+  await expect(
+    bob.page.locator('[data-testid="voice-channel-row"]'),
+  ).toContainText("Voice Channel");
 
   // Both peers join voice. On Desktop the voice-leave button appears
   // when voice_start() resolves Ok — same gating signal the rest of
