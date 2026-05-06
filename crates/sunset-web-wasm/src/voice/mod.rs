@@ -112,19 +112,26 @@ pub(crate) fn voice_stop(cell: &VoiceCell) -> Result<(), JsError> {
     Ok(())
 }
 
+/// Number of samples the JS-side capture worklet hands us per
+/// frame: `FRAME_SAMPLES_PER_CHANNEL × 2` interleaved L/R. We
+/// always capture stereo from JS regardless of the active quality
+/// preset; the runtime downmixes to mono when the preset selects
+/// `OPUS_APPLICATION_VOIP`.
+const STEREO_SAMPLES_PER_FRAME: usize = sunset_voice::FRAME_SAMPLES_PER_CHANNEL * 2;
+
 pub(crate) fn voice_input(cell: &VoiceCell, pcm: &Float32Array) -> Result<(), JsError> {
     let slot = cell.borrow();
     let v = slot
         .as_ref()
         .ok_or_else(|| JsError::new("voice not started"))?;
-    if pcm.length() as usize != sunset_voice::FRAME_SAMPLES {
+    if pcm.length() as usize != STEREO_SAMPLES_PER_FRAME {
         return Err(JsError::new(&format!(
-            "voice_input: expected {} samples, got {}",
-            sunset_voice::FRAME_SAMPLES,
+            "voice_input: expected {} samples (stereo interleaved), got {}",
+            STEREO_SAMPLES_PER_FRAME,
             pcm.length()
         )));
     }
-    let mut buf = vec![0.0_f32; sunset_voice::FRAME_SAMPLES];
+    let mut buf = vec![0.0_f32; STEREO_SAMPLES_PER_FRAME];
     pcm.copy_to(&mut buf);
     v.runtime.send_pcm(&buf);
     Ok(())
@@ -140,6 +147,26 @@ pub(crate) fn voice_set_deafened(cell: &VoiceCell, deafened: bool) {
     if let Some(v) = cell.borrow().as_ref() {
         v.runtime.set_deafened(deafened);
     }
+}
+
+/// Switch the active send-side voice quality preset. Accepts
+/// `"voice"`, `"high"`, `"maximum"` (case-sensitive). Returns an
+/// error if voice isn't started or the label is unknown.
+pub(crate) fn voice_set_quality(cell: &VoiceCell, label: &str) -> Result<(), JsError> {
+    let quality = sunset_voice::VoiceQuality::from_str_label(label)
+        .ok_or_else(|| JsError::new(&format!("unknown voice quality: {label}")))?;
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    v.runtime
+        .set_quality(quality)
+        .map_err(|e| JsError::new(&format!("set_quality failed: {e}")))
+}
+
+/// Read back the active send-side voice quality preset (label).
+pub(crate) fn voice_quality(cell: &VoiceCell) -> Option<&'static str> {
+    cell.borrow().as_ref().map(|v| v.runtime.quality().as_str())
 }
 
 // ---------- Test-hooks helpers (compiled in only with feature "test-hooks") ----------

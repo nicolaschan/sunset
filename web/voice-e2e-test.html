@@ -68,7 +68,15 @@
           window.__voice.client.voice_stop();
         },
         injectPcm(samples) {
+          // Expects 1920 interleaved L/R samples (stereo) — see
+          // `crates/sunset-web-wasm/src/voice/mod.rs::voice_input`.
           window.__voice.client.voice_inject_pcm(new Float32Array(samples));
+        },
+        setQuality(label) {
+          window.__voice.client.voice_set_quality(label);
+        },
+        getQuality() {
+          return window.__voice.client.voice_quality();
         },
         voiceStateFor(hexPeerId) {
           return voiceState.get(hexPeerId) ?? null;

@@ -86,7 +86,8 @@ impl VoiceRuntime {
             frame_sink: RefCell::new(frame_sink),
             peer_state_sink,
             encoder: RefCell::new(
-                VoiceEncoder::new().expect("opus encoder construction must succeed"),
+                VoiceEncoder::new(crate::VoiceQuality::default())
+                    .expect("opus encoder construction must succeed"),
             ),
             seq: RefCell::new(0),
             rng: RefCell::new(ChaCha20Rng::seed_from_u64(now_nanos)),
@@ -114,16 +115,31 @@ impl VoiceRuntime {
 
     /// Capture-path entry. Encodes one frame, encrypts, publishes via
     /// `Bus::publish_ephemeral`. Drops the frame silently if `muted`.
+    ///
+    /// Expected `pcm` length depends on the encoder's quality preset
+    /// (mono = `FRAME_SAMPLES_PER_CHANNEL`, stereo = that × 2). The
+    /// caller is the worklet bridge in `sunset-web-wasm/src/voice`,
+    /// which always sends interleaved stereo (1920 samples) — when
+    /// the active preset is mono we downmix here so the encoder gets
+    /// the shape it expects.
     pub fn send_pcm(&self, pcm: &[f32]) {
         if *self.inner.muted.borrow() {
             return;
         }
-        if pcm.len() != crate::FRAME_SAMPLES {
-            return;
-        }
+        let expected = self.inner.encoder.borrow().samples_per_frame();
+        let stereo_in = crate::FRAME_SAMPLES_PER_CHANNEL * 2;
+        let pcm_owned: Vec<f32> = match (pcm.len(), expected) {
+            // Caller already matches: pass through.
+            (n, e) if n == e => pcm.to_vec(),
+            // Stereo capture from JS, mono encoder: downmix L+R/2.
+            (n, e) if n == stereo_in && e == crate::FRAME_SAMPLES_PER_CHANNEL => {
+                pcm.chunks_exact(2).map(|p| 0.5 * (p[0] + p[1])).collect()
+            }
+            _ => return,
+        };
 
         let inner = self.inner.clone();
-        let pcm = pcm.to_vec();
+        let pcm = pcm_owned;
         // Spawn the publish — Bus::publish_ephemeral is async. We
         // can't .await synchronously here.
         spawn_local(async move {
@@ -187,6 +203,22 @@ impl VoiceRuntime {
 
     pub fn set_deafened(&self, deafened: bool) {
         *self.inner.deafened.borrow_mut() = deafened;
+    }
+
+    /// Switch the active send-side quality preset. Rebuilds the
+    /// encoder; existing encoder state (predictor history, FEC) is
+    /// dropped, which means the very next encoded frame will be
+    /// indistinguishable from the start of a fresh stream — fine
+    /// since this is a one-shot reconfig, not a per-frame thing.
+    pub fn set_quality(&self, quality: crate::VoiceQuality) -> Result<(), crate::Error> {
+        let new_encoder = VoiceEncoder::new(quality)?;
+        *self.inner.encoder.borrow_mut() = new_encoder;
+        Ok(())
+    }
+
+    /// Currently active send-side quality preset.
+    pub fn quality(&self) -> crate::VoiceQuality {
+        self.inner.encoder.borrow().quality()
     }
 
     /// Stop the runtime. Dropping `self` has the same effect — all tasks
