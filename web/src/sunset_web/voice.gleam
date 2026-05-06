@@ -43,3 +43,19 @@ pub fn voice_set_deafened(client: ClientHandle, deafened: Bool) -> Nil
 pub fn install_voice_state_handler(
   cb: fn(String, Bool, Bool, Bool) -> Nil,
 ) -> Nil
+
+/// Install the global `window.__voicePeerLevelHandler` callback so
+/// per-peer audio-level updates fire into Lustre dispatch. The level is
+/// a smoothed 0..1 value computed from the RMS of each delivered PCM
+/// frame; the rail's waveform reads from it to reflect who is talking.
+/// Call once at app init via `effect.from`.
+@external(javascript, "./voice.ffi.mjs", "installVoicePeerLevelHandler")
+pub fn install_voice_peer_level_handler(
+  cb: fn(String, Float) -> Nil,
+) -> Nil
+
+/// Install the global `window.__voiceSelfLevelHandler` callback so the
+/// local mic level fires into Lustre dispatch. Drives the self row's
+/// waveform.
+@external(javascript, "./voice.ffi.mjs", "installVoiceSelfLevelHandler")
+pub fn install_voice_self_level_handler(cb: fn(Float) -> Nil) -> Nil
