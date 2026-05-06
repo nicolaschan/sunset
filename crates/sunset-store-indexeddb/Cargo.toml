@@ -28,16 +28,15 @@ wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
     "DomException",
+    # Required for `IdbDatabase::object_store_names()` (returns a
+    # `DomStringList`); see schema-creation in `db.rs::open_database`.
     "DomStringList",
     "Event",
     "IdbDatabase",
     "IdbFactory",
-    "IdbKeyRange",
     "IdbObjectStore",
-    "IdbObjectStoreParameters",
     "IdbOpenDbRequest",
     "IdbRequest",
-    "IdbRequestReadyState",
     "IdbTransaction",
     "IdbTransactionMode",
     "IdbVersionChangeEvent",
