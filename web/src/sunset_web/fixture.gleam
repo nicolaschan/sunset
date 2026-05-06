@@ -108,10 +108,10 @@ pub fn channels() -> List(Channel) {
       unread: 0,
     ),
     Channel(
-      id: ChannelId("lounge"),
-      name: "Lounge",
+      id: ChannelId("voice"),
+      name: "Voice Channel",
       kind: Voice,
-      in_call: 3,
+      in_call: 0,
       unread: 0,
     ),
   ]

@@ -28,8 +28,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Reaction, type Room, ChannelId, MemberId, Reaction, Room,
-  RoomId, VoiceModel, VoicePeerStateUI,
+  type ChannelId, type Reaction, type Room, ChannelId, Reaction, Room, RoomId,
+  VoiceModel, VoicePeerStateUI,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -302,6 +302,8 @@ pub type Msg {
     talking: Bool,
     is_muted: Bool,
   )
+  VoicePeerLevelChanged(peer_hex: String, level: Float)
+  VoiceSelfLevelChanged(level: Float)
   SetPeerVolume(peer_hex: String, gain: Float)
   ToggleMuteForPeer(peer_hex: String)
   VoicePermissionDenied(message: String)
@@ -367,7 +369,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
-      voice_settings: seed_voice_settings(),
+      voice_settings: dict.new(),
       client: None,
       intents: dict.new(),
       viewport: initial_viewport,
@@ -379,6 +381,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         self_muted: False,
         self_deafened: False,
         peers: dict.new(),
+        peer_levels: dict.new(),
+        self_level: 0.0,
         permission_error: None,
       ),
       voice_quality: voice.voice_get_quality(),
@@ -458,6 +462,16 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       })
     })
 
+  let install_voice_level_handlers_eff =
+    effect.from(fn(dispatch) {
+      voice.install_voice_peer_level_handler(fn(hex, level) {
+        dispatch(VoicePeerLevelChanged(hex, level))
+      })
+      voice.install_voice_self_level_handler(fn(level) {
+        dispatch(VoiceSelfLevelChanged(level))
+      })
+    })
+
   // On first paint, force the composer textarea back to its single-row
   // height. The autoGrow effect only fires on `input`, so without an
   // explicit reset the textarea can render as a doubled-up 2-line
@@ -478,27 +492,10 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       ticker_eff,
       attach_shortcuts_eff,
       install_voice_handler_eff,
+      install_voice_level_handlers_eff,
       initial_compose_reset_eff,
     ]),
   )
-}
-
-/// Seed per-member voice tweaks for every in-call member: full
-/// volume, denoise on, not locally muted. Keyed by member name so
-/// callers don't need to thread MemberId through the popover wiring.
-fn seed_voice_settings() -> Dict(String, domain.VoiceSettings) {
-  fixture.members()
-  |> list.fold(dict.new(), fn(d, m) {
-    case m.in_call {
-      True ->
-        dict.insert(
-          d,
-          m.name,
-          domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
-        )
-      False -> d
-    }
-  })
 }
 
 fn member_voice_settings(
@@ -509,6 +506,24 @@ fn member_voice_settings(
     Ok(s) -> s
     Error(_) ->
       domain.VoiceSettings(volume: 100, denoise: True, deafened: False)
+  }
+}
+
+/// Smoothed audio level (0..1) for the popover's waveform. Self uses
+/// the local mic level; peers use the playback-level dict keyed by the
+/// member's full pubkey hex.
+fn peer_level_for_member(
+  voice: domain.VoiceModel,
+  m: domain.Member,
+  peer_hex: String,
+) -> Float {
+  case m.you {
+    True -> voice.self_level
+    False ->
+      case dict.get(voice.peer_levels, peer_hex) {
+        Ok(l) -> l
+        Error(_) -> 0.0
+      }
   }
 }
 
@@ -1606,12 +1621,20 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
 
     LeaveVoice -> {
+      // Clear peer state + levels so a fresh join doesn't reuse stale
+      // bars / talking flags. The FFI's stopCapture flushes its own
+      // EMA state and dispatches one final 0 per peer, but we reset
+      // here too so the UI is clean immediately on click rather than
+      // racing the FFI callback.
       let new_voice =
         VoiceModel(
           ..model.voice,
           self_in_call: None,
           self_muted: False,
           self_deafened: False,
+          peers: dict.new(),
+          peer_levels: dict.new(),
+          self_level: 0.0,
         )
       let eff = case model.client {
         Some(client) -> effect.from(fn(_) { voice.voice_stop(client) })
@@ -1654,6 +1677,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           ),
         )
       let new_voice = VoiceModel(..model.voice, peers: new_peers)
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    VoicePeerLevelChanged(hex, level) -> {
+      let new_levels = dict.insert(model.voice.peer_levels, hex, level)
+      let new_voice = VoiceModel(..model.voice, peer_levels: new_levels)
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    VoiceSelfLevelChanged(level) -> {
+      let new_voice = VoiceModel(..model.voice, self_level: level)
       #(Model(..model, voice: new_voice), effect.none())
     }
 
@@ -2003,26 +2037,37 @@ fn room_view_with_state(
     None -> element.fragment([])
   }
 
-  // Derive in_call status from real voice state: a member is in_call if
-  // their id (short pubkey hex) appears as a key in model.voice.peers with
-  // in_call = True. Self is in_call if model.voice.self_in_call is Some.
-  // Falls back to fixture.members() when state.members is empty (pre-connect).
-  let members_for_channels = case state.members {
-    [] -> fixture.members()
-    ms ->
-      list.map(ms, fn(m) {
-        let MemberId(id_str) = m.id
-        let in_call_from_voice = case m.you {
-          True -> option.is_some(model.voice.self_in_call)
-          False ->
-            case dict.get(model.voice.peers, id_str) {
-              Ok(ps) -> ps.in_call
-              Error(_) -> False
-            }
-        }
-        domain.Member(..m, in_call: in_call_from_voice)
-      })
-  }
+  // Derive in_call + muted status from real voice state. The voice
+  // runtime keys peer state by *full* pubkey hex (32 bytes / 64 chars);
+  // Member.id is the truncated short_pubkey used for display, so we
+  // look up by `hex_encode(m.pubkey)` rather than the MemberId. Self
+  // is in_call iff model.voice.self_in_call is Some, and uses the
+  // local self_muted flag (the runtime emits one VoicePeerStateChanged
+  // for each peer but not for self).
+  //
+  // No fixture fallback: pre-connect we just render an empty roster.
+  // The voice rail is idle; the channel goes live only when real
+  // peers start arriving.
+  let members_for_channels =
+    list.map(state.members, fn(m) {
+      let peer_hex = hex_encode(m.pubkey)
+      let #(in_call_now, is_muted_now) = case m.you {
+        True -> #(
+          option.is_some(model.voice.self_in_call),
+          model.voice.self_muted,
+        )
+        False ->
+          case dict.get(model.voice.peers, peer_hex) {
+            Ok(ps) -> #(ps.in_call, ps.is_muted)
+            Error(_) -> #(False, False)
+          }
+      }
+      let next_status = case is_muted_now {
+        True -> domain.MutedP
+        False -> m.status
+      }
+      domain.Member(..m, in_call: in_call_now, status: next_status)
+    })
 
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
@@ -2050,7 +2095,9 @@ fn room_view_with_state(
 
   let voice_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.VoiceSheet(member_name: id_str)) ->
-      case list.find(members_for_channels, fn(m) { m.id == MemberId(id_str) }) {
+      case
+        list.find(members_for_channels, fn(m) { hex_encode(m.pubkey) == id_str })
+      {
         Ok(m) ->
           bottom_sheet.view(
             palette: palette,
@@ -2063,6 +2110,7 @@ fn room_view_with_state(
               member: m,
               settings: member_voice_settings(model.voice_settings, id_str),
               voice_quality: model.voice_quality,
+              level: peer_level_for_member(model.voice, m, id_str),
               on_close: CloseVoicePopover,
               on_set_volume: fn(v) {
                 SetPeerVolume(id_str, int.to_float(v) /. 100.0)
@@ -2127,19 +2175,44 @@ fn room_view_with_state(
   // Use real voice model state: show minibar when user is in call.
   let user_in_call = option.is_some(model.voice.self_in_call)
 
-  let active_voice_channel_name =
-    list.find(fixture.channels(), fn(c) {
-      c.kind == domain.Voice && c.in_call > 0
+  // Derive the live in-call count for the voice channel from real
+  // members rather than the fixture's hardcoded number, so the rail
+  // shows "live" iff somebody (including self) is actually connected.
+  let live_voice_count =
+    list.fold(members_for_channels, 0, fn(acc, m) {
+      case m.in_call {
+        True -> acc + 1
+        False -> acc
+      }
     })
+
+  let channels_for_view =
+    list.map(fixture.channels(), fn(c) {
+      case c.kind {
+        domain.Voice -> domain.Channel(..c, in_call: live_voice_count)
+        _ -> c
+      }
+    })
+
+  let active_voice_channel_name =
+    list.find(channels_for_view, fn(c) { c.kind == domain.Voice })
     |> result.map(fn(c) { c.name })
-    |> result.unwrap("voice")
+    |> result.unwrap("Voice Channel")
+
+  // Self peer hex for the minibar's "open my own popover" affordance.
+  // Falls back to "self" when there's no client (pre-bootstrap, never
+  // actually rendered because the minibar requires user_in_call).
+  let self_peer_hex_for_minibar =
+    model.client
+    |> option.map(client_pubkey_hex)
+    |> option.unwrap("self")
 
   let voice_minibar_el = case model.viewport, user_in_call {
     domain.Phone, True ->
       voice_minibar.view(
         palette: palette,
         channel_name: active_voice_channel_name,
-        on_open: OpenVoicePopover("u3"),
+        on_open: OpenVoicePopover(self_peer_hex_for_minibar),
         on_mute: ToggleSelfMute,
         on_deafen: ToggleSelfDeafen,
         on_leave: LeaveVoice,
@@ -2186,8 +2259,10 @@ fn room_view_with_state(
     channels.view(
       palette: palette,
       room: active_room,
-      channels: fixture.channels(),
+      channels: channels_for_view,
       members: members_for_channels,
+      peer_levels: model.voice.peer_levels,
+      self_level: model.voice.self_level,
       current_channel: state.current_channel,
       voice_popover_open: case state.sheet {
         Some(domain.VoiceSheet(member_name: name)) -> Some(name)
@@ -2298,7 +2373,9 @@ fn voice_popover_overlay(
 ) -> Element(Msg) {
   case model.viewport, state.sheet {
     domain.Desktop, Some(domain.VoiceSheet(member_name: id_str)) ->
-      case list.find(members_for_channels, fn(m) { m.id == MemberId(id_str) }) {
+      case
+        list.find(members_for_channels, fn(m) { hex_encode(m.pubkey) == id_str })
+      {
         Error(_) -> element.fragment([])
         Ok(m) ->
           voice_popover.view(
@@ -2307,6 +2384,7 @@ fn voice_popover_overlay(
             member: m,
             settings: member_voice_settings(model.voice_settings, id_str),
             voice_quality: model.voice_quality,
+            level: peer_level_for_member(model.voice, m, id_str),
             on_close: CloseVoicePopover,
             on_set_volume: fn(v) {
               SetPeerVolume(id_str, int.to_float(v) /. 100.0)

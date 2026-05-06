@@ -184,11 +184,15 @@ test("changing preset to `voice` persists and applies", async ({ browser }) => {
   await bob.ctx.close();
 });
 
-test("each preset delivers real audio end-to-end", async ({ browser }) => {
-  for (const preset of ["voice", "high", "maximum"]) {
-    const alice = await openPeer(browser, relay.addr);
-    const bob = await openPeer(browser, relay.addr);
-
+// Each preset gets its own test so they run in parallel under
+// independent timeout budgets. A single test that looped over all
+// three serially was tipping over the 30 s default budget under
+// worker contention (3 × WebRTC handshake + 3 × 5 s frame-collect),
+// which surfaced as a flake on the first run after a master merge.
+async function assertPresetDeliversAudio(browser, preset) {
+  const alice = await openPeer(browser, relay.addr);
+  const bob = await openPeer(browser, relay.addr);
+  try {
     await joinVoice(alice.page);
     await joinVoice(bob.page);
 
@@ -211,8 +215,20 @@ test("each preset delivers real audio end-to-end", async ({ browser }) => {
     // Decoder-side frames are always 1920-sample stereo regardless of
     // the sender's preset.
     expect(frames[0].len).toBe(1920);
-
+  } finally {
     await alice.ctx.close();
     await bob.ctx.close();
   }
+}
+
+test("preset `voice` delivers real audio end-to-end", async ({ browser }) => {
+  await assertPresetDeliversAudio(browser, "voice");
+});
+
+test("preset `high` delivers real audio end-to-end", async ({ browser }) => {
+  await assertPresetDeliversAudio(browser, "high");
+});
+
+test("preset `maximum` delivers real audio end-to-end", async ({ browser }) => {
+  await assertPresetDeliversAudio(browser, "maximum");
 });

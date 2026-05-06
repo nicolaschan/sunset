@@ -30,7 +30,6 @@ import { join } from "path";
 
 let relayProcess = null;
 let relayWsAddress = null;
-let relayWtAddress = null;
 let relayDataDir = null;
 let configPath = null;
 
@@ -52,23 +51,22 @@ async function startRelay(listenAddr) {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const { ws, wt } = await new Promise((resolve, reject) => {
+  const ws = await new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error("relay banner not seen within 15s")),
       15_000,
     );
     let buffer = "";
-    let wsAddr = null;
-    let wtAddr = null;
     proc.stdout.on("data", (chunk) => {
       buffer += chunk.toString();
       const wsMatch = buffer.match(/address:\s+(ws:\/\/[^\s]+)/);
-      const wtMatch = buffer.match(/wt:\s+(wt:\/\/[^\s]+)/);
-      if (wsMatch) wsAddr = wsMatch[1];
-      if (wtMatch) wtAddr = wtMatch[1];
-      if (wsAddr && wtAddr) {
+      // We only need the WS address here — this fallback test
+      // synthesises a sabotaged WT URL by hand (with a deliberately
+      // wrong cert-sha256), so we don't care what the relay's actual
+      // cert hash is.
+      if (wsMatch) {
         clearTimeout(timer);
-        resolve({ ws: wsAddr, wt: wtAddr });
+        resolve(wsMatch[1]);
       }
     });
     proc.stderr.on("data", (chunk) =>
@@ -86,7 +84,7 @@ async function startRelay(listenAddr) {
     });
   });
 
-  return { proc, ws, wt };
+  return { proc, ws };
 }
 
 test.beforeAll(async () => {
@@ -95,7 +93,6 @@ test.beforeAll(async () => {
   const r = await startRelay("127.0.0.1:0");
   relayProcess = r.proc;
   relayWsAddress = r.ws;
-  relayWtAddress = r.wt;
 });
 
 test.afterAll(async () => {

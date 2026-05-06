@@ -122,10 +122,11 @@ struct CommandContext {
     x25519_public: [u8; 32],
     listen_addr: SocketAddr,
     dial_url: String,
-    /// `wt://`/`wts://` URL with `cert-sha256=…` fragment. `None` when
-    /// the relay couldn't bind a UDP listener (logs the failure and
-    /// degrades to WS-only without aborting).
-    webtransport_address: Option<String>,
+    /// SHA-256 hex of the SPKI for the WT cert, or `None` when the
+    /// relay couldn't bind its UDP listener. Shipped to the descriptor
+    /// JSON; the resolver builds the actual WT URL from the user-typed
+    /// authority.
+    webtransport_cert_sha256: Option<String>,
     configured_peers: Vec<String>,
 }
 
@@ -232,19 +233,25 @@ impl Relay {
         if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
             wt_sans.push(listen_ip);
         }
-        let wt_addr_opt = match crate::wt_cert::load_or_generate(&config.data_dir, &wt_sans).await {
+        let wt_cert_hex_opt = match crate::wt_cert::load_or_generate(&config.data_dir, &wt_sans)
+            .await
+        {
             Ok(wt_identity) => {
                 let cert_hash = wt_identity.certificate_chain().as_slice()[0].hash();
                 let cert_hex = sha256_digest_to_hex(&cert_hash);
                 let wt_bind: SocketAddr = bound;
                 match build_server_endpoint(wt_bind, wt_identity, Some(Duration::from_secs(15))) {
                     Ok(endpoint) => {
-                        let wt_url = format!(
-                            "wt://{bound}#x25519={}&cert-sha256={cert_hex}",
-                            hex::encode(x25519_public),
-                        );
                         spawn_wt_accept_loop(endpoint, wt_accept_tx);
-                        Some(wt_url)
+                        // Ship only the cert hash to the descriptor.
+                        // The relay has no reliable way to know the
+                        // public hostname clients will reach it on
+                        // (it binds `0.0.0.0` and may sit behind any
+                        // number of proxies); the resolver builds the
+                        // actual WT URL from the user-typed authority.
+                        // Shipping a URL here was the prod-bug origin
+                        // — see PR fixing the `0.0.0.0:8443` regression.
+                        Some(cert_hex)
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "wt: server endpoint bind failed; degrading to WS-only");
@@ -289,7 +296,7 @@ impl Relay {
             x25519_public,
             listen_addr: bound,
             dial_url: local_address.clone(),
-            webtransport_address: wt_addr_opt.clone(),
+            webtransport_cert_sha256: wt_cert_hex_opt.clone(),
             configured_peers: config.peers.clone(),
         });
         spawn_command_pump(cmd_rx, cmd_ctx.clone());
@@ -298,8 +305,10 @@ impl Relay {
         let mut banner = identity::format_address(&bound, &identity);
         banner.push_str(&format!("\n  dashboard: http://{bound}/dashboard"));
         banner.push_str(&format!("\n  identity:  http://{bound}/"));
-        if let Some(wt) = &wt_addr_opt {
-            banner.push_str(&format!("\n  wt:        {wt}"));
+        if let Some(cert_hex) = &wt_cert_hex_opt {
+            banner.push_str(&format!(
+                "\n  wt:        cert-sha256={cert_hex} (clients build the URL from the hostname they reached the descriptor on)"
+            ));
         } else {
             banner.push_str("\n  wt:        (disabled — UDP bind failed)");
         }
@@ -382,7 +391,7 @@ fn spawn_command_pump(mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>, ctx: Rc
                         ctx.ed25519_public,
                         ctx.x25519_public,
                         &ctx.dial_url,
-                        ctx.webtransport_address.as_deref(),
+                        ctx.webtransport_cert_sha256.as_deref(),
                     );
                     let _ = reply.send(snap);
                 }

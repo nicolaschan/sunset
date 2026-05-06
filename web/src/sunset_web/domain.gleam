@@ -226,8 +226,17 @@ pub type VoiceModel {
     self_in_call: option.Option(RoomId),
     self_muted: Bool,
     self_deafened: Bool,
-    /// Per-peer state keyed by pubkey hex string.
+    /// Per-peer state keyed by full pubkey hex string.
     peers: Dict(String, VoicePeerStateUI),
+    /// Per-peer smoothed playback level keyed by full pubkey hex
+    /// (0..1, normalised so realistic speech reaches ~1.0). Updated
+    /// from `__voicePeerLevelHandler` every ~80 ms while audio is
+    /// flowing; drives the voice rail's waveform so the user can see
+    /// who is talking.
+    peer_levels: Dict(String, Float),
+    /// Smoothed local mic level (0..1). Drives the self row's
+    /// waveform.
+    self_level: Float,
     /// Set when mic permission is denied; cleared by `ResetVoiceError`.
     permission_error: option.Option(String),
   )

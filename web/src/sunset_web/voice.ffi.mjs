@@ -13,6 +13,21 @@ const peers = new Map(); // peerHex -> { worklet, gain }
 let captureNode = null;
 let captureStream = null;
 
+// Per-peer audio-level state. RMS of each delivered PCM frame is fed
+// into a single-pole EMA so the rendered bar doesn't visibly twitch on
+// every 20 ms frame, then dispatched to the Gleam UI on a fixed cadence
+// (see LEVEL_DISPATCH_INTERVAL_MS). Reset on stopCapture / dropPeer so
+// stale levels don't linger in the voice rail.
+const LEVEL_EMA_ALPHA = 0.35;
+const LEVEL_DISPATCH_INTERVAL_MS = 80;
+// Speech RMS sits in 0.05–0.2 territory; multiply so realistic speech
+// reaches ~1.0 on the bar without clipping for louder bursts.
+const LEVEL_RMS_GAIN = 4.0;
+const peerLevelEma = new Map(); // peerHex -> last EMA value (0..1)
+const peerLevelLastDispatchMs = new Map(); // peerHex -> ms
+let selfLevelEma = 0;
+let selfLevelLastDispatchMs = 0;
+
 // Test-only handle. The bundled module is otherwise unreachable from
 // page.evaluate() because Lustre's prod build inlines it into sunset_web.js
 // (no `/javascript/...` URL to dynamic-import). With `window.SUNSET_TEST`
@@ -20,13 +35,28 @@ let captureStream = null;
 // drive + inspect, plus `stopCaptureSource` which detaches the mic
 // capture worklet from the live MediaStream so deterministic
 // `voice_inject_pcm` tests aren't polluted by fake-mic noise. No-op
-// in production.
+// in production. `getPeerLevel` exposes the latest smoothed playback
+// level for a peer so e2e specs can assert the "who is talking"
+// waveform actually reflects audio (not just a fixture animation).
 if (typeof window !== "undefined" && window.SUNSET_TEST) {
   window.__voiceFfi = {
     setPeerVolume: (peerHex, gain) => setPeerVolume(peerHex, gain),
     getPeerGain: (peerHex) => getPeerGain(peerHex),
+    getPeerLevel: (peerHex) => peerLevelEma.get(peerHex) ?? 0,
+    getSelfLevel: () => selfLevelEma,
     stopCaptureSource: () => stopCaptureSource(),
   };
+}
+
+function computeRms(pcm) {
+  if (!pcm || pcm.length === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+  return Math.sqrt(sum / pcm.length);
+}
+
+function clamp01(x) {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
 export function ensureCtx() {
@@ -76,9 +106,76 @@ export async function startCapture(client) {
       } catch (err) {
         console.warn("voice_input failed", err);
       }
+      // Smooth and dispatch self mic level so the local row's waveform
+      // reflects what the user is actually saying, not a fixture
+      // animation. Runs on every captured 20 ms frame regardless of
+      // mute state — muting filters the outgoing audio downstream but
+      // the user still expects to see their own meter move.
+      updateSelfLevel(e.data);
     }
   };
   src.connect(captureNode);
+}
+
+function updateSelfLevel(pcm) {
+  const rms = computeRms(pcm);
+  const normalized = clamp01(rms * LEVEL_RMS_GAIN);
+  selfLevelEma = LEVEL_EMA_ALPHA * normalized + (1 - LEVEL_EMA_ALPHA) * selfLevelEma;
+  const now = Date.now();
+  if (now - selfLevelLastDispatchMs >= LEVEL_DISPATCH_INTERVAL_MS) {
+    selfLevelLastDispatchMs = now;
+    if (window.__voiceSelfLevelHandler) {
+      try {
+        window.__voiceSelfLevelHandler(selfLevelEma);
+      } catch (err) {
+        console.warn("self level handler failed", err);
+      }
+    }
+  }
+}
+
+function updatePeerLevel(peerHex, pcm) {
+  const rms = computeRms(pcm);
+  const normalized = clamp01(rms * LEVEL_RMS_GAIN);
+  const prev = peerLevelEma.get(peerHex) ?? 0;
+  const next = LEVEL_EMA_ALPHA * normalized + (1 - LEVEL_EMA_ALPHA) * prev;
+  peerLevelEma.set(peerHex, next);
+  const now = Date.now();
+  const last = peerLevelLastDispatchMs.get(peerHex) ?? 0;
+  if (now - last >= LEVEL_DISPATCH_INTERVAL_MS) {
+    peerLevelLastDispatchMs.set(peerHex, now);
+    if (window.__voicePeerLevelHandler) {
+      try {
+        window.__voicePeerLevelHandler(peerHex, next);
+      } catch (err) {
+        console.warn("peer level handler failed", err);
+      }
+    }
+  }
+}
+
+function flushPeerLevelToZero(peerHex) {
+  peerLevelEma.set(peerHex, 0);
+  peerLevelLastDispatchMs.set(peerHex, 0);
+  if (window.__voicePeerLevelHandler) {
+    try {
+      window.__voicePeerLevelHandler(peerHex, 0);
+    } catch (err) {
+      console.warn("peer level handler failed", err);
+    }
+  }
+}
+
+function flushSelfLevelToZero() {
+  selfLevelEma = 0;
+  selfLevelLastDispatchMs = 0;
+  if (window.__voiceSelfLevelHandler) {
+    try {
+      window.__voiceSelfLevelHandler(0);
+    } catch (err) {
+      console.warn("self level handler failed", err);
+    }
+  }
 }
 
 export function stopCapture() {
@@ -87,15 +184,19 @@ export function stopCapture() {
     captureStream = null;
   }
   captureNode = null;
-  for (const [_peer, slot] of peers) {
+  for (const [peerHex, slot] of peers) {
     try {
       slot.worklet.disconnect();
       slot.gain.disconnect();
     } catch (_e) {
       // ignore disconnect errors
     }
+    flushPeerLevelToZero(peerHex);
   }
   peers.clear();
+  peerLevelEma.clear();
+  peerLevelLastDispatchMs.clear();
+  flushSelfLevelToZero();
 }
 
 // Test-only: silence the capture worklet path so the fake mic
@@ -135,6 +236,10 @@ export function deliverFrame(peerHex, pcm) {
     slot = { worklet: w, gain: g };
     peers.set(peerHex, slot);
   }
+  // Compute the peer's playback level *before* transferring the buffer
+  // — postMessage with the [pcm.buffer] transfer list neuters the
+  // Float32Array on this side, so any later reads would see length 0.
+  updatePeerLevel(peerHex, pcm);
   slot.worklet.port.postMessage(pcm, [pcm.buffer]);
 }
 
@@ -148,6 +253,9 @@ export function dropPeer(peerHex) {
     // ignore disconnect errors
   }
   peers.delete(peerHex);
+  flushPeerLevelToZero(peerHex);
+  peerLevelEma.delete(peerHex);
+  peerLevelLastDispatchMs.delete(peerHex);
 }
 
 export function setPeerVolume(peerHex, gain) {
@@ -279,4 +387,19 @@ export function wasmVoiceGetQuality() {
 
 export function installVoiceStateHandler(cb) {
   window.__voicePeerStateHandler = cb;
+}
+
+// Smoothed playback-level updates per peer (0..1, normalised so realistic
+// speech reaches ~1.0 without clipping). Fires at LEVEL_DISPATCH_INTERVAL_MS
+// cadence so the rail's waveform drives off real audio energy without
+// stalling Lustre on every 20 ms PCM frame.
+export function installVoicePeerLevelHandler(cb) {
+  window.__voicePeerLevelHandler = cb;
+}
+
+// Smoothed local mic-level updates (0..1). Drives the self row's
+// waveform so the local user can see their own meter respond to their
+// voice.
+export function installVoiceSelfLevelHandler(cb) {
+  window.__voiceSelfLevelHandler = cb;
 }
