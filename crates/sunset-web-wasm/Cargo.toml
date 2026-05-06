@@ -40,7 +40,7 @@ sunset-core.workspace = true
 sunset-markdown = { workspace = true, features = ["serde"] }
 sunset-noise.workspace = true
 sunset-store.workspace = true
-sunset-store-memory.workspace = true
+sunset-store-indexeddb.workspace = true
 sunset-relay-resolver.workspace = true
 sunset-sync.workspace = true
 sunset-sync-webrtc-browser.workspace = true

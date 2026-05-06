@@ -168,12 +168,44 @@ export function onViewportChange(callback) {
   }
 }
 
-// Wipe all `sunset-web/` localStorage keys (and any other state
-// the app stores in local persistence) and reload the page so the
-// caller gets a clean slate. Triggered by the "reset local state"
-// settings action — equivalent to "log out + clear identity"
-// because the keypair is stored in localStorage too.
+// Wipe all `sunset-web/` localStorage keys, clear sessionStorage, and
+// delete the IndexedDB-backed `sunset-store` database — i.e. every
+// piece of durable client state — then reload the page so the caller
+// gets a clean slate. Triggered by the "reset local state" settings
+// action.
+//
+// IndexedDB-delete + reload ordering: the wasm Client holds an open
+// IDB connection. Issuing `indexedDB.deleteDatabase(...)` while a
+// connection is open puts the delete request into a "blocked" state
+// until that connection closes. Awaiting the delete from JS would
+// hang because the page is still alive and our connection is still
+// open. Instead we just *issue* the delete and let `location.reload()`
+// proceed — the page unload closes our IDB connection, after which
+// the queued delete completes before the next page load opens a
+// fresh database.
 export function resetLocalStateAndReload() {
+  // Issue the IDB delete without awaiting. The browser keeps the
+  // delete request alive across our page navigation; once
+  // `location.reload()` fires below, the page unload closes our
+  // open IDB connection and the delete drains.
+  try {
+    const req = indexedDB.deleteDatabase("sunset-store");
+    // No await: the request resolves only after the connection from
+    // the current page closes, which happens on `location.reload()`.
+    // We attach an onerror handler purely so an unexpected error
+    // surfaces in the devtools console rather than silently
+    // swallowing.
+    req.onerror = () => {
+      // eslint-disable-next-line no-console
+      console.warn("indexedDB.deleteDatabase error", req.error);
+    };
+  } catch (e) {
+    // ignored: best-effort. The reload below still gives the user a
+    // clean slate from the localStorage / sessionStorage perspective.
+    // eslint-disable-next-line no-console
+    console.warn("indexedDB.deleteDatabase threw", e);
+  }
+
   try {
     // Iterate forward then remove — calling removeItem inside a
     // forward iteration mutates the indices, so collect keys first.

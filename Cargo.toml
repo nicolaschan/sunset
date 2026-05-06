@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-markdown", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-sync-webrtc-browser", "crates/sunset-sync-webtransport-native", "crates/sunset-sync-webtransport-browser", "crates/sunset-voice", "crates/sunset-web-wasm", "crates/sunset-relay", "crates/sunset-relay-resolver"]
+members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-store-indexeddb", "crates/sunset-sync", "crates/sunset-markdown", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-sync-webrtc-browser", "crates/sunset-sync-webtransport-native", "crates/sunset-sync-webtransport-browser", "crates/sunset-voice", "crates/sunset-web-wasm", "crates/sunset-relay", "crates/sunset-relay-resolver"]
 resolver = "2"
 
 [workspace.package]
@@ -97,6 +97,7 @@ url = "2"
 sunset-store = { path = "crates/sunset-store" }
 sunset-store-fs = { path = "crates/sunset-store-fs" }
 sunset-store-memory = { path = "crates/sunset-store-memory" }
+sunset-store-indexeddb = { path = "crates/sunset-store-indexeddb" }
 sunset-sync = { path = "crates/sunset-sync" }
 sunset-markdown = { path = "crates/sunset-markdown" }
 sunset-noise = { path = "crates/sunset-noise" }

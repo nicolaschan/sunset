@@ -240,6 +240,10 @@ A shared integration-test suite, exposed as a public test helper from `sunset-st
 - Maximum-size limits for KV values, ContentBlock data, names.
 - Concurrency-control optimizations for `sunset-store-fs` under high write contention (WAL settings, batch commit windows).
 
+### Implementation note: `sunset-store-indexeddb` durability is best-effort
+
+`sunset-store-indexeddb` (added 2026-05-05) maintains an in-memory mirror of the IndexedDB-backed object stores, and `insert` / `put_content` return `Ok(())` after the in-memory mirror is updated — the IDB transaction commit is **not awaited** before the call returns. Browsers drain pending IDB transactions during the page-unload that follows `location.reload()` (and during normal navigation), so persistence across a reload is reliable in practice and is verified by `web/e2e/indexeddb_persistence.spec.js`. A genuine browser/tab crash between an `insert` returning and the IDB commit can lose the entry; the CRDT contract still holds — sync re-fetches lost entries from peers — but a single-relay user could perceive a recently-typed message vanishing. This is an explicit performance-vs-strict-durability tradeoff: pinning a macrotask hop on every insert (presence heartbeats, voice presence, membership, message receipts) was wide enough to drop voice frames during peer-connection setup. Future work to recover stricter durability without the latency cost would either need a batched/coalesced commit pump or platform support for synchronous IDB writes (not currently available).
+
 ## sunset-sync
 
 ### Purpose and shape

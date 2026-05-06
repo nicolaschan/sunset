@@ -44,6 +44,22 @@ pub struct Client;
 #[cfg(not(target_arch = "wasm32"))]
 pub struct IncomingMessage;
 
+/// Delete the local IndexedDB store. Called by the "reset local state"
+/// button in the settings popover, before reloading the page. Returns a
+/// `Promise<undefined>` to JS callers.
+///
+/// Connections held by an existing `Client` automatically close via the
+/// `onversionchange` listener wired in `sunset_store_indexeddb`, so a
+/// reset that's issued mid-session does not deadlock on "database
+/// blocked".
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn reset_local_database() -> Result<(), wasm_bindgen::JsError> {
+    sunset_store_indexeddb::delete_database(sunset_store_indexeddb::DEFAULT_DATABASE_NAME)
+        .await
+        .map_err(|e| wasm_bindgen::JsError::new(&format!("delete_database: {e}")))
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn __sunset_web_wasm_start() {

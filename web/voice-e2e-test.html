@@ -25,11 +25,11 @@
         async start({ seed, room, relay }) {
           await init();
           const bytes = new Uint8Array(seed.match(/.{2}/g).map((b) => parseInt(b, 16)));
-          // Multi-room API: Client::new takes only the seed; the room
-          // is opened via client.open_room(name) which publishes the
-          // <fp>/* subscription internally (replaces the old
-          // publish_room_subscription call).
-          const client = new Client(bytes, 0);
+          // Multi-room API: `Client.open(seed, hb)` opens the IndexedDB
+          // store and constructs a client wired into it; the room is
+          // opened via client.open_room(name) which publishes the
+          // <fp>/* subscription internally.
+          const client = await Client.open(bytes, 0);
           window.__voice.client = client;
           window.__voice.room = room;
           window.__voice.publicKeyHex = hex(new Uint8Array(client.public_key));
