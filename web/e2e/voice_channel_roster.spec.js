@@ -134,6 +134,18 @@ test("voice channel roster: both peers visible, waveform tracks real audio", asy
     bob.page.locator(`[data-testid="voice-member"][data-peer-hex="${bobHex}"]`),
   ).toBeVisible({ timeout: 4_000 });
 
+  // Self-level path: chromium's --use-fake-device-for-media-stream
+  // pipes a steady 440 Hz tone into the capture worklet, so alice's
+  // own mic level should rise above the speaking threshold within a
+  // couple of seconds. Catches a regression in the
+  // capture → updateSelfLevel → __voiceSelfLevelHandler dispatch that
+  // would otherwise only show up on a real device.
+  await alice.page.waitForFunction(
+    () => (window.__voiceFfi.getSelfLevel() ?? 0) > 0.1,
+    null,
+    { timeout: 3_000 },
+  );
+
   // Detach the fake-mic from alice's capture worklet so only the
   // injected sine reaches bob's playback path. This isolates the
   // "is the waveform driven by real audio" check from chromium's

@@ -3,7 +3,6 @@
 //// and bridge channels.
 
 import gleam/dict.{type Dict}
-import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -21,6 +20,7 @@ import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 import sunset_web/views/relays as relays_view
+import sunset_web/views/voice_meter
 
 pub fn view(
   palette p: Palette,
@@ -560,7 +560,7 @@ fn voice_member_row(
     True -> 0.0
     False -> raw_level
   }
-  let speaking = level >. speaking_threshold()
+  let speaking = level >. voice_meter.speaking_threshold()
   let dot_color = case muted, speaking {
     True, _ -> p.text_faint
     False, True -> p.live
@@ -579,7 +579,10 @@ fn voice_member_row(
       attribute.attribute("data-testid", "voice-member"),
       attribute.attribute("data-voice-name", m.name),
       attribute.attribute("data-peer-hex", peer_key),
-      attribute.attribute("data-voice-level", float_to_attribute(level)),
+      attribute.attribute(
+        "data-voice-level",
+        voice_meter.level_to_attribute(level),
+      ),
       attribute.attribute("data-voice-speaking", case speaking {
         True -> "true"
         False -> "false"
@@ -653,13 +656,6 @@ fn voice_member_row(
   )
 }
 
-/// RMS level above which we render the row as "speaking" (bold name,
-/// live dot). Matches the threshold used by the voice e2e suite to
-/// distinguish real Opus-decoded audio from silence underrun padding.
-fn speaking_threshold() -> Float {
-  0.05
-}
-
 /// 12-bar VU-meter visualisation of an audio level (0..1). Bar `i`
 /// scales between `min_height` and `max_height` proportional to where
 /// `level` falls along its slot — so bars light up left-to-right as
@@ -718,29 +714,11 @@ fn meter_bar(p: Palette, level: Float, i: Int, n: Int) -> Element(msg) {
         #("border-radius", "1px"),
         #("background", color),
         #("opacity", opacity),
-        #("height", float_to_px(h)),
+        #("height", voice_meter.float_to_px(h)),
       ]),
     ],
     [],
   )
-}
-
-fn float_to_px(f: Float) -> String {
-  // CSS tolerates "8.4px" but rounding keeps render clean.
-  int.to_string(float.round(f)) <> "px"
-}
-
-fn float_to_attribute(f: Float) -> String {
-  // Two-decimal precision is plenty for the e2e selector + still
-  // distinguishes silence (~0.00) from speech (≥ 0.05).
-  let scaled = float.round(f *. 100.0)
-  let int_part = scaled / 100
-  let frac = scaled % 100
-  let frac_part = case frac < 10 {
-    True -> "0" <> int.to_string(frac)
-    False -> int.to_string(frac)
-  }
-  int.to_string(int_part) <> "." <> frac_part
 }
 
 fn you_tag(p: Palette) -> Element(msg) {

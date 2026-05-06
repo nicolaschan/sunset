@@ -13,7 +13,6 @@
 //// once at the shell level; visibility is driven by `Model.voice_popover`.
 
 import gleam/dynamic/decode
-import gleam/float
 import gleam/int
 import lustre/attribute
 import lustre/element.{type Element}
@@ -25,6 +24,7 @@ import sunset_web/domain.{
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
+import sunset_web/views/voice_meter
 
 pub type Placement {
   Floating
@@ -108,7 +108,7 @@ fn header(
   // the static presence enum — m.status is a coarse online/away/muted
   // flag, not a moment-to-moment voice activity signal.
   let muted = m.status == MutedP
-  let speaking = !muted && level >. speaking_threshold()
+  let speaking = !muted && level >. voice_meter.speaking_threshold()
   let status_text = case muted, speaking {
     True, _ -> "muted"
     False, True -> "speaking"
@@ -298,13 +298,6 @@ fn relay_label(m: Member) -> String {
   }
 }
 
-/// Audio-level threshold above which we render the popover header /
-/// waveform as "speaking". Mirrors the channels-rail row threshold so
-/// both surfaces flip together.
-fn speaking_threshold() -> Float {
-  0.05
-}
-
 fn waveform_strip(
   p: Palette,
   m: Member,
@@ -321,13 +314,13 @@ fn waveform_strip(
     True -> 0.0
     False -> level
   }
-  let speaking = effective_level >. speaking_threshold()
+  let speaking = effective_level >. voice_meter.speaking_threshold()
   html.div(
     [
       attribute.attribute("data-testid", "voice-popover-waveform"),
       attribute.attribute(
         "data-voice-level",
-        level_to_attribute(effective_level),
+        voice_meter.level_to_attribute(effective_level),
       ),
       attribute.attribute("data-voice-speaking", case speaking {
         True -> "true"
@@ -372,7 +365,7 @@ fn single_bar(p: Palette, level: Float, i: Int, n: Int) -> Element(msg) {
     True -> "0.85"
     False -> "0.35"
   }
-  let color = case level >. speaking_threshold() {
+  let color = case level >. voice_meter.speaking_threshold() {
     True -> p.accent
     False -> p.text_faint
   }
@@ -384,7 +377,7 @@ fn single_bar(p: Palette, level: Float, i: Int, n: Int) -> Element(msg) {
         #("border-radius", "2px"),
         #("background", color),
         #("opacity", opacity),
-        #("height", float_to_px(h)),
+        #("height", voice_meter.float_to_px(h)),
       ]),
     ],
     [],
@@ -405,21 +398,6 @@ fn arch_envelope(i: Int, n: Int) -> Float {
     True -> 0.0
     False -> normalised
   }
-}
-
-fn float_to_px(f: Float) -> String {
-  int.to_string(float.round(f)) <> "px"
-}
-
-fn level_to_attribute(f: Float) -> String {
-  let scaled = float.round(f *. 100.0)
-  let int_part = scaled / 100
-  let frac = scaled % 100
-  let frac_part = case frac < 10 {
-    True -> "0" <> int.to_string(frac)
-    False -> int.to_string(frac)
-  }
-  int.to_string(int_part) <> "." <> frac_part
 }
 
 fn list_repeat_index(n: Int) -> List(Int) {
