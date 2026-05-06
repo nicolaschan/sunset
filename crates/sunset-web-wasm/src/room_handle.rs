@@ -5,12 +5,12 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 use sunset_core::OpenRoom;
-use sunset_store_memory::MemoryStore;
+use sunset_store_indexeddb::IndexedDbStore;
 use sunset_sync::MultiTransport;
 
 use crate::client::{RtcT, WsT};
 
-pub(crate) type OpenRoomT = OpenRoom<MemoryStore, MultiTransport<WsT, RtcT>>;
+pub(crate) type OpenRoomT = OpenRoom<IndexedDbStore, MultiTransport<WsT, RtcT>>;
 
 #[wasm_bindgen]
 pub struct RoomHandle {

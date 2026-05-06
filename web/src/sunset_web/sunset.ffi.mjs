@@ -66,7 +66,12 @@ export async function createClient(seed, heartbeatIntervalMs, callback) {
     Number.isFinite(heartbeatIntervalMs) && heartbeatIntervalMs > 0
       ? heartbeatIntervalMs
       : 0;
-  const client = new Client(seedBytes, hb);
+  // `Client.open` is async because it opens the per-origin IndexedDB
+  // store (`sunset-store`) before wiring the sync engine. The store
+  // persists durable state across reloads — see
+  // `sunset_web/storage.ffi.mjs::resetLocalStateAndReload` for the
+  // counterpart that wipes it.
+  const client = await Client.open(seedBytes, hb);
   // Test-only hook: expose the client to Playwright when SUNSET_TEST is
   // set on `window` before the bundle loads. No-op in production.
   if (typeof window !== "undefined" && window.SUNSET_TEST) {
@@ -414,7 +419,7 @@ export function registerEmojiPicker() {
 export function truncFloat(f) { return Math.trunc(f); }
 
 /// Read `?heartbeat_interval_ms=NNN` from the current URL. Returns 0
-/// when absent or unparseable, signalling Client::new to use the
+/// when absent or unparseable, signalling Client.open to use the
 /// SyncConfig default (15 s). e2e-only knob.
 export function heartbeatIntervalMsFromUrl() {
   const params = new URLSearchParams(window.location.search);
