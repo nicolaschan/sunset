@@ -1130,3 +1130,146 @@ async fn dropping_runtime_terminates_all_tasks() {
         })
         .await;
 }
+
+/// `set_denoise(false)` plumbs through to the receiver path: with denoise
+/// off the inbound PCM is delivered raw (modulo Opus quantization), with
+/// denoise on the same packets are attenuated by RNNoise. The test feeds
+/// pseudo-random noise through a real encrypt → bus → decrypt → decode →
+/// jitter → sink loop and compares RMS energy at the sink.
+#[tokio::test(flavor = "current_thread")]
+async fn set_denoise_toggle_attenuates_inbound_noise() {
+    async fn run(denoise_on: bool) -> f32 {
+        let delivered_rms_sum = Rc::new(RefCell::new(0.0_f32));
+        let delivered_rms_count = Rc::new(RefCell::new(0_usize));
+
+        tokio::task::LocalSet::new()
+            .run_until({
+                let delivered_rms_sum = delivered_rms_sum.clone();
+                let delivered_rms_count = delivered_rms_count.clone();
+                async move {
+                    let (alice, room) = make_identity_and_room(33);
+                    let (bob, _) = make_identity_and_room(34);
+                    let alice_pk = alice.store_verifying_key();
+
+                    let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+                    let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+                    let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                        calls: Rc::new(RefCell::new(vec![])),
+                    });
+
+                    // Custom sink that accumulates RMS so we don't need to
+                    // hold every f32 of every frame.
+                    struct RmsSink {
+                        sum: Rc<RefCell<f32>>,
+                        count: Rc<RefCell<usize>>,
+                    }
+                    impl FrameSink for RmsSink {
+                        fn deliver(&self, _peer: &PeerId, pcm: &[f32]) {
+                            let s: f32 = pcm.iter().map(|s| s * s).sum();
+                            let rms = (s / pcm.len() as f32).sqrt();
+                            *self.sum.borrow_mut() += rms;
+                            *self.count.borrow_mut() += 1;
+                        }
+                        fn drop_peer(&self, _peer: &PeerId) {}
+                    }
+                    let frame_sink: Rc<dyn FrameSink> = Rc::new(RmsSink {
+                        sum: delivered_rms_sum.clone(),
+                        count: delivered_rms_count.clone(),
+                    });
+                    let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                        events: Rc::new(RefCell::new(vec![])),
+                    });
+
+                    let (runtime, tasks) = VoiceRuntime::new(
+                        bob_bus,
+                        room.clone(),
+                        bob.clone(),
+                        dialer,
+                        frame_sink,
+                        peer_state_sink,
+                    );
+                    runtime.set_denoise(denoise_on);
+                    assert_eq!(runtime.is_denoise_enabled(), denoise_on);
+
+                    tokio::task::spawn_local(tasks.subscribe);
+                    tokio::task::spawn_local(tasks.jitter_pump);
+                    tokio::task::yield_now().await;
+
+                    // Feed deterministic pseudo-random noise at amplitude
+                    // 0.05 (well below clipping). 30 frames = 600 ms,
+                    // enough for RNNoise to settle past its fade-in window.
+                    let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
+                    let mut rng_seed: u32 = 0xBEEF_F00D;
+                    for seq in 0..30 {
+                        let mut pcm = vec![0.0_f32; sunset_voice::FRAME_SAMPLES];
+                        for s in pcm.iter_mut() {
+                            rng_seed = rng_seed.wrapping_mul(48271) % 0x7FFF_FFFF;
+                            let n = (rng_seed as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0;
+                            *s = n * 0.05;
+                        }
+                        let bytes = enc.encode(&pcm).unwrap();
+                        let pkt = sunset_voice::packet::VoicePacket::Frame {
+                            codec_id: sunset_voice::CODEC_ID.to_string(),
+                            seq,
+                            sender_time_ms: 1000 + seq * 20,
+                            payload: bytes,
+                        };
+                        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seq);
+                        let ev = sunset_voice::packet::encrypt(
+                            &room,
+                            0,
+                            &alice.public(),
+                            &pkt,
+                            &mut rng,
+                        )
+                        .unwrap();
+                        let payload = postcard::to_stdvec(&ev).unwrap();
+                        let room_fp = room.fingerprint().to_hex();
+                        let sender_pk = hex::encode(alice_pk.as_bytes());
+                        let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
+                        bob_bus_impl
+                            .inject(SignedDatagram {
+                                verifying_key: alice_pk.clone(),
+                                name,
+                                payload: Bytes::from(payload),
+                                signature: Bytes::new(),
+                            })
+                            .await;
+                    }
+
+                    // Wait for at least 25 frames to be delivered. The
+                    // jitter pump runs every 20 ms; 25 × 20 ms = 500 ms,
+                    // well under any per-frame UX budget.
+                    tokio::time::timeout(Duration::from_millis(800), async {
+                        loop {
+                            if *delivered_rms_count.borrow() >= 25 {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("at least 25 frames delivered within 800ms");
+
+                    drop(runtime);
+                }
+            })
+            .await;
+        let total = *delivered_rms_sum.borrow();
+        let count = *delivered_rms_count.borrow();
+        total / count as f32
+    }
+
+    let off_rms = run(false).await;
+    let on_rms = run(true).await;
+    // Denoising should drop the inbound RMS substantially. Same input
+    // signal, same Opus codec; the only difference is the RNNoise stage.
+    assert!(
+        off_rms > 0.001,
+        "raw path should preserve audible energy: {off_rms}"
+    );
+    assert!(
+        on_rms * 2.0 < off_rms,
+        "denoise on should attenuate inbound noise vs off: on={on_rms}, off={off_rms}",
+    );
+}

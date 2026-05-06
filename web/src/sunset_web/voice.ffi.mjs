@@ -203,6 +203,14 @@ export function wasmVoiceSetDeafened(client, d) {
   }
 }
 
+export function wasmVoiceSetDenoise(client, on) {
+  try {
+    client.voice_set_denoise(!!on);
+  } catch (e) {
+    console.warn("voice_set_denoise failed", e);
+  }
+}
+
 export function installVoiceStateHandler(cb) {
   window.__voicePeerStateHandler = cb;
 }
