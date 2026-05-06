@@ -16,13 +16,22 @@ use sunset_voice::FrameSink;
 
 const RING_PER_PEER: usize = 1024;
 
-/// A single recorded frame: embedded counter (from `pcm[0]`), length
-/// in samples, and SHA-256 checksum (hex) of the raw f32 bytes.
+/// A single recorded frame: length in samples, SHA-256 checksum
+/// (hex) of the raw f32 bytes, and root-mean-square amplitude.
+///
+/// `checksum` is a stuck-frame tripwire — distinct decoded frames
+/// land at distinct checksums even after Opus, so consecutive
+/// identical checksums catch jitter-pump stuttering. It also doubles
+/// as a "frame is not silence" signal: zero-PCM has a known checksum.
+///
+/// `rms` is a "real-audio-vs-silence" signal: an Opus-decoded sine
+/// wave at amplitude 0.5 lands around RMS 0.35, while silence /
+/// underrun-padding lands at 0.
 #[derive(Clone)]
 pub struct RecordedFrame {
-    pub seq_in_frame: i32,
     pub len: u32,
     pub checksum: String,
+    pub rms: f32,
 }
 
 struct Inner {
@@ -58,16 +67,17 @@ impl RecordingFrameSink {
 
 impl FrameSink for RecordingFrameSink {
     fn deliver(&self, peer: &PeerId, pcm: &[f32]) {
-        let seq = decode_counter(pcm);
         let mut hasher = sha2::Sha256::new();
         for s in pcm {
             hasher.update(s.to_le_bytes());
         }
         let checksum = hex::encode(hasher.finalize());
+        let sum_sq: f32 = pcm.iter().map(|s| s * s).sum();
+        let rms = (sum_sq / pcm.len().max(1) as f32).sqrt();
         let frame = RecordedFrame {
-            seq_in_frame: seq,
             len: pcm.len() as u32,
             checksum,
+            rms,
         };
         let mut inner = self.inner.borrow_mut();
         let q = inner.frames.entry(peer.clone()).or_default();
@@ -84,22 +94,27 @@ impl FrameSink for RecordingFrameSink {
     }
 }
 
-/// Generate a synthetic PCM frame with an embedded counter in `pcm[0]`.
-/// `pcm[0] = counter / 1_000_000.0`. Remaining samples follow a
-/// deterministic pattern so each counter value produces a unique checksum.
+/// Generate one 20 ms PCM frame of continuous 440 Hz sine at
+/// amplitude 0.5. `counter` advances the phase by exactly one frame
+/// so concatenated frames sound like one continuous tone — which is
+/// what an Opus encoder is built to compress efficiently and
+/// reproduce faithfully.
+///
+/// (Pre-Opus this function packed `counter` into `pcm[0]` so the
+/// per-frame checksum was deterministic for the test recorder. With
+/// a lossy codec that approach is unsound — Opus does not preserve
+/// individual sample values — so callers identify frames by the
+/// recorder's per-peer ordering and `checksum`-distinctness signal
+/// instead of by an embedded counter.)
 pub fn synth_pcm_with_counter(counter: i32) -> Vec<f32> {
-    let mut v = vec![0.0_f32; sunset_voice::FRAME_SAMPLES];
-    v[0] = (counter as f32) / 1_000_000.0;
-    for i in 1..v.len() {
-        v[i] = ((counter.wrapping_add(i as i32) as f32) / 1_000_000.0).sin();
-    }
-    v
-}
-
-/// Decode the counter embedded in `pcm[0]` by `synth_pcm_with_counter`.
-pub fn decode_counter(pcm: &[f32]) -> i32 {
-    if pcm.is_empty() {
-        return -1;
-    }
-    (pcm[0] * 1_000_000.0).round() as i32
+    const FREQ_HZ: f32 = 440.0;
+    let sr = sunset_voice::SAMPLE_RATE as f32;
+    let frame_offset = (counter as i64).wrapping_mul(sunset_voice::FRAME_SAMPLES as i64);
+    (0..sunset_voice::FRAME_SAMPLES)
+        .map(|i| {
+            let n = frame_offset.wrapping_add(i as i64);
+            let t = n as f32 / sr;
+            0.5 * (2.0 * core::f32::consts::PI * FREQ_HZ * t).sin()
+        })
+        .collect()
 }

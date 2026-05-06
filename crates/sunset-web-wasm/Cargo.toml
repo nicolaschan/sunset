@@ -4,9 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+build = "build.rs"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+# Build script reads `DEP_OPUS_LIB_DIR` and re-emits link directives
+# so libopus.a — built by `sunset-voice/build.rs` — actually reaches
+# this cdylib's link command. No build-script logic of its own;
+# `cc` is not needed here.
 
 [features]
 default = []
@@ -51,6 +58,10 @@ zeroize.workspace = true
 # "getrandom" feature to work on wasm32-unknown-unknown. (rand_core 0.6
 # depends on getrandom 0.2, which needs "js" to use the browser RNG.)
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# Routes Rust panics through `console.error` so the message is visible
+# in the browser devtools / Playwright `pageerror` listener instead of
+# the `unreachable` wasm trap producing only a numeric stack frame.
+console_error_panic_hook.workspace = true
 js-sys.workspace = true
 serde-wasm-bindgen = { workspace = true }
 wasm-bindgen.workspace = true
