@@ -19,6 +19,7 @@ pub struct OpusDecoder {
 
 pub const OPUS_OK: i32 = 0;
 pub const OPUS_APPLICATION_VOIP: i32 = 2048;
+pub const OPUS_APPLICATION_AUDIO: i32 = 2049;
 
 // CTL request codes from `vendor/libopus/include/opus_defines.h`.
 pub const OPUS_SET_BITRATE_REQUEST: i32 = 4002;

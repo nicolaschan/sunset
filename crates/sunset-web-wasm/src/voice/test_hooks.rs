@@ -109,12 +109,18 @@ impl FrameSink for RecordingFrameSink {
 pub fn synth_pcm_with_counter(counter: i32) -> Vec<f32> {
     const FREQ_HZ: f32 = 440.0;
     let sr = sunset_voice::SAMPLE_RATE as f32;
-    let frame_offset = (counter as i64).wrapping_mul(sunset_voice::FRAME_SAMPLES as i64);
-    (0..sunset_voice::FRAME_SAMPLES)
-        .map(|i| {
-            let n = frame_offset.wrapping_add(i as i64);
-            let t = n as f32 / sr;
-            0.5 * (2.0 * core::f32::consts::PI * FREQ_HZ * t).sin()
-        })
-        .collect()
+    let per_channel = sunset_voice::FRAME_SAMPLES_PER_CHANNEL;
+    let channels = sunset_voice::PLAYBACK_CHANNELS as usize;
+    let frame_offset = (counter as i64).wrapping_mul(per_channel as i64);
+    let mut out = vec![0.0_f32; per_channel * channels];
+    for i in 0..per_channel {
+        let n = frame_offset.wrapping_add(i as i64);
+        let t = n as f32 / sr;
+        let s = 0.5 * (2.0 * core::f32::consts::PI * FREQ_HZ * t).sin();
+        // Interleaved L/R; both channels carry the same tone.
+        for c in 0..channels {
+            out[i * channels + c] = s;
+        }
+    }
+    out
 }

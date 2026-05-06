@@ -36,10 +36,12 @@ pub fn view(
   placement placement: Placement,
   member m: Member,
   settings settings: VoiceSettings,
+  voice_quality voice_quality: String,
   level level: Float,
   on_close on_close: msg,
   on_set_volume on_set_volume: fn(Int) -> msg,
   on_toggle_denoise on_toggle_denoise: msg,
+  on_set_voice_quality on_set_voice_quality: fn(String) -> msg,
   on_toggle_deafen on_toggle_deafen: msg,
   on_reset on_reset: msg,
 ) -> Element(msg) {
@@ -52,7 +54,16 @@ pub fn view(
   let body_children = [
     header(p, m, settings, level, on_close),
     waveform_strip(p, m, settings, level),
-    body(p, m, settings, max_volume, on_set_volume, on_toggle_denoise),
+    body(
+      p,
+      m,
+      settings,
+      voice_quality,
+      max_volume,
+      on_set_volume,
+      on_toggle_denoise,
+      on_set_voice_quality,
+    ),
     case is_self {
       True -> element.fragment([])
       False -> footer(p, settings, on_toggle_deafen, on_reset)
@@ -437,10 +448,16 @@ fn body(
   p: Palette,
   m: Member,
   settings: VoiceSettings,
+  voice_quality: String,
   max_volume: Int,
   on_set_volume: fn(Int) -> msg,
   on_toggle_denoise: msg,
+  on_set_voice_quality: fn(String) -> msg,
 ) -> Element(msg) {
+  let quality_row = case m.you {
+    True -> quality_control(p, voice_quality, on_set_voice_quality)
+    False -> element.fragment([])
+  }
   html.div(
     [
       ui.css([
@@ -453,6 +470,131 @@ fn body(
     [
       volume_control(p, m, settings, max_volume, on_set_volume),
       denoise_control(p, m, settings, on_toggle_denoise),
+      quality_row,
+    ],
+  )
+}
+
+/// Self-row only: send-side Opus quality preset. Three radio buttons
+/// covering `"voice"` / `"high"` / `"maximum"`. Persisted by
+/// `voice.ffi.mjs` through localStorage so the choice survives
+/// reload + reapplies on the next `voice_start`.
+fn quality_control(
+  p: Palette,
+  current: String,
+  on_set: fn(String) -> msg,
+) -> Element(msg) {
+  let presets = [
+    #("voice", "Voice", "24 kbps mono — best for slow networks"),
+    #("high", "High", "96 kbps stereo — balanced"),
+    #("maximum", "Maximum", "510 kbps stereo — transparent"),
+  ]
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("gap", "8px"),
+      ]),
+    ],
+    [
+      control_label(p, "Send quality"),
+      html.div(
+        [
+          ui.css([
+            #("font-size", "11.25px"),
+            #("color", p.text_faint),
+            #("margin-bottom", "2px"),
+          ]),
+        ],
+        [
+          html.text(
+            "Opus codec settings for your outgoing audio. Other peers always hear you in stereo.",
+          ),
+        ],
+      ),
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "6px"),
+          ]),
+        ],
+        list_map(presets, fn(preset) {
+          let #(label, title, desc) = preset
+          let checked = label == current
+          html.label(
+            [
+              attribute.attribute(
+                "data-testid",
+                "voice-popover-quality-" <> label,
+              ),
+              event.on_click(on_set(label)),
+              ui.css([
+                #("display", "flex"),
+                #("align-items", "flex-start"),
+                #("gap", "8px"),
+                #("padding", "6px 8px"),
+                #(
+                  "border",
+                  "1px solid "
+                    <> case checked {
+                    True -> p.accent
+                    False -> p.border
+                  },
+                ),
+                #("border-radius", "6px"),
+                #("cursor", "pointer"),
+                #("background", case checked {
+                  True -> p.surface_alt
+                  False -> "transparent"
+                }),
+              ]),
+            ],
+            [
+              html.input([
+                attribute.attribute("type", "radio"),
+                attribute.attribute("name", "voice-popover-quality"),
+                attribute.value(label),
+                attribute.checked(checked),
+                ui.css([#("accent-color", p.accent), #("margin-top", "2px")]),
+              ]),
+              html.div(
+                [
+                  ui.css([
+                    #("display", "flex"),
+                    #("flex-direction", "column"),
+                    #("gap", "1px"),
+                    #("flex", "1"),
+                  ]),
+                ],
+                [
+                  html.span(
+                    [
+                      ui.css([
+                        #("font-size", "12.75px"),
+                        #("font-weight", "600"),
+                        #("color", p.text),
+                      ]),
+                    ],
+                    [html.text(title)],
+                  ),
+                  html.span(
+                    [
+                      ui.css([
+                        #("font-size", "11.25px"),
+                        #("color", p.text_faint),
+                      ]),
+                    ],
+                    [html.text(desc)],
+                  ),
+                ],
+              ),
+            ],
+          )
+        }),
+      ),
     ],
   )
 }

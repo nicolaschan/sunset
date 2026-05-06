@@ -115,27 +115,31 @@ export function freshSeedHex() {
 // ---------------------------------------------------------------------------
 
 /**
- * Build one 20 ms PCM frame of continuous 440 Hz sine at amplitude 0.5.
- * `counter` advances the phase by exactly one frame so consecutive
- * `syntheticPcm(c)` outputs are continuous (no clicks). This matches the
- * Rust `synth_pcm_with_counter` and is what an Opus encoder is built to
- * compress + decode faithfully — pre-Opus we packed a counter into
- * `pcm[0]`, but Opus is lossy and individual sample values do not
- * survive, so we identify frames by their per-peer ordering and
- * checksum-distinctness in the recorder instead.
+ * Build one 20 ms PCM frame of continuous 440 Hz sine at amplitude
+ * 0.5, interleaved L/R stereo. `counter` advances the phase by
+ * exactly one frame so consecutive `syntheticPcm(c)` outputs form a
+ * continuous tone (no clicks). Matches the Rust
+ * `synth_pcm_with_counter` helper and the shape `voice_inject_pcm`
+ * expects (1920 interleaved samples).
+ *
+ * Both channels carry the same tone — enough for the e2e tests'
+ * RMS-based "real audio" check.
  *
  * @param {number} counter  Frame index (any integer; controls phase only).
- * @returns {Float32Array}  960-sample frame at 48 kHz.
+ * @returns {Float32Array}  1920-sample interleaved L/R frame at 48 kHz.
  */
 export function syntheticPcm(counter) {
   const FREQ_HZ = 440;
   const SR = 48_000;
-  const FRAME = 960;
-  const pcm = new Float32Array(FRAME);
-  const offset = counter * FRAME;
-  for (let i = 0; i < FRAME; i++) {
+  const FRAME_PER_CH = 960;
+  const CHANNELS = 2;
+  const pcm = new Float32Array(FRAME_PER_CH * CHANNELS);
+  const offset = counter * FRAME_PER_CH;
+  for (let i = 0; i < FRAME_PER_CH; i++) {
     const t = (offset + i) / SR;
-    pcm[i] = 0.5 * Math.sin(2 * Math.PI * FREQ_HZ * t);
+    const s = 0.5 * Math.sin(2 * Math.PI * FREQ_HZ * t);
+    pcm[i * CHANNELS] = s; // L
+    pcm[i * CHANNELS + 1] = s; // R
   }
   return pcm;
 }

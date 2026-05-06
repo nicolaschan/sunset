@@ -64,6 +64,16 @@ export function ensureCtx() {
   return ctx;
 }
 
+// Frame size constants must agree with the Rust constants in
+// `crates/sunset-voice/src/lib.rs`. The capture worklet always
+// posts interleaved L/R stereo (PER_CHANNEL × 2) regardless of the
+// active send-side quality preset; the Rust runtime downmixes when
+// the encoder is mono. The playback worklet always receives the
+// same interleaved stereo shape because the decoder is fixed at
+// 2-channel.
+const FRAME_SAMPLES_PER_CHANNEL = 960;
+const STEREO_FRAME_TOTAL = FRAME_SAMPLES_PER_CHANNEL * 2;
+
 export async function startCapture(client) {
   ensureCtx();
   await ctx.audioWorklet.addModule("/audio/voice-capture-worklet.js");
@@ -73,13 +83,24 @@ export async function startCapture(client) {
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
-      channelCount: 1,
+      // Always request stereo capture. If the platform only has a
+      // mono mic the worklet duplicates L into R so we get the same
+      // interleaved 1920-sample frame shape regardless. See
+      // `voice-capture-worklet.js` for the rationale on not
+      // reconfiguring channelCount per quality preset.
+      channelCount: 2,
     },
   });
   const src = ctx.createMediaStreamSource(captureStream);
-  captureNode = new AudioWorkletNode(ctx, "voice-capture");
+  captureNode = new AudioWorkletNode(ctx, "voice-capture", {
+    // The capture worklet reads from a stereo source; tell the audio
+    // graph not to downmix to mono before the worklet sees it.
+    channelCount: 2,
+    channelCountMode: "explicit",
+    channelInterpretation: "speakers",
+  });
   captureNode.port.onmessage = (e) => {
-    if (e.data instanceof Float32Array && e.data.length === 960) {
+    if (e.data instanceof Float32Array && e.data.length === STEREO_FRAME_TOTAL) {
       try {
         client.voice_input(e.data);
       } catch (err) {
@@ -203,7 +224,12 @@ export function deliverFrame(peerHex, pcm) {
   if (!ctx) return;
   let slot = peers.get(peerHex);
   if (!slot) {
-    const w = new AudioWorkletNode(ctx, "voice-playback");
+    const w = new AudioWorkletNode(ctx, "voice-playback", {
+      // Decoder always emits stereo; configure the worklet's output
+      // node accordingly so the audio graph routes L/R to the
+      // appropriate destination channels rather than downmixing.
+      outputChannelCount: [2],
+    });
     const g = ctx.createGain();
     g.gain.value = 1.0;
     w.connect(g).connect(ctx.destination);
@@ -275,6 +301,20 @@ export function wasmVoiceStart(client, roomHandle, callback) {
             }
           },
         );
+        // Re-apply the user's preferred quality preset. localStorage
+        // is the canonical persistence; default `"maximum"` matches
+        // the Rust default. Failures are non-fatal — the encoder
+        // already constructed itself with the default.
+        try {
+          const stored = window.localStorage?.getItem("sunset/voice-quality");
+          const label =
+            stored === "voice" || stored === "high" || stored === "maximum"
+              ? stored
+              : "maximum";
+          client.voice_set_quality(label);
+        } catch (qe) {
+          console.warn("voice_set_quality on start failed", qe);
+        }
         callback(new Ok(null));
       } catch (e) {
         stopCapture();
@@ -309,6 +349,40 @@ export function wasmVoiceSetDeafened(client, d) {
   } catch (e) {
     console.warn("voice_set_deafened failed", e);
   }
+}
+
+// Persists the new quality preset to localStorage and pushes it
+// down to the active encoder if voice is started. The setting is
+// re-applied on every voice_start so a user who changes it before
+// joining a call sees the right preset on rejoin.
+export function wasmVoiceSetQuality(client, label) {
+  try {
+    window.localStorage?.setItem("sunset/voice-quality", label);
+  } catch (_e) {
+    // Private browsing or full quota — non-fatal.
+  }
+  try {
+    client.voice_set_quality(label);
+  } catch (e) {
+    // "voice not started" is fine — the value persists in
+    // localStorage and applies on the next start.
+    if (!String(e?.message || e).includes("voice not started")) {
+      console.warn("voice_set_quality failed", e);
+    }
+  }
+}
+
+// Read the persisted preset (or the Rust default if nothing saved).
+export function wasmVoiceGetQuality() {
+  try {
+    const stored = window.localStorage?.getItem("sunset/voice-quality");
+    if (stored === "voice" || stored === "high" || stored === "maximum") {
+      return stored;
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return "maximum";
 }
 
 export function installVoiceStateHandler(cb) {

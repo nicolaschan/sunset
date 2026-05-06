@@ -190,6 +190,11 @@ pub type Model {
     rooms: Dict(String, RoomState),
     /// Voice subsystem state: self_in_call, mute, deafen, per-peer live state.
     voice: domain.VoiceModel,
+    /// Send-side Opus quality preset (`"voice"` / `"high"` / `"maximum"`).
+    /// Persisted to localStorage; the JS bridge re-applies on every
+    /// `voice_start`. Read from the store at model init so the radio
+    /// in the self-row popover renders the right initial selection.
+    voice_quality: String,
     /// IntentId of the relay whose popover is currently open. Client-wide
     /// (not per-room) because relays are a client-level concept.
     relays_popover: option.Option(Float),
@@ -252,6 +257,9 @@ pub type Msg {
   ToggleMemberDenoise(String)
   ToggleMemberDeafen(String)
   ResetMemberVoice(String)
+  /// Self-row popover radio: change the active send-side Opus
+  /// quality preset (`"voice"` / `"high"` / `"maximum"`).
+  SetVoiceQuality(String)
   // sunset-web-wasm bridge wiring:
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
@@ -377,6 +385,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         self_level: 0.0,
         permission_error: None,
       ),
+      voice_quality: voice.voice_get_quality(),
       relays_popover: None,
       name_map: dict.new(),
       self_name: storage.read_self_name(),
@@ -1469,6 +1478,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         eff,
       )
     }
+    SetVoiceQuality(label) -> {
+      // Persist + apply. The JS bridge writes localStorage and pushes
+      // the change to the active encoder (no-op if voice isn't
+      // started yet — the value is reapplied on next `voice_start`).
+      let eff = case model.client {
+        Some(c) -> effect.from(fn(_) { voice.voice_set_quality(c, label) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice_quality: label), eff)
+    }
     ViewportChanged(v) -> {
       // Crossing the boundary in either direction closes any open drawer.
       // Sheets intentionally survive: DetailsSheet and VoiceSheet render
@@ -2090,12 +2109,14 @@ fn room_view_with_state(
               placement: voice_popover.InSheet,
               member: m,
               settings: member_voice_settings(model.voice_settings, id_str),
+              voice_quality: model.voice_quality,
               level: peer_level_for_member(model.voice, m, id_str),
               on_close: CloseVoicePopover,
               on_set_volume: fn(v) {
                 SetPeerVolume(id_str, int.to_float(v) /. 100.0)
               },
               on_toggle_denoise: ToggleMemberDenoise(id_str),
+              on_set_voice_quality: SetVoiceQuality,
               on_toggle_deafen: ToggleMuteForPeer(id_str),
               on_reset: ResetMemberVoice(id_str),
             ),
@@ -2362,12 +2383,14 @@ fn voice_popover_overlay(
             placement: voice_popover.Floating,
             member: m,
             settings: member_voice_settings(model.voice_settings, id_str),
+            voice_quality: model.voice_quality,
             level: peer_level_for_member(model.voice, m, id_str),
             on_close: CloseVoicePopover,
             on_set_volume: fn(v) {
               SetPeerVolume(id_str, int.to_float(v) /. 100.0)
             },
             on_toggle_denoise: ToggleMemberDenoise(id_str),
+            on_set_voice_quality: SetVoiceQuality,
             on_toggle_deafen: ToggleMuteForPeer(id_str),
             on_reset: ResetMemberVoice(id_str),
           )

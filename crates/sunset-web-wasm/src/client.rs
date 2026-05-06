@@ -336,6 +336,20 @@ impl Client {
         crate::voice::voice_set_deafened(&self.voice, deafened);
     }
 
+    /// Switch the active send-side voice quality preset. Accepts
+    /// `"voice"` (24 kbps mono VOIP), `"high"` (96 kbps stereo), or
+    /// `"maximum"` (510 kbps stereo, the default). Returns an error
+    /// if voice isn't started or the label is unknown.
+    pub fn voice_set_quality(&self, label: &str) -> Result<(), JsError> {
+        crate::voice::voice_set_quality(&self.voice, label)
+    }
+
+    /// Read back the active quality preset as one of `"voice"`,
+    /// `"high"`, `"maximum"`, or `null` if voice isn't started.
+    pub fn voice_quality(&self) -> Option<String> {
+        crate::voice::voice_quality(&self.voice).map(str::to_string)
+    }
+
     // ---- Test hooks (compiled in only with feature "test-hooks") ----
 
     /// Bypass the capture worklet and inject PCM directly into the

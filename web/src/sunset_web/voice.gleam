@@ -36,6 +36,18 @@ pub fn voice_set_muted(client: ClientHandle, muted: Bool) -> Nil
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceSetDeafened")
 pub fn voice_set_deafened(client: ClientHandle, deafened: Bool) -> Nil
 
+/// Switch the active send-side voice quality preset. Persists the
+/// label to localStorage and (if voice is running) pushes the change
+/// down to the active encoder. Accepted labels: `"voice"`, `"high"`,
+/// `"maximum"`. Unknown labels are silently ignored.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceSetQuality")
+pub fn voice_set_quality(client: ClientHandle, label: String) -> Nil
+
+/// Read the persisted quality preset, or the default (`"maximum"`)
+/// if nothing has been saved.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceGetQuality")
+pub fn voice_get_quality() -> String
+
 /// Install the global `window.__voicePeerStateHandler` callback so
 /// `wasmVoiceStart`'s `on_voice_peer_state` fires into Lustre dispatch.
 /// Call once at app init via `effect.from`.
