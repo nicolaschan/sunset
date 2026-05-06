@@ -58,17 +58,30 @@ where
     }
 }
 
-/// Parse `wss://host:port#x25519=<hex>` (or ws://, etc.) and return the
-/// X25519 pubkey. The fragment is the contractual home for the responder's
-/// expected static pubkey under the Noise IK pattern.
+/// Parse `wss://host:port#x25519=<hex>` (or `ws://`, `wt://`, etc.) and
+/// return the X25519 pubkey. The fragment is the contractual home for
+/// the responder's expected static pubkey under the Noise IK pattern.
+///
+/// The fragment is parsed as an `&`-separated list of `key=value`
+/// pairs, ignoring keys other than `x25519=`. Other keys are reserved
+/// for transport-specific concerns — for example the WebTransport
+/// transport stores `cert-sha256=<hex>` alongside `x25519=<hex>`. The
+/// order of keys is not significant.
 fn parse_addr_x25519(addr: &PeerAddr) -> Result<[u8; 32]> {
     let s =
         std::str::from_utf8(addr.as_bytes()).map_err(|e| Error::Addr(format!("not utf-8: {e}")))?;
     let (_url, fragment) = s
         .split_once('#')
         .ok_or_else(|| Error::MissingStaticPubkey(format!("address has no fragment: {s}")))?;
-    let pair = fragment.strip_prefix("x25519=").ok_or_else(|| {
-        Error::MissingStaticPubkey(format!("fragment is not `x25519=…`: {fragment}"))
+    let mut x25519_hex: Option<&str> = None;
+    for part in fragment.split('&') {
+        if let Some(v) = part.strip_prefix("x25519=") {
+            x25519_hex = Some(v);
+            break;
+        }
+    }
+    let pair = x25519_hex.ok_or_else(|| {
+        Error::MissingStaticPubkey(format!("fragment lacks `x25519=…`: {fragment}"))
     })?;
     let bytes = hex::decode(pair)
         .map_err(|e| Error::MissingStaticPubkey(format!("hex decode failed: {e}")))?;
@@ -351,5 +364,24 @@ mod tests {
         let addr = PeerAddr::new(Bytes::copy_from_slice(bytes));
         let err = parse_addr_x25519(&addr).unwrap_err();
         assert!(matches!(err, Error::MissingStaticPubkey(_)));
+    }
+
+    #[test]
+    fn parse_addr_handles_wt_url_with_extra_fragment_keys() {
+        // WebTransport addresses carry both `x25519=` (for Noise IK)
+        // and `cert-sha256=` (for self-signed cert pinning). The
+        // parser must ignore the extra keys.
+        let cert_hex = "ee".repeat(32);
+        let x25519_hex = "11".repeat(32);
+        let s = format!("wt://127.0.0.1:8443#x25519={x25519_hex}&cert-sha256={cert_hex}");
+        let addr = PeerAddr::new(Bytes::copy_from_slice(s.as_bytes()));
+        let key = parse_addr_x25519(&addr).unwrap();
+        assert_eq!(key, [0x11u8; 32]);
+
+        // Ordering reversed.
+        let s2 = format!("wt://127.0.0.1:8443#cert-sha256={cert_hex}&x25519={x25519_hex}");
+        let addr2 = PeerAddr::new(Bytes::copy_from_slice(s2.as_bytes()));
+        let key2 = parse_addr_x25519(&addr2).unwrap();
+        assert_eq!(key2, [0x11u8; 32]);
     }
 }

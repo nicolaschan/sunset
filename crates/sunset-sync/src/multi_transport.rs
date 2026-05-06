@@ -4,9 +4,11 @@
 //!
 //! Routing rule: PeerAddr's URL prefix decides which underlying
 //! transport gets the dial.
-//! - `ws://...` or `wss://...` → primary
-//! - `webrtc://...`            → secondary
-//! - other                     → `Error::Transport("multi: unknown scheme...")`
+//! - `ws://...` / `wss://...` → primary
+//! - `wt://...` / `wts://...` → primary (the `FallbackTransport`
+//!   wrapper above routes WT vs. WS internally)
+//! - `webrtc://...` → secondary
+//! - other → `Error::Transport("multi: unknown scheme...")`
 //!
 //! Inbound (`accept`): both transports race; whichever yields first
 //! wins. The connection's `peer_id()` carries the per-transport
@@ -44,7 +46,11 @@ where
     async fn connect(&self, addr: PeerAddr) -> Result<Self::Connection> {
         let s = std::str::from_utf8(addr.as_bytes())
             .map_err(|e| Error::Transport(format!("multi: addr not utf-8: {e}")))?;
-        if s.starts_with("ws://") || s.starts_with("wss://") {
+        if s.starts_with("ws://")
+            || s.starts_with("wss://")
+            || s.starts_with("wt://")
+            || s.starts_with("wts://")
+        {
             Ok(MultiConnection::Primary(self.primary.connect(addr).await?))
         } else if s.starts_with("webrtc://") {
             Ok(MultiConnection::Secondary(
@@ -52,7 +58,7 @@ where
             ))
         } else {
             Err(Error::Transport(format!(
-                "multi: unknown scheme in {s} (expected ws://, wss://, or webrtc://)"
+                "multi: unknown scheme in {s} (expected ws://, wss://, wt://, wts://, or webrtc://)"
             )))
         }
     }

@@ -44,6 +44,7 @@ sunset-store-memory.workspace = true
 sunset-relay-resolver.workspace = true
 sunset-sync.workspace = true
 sunset-sync-webrtc-browser.workspace = true
+sunset-sync-webtransport-browser.workspace = true
 sunset-sync-ws-browser.workspace = true
 sha2.workspace = true
 sunset-voice = { workspace = true }

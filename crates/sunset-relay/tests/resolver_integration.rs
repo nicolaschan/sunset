@@ -61,12 +61,17 @@ async fn resolves_loopback_host_port_to_canonical_peeraddr() {
             let dir = tempfile::tempdir().unwrap();
             let config = relay_config(dir.path(), "127.0.0.1:0");
             let mut relay = Relay::start(config).await.expect("relay new");
-            let canonical_expected = relay.dial_address(); // ws://127.0.0.1:<port>#x25519=<hex>
+            // `dial_address()` is the legacy WS form (`ws://…#x25519=…`).
+            // After WebTransport became the preferred path, the resolver
+            // returns the WT URL when the relay advertises one — so we
+            // can't compare to dial_address() directly. We do compare
+            // the host:port and the x25519 fragment.
+            let ws_canonical = relay.dial_address();
             let _engine = relay.run_for_test().await.expect("relay run");
 
             // Pull the bound host:port out of the canonical form so we
             // can feed it back through the resolver.
-            let host_port = canonical_expected
+            let host_port = ws_canonical
                 .strip_prefix("ws://")
                 .unwrap()
                 .split('#')
@@ -78,9 +83,25 @@ async fn resolves_loopback_host_port_to_canonical_peeraddr() {
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             let resolver = Resolver::new(adapter::ReqwestFetch::new());
-            let resolved = resolver.resolve(&host_port).await.expect("resolve");
+            let resolved = resolver
+                .resolve_with_fallback(&host_port)
+                .await
+                .expect("resolve");
 
-            assert_eq!(resolved, canonical_expected);
+            // Fallback URL must always be the legacy WS form, byte-for-byte.
+            assert_eq!(resolved.fallback, ws_canonical);
+            // Primary should be the WT URL when the relay successfully
+            // bound UDP — it does on 127.0.0.1 in tests.
+            assert!(
+                resolved.primary.starts_with("wt://"),
+                "expected WT URL as primary, got: {}",
+                resolved.primary,
+            );
+            assert!(
+                resolved.primary.contains("cert-sha256="),
+                "primary lacks cert-sha256 fragment: {}",
+                resolved.primary,
+            );
         })
         .await;
 }

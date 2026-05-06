@@ -13,13 +13,26 @@ use std::time::Duration;
 use sunset_core::{Ed25519Verifier, Identity};
 use sunset_noise::{NoiseIdentity, NoiseTransport, do_handshake_responder};
 use sunset_store_memory::MemoryStore;
-use sunset_sync::{MultiTransport, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine};
+use sunset_sync::{
+    FallbackTransport, MultiTransport, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine,
+};
 use sunset_sync_webrtc_browser::WebRtcRawTransport;
+use sunset_sync_webtransport_browser::WebTransportRawTransport;
 use sunset_sync_ws_browser::WebSocketRawTransport;
 
 use crate::identity::identity_from_seed;
 
-pub(crate) type WsT = NoiseTransport<WebSocketRawTransport>;
+/// Primary half of the browser's outer `MultiTransport`: WebTransport
+/// preferred, with WebSocket as the fallback. The relay's identity
+/// descriptor advertises a WT URL when the relay has UDP/QUIC bound;
+/// `FallbackTransport` rewrites the scheme and falls back to WS on any
+/// connect failure (cert mismatch, UDP blocked, browser w/o WT
+/// support, …). When the relay only advertises WS,
+/// `FallbackTransport::connect` short-circuits straight to the WS half.
+pub(crate) type WsT = FallbackTransport<
+    NoiseTransport<WebTransportRawTransport>,
+    NoiseTransport<WebSocketRawTransport>,
+>;
 /// The browser's inbound WebRTC pipeline mirrors the relay's
 /// WebSocket wiring (see `sunset-relay/src/relay.rs`):
 ///   raw WebRTC accept → spawn task → Noise IK responder → ready conn
@@ -105,6 +118,13 @@ impl Client {
         let ws_raw = WebSocketRawTransport::dial_only();
         let ws_noise =
             NoiseTransport::new(ws_raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
+        let wt_raw = WebTransportRawTransport::dial_only();
+        let wt_noise =
+            NoiseTransport::new(wt_raw, Arc::new(IdentityNoiseAdapter(identity.clone())));
+        // FallbackTransport routes by URL scheme: `wt://`/`wts://` →
+        // try WT first, then WS on failure (URL scheme rewritten by
+        // `fallback_addr_for`); `ws://`/`wss://` → straight to WS.
+        let primary = FallbackTransport::new(wt_noise, ws_noise);
 
         let dispatcher = sunset_core::MultiRoomSignaler::new();
         let dispatcher_dyn: Rc<dyn sunset_sync::Signaler> = dispatcher.clone();
@@ -139,7 +159,7 @@ impl Client {
         let rtc =
             SpawningAcceptor::new(rtc_raw, rtc_connector, rtc_promote, Duration::from_secs(60));
 
-        let multi = MultiTransport::new(ws_noise, rtc);
+        let multi = MultiTransport::new(primary, rtc);
         let signer: Arc<dyn Signer> = Arc::new(identity.clone());
 
         let mut config = SyncConfig::default();
