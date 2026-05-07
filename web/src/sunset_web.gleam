@@ -460,21 +460,17 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
 
   let install_voice_handler_eff =
     effect.from(fn(dispatch) {
-      voice.install_voice_state_handler(fn(
-        hex,
-        in_call,
-        talking,
-        is_muted,
-        in_voice_channel,
-      ) {
-        dispatch(VoicePeerStateChanged(
-          hex,
-          in_call,
-          talking,
-          is_muted,
-          in_voice_channel,
-        ))
-      })
+      voice.install_voice_state_handler(
+        fn(hex, in_call, talking, is_muted, in_voice_channel) {
+          dispatch(VoicePeerStateChanged(
+            hex,
+            in_call,
+            talking,
+            is_muted,
+            in_voice_channel,
+          ))
+        },
+      )
     })
 
   let install_voice_level_handlers_eff =
