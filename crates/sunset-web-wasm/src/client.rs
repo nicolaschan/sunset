@@ -336,6 +336,13 @@ impl Client {
         crate::voice::voice_set_deafened(&self.voice, deafened);
     }
 
+    /// Toggle receiver-side RNNoise denoising. Defaults to on at runtime
+    /// startup; pass `false` to bypass the denoiser without tearing down
+    /// per-peer state, so flipping back on resumes from where it left off.
+    pub fn voice_set_denoise(&self, denoise: bool) {
+        crate::voice::voice_set_denoise(&self.voice, denoise);
+    }
+
     /// Switch the active send-side voice quality preset. Accepts
     /// `"voice"` (24 kbps mono VOIP), `"high"` (96 kbps stereo), or
     /// `"maximum"` (510 kbps stereo, the default). Returns an error

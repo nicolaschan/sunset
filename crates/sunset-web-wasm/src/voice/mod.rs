@@ -149,6 +149,12 @@ pub(crate) fn voice_set_deafened(cell: &VoiceCell, deafened: bool) {
     }
 }
 
+pub(crate) fn voice_set_denoise(cell: &VoiceCell, denoise: bool) {
+    if let Some(v) = cell.borrow().as_ref() {
+        v.runtime.set_denoise(denoise);
+    }
+}
+
 /// Switch the active send-side voice quality preset. Accepts
 /// `"voice"`, `"high"`, `"maximum"` (case-sensitive). Returns an
 /// error if voice isn't started or the label is unknown.

@@ -351,6 +351,14 @@ export function wasmVoiceSetDeafened(client, d) {
   }
 }
 
+export function wasmVoiceSetDenoise(client, on) {
+  try {
+    client.voice_set_denoise(!!on);
+  } catch (e) {
+    console.warn("voice_set_denoise failed", e);
+  }
+}
+
 // Persists the new quality preset to localStorage and pushes it
 // down to the active encoder if voice is started. The setting is
 // re-applied on every voice_start so a user who changes it before
@@ -384,6 +392,7 @@ export function wasmVoiceGetQuality() {
   }
   return "maximum";
 }
+
 
 export function installVoiceStateHandler(cb) {
   window.__voicePeerStateHandler = cb;

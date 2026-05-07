@@ -23,6 +23,10 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "f
 hkdf = "0.12"
 js-sys = "0.3"
 libm = "0.2"
+# Pinned to =0.3.0: 0.4+ have a quality regression on speech.
+# default-features = false drops the `bin` feature that pulls clap, anyhow,
+# dasp, hound — none of which we need for the library API.
+nnnoiseless = { version = "=0.3.0", default-features = false }
 console_error_panic_hook = "0.1"
 rand_chacha = { version = "0.3", default-features = false }
 rand_core = "0.6"

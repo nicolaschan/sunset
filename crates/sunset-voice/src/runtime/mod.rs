@@ -93,6 +93,8 @@ impl VoiceRuntime {
             rng: RefCell::new(ChaCha20Rng::seed_from_u64(now_nanos)),
             muted: RefCell::new(false),
             deafened: RefCell::new(false),
+            denoise: RefCell::new(true),
+            denoisers: RefCell::new(Default::default()),
             frame_liveness,
             membership_liveness,
             jitter: RefCell::new(Default::default()),
@@ -205,6 +207,14 @@ impl VoiceRuntime {
         *self.inner.deafened.borrow_mut() = deafened;
     }
 
+    /// Toggle receiver-side RNNoise denoising. Defaults to `true` (on)
+    /// at runtime construction. Off bypasses the denoiser entirely;
+    /// previously-built per-peer state is kept so re-enabling resumes
+    /// where it left off rather than starting from scratch.
+    pub fn set_denoise(&self, denoise: bool) {
+        *self.inner.denoise.borrow_mut() = denoise;
+    }
+
     /// Switch the active send-side quality preset. Rebuilds the
     /// encoder; existing encoder state (predictor history, FEC) is
     /// dropped, which means the very next encoded frame will be
@@ -232,6 +242,13 @@ impl VoiceRuntime {
     #[cfg(feature = "test-hooks")]
     pub fn is_muted(&self) -> bool {
         *self.inner.muted.borrow()
+    }
+
+    /// Read denoise toggle state. Gated behind `test-hooks`; production
+    /// code reads `inner.denoise` directly.
+    #[cfg(feature = "test-hooks")]
+    pub fn is_denoise_enabled(&self) -> bool {
+        *self.inner.denoise.borrow()
     }
 
     /// Test-only: report jitter buffer depth for a peer.

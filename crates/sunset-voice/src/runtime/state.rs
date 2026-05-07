@@ -13,9 +13,9 @@ use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
-use crate::VoiceEncoder;
 use crate::runtime::dyn_bus::DynBus;
 use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink};
+use crate::{Denoiser, VoiceEncoder};
 
 pub(crate) struct RuntimeInner {
     pub identity: Identity,
@@ -33,6 +33,15 @@ pub(crate) struct RuntimeInner {
 
     pub muted: RefCell<bool>,
     pub deafened: RefCell<bool>,
+    /// Receiver-side RNNoise denoiser toggle. Defaults to true (on).
+    /// Toggle via `VoiceRuntime::set_denoise`. When false, `denoisers`
+    /// is left intact so flipping back on resumes with the existing
+    /// per-peer state instead of starting cold.
+    pub denoise: RefCell<bool>,
+    /// Per-peer denoiser state. Lazily inserted on first frame from a
+    /// peer; entries are kept for the lifetime of the runtime so peers
+    /// that briefly disappear and return don't lose their tuning.
+    pub denoisers: RefCell<HashMap<PeerId, Denoiser>>,
 
     pub frame_liveness: Arc<Liveness>,
     pub membership_liveness: Arc<Liveness>,

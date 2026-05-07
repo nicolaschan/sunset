@@ -82,7 +82,22 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                         SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sender_time_ms);
                     inner.frame_liveness.observe(peer.clone(), st).await;
                     match decoder.decode(&payload) {
-                        Ok(pcm) => {
+                        Ok(mut pcm) => {
+                            // Denoise per peer when enabled. Each peer
+                            // owns a stateful `Denoiser` so RNNoise's
+                            // predictor is never crossed between
+                            // sources. Bypass on toggle-off; on size
+                            // mismatch the bug is in the decoder, so
+                            // surface it but still deliver the frame.
+                            if *inner.denoise.borrow() {
+                                let mut denoisers = inner.denoisers.borrow_mut();
+                                let d = denoisers
+                                    .entry(peer.clone())
+                                    .or_insert_with(crate::Denoiser::start);
+                                if let Err(e) = d.denoise_in_place(&mut pcm) {
+                                    tracing::warn!(error = %e, "denoise skipped");
+                                }
+                            }
                             let mut jitter = inner.jitter.borrow_mut();
                             let q = jitter.entry(peer).or_default();
                             q.push_back(pcm);
