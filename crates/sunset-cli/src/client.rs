@@ -23,10 +23,12 @@ use crate::view::{MemberRow, MessageLine, RelayRow, RoomView, TopState};
 
 /// One open room: the snapshot view + the `OpenRoom` handle. Holding
 /// the handle keeps the per-room background tasks (decode loop,
-/// presence publisher, members tracker) alive.
+/// presence publisher, members tracker) alive, and lets `send_text`
+/// route through the cached `RoomState` instead of paying Argon2 on
+/// every message.
 struct Joined {
     view: Rc<RefCell<RoomView>>,
-    _open_room: OpenRoom<sunset_store_memory::MemoryStore, crate::build::CliTransport>,
+    open_room: OpenRoom<sunset_store_memory::MemoryStore, crate::build::CliTransport>,
 }
 
 pub struct Client {
@@ -36,7 +38,7 @@ pub struct Client {
     pub supervisor: Rc<CliSupervisor>,
 
     pub top: Rc<RefCell<TopState>>,
-    rooms: Rc<RefCell<HashMap<String, Joined>>>,
+    rooms: Rc<RefCell<HashMap<String, Rc<Joined>>>>,
     pub notify: Rc<Notify>,
 }
 
@@ -204,13 +206,9 @@ impl Client {
 
         open_room.start_presence(2_000, 6_000, 1_000).await;
 
-        self.rooms.borrow_mut().insert(
-            name.to_owned(),
-            Joined {
-                view,
-                _open_room: open_room,
-            },
-        );
+        self.rooms
+            .borrow_mut()
+            .insert(name.to_owned(), Rc::new(Joined { view, open_room }));
         self.set_active(name);
 
         Ok(())
@@ -238,18 +236,21 @@ impl Client {
     }
 
     /// Send a chat text into the active room. No-op if no active room.
+    /// Routes through the cached `OpenRoom` rather than re-deriving
+    /// the room key (Argon2 is ~tens to hundreds of ms — unacceptable
+    /// per keystroke).
     pub async fn send_text(&self, body: String) -> Result<(), String> {
         let active = self.top.borrow().active_room.clone();
         let Some(name) = active else {
             return Ok(());
         };
-        let open_room = self
-            .peer
-            .open_room(&name)
-            .await
-            .map_err(|e| format!("{e}"))?;
+        let joined = match self.rooms.borrow().get(&name) {
+            Some(j) => j.clone(),
+            None => return Err(format!("not joined to room '{name}'")),
+        };
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        open_room
+        joined
+            .open_room
             .send_text(body, now_ms)
             .await
             .map_err(|e| format!("{e}"))?;
