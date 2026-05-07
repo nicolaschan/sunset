@@ -819,6 +819,82 @@ async fn auto_connect_skips_dial_when_self_pk_is_larger() {
         .await;
 }
 
+/// `voice_presence_membership` consumes the durable presence stream
+/// and feeds `voice_presence_liveness`, which the combiner reads to
+/// flip `in_voice_channel` to `true`. Critically, this should fire
+/// *without* any ephemeral traffic — modelling the case where peer A
+/// is in the voice channel (publishing presence) but no P2P
+/// connection has been established yet, so neither frames nor
+/// heartbeats reach us.
+#[tokio::test(flavor = "current_thread")]
+async fn membership_marks_in_voice_channel_without_p2p_traffic() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // bob's runtime; alice is the remote peer whose presence is injected.
+            let (bob, alice, room) = make_pair_self_smaller(20, 21);
+            let alice_pk = alice.store_verifying_key();
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let events: EventSink = Rc::new(RefCell::new(vec![]));
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: events.clone(),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.combiner);
+            tokio::task::spawn_local(tasks.voice_presence_membership);
+
+            tokio::task::yield_now().await;
+
+            // Inject one durable presence entry from alice. No frames,
+            // no heartbeats — this models "alice is in the channel but
+            // I'm not connected to her".
+            let entry = make_presence_entry(&alice, &room);
+            bob_bus_impl.inject_durable(entry).await;
+
+            // Wait for the combiner to emit a state where in_voice_channel
+            // is true (and in_call is false — no P2P traffic).
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(ev) = events.borrow().last().cloned() {
+                        if ev.in_voice_channel {
+                            return ev;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("in_voice_channel emit within 2s");
+
+            assert_eq!(result.peer, PeerId(alice_pk));
+            assert!(
+                result.in_voice_channel,
+                "expected in_voice_channel=true after presence-only event"
+            );
+            assert!(
+                !result.in_call,
+                "in_call must remain false without ephemeral heartbeats / frames"
+            );
+            assert!(!result.talking, "talking must remain false without frames");
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn voice_presence_publisher_emits_periodically() {
     tokio::task::LocalSet::new()

@@ -134,6 +134,17 @@ test("voice channel roster: both peers visible, waveform tracks real audio", asy
     bob.page.locator(`[data-testid="voice-member"][data-peer-hex="${bobHex}"]`),
   ).toBeVisible({ timeout: 4_000 });
 
+  // Once the WebRTC handshake completes, both peers should reach the
+  // "connected" state (in_call=true). data-voice-connected="true"
+  // means we have audio flow with that peer; this is the distinction
+  // we'll pull on in the "in channel but not connected" test below.
+  await expect(
+    bob.page.locator(`[data-testid="voice-member"][data-peer-hex="${aliceHex}"]`),
+  ).toHaveAttribute("data-voice-connected", "true", { timeout: 4_000 });
+  await expect(
+    alice.page.locator(`[data-testid="voice-member"][data-peer-hex="${bobHex}"]`),
+  ).toHaveAttribute("data-voice-connected", "true", { timeout: 4_000 });
+
   // Self-level path: chromium's --use-fake-device-for-media-stream
   // pipes a steady 440 Hz tone into the capture worklet, so alice's
   // own mic level should rise above the speaking threshold within a
@@ -202,6 +213,83 @@ test("voice channel roster: both peers visible, waveform tracks real audio", asy
   // While alice's row decays toward zero on bob's UI, ensure the row
   // is still in the roster — silence shouldn't unlist a peer.
   await expect(aliceRowOnBob).toBeVisible();
+
+  await alice.ctx.close();
+  await bob.ctx.close();
+});
+
+test("voice channel roster: peer in channel but not connected renders dimmed with 'connecting…' affordance", async ({
+  browser,
+}) => {
+  // The natural "WebRTC dial in flight" state is too fast to catch
+  // deterministically in e2e (handshake completes in <500 ms in
+  // tests). We exercise the same render path by dispatching a
+  // synthetic VoicePeerStateChanged for a peer that's already in
+  // the room: in_voice_channel=true but in_call=false. The Gleam
+  // model treats this exactly like a pre-handshake state, and the
+  // visual rendering is what the user is asking us to distinguish.
+  //
+  // Two peers joined via the normal flow, then we synthetically
+  // flip alice's `in_voice_channel=true, in_call=false` on bob's
+  // side to simulate "alice is in the channel but bob hasn't
+  // connected to her yet". The other path — bob's natural view of
+  // alice when she's actually connected — is covered by the
+  // earlier roster test (data-voice-connected="true").
+  const alice = await openPeer(browser, relay.addr);
+  const bob = await openPeer(browser, relay.addr);
+
+  await alice.page
+    .locator('[data-testid="voice-channel-row"]')
+    .first()
+    .click();
+  await expect(alice.page.locator('[data-testid="voice-leave"]')).toBeVisible({
+    timeout: 2_000,
+  });
+  await bob.page
+    .locator('[data-testid="voice-channel-row"]')
+    .first()
+    .click();
+  await expect(bob.page.locator('[data-testid="voice-leave"]')).toBeVisible({
+    timeout: 2_000,
+  });
+
+  const aliceHex = await getPubkeyHex(alice.page);
+  const aliceRowOnBob = bob.page.locator(
+    `[data-testid="voice-member"][data-peer-hex="${aliceHex}"]`,
+  );
+
+  // Wait until alice is in bob's roster (both connected initially).
+  await expect(aliceRowOnBob).toHaveAttribute(
+    "data-voice-connected",
+    "true",
+    { timeout: 4_000 },
+  );
+
+  // Force bob's view of alice into "in channel, not connected"
+  // by re-dispatching the peer-state callback with
+  // (in_call=false, in_voice_channel=true). The Gleam Msg flow
+  // is the same path the runtime uses, just driven from the test
+  // instead of from the bus subscriber.
+  await bob.page.evaluate((hex) => {
+    window.__voicePeerStateHandler(hex, false, false, false, true);
+  }, aliceHex);
+
+  // Within Lustre's next render the row should flip to
+  // disconnected and show the 'connecting…' affordance instead of
+  // the waveform meter. 1 s is generous for a virtual-DOM diff.
+  await expect(aliceRowOnBob).toHaveAttribute(
+    "data-voice-connected",
+    "false",
+    { timeout: 1_000 },
+  );
+  await expect(aliceRowOnBob).toBeVisible();
+  await expect(
+    aliceRowOnBob.locator('[data-testid="voice-member-not-connected"]'),
+  ).toBeVisible();
+  // Waveform meter should not render in the disconnected branch.
+  await expect(
+    aliceRowOnBob.locator('[data-testid="voice-waveform"]'),
+  ).toHaveCount(0);
 
   await alice.ctx.close();
   await bob.ctx.close();

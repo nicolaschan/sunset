@@ -56,10 +56,15 @@ pub fn voice_get_quality() -> String
 
 /// Install the global `window.__voicePeerStateHandler` callback so
 /// `wasmVoiceStart`'s `on_voice_peer_state` fires into Lustre dispatch.
+/// Five-arg signature: `(peer_hex, in_call, talking, is_muted,
+/// in_voice_channel)`. `in_voice_channel` is the durable-presence
+/// signal — true once we've seen a `voice-presence/<room_fp>/<peer>`
+/// entry from this peer, regardless of whether a P2P connection is
+/// up. `in_call` flips on once the P2P channel is established.
 /// Call once at app init via `effect.from`.
 @external(javascript, "./voice.ffi.mjs", "installVoiceStateHandler")
 pub fn install_voice_state_handler(
-  cb: fn(String, Bool, Bool, Bool) -> Nil,
+  cb: fn(String, Bool, Bool, Bool, Bool) -> Nil,
 ) -> Nil
 
 /// Install the global `window.__voicePeerLevelHandler` callback so

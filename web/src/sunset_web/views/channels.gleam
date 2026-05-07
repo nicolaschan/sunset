@@ -13,8 +13,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
   type Channel, type ChannelId, type ConnStatus, type Member, type Relay,
-  type Room, type Viewport, Connected, Desktop, MutedP, Offline, Phone,
-  Reconnecting, TextChannel, Voice,
+  type Room, type Viewport, type VoicePeerStateUI, Connected, Desktop, MutedP,
+  Offline, Phone, Reconnecting, TextChannel, Voice,
 }
 import sunset_web/sunset
 import sunset_web/theme.{type Palette}
@@ -27,6 +27,7 @@ pub fn view(
   room r: Room,
   channels cs: List(Channel),
   members ms: List(Member),
+  voice_peers voice_peers: Dict(String, VoicePeerStateUI),
   peer_levels peer_levels: Dict(String, Float),
   self_level self_level: Float,
   current_channel cur: ChannelId,
@@ -111,6 +112,7 @@ pub fn view(
                   p,
                   c,
                   in_call,
+                  voice_peers,
                   peer_levels,
                   self_level,
                   voice_popover_open,
@@ -350,6 +352,7 @@ fn voice_block(
   p: Palette,
   c: Channel,
   in_call_members: List(Member),
+  voice_peers: Dict(String, VoicePeerStateUI),
   peer_levels: Dict(String, Float),
   self_level: Float,
   popover_open: Option(String),
@@ -366,6 +369,7 @@ fn voice_block(
         p,
         c,
         in_call_members,
+        voice_peers,
         peer_levels,
         self_level,
         popover_open,
@@ -424,6 +428,7 @@ fn live_voice_block(
   p: Palette,
   c: Channel,
   ms: List(Member),
+  voice_peers: Dict(String, VoicePeerStateUI),
   peer_levels: Dict(String, Float),
   self_level: Float,
   popover_open: Option(String),
@@ -502,8 +507,10 @@ fn live_voice_block(
             voice_member_row(
               p,
               m,
+              voice_peers,
               peer_levels,
               self_level,
+              self_in_call,
               popover_open,
               on_open_voice_popover,
             )
@@ -538,8 +545,10 @@ fn connector_line(p: Palette) -> Element(msg) {
 fn voice_member_row(
   p: Palette,
   m: Member,
+  voice_peers: Dict(String, VoicePeerStateUI),
   peer_levels: Dict(String, Float),
   self_level: Float,
+  self_in_call: Bool,
   popover_open: Option(String),
   on_open_voice_popover: fn(String) -> msg,
 ) -> Element(msg) {
@@ -550,25 +559,42 @@ fn voice_member_row(
   // message authoring), so this row derives the full hex on demand.
   let peer_key = sunset.bits_to_hex(m.pubkey)
   let muted = m.status == MutedP
+  // "Connected" = we have audio flow with this peer (in_call from
+  // voice.peers, driven by frame/heartbeat liveness). "In voice
+  // channel" = peer announced presence (in_voice_channel; broader,
+  // already gated upstream — Member.in_call carries that signal
+  // here). The connected/not-connected distinction is what drives
+  // the dimmed style + "connecting…" affordance for peers we see
+  // in the channel but haven't established a P2P link with yet.
+  // Self is trivially connected once we've joined.
+  let connected = case m.you {
+    True -> self_in_call
+    False ->
+      case dict.get(voice_peers, peer_key) {
+        Ok(ps) -> ps.in_call
+        Error(_) -> False
+      }
+  }
   // Real audio level: 0..1, driven by the FFI's per-peer RMS smoother
-  // (or the local mic level for self). When muted, force to 0 so the
-  // bar matches the "muted" affordance instead of pretending audio is
-  // flowing.
+  // (or the local mic level for self). When muted or not yet
+  // connected (no audio path), force to 0 — neither the level meter
+  // nor the "speaking" highlight should imply audio is flowing.
   let raw_level = case m.you {
     True -> self_level
     False ->
       dict.get(peer_levels, peer_key)
       |> result.unwrap(0.0)
   }
-  let level = case muted {
-    True -> 0.0
-    False -> raw_level
+  let level = case muted, connected {
+    False, True -> raw_level
+    _, _ -> 0.0
   }
-  let speaking = level >. voice_meter.speaking_threshold()
-  let dot_color = case muted, speaking {
-    True, _ -> p.text_faint
-    False, True -> p.live
-    False, False -> p.accent
+  let speaking = connected && level >. voice_meter.speaking_threshold()
+  let dot_color = case connected, muted, speaking {
+    False, _, _ -> p.text_faint
+    True, True, _ -> p.text_faint
+    True, False, True -> p.live
+    True, False, False -> p.accent
   }
   let active = case popover_open {
     Some(open_id) -> open_id == peer_key
@@ -578,11 +604,22 @@ fn voice_member_row(
     True -> p.surface
     False -> "transparent"
   }
+  // Disconnected rows render at reduced opacity so the eye reads them
+  // as "in the channel but not currently audible" without removing
+  // them from the roster.
+  let row_opacity = case connected {
+    True -> "1"
+    False -> "0.55"
+  }
   html.button(
     [
       attribute.attribute("data-testid", "voice-member"),
       attribute.attribute("data-voice-name", m.name),
       attribute.attribute("data-peer-hex", peer_key),
+      attribute.attribute("data-voice-connected", case connected {
+        True -> "true"
+        False -> "false"
+      }),
       attribute.attribute(
         "data-voice-level",
         voice_meter.level_to_attribute(level),
@@ -605,6 +642,7 @@ fn voice_member_row(
         #("font-family", "inherit"),
         #("font-size", "15.625px"),
         #("cursor", "pointer"),
+        #("opacity", row_opacity),
       ]),
     ],
     [
@@ -642,8 +680,9 @@ fn voice_member_row(
         ]),
       ),
       html.span([ui.css([#("flex", "1")])], []),
-      case muted {
-        True ->
+      case connected, muted {
+        False, _ -> not_connected_label(p)
+        True, True ->
           html.span(
             [
               ui.css([
@@ -654,9 +693,27 @@ fn voice_member_row(
             ],
             [html.text("muted")],
           )
-        False -> waveform_meter(p, level)
+        True, False -> waveform_meter(p, level)
       },
     ],
+  )
+}
+
+/// Affordance for a peer who is in the voice channel but we don't
+/// have a P2P connection to yet (or anymore). Replaces the waveform
+/// meter so the row reads as "joined, audio not flowing" instead of
+/// "joined, silent" (which `waveform_meter(_, 0.0)` would imply).
+fn not_connected_label(p: Palette) -> Element(msg) {
+  html.span(
+    [
+      attribute.attribute("data-testid", "voice-member-not-connected"),
+      ui.css([
+        #("font-size", "13.125px"),
+        #("color", p.text_faint),
+        #("font-style", "italic"),
+      ]),
+    ],
+    [html.text("connecting…")],
   )
 }
 

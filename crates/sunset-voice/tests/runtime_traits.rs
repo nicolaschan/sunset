@@ -61,5 +61,6 @@ async fn traits_are_object_safe_and_implementable() {
         in_call: true,
         talking: false,
         is_muted: false,
+        in_voice_channel: true,
     });
 }

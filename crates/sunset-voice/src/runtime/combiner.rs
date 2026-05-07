@@ -1,14 +1,23 @@
-//! Combines the two `Liveness` streams into `VoicePeerState`. Debounces
-//! by suppressing emissions when (in_call, talking, is_muted) doesn't
-//! change for a peer.
+//! Combines the three `Liveness` streams (frames, ephemeral
+//! heartbeats, durable voice-presence) into `VoicePeerState`.
+//! Debounces by suppressing emissions when the four observable
+//! booleans (`in_call`, `talking`, `is_muted`, `in_voice_channel`)
+//! don't change for a peer.
 //!
-//! `in_call = frame_alive || membership_alive`. Both signals must be tracked
-//! independently because a peer can register in `last_emitted` via frames
-//! before any heartbeat arrives (or vice versa). If we computed `in_call`
-//! from only the most-recent event, a hard departure that happened before
-//! the first heartbeat reached us would leave `in_call` stuck at true: frame
-//! Stale would drop `talking` but couldn't safely flip `in_call` (the peer
-//! might still be heartbeating), and no membership Stale would ever fire
+//! `in_call = frame_alive || membership_alive` — i.e. we have audio
+//! flowing or have recently heard an over-the-air heartbeat.
+//! `in_voice_channel = frame_alive || membership_alive ||
+//! presence_alive` — anything that proves the peer is in the channel,
+//! including the durable presence record (which arrives via the sync
+//! layer regardless of whether we have a P2P connection yet).
+//!
+//! Both signals must be tracked independently because a peer can
+//! register in `last_emitted` via frames before any heartbeat arrives
+//! (or vice versa). If we computed `in_call` from only the most-recent
+//! event, a hard departure that happened before the first heartbeat
+//! reached us would leave `in_call` stuck at true: frame Stale would
+//! drop `talking` but couldn't safely flip `in_call` (the peer might
+//! still be heartbeating), and no membership Stale would ever fire
 //! because membership_liveness has no entry to time out for that peer.
 
 use std::rc::Weak;
@@ -27,10 +36,12 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         };
         let frame_arc = inner.frame_liveness.clone();
         let membership_arc = inner.membership_liveness.clone();
+        let presence_arc = inner.voice_presence_liveness.clone();
         drop(inner);
 
         let mut frame_sub = frame_arc.subscribe().await;
         let mut membership_sub = membership_arc.subscribe().await;
+        let mut presence_sub = presence_arc.subscribe().await;
 
         loop {
             tokio::select! {
@@ -40,12 +51,14 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     let mut last = inner.last_emitted.borrow_mut();
                     let entry = last.entry(ev.peer.clone()).or_insert(EmittedState {
                         in_call: false, talking: false, is_muted: false,
-                        frame_alive: false, membership_alive: false,
+                        in_voice_channel: false,
+                        frame_alive: false, membership_alive: false, presence_alive: false,
                     });
                     let mut new = *entry;
                     new.frame_alive = alive;
                     new.talking = alive;
                     new.in_call = new.frame_alive || new.membership_alive;
+                    new.in_voice_channel = new.in_call || new.presence_alive;
                     if new != *entry {
                         *entry = new;
                         let state = VoicePeerState {
@@ -53,6 +66,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                             in_call: new.in_call,
                             talking: new.talking,
                             is_muted: new.is_muted,
+                            in_voice_channel: new.in_voice_channel,
                         };
                         let sink = inner.peer_state_sink.clone();
                         drop(last);
@@ -65,11 +79,13 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     let mut last = inner.last_emitted.borrow_mut();
                     let entry = last.entry(ev.peer.clone()).or_insert(EmittedState {
                         in_call: false, talking: false, is_muted: false,
-                        frame_alive: false, membership_alive: false,
+                        in_voice_channel: false,
+                        frame_alive: false, membership_alive: false, presence_alive: false,
                     });
                     let mut new = *entry;
                     new.membership_alive = alive;
                     new.in_call = new.frame_alive || new.membership_alive;
+                    new.in_voice_channel = new.in_call || new.presence_alive;
                     if new != *entry {
                         *entry = new;
                         let state = VoicePeerState {
@@ -77,6 +93,33 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                             in_call: new.in_call,
                             talking: new.talking,
                             is_muted: new.is_muted,
+                            in_voice_channel: new.in_voice_channel,
+                        };
+                        let sink = inner.peer_state_sink.clone();
+                        drop(last);
+                        sink.emit(&state);
+                    }
+                }
+                Some(ev) = presence_sub.next() => {
+                    let Some(inner) = weak.upgrade() else { return; };
+                    let alive = ev.state == LivenessState::Live;
+                    let mut last = inner.last_emitted.borrow_mut();
+                    let entry = last.entry(ev.peer.clone()).or_insert(EmittedState {
+                        in_call: false, talking: false, is_muted: false,
+                        in_voice_channel: false,
+                        frame_alive: false, membership_alive: false, presence_alive: false,
+                    });
+                    let mut new = *entry;
+                    new.presence_alive = alive;
+                    new.in_voice_channel = new.in_call || new.presence_alive;
+                    if new != *entry {
+                        *entry = new;
+                        let state = VoicePeerState {
+                            peer: ev.peer.clone(),
+                            in_call: new.in_call,
+                            talking: new.talking,
+                            is_muted: new.is_muted,
+                            in_voice_channel: new.in_voice_channel,
                         };
                         let sink = inner.peer_state_sink.clone();
                         drop(last);

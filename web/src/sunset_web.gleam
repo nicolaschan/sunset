@@ -302,6 +302,7 @@ pub type Msg {
     in_call: Bool,
     talking: Bool,
     is_muted: Bool,
+    in_voice_channel: Bool,
   )
   VoicePeerLevelChanged(peer_hex: String, level: Float)
   VoiceSelfLevelChanged(level: Float)
@@ -459,8 +460,20 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
 
   let install_voice_handler_eff =
     effect.from(fn(dispatch) {
-      voice.install_voice_state_handler(fn(hex, in_call, talking, is_muted) {
-        dispatch(VoicePeerStateChanged(hex, in_call, talking, is_muted))
+      voice.install_voice_state_handler(fn(
+        hex,
+        in_call,
+        talking,
+        is_muted,
+        in_voice_channel,
+      ) {
+        dispatch(VoicePeerStateChanged(
+          hex,
+          in_call,
+          talking,
+          is_muted,
+          in_voice_channel,
+        ))
       })
     })
 
@@ -1686,7 +1699,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(Model(..model, voice: new_voice), eff)
     }
 
-    VoicePeerStateChanged(hex, in_call, talking, is_muted) -> {
+    VoicePeerStateChanged(hex, in_call, talking, is_muted, in_voice_channel) -> {
       let new_peers =
         dict.insert(
           model.voice.peers,
@@ -1695,6 +1708,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             in_call: in_call,
             talking: talking,
             is_muted: is_muted,
+            in_voice_channel: in_voice_channel,
           ),
         )
       let new_voice = VoiceModel(..model.voice, peers: new_peers)
@@ -2058,13 +2072,23 @@ fn room_view_with_state(
     None -> element.fragment([])
   }
 
-  // Derive in_call + muted status from real voice state. The voice
-  // runtime keys peer state by *full* pubkey hex (32 bytes / 64 chars);
-  // Member.id is the truncated short_pubkey used for display, so we
-  // look up by `hex_encode(m.pubkey)` rather than the MemberId. Self
-  // is in_call iff model.voice.self_in_call is Some, and uses the
-  // local self_muted flag (the runtime emits one VoicePeerStateChanged
-  // for each peer but not for self).
+  // Derive voice-channel membership + muted status from real voice
+  // state. The voice runtime keys peer state by *full* pubkey hex (32
+  // bytes / 64 chars); Member.id is the truncated short_pubkey used
+  // for display, so we look up by `hex_encode(m.pubkey)` rather than
+  // the MemberId.
+  //
+  // We surface the *broader* "in voice channel" signal here (so the
+  // rail shows everyone announcing presence, not just peers we have
+  // a P2P connection to) by mapping it into `Member.in_call`. The
+  // narrower "connected" signal — i.e. `voice.peers[hex].in_call` —
+  // stays in `model.voice.peers`, threaded straight through to the
+  // channels view so each row can distinguish "connected"
+  // (audio flowing) from "in channel but not connected yet"
+  // (presence seen, P2P still pending).
+  //
+  // For self the two coincide: if I'm in the call, I'm trivially
+  // connected to myself.
   //
   // No fixture fallback: pre-connect we just render an empty roster.
   // The voice rail is idle; the channel goes live only when real
@@ -2072,14 +2096,14 @@ fn room_view_with_state(
   let members_for_channels =
     list.map(state.members, fn(m) {
       let peer_hex = hex_encode(m.pubkey)
-      let #(in_call_now, is_muted_now) = case m.you {
+      let #(in_voice_channel_now, is_muted_now) = case m.you {
         True -> #(
           option.is_some(model.voice.self_in_call),
           model.voice.self_muted,
         )
         False ->
           case dict.get(model.voice.peers, peer_hex) {
-            Ok(ps) -> #(ps.in_call, ps.is_muted)
+            Ok(ps) -> #(ps.in_voice_channel, ps.is_muted)
             Error(_) -> #(False, False)
           }
       }
@@ -2087,7 +2111,7 @@ fn room_view_with_state(
         True -> domain.MutedP
         False -> m.status
       }
-      domain.Member(..m, in_call: in_call_now, status: next_status)
+      domain.Member(..m, in_call: in_voice_channel_now, status: next_status)
     })
 
   let details_sheet_el = case model.viewport, state.sheet {
@@ -2282,6 +2306,7 @@ fn room_view_with_state(
       room: active_room,
       channels: channels_for_view,
       members: members_for_channels,
+      voice_peers: model.voice.peers,
       peer_levels: model.voice.peer_levels,
       self_level: model.voice.self_level,
       current_channel: state.current_channel,

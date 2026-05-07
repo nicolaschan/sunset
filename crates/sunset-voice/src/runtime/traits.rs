@@ -5,18 +5,30 @@ use async_trait::async_trait;
 use sunset_sync::PeerId;
 
 /// Per-peer voice state surfaced to the UI. The runtime emits a new
-/// `VoicePeerState` whenever any of the three booleans changes.
+/// `VoicePeerState` whenever any of the four booleans changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoicePeerState {
     pub peer: PeerId,
-    /// Heartbeats have arrived recently (or a frame, which implies
-    /// the peer is in the call).
+    /// Heartbeats (ephemeral, over the P2P channel) or frames have
+    /// arrived recently — i.e. the local client is currently
+    /// connected to this peer's audio path. Distinct from
+    /// `in_voice_channel` (peer announced membership via durable
+    /// presence but we may not yet have a connection).
     pub in_call: bool,
     /// Frame heard within the last ~1 s.
     pub talking: bool,
     /// Last heartbeat reported `is_muted: true`. Default false until
     /// the first heartbeat lands.
     pub is_muted: bool,
+    /// The peer has a fresh durable `voice-presence/<room_fp>/<peer>`
+    /// entry — i.e. they're announcing membership in the voice
+    /// channel via the sync layer. Stays true even when no P2P
+    /// connection has been established yet (or when one exists,
+    /// since presence is republished while in the call). Driven by
+    /// the durable presence stream, with TTL slightly longer than
+    /// the publisher's republish interval so a single missed
+    /// republish doesn't visibly drop the peer from the roster.
+    pub in_voice_channel: bool,
 }
 
 /// Idempotent connection-establishment hook. The runtime calls this

@@ -39,6 +39,12 @@ const JITTER_MAX_DEPTH: usize = 8;
 const JITTER_PUMP_INTERVAL: Duration = Duration::from_millis(20);
 pub(crate) const VOICE_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const VOICE_PRESENCE_TTL: Duration = Duration::from_secs(6);
+/// Stale-after window for the durable-presence-driven `in_voice_channel`
+/// signal. Set slightly larger than `VOICE_PRESENCE_TTL` so that a single
+/// missed republish doesn't drop a peer from the roster — the durable
+/// entry's `expires_at` is the floor and the relayed propagation latency
+/// is non-zero.
+const VOICE_PRESENCE_STALE_AFTER: Duration = Duration::from_secs(8);
 
 pub(crate) fn voice_presence_name(room_fp_hex: &str, sender_pk_hex: &str) -> bytes::Bytes {
     bytes::Bytes::from(format!("voice-presence/{room_fp_hex}/{sender_pk_hex}"))
@@ -59,6 +65,11 @@ pub struct VoiceTasks {
     pub auto_connect: futures::future::LocalBoxFuture<'static, ()>,
     pub jitter_pump: futures::future::LocalBoxFuture<'static, ()>,
     pub voice_presence_publisher: futures::future::LocalBoxFuture<'static, ()>,
+    /// Subscribes to durable `voice-presence/<room_fp>/` entries and
+    /// observes them into `voice_presence_liveness`. Emits the
+    /// `in_voice_channel` signal via the combiner so the UI knows
+    /// about peers who are in the channel but not yet connected.
+    pub voice_presence_membership: futures::future::LocalBoxFuture<'static, ()>,
 }
 
 impl VoiceRuntime {
@@ -77,6 +88,7 @@ impl VoiceRuntime {
 
         let frame_liveness = Liveness::new(FRAME_STALE_AFTER);
         let membership_liveness = Liveness::new(MEMBERSHIP_STALE_AFTER);
+        let voice_presence_liveness = Liveness::new(VOICE_PRESENCE_STALE_AFTER);
 
         let inner = Rc::new(state::RuntimeInner {
             identity,
@@ -97,6 +109,7 @@ impl VoiceRuntime {
             denoisers: RefCell::new(Default::default()),
             frame_liveness,
             membership_liveness,
+            voice_presence_liveness,
             jitter: RefCell::new(Default::default()),
             last_delivered: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
@@ -110,6 +123,7 @@ impl VoiceRuntime {
             auto_connect: auto_connect::spawn(Rc::downgrade(&inner)),
             jitter_pump: jitter::spawn(Rc::downgrade(&inner)),
             voice_presence_publisher: voice_presence_publisher::spawn(Rc::downgrade(&inner)),
+            voice_presence_membership: voice_presence_membership::spawn(Rc::downgrade(&inner)),
         };
 
         (VoiceRuntime { inner }, tasks)
@@ -293,6 +307,7 @@ impl VoiceRuntime {
                 in_call: s.in_call,
                 talking: s.talking,
                 is_muted: s.is_muted,
+                in_voice_channel: s.in_voice_channel,
             })
             .collect()
     }
@@ -370,4 +385,5 @@ mod combiner;
 mod heartbeat;
 mod jitter;
 mod subscribe;
+mod voice_presence_membership;
 mod voice_presence_publisher;
