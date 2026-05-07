@@ -94,6 +94,7 @@ pub(crate) fn voice_start(
     wasm_bindgen_futures::spawn_local(tasks.auto_connect);
     wasm_bindgen_futures::spawn_local(tasks.jitter_pump);
     wasm_bindgen_futures::spawn_local(tasks.voice_presence_publisher);
+    wasm_bindgen_futures::spawn_local(tasks.voice_presence_membership);
 
     *cell.borrow_mut() = Some(ActiveVoice {
         runtime,

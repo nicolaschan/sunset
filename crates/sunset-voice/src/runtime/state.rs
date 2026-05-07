@@ -36,6 +36,13 @@ pub(crate) struct RuntimeInner {
 
     pub frame_liveness: Arc<Liveness>,
     pub membership_liveness: Arc<Liveness>,
+    /// Tracks "this peer published a fresh durable `voice-presence`
+    /// entry recently" — the source of truth for `in_voice_channel`.
+    /// Independent of frame/heartbeat liveness because presence
+    /// propagates through the sync layer (relay-replicated CRDT) and
+    /// reaches us regardless of whether we've established a P2P
+    /// connection yet.
+    pub voice_presence_liveness: Arc<Liveness>,
 
     /// Per-peer jitter buffers (`VecDeque<Vec<f32>>`). Used by the
     /// subscribe loop (push) and the jitter pump (pop).
@@ -74,8 +81,10 @@ pub(crate) struct EmittedState {
     pub in_call: bool,
     pub talking: bool,
     pub is_muted: bool,
+    pub in_voice_channel: bool,
     pub frame_alive: bool,
     pub membership_alive: bool,
+    pub presence_alive: bool,
 }
 
 impl RuntimeInner {
@@ -96,8 +105,10 @@ impl RuntimeInner {
             in_call: false,
             talking: false,
             is_muted: false,
+            in_voice_channel: false,
             frame_alive: false,
             membership_alive: false,
+            presence_alive: false,
         });
         if entry.is_muted != is_muted {
             entry.is_muted = is_muted;
