@@ -21,7 +21,9 @@ pub mod signaling;
 pub mod verifier;
 
 pub use bus::{Bus, BusEvent, BusImpl};
-pub use crypto::envelope::{EncryptedMessage, MessageBody, ReactionAction, SignedMessage};
+pub use crypto::envelope::{
+    ChannelLabel, DEFAULT_CHANNEL, EncryptedMessage, MessageBody, ReactionAction, SignedMessage,
+};
 pub use crypto::room::{Room, RoomFingerprint, V1_EPOCH_ID};
 pub use error::{Error, Result};
 pub use filters::{room_filter, room_messages_filter};

@@ -11,7 +11,8 @@ use sunset_store::{ContentBlock, Hash, SignedKvEntry};
 use crate::canonical::signing_payload;
 use crate::crypto::aead::{aead_decrypt, aead_encrypt, build_msg_aad, derive_msg_key, fresh_nonce};
 use crate::crypto::envelope::{
-    EncryptedMessage, MessageBody, ReactionAction, SignedMessage, inner_sig_payload_bytes,
+    ChannelLabel, EncryptedMessage, MessageBody, ReactionAction, SignedMessage,
+    inner_sig_payload_bytes,
 };
 use crate::crypto::room::{Room, RoomFingerprint};
 use crate::error::{Error, Result};
@@ -28,6 +29,7 @@ pub struct DecodedMessage {
     pub author_key: IdentityKey,
     pub room_fingerprint: RoomFingerprint,
     pub epoch_id: u64,
+    pub channel: ChannelLabel,
     pub value_hash: Hash,
     pub sent_at_ms: u64,
     pub body: MessageBody,
@@ -42,18 +44,20 @@ pub fn compose_message<R: CryptoRngCore + ?Sized>(
     room: &Room,
     epoch_id: u64,
     sent_at_ms: u64,
+    channel: ChannelLabel,
     body: MessageBody,
     rng: &mut R,
 ) -> Result<ComposedMessage> {
     let epoch_root = room.epoch_root(epoch_id).ok_or(Error::EpochMismatch)?;
     let room_fp = room.fingerprint();
 
-    let inner_payload = inner_sig_payload_bytes(&room_fp, epoch_id, sent_at_ms, &body);
+    let inner_payload = inner_sig_payload_bytes(&room_fp, epoch_id, sent_at_ms, &channel, &body);
     let inner_sig = identity.sign(&inner_payload).to_bytes(); // [u8; 64]
 
     let signed = SignedMessage {
         inner_signature: inner_sig.into(), // convert [u8; 64] -> Signature newtype
         sent_at_ms,
+        channel,
         body,
     };
     let pt = postcard::to_stdvec(&signed)?;
@@ -96,6 +100,7 @@ pub fn compose_text<R: CryptoRngCore + ?Sized>(
     room: &Room,
     epoch_id: u64,
     sent_at_ms: u64,
+    channel: ChannelLabel,
     text: &str,
     rng: &mut R,
 ) -> Result<ComposedMessage> {
@@ -104,6 +109,7 @@ pub fn compose_text<R: CryptoRngCore + ?Sized>(
         room,
         epoch_id,
         sent_at_ms,
+        channel,
         MessageBody::Text(text.to_owned()),
         rng,
     )
@@ -116,6 +122,7 @@ pub fn compose_receipt<R: CryptoRngCore + ?Sized>(
     room: &Room,
     epoch_id: u64,
     sent_at_ms: u64,
+    channel: ChannelLabel,
     for_value_hash: Hash,
     rng: &mut R,
 ) -> Result<ComposedMessage> {
@@ -124,6 +131,7 @@ pub fn compose_receipt<R: CryptoRngCore + ?Sized>(
         room,
         epoch_id,
         sent_at_ms,
+        channel,
         MessageBody::Receipt { for_value_hash },
         rng,
     )
@@ -152,6 +160,7 @@ pub fn compose_reaction<R: CryptoRngCore + ?Sized>(
     room: &Room,
     epoch_id: u64,
     sent_at_ms: u64,
+    channel: ChannelLabel,
     payload: &ReactionPayload<'_>,
     rng: &mut R,
 ) -> Result<ComposedMessage> {
@@ -165,6 +174,7 @@ pub fn compose_reaction<R: CryptoRngCore + ?Sized>(
         room,
         epoch_id,
         sent_at_ms,
+        channel,
         MessageBody::Reaction {
             for_value_hash: payload.for_value_hash,
             emoji: payload.emoji.to_owned(),
@@ -223,6 +233,7 @@ pub fn decode_message(
         &room.fingerprint(),
         envelope.epoch_id,
         signed.sent_at_ms,
+        &signed.channel,
         &signed.body,
     );
     // Use dalek's Signature type (distinct from our envelope::Signature newtype)
@@ -239,6 +250,7 @@ pub fn decode_message(
         author_key,
         room_fingerprint: room.fingerprint(),
         epoch_id: envelope.epoch_id,
+        channel: signed.channel,
         value_hash: entry.value_hash,
         sent_at_ms: signed.sent_at_ms,
         body: signed.body,
@@ -270,6 +282,7 @@ mod tests {
             &room,
             0,
             1_700_000_000_000,
+            ChannelLabel::default_general(),
             MessageBody::Text("hi".to_owned()),
             &mut OsRng,
         )
@@ -291,6 +304,7 @@ mod tests {
             &room,
             0,
             1,
+            ChannelLabel::default_general(),
             MessageBody::Text("x".to_owned()),
             &mut OsRng,
         )
@@ -308,6 +322,7 @@ mod tests {
             &alice_room,
             0,
             1,
+            ChannelLabel::default_general(),
             MessageBody::Text("x".to_owned()),
             &mut OsRng,
         )
@@ -325,6 +340,7 @@ mod tests {
             &room,
             0,
             1,
+            ChannelLabel::default_general(),
             MessageBody::Text("x".to_owned()),
             &mut OsRng,
         )
@@ -344,6 +360,7 @@ mod tests {
             &room,
             0,
             1,
+            ChannelLabel::default_general(),
             MessageBody::Text("x".to_owned()),
             &mut OsRng,
         )
@@ -371,6 +388,7 @@ mod tests {
             &room,
             0,
             1,
+            ChannelLabel::default_general(),
             MessageBody::Text("real".to_owned()),
             &mut OsRng,
         )
@@ -389,6 +407,7 @@ mod tests {
             &room.fingerprint(),
             0,
             signed.sent_at_ms,
+            &signed.channel,
             &signed.body,
         ));
         signed.inner_signature = mallory_sig.to_bytes().into(); // convert [u8; 64] -> Signature newtype
@@ -422,8 +441,16 @@ mod tests {
         let id = alice();
         let room = general();
         let target: Hash = blake3::hash(b"original message").into();
-        let composed =
-            compose_receipt(&id, &room, 0, 1_700_000_000_000, target, &mut OsRng).unwrap();
+        let composed = compose_receipt(
+            &id,
+            &room,
+            0,
+            1_700_000_000_000,
+            ChannelLabel::default_general(),
+            target,
+            &mut OsRng,
+        )
+        .unwrap();
         let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
         assert_eq!(
             decoded.body,
@@ -438,7 +465,16 @@ mod tests {
     fn compose_text_roundtrips() {
         let id = alice();
         let room = general();
-        let composed = compose_text(&id, &room, 0, 1_700_000_000_000, "hi", &mut OsRng).unwrap();
+        let composed = compose_text(
+            &id,
+            &room,
+            0,
+            1_700_000_000_000,
+            ChannelLabel::default_general(),
+            "hi",
+            &mut OsRng,
+        )
+        .unwrap();
         let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
         assert_eq!(decoded.body, MessageBody::Text("hi".to_owned()));
     }
@@ -453,6 +489,7 @@ mod tests {
             &room,
             0,
             1_700_000_000_000,
+            ChannelLabel::default_general(),
             &ReactionPayload {
                 for_value_hash: target,
                 emoji: "👍",
@@ -483,6 +520,7 @@ mod tests {
             &room,
             0,
             2,
+            ChannelLabel::default_general(),
             &ReactionPayload {
                 for_value_hash: target,
                 emoji: "🎉",
@@ -512,6 +550,7 @@ mod tests {
             &room,
             0,
             1,
+            ChannelLabel::default_general(),
             &ReactionPayload {
                 for_value_hash: target,
                 emoji: &oversized,
@@ -534,6 +573,7 @@ mod tests {
             &room,
             0,
             1,
+            ChannelLabel::default_general(),
             &ReactionPayload {
                 for_value_hash: target,
                 emoji: &max_size,
@@ -545,6 +585,127 @@ mod tests {
             result.is_ok(),
             "64 bytes should be accepted (limit is inclusive)"
         );
+    }
+
+    #[test]
+    fn compose_then_decode_preserves_channel() {
+        let id = alice();
+        let room = general();
+        let composed = compose_text(
+            &id,
+            &room,
+            0,
+            1_700_000_000_000,
+            ChannelLabel::try_new("links").unwrap(),
+            "hi",
+            &mut OsRng,
+        )
+        .unwrap();
+        let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
+        assert_eq!(decoded.channel.as_str(), "links");
+        assert_eq!(decoded.body, MessageBody::Text("hi".to_owned()));
+    }
+
+    #[test]
+    fn decode_rejects_tampered_channel() {
+        // Compose a real message in #links, then re-encrypt with the
+        // channel field rewritten to "off-topic" without re-signing.
+        // The inner signature should fail to verify because the channel is
+        // covered by it.
+        let id = alice();
+        let room = general();
+        let composed = compose_text(
+            &id,
+            &room,
+            0,
+            1,
+            ChannelLabel::try_new("links").unwrap(),
+            "hi",
+            &mut OsRng,
+        )
+        .unwrap();
+
+        // Decrypt the plaintext, swap the channel, re-encrypt under a new
+        // key (which is fine — it's keyed off pt_hash).
+        let env = EncryptedMessage::from_bytes(&composed.block.data).unwrap();
+        let pt_hash = *composed.block.references.first().unwrap();
+        let k = derive_msg_key(room.epoch_root(0).unwrap(), 0, &pt_hash);
+        let aad = build_msg_aad(room.fingerprint().as_bytes(), 0, &id.public(), 1);
+        let pt = aead_decrypt(&k, &env.nonce, &aad, &env.ciphertext).unwrap();
+        let mut signed: SignedMessage = postcard::from_bytes(&pt).unwrap();
+        signed.channel = ChannelLabel::try_new("off-topic").unwrap();
+        // Re-encrypt under a fresh pt_hash so the block is internally consistent.
+        let pt_new = postcard::to_stdvec(&signed).unwrap();
+        let pt_hash_new: Hash = blake3::hash(&pt_new).into();
+        let k_new = derive_msg_key(room.epoch_root(0).unwrap(), 0, &pt_hash_new);
+        let ct_new = aead_encrypt(&k_new, &env.nonce, &aad, &pt_new);
+        let env_new = EncryptedMessage {
+            epoch_id: 0,
+            nonce: env.nonce,
+            ciphertext: Bytes::from(ct_new),
+        };
+        let block_new = ContentBlock {
+            data: Bytes::from(env_new.to_bytes()),
+            references: vec![pt_hash_new],
+        };
+        let mut entry = composed.entry.clone();
+        entry.value_hash = block_new.hash();
+        entry.name = Bytes::from(format!(
+            "{}/msg/{}",
+            room.fingerprint().to_hex(),
+            entry.value_hash.to_hex()
+        ));
+        // Re-sign the outer KV entry too (the outer signature is honest;
+        // the attack is on the inner signature only).
+        let outer_sig = id.sign(&crate::canonical::signing_payload(&entry));
+        entry.signature = Bytes::copy_from_slice(&outer_sig.to_bytes());
+
+        // The inner signature was computed over channel="links" but the
+        // ciphertext now decodes to channel="off-topic" → inner verify fails.
+        let err = decode_message(&room, &entry, &block_new).unwrap_err();
+        assert!(matches!(err, crate::Error::Signature(_)));
+    }
+
+    #[test]
+    fn compose_receipt_carries_channel() {
+        let id = alice();
+        let room = general();
+        let target: Hash = blake3::hash(b"x").into();
+        let composed = compose_receipt(
+            &id,
+            &room,
+            0,
+            1,
+            ChannelLabel::try_new("off-topic").unwrap(),
+            target,
+            &mut OsRng,
+        )
+        .unwrap();
+        let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
+        assert_eq!(decoded.channel.as_str(), "off-topic");
+    }
+
+    #[test]
+    fn compose_reaction_carries_channel() {
+        let id = alice();
+        let room = general();
+        let target: Hash = blake3::hash(b"target").into();
+        let composed = compose_reaction(
+            &id,
+            &room,
+            0,
+            2,
+            ChannelLabel::try_new("links").unwrap(),
+            &ReactionPayload {
+                for_value_hash: target,
+                emoji: "👍",
+                action: crate::ReactionAction::Add,
+            },
+            &mut OsRng,
+        )
+        .unwrap();
+        let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
+        assert_eq!(decoded.channel.as_str(), "links");
     }
 
     #[test]
@@ -566,11 +727,13 @@ mod tests {
             emoji: "a".repeat(65),
             action: ReactionAction::Add,
         };
-        let inner_payload = inner_sig_payload_bytes(&room_fp, 0, 1, &body);
+        let channel = ChannelLabel::default_general();
+        let inner_payload = inner_sig_payload_bytes(&room_fp, 0, 1, &channel, &body);
         let inner_sig: Signature = id.sign(&inner_payload).to_bytes().into();
         let signed = SignedMessage {
             inner_signature: inner_sig,
             sent_at_ms: 1,
+            channel,
             body,
         };
 
@@ -615,6 +778,7 @@ mod tests {
             &room,
             0,
             1,
+            ChannelLabel::default_general(),
             MessageBody::Text("x".to_owned()),
             &mut OsRng,
         )

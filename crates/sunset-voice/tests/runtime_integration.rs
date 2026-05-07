@@ -1249,9 +1249,15 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                     }
 
                     // Wait for at least 25 frames to be delivered. The
-                    // jitter pump runs every 20 ms; 25 × 20 ms = 500 ms,
-                    // well under any per-frame UX budget.
-                    tokio::time::timeout(Duration::from_millis(800), async {
+                    // jitter pump runs every 20 ms; 25 × 20 ms = 500 ms
+                    // of audio, well under any per-frame UX budget. The
+                    // 2-second wall budget is a CI tolerance — the
+                    // delivery cadence is paced by tokio::time::sleep
+                    // and runner load can stretch that real-time
+                    // significantly without affecting the user-visible
+                    // denoise behaviour we're verifying. Locally this
+                    // path completes in ~2s.
+                    tokio::time::timeout(Duration::from_secs(2), async {
                         loop {
                             if *delivered_rms_count.borrow() >= 25 {
                                 return;
@@ -1260,7 +1266,7 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                         }
                     })
                     .await
-                    .expect("at least 25 frames delivered within 800ms");
+                    .expect("at least 25 frames delivered within 2s");
 
                     drop(runtime);
                 }

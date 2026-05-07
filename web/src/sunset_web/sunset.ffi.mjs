@@ -146,9 +146,9 @@ export function onIntentChanged(client, callback) {
   });
 }
 
-export async function sendMessage(room, body, sentAtMs, callback) {
+export async function sendMessage(room, channel, body, sentAtMs, callback) {
   try {
-    const valueHashHex = await room.send_message(body, sentAtMs);
+    const valueHashHex = await room.send_message(channel, body, sentAtMs);
     callback(new Ok(valueHashHex));
   } catch (e) {
     callback(new GError(String(e)));
@@ -163,6 +163,7 @@ export function onMessage(room, callback) {
       author_pubkey: incoming.author_pubkey,
       epoch_id: incoming.epoch_id,
       sent_at_ms: incoming.sent_at_ms,
+      channel: incoming.channel,
       body: incoming.body,
       value_hash_hex: incoming.value_hash_hex,
       is_self: incoming.is_self,
@@ -235,6 +236,7 @@ export function incSentAtMs(msg) { return msg.sent_at_ms; }
 export function incBody(msg) { return msg.body; }
 export function incValueHashHex(msg) { return msg.value_hash_hex; }
 export function incIsSelf(msg) { return msg.is_self; }
+export function incChannel(msg) { return msg.channel; }
 
 // Presence + membership FFI shims.
 
@@ -325,6 +327,7 @@ export function onReceipt(room, callback) {
     const plain = {
       for_value_hash_hex: incoming.for_value_hash_hex,
       from_pubkey: incoming.from_pubkey,
+      channel: incoming.channel,
       sent_at_ms: incoming.sent_at_ms,
     };
     incoming.free();
@@ -342,6 +345,22 @@ export function recFromPubkey(rec) {
 
 export function recSentAtMs(rec) {
   return rec.sent_at_ms;
+}
+
+export function recChannel(rec) {
+  return rec.channel;
+}
+
+// Sorted snapshot of channel-name strings observed in this room. Always
+// includes "general". Returned as a Gleam List(String).
+export function observedChannels(room) {
+  return toList(Array.from(room.observed_channels()));
+}
+
+// Register a callback fired (immediately with the current snapshot,
+// then on every change) with a Gleam List(String) of channel names.
+export function onChannelsChanged(room, callback) {
+  room.on_channels_changed((arr) => callback(toList(Array.from(arr))));
 }
 
 /// Schedule a recurring callback every `ms` milliseconds. Returns
@@ -377,6 +396,10 @@ export function reactionsSnapshotTargetHex(snapshot) {
   return snapshot.target_hex;
 }
 
+export function reactionsSnapshotChannel(snapshot) {
+  return snapshot.channel;
+}
+
 export function reactionsSnapshotEntries(snapshot) {
   // Inner shape on the wasm side is `Map<author_pubkey_hex, sent_at_ms>`.
   // Flatten each emoji's Map to a Gleam-friendly `List(#(author_hex, sent_at_ms))`.
@@ -391,9 +414,9 @@ export function reactionsSnapshotEntries(snapshot) {
   return toList(out);
 }
 
-export function sendReaction(roomHandle, targetHex, emoji, action, callback) {
+export function sendReaction(roomHandle, channel, targetHex, emoji, action, callback) {
   roomHandle
-    .send_reaction(targetHex, emoji, action)
+    .send_reaction(channel, targetHex, emoji, action)
     .then(() => callback(new Ok(undefined)))
     .catch((e) => callback(new GError(String(e?.message ?? e))));
 }
