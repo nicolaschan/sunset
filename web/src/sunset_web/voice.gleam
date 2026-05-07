@@ -42,6 +42,18 @@ pub fn voice_set_deafened(client: ClientHandle, deafened: Bool) -> Nil
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceSetDenoise")
 pub fn voice_set_denoise(client: ClientHandle, denoise: Bool) -> Nil
 
+/// Switch the active send-side voice quality preset. Persists the
+/// label to localStorage and (if voice is running) pushes the change
+/// down to the active encoder. Accepted labels: `"voice"`, `"high"`,
+/// `"maximum"`. Unknown labels are silently ignored.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceSetQuality")
+pub fn voice_set_quality(client: ClientHandle, label: String) -> Nil
+
+/// Read the persisted quality preset, or the default (`"maximum"`)
+/// if nothing has been saved.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceGetQuality")
+pub fn voice_get_quality() -> String
+
 /// Install the global `window.__voicePeerStateHandler` callback so
 /// `wasmVoiceStart`'s `on_voice_peer_state` fires into Lustre dispatch.
 /// Call once at app init via `effect.from`.
@@ -49,3 +61,17 @@ pub fn voice_set_denoise(client: ClientHandle, denoise: Bool) -> Nil
 pub fn install_voice_state_handler(
   cb: fn(String, Bool, Bool, Bool) -> Nil,
 ) -> Nil
+
+/// Install the global `window.__voicePeerLevelHandler` callback so
+/// per-peer audio-level updates fire into Lustre dispatch. The level is
+/// a smoothed 0..1 value computed from the RMS of each delivered PCM
+/// frame; the rail's waveform reads from it to reflect who is talking.
+/// Call once at app init via `effect.from`.
+@external(javascript, "./voice.ffi.mjs", "installVoicePeerLevelHandler")
+pub fn install_voice_peer_level_handler(cb: fn(String, Float) -> Nil) -> Nil
+
+/// Install the global `window.__voiceSelfLevelHandler` callback so the
+/// local mic level fires into Lustre dispatch. Drives the self row's
+/// waveform.
+@external(javascript, "./voice.ffi.mjs", "installVoiceSelfLevelHandler")
+pub fn install_voice_self_level_handler(cb: fn(Float) -> Nil) -> Nil

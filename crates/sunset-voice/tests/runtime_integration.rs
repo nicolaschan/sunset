@@ -353,7 +353,9 @@ async fn send_pcm_publishes_frame_when_unmuted() {
             );
             let mut rx = tx.subscribe();
 
-            let pcm: Vec<f32> = (0..960).map(|i| (i as f32) / 1000.0).collect();
+            // Default quality is `Maximum` (stereo): 1920 interleaved
+            // samples per frame.
+            let pcm: Vec<f32> = (0..1920).map(|i| (i as f32) / 1000.0).collect();
             runtime.send_pcm(&pcm);
 
             let frame = tokio::time::timeout(Duration::from_secs(1), async {
@@ -378,8 +380,11 @@ async fn send_pcm_publishes_frame_when_unmuted() {
             let decoded = decoder.decode(&bytes).unwrap();
             // Opus is lossy; we just need the frame to round-trip
             // through encrypt → bus → decrypt → decode and produce
-            // the right-sized PCM frame.
-            assert_eq!(decoded.len(), sunset_voice::FRAME_SAMPLES);
+            // the right-sized stereo PCM frame.
+            assert_eq!(
+                decoded.len(),
+                sunset_voice::FRAME_SAMPLES_PER_CHANNEL * sunset_voice::PLAYBACK_CHANNELS as usize
+            );
             assert!(decoded.iter().all(|s| s.is_finite()));
         })
         .await;
@@ -476,7 +481,8 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
 
             // Alice publishes one Frame as if she were on the network.
             let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
-            let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
+            let mut enc =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
             let bytes = enc.encode(&pcm).unwrap();
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
@@ -642,7 +648,8 @@ async fn combiner_evicts_peer_seen_only_via_frames() {
 
             // Inject one frame from alice — no heartbeat ever.
             let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
-            let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
+            let mut enc =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
             let bytes = enc.encode(&pcm).unwrap();
             let now_ms: u64 = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
@@ -1198,10 +1205,14 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                     // Feed deterministic pseudo-random noise at amplitude
                     // 0.05 (well below clipping). 30 frames = 600 ms,
                     // enough for RNNoise to settle past its fade-in window.
-                    let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
+                    // Mono encoder; decoder upmixes to stereo, so the
+                    // RMS sink sees 1920-sample stereo frames either
+                    // way and the on/off comparison is fair.
+                    let mut enc =
+                        sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
                     let mut rng_seed: u32 = 0xBEEF_F00D;
                     for seq in 0..30 {
-                        let mut pcm = vec![0.0_f32; sunset_voice::FRAME_SAMPLES];
+                        let mut pcm = vec![0.0_f32; sunset_voice::FRAME_SAMPLES_PER_CHANNEL];
                         for s in pcm.iter_mut() {
                             rng_seed = rng_seed.wrapping_mul(48271) % 0x7FFF_FFFF;
                             let n = (rng_seed as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0;
