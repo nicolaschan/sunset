@@ -1,11 +1,13 @@
 //// Channels rail (column 2): room header, text channels, voice
-//// channels (with grouped live detail for the active Lounge), and
-//// bridge channels.
+//// channel (with grouped live detail when peers are connected),
+//// and bridge channels.
 
+import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
@@ -13,18 +15,22 @@ import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
   type Channel, type ChannelId, type ConnStatus, type Member, type Relay,
-  type Room, type Viewport, Connected, Desktop, MemberId, MutedP, Offline, Phone,
-  Reconnecting, Speaking, TextChannel, Voice,
+  type Room, type Viewport, Connected, Desktop, MutedP, Offline, Phone,
+  Reconnecting, TextChannel, Voice,
 }
+import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 import sunset_web/views/relays as relays_view
+import sunset_web/views/voice_meter
 
 pub fn view(
   palette p: Palette,
   room r: Room,
   channels cs: List(Channel),
   members ms: List(Member),
+  peer_levels peer_levels: Dict(String, Float),
+  self_level self_level: Float,
   current_channel cur: ChannelId,
   voice_popover_open voice_popover_open: Option(String),
   on_select_channel sel: fn(ChannelId) -> msg,
@@ -37,9 +43,11 @@ pub fn view(
   on_leave_voice on_leave_voice: msg,
   on_mute_self on_mute_self: msg,
   on_deafen_self on_deafen_self: msg,
+  on_toggle_denoise on_toggle_denoise: msg,
   self_in_call self_in_call: Bool,
   self_muted self_muted: Bool,
   self_deafened self_deafened: Bool,
+  denoise_on denoise_on: Bool,
   relays relays: List(Relay),
   on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
@@ -47,8 +55,18 @@ pub fn view(
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
   let in_call = list.filter(ms, fn(m) { m.in_call })
 
+  // Always anchor the desktop self-controls bar to the channels rail's
+  // first voice channel, regardless of whether anyone is in_call yet.
+  // The bar's bottom seam needs to line up with the rooms rail's "you"
+  // row and the main panel's composer (shell.spec.js's
+  // "column-bottom rows share a top y-coordinate" check), and a user
+  // who hasn't joined voice still wants to see the channel they can
+  // join. Pre-cleanup the fixture's hardcoded in_call: 3 was what made
+  // this branch fire for free; post-cleanup the rail derives in_call
+  // from real peers, so we anchor by existence rather than activity.
   let active_voice =
-    list.find(voice_channels, fn(c) { c.in_call > 0 })
+    voice_channels
+    |> list.first
     |> result_to_option
   // `height: 100%` resolves correctly for both layouts: the drawer's
   // safe-area-padded content box on phone, and the desktop grid row
@@ -101,6 +119,8 @@ pub fn view(
                   p,
                   c,
                   in_call,
+                  peer_levels,
+                  self_level,
                   voice_popover_open,
                   on_open_voice_popover,
                   on_join_voice,
@@ -126,9 +146,11 @@ pub fn view(
             on_join_voice,
             on_mute_self,
             on_deafen_self,
+            on_toggle_denoise,
             self_in_call,
             self_muted,
             self_deafened,
+            denoise_on,
           )
         _, _ -> element.fragment([])
       },
@@ -410,6 +432,8 @@ fn voice_block(
   p: Palette,
   c: Channel,
   in_call_members: List(Member),
+  peer_levels: Dict(String, Float),
+  self_level: Float,
   popover_open: Option(String),
   on_open_voice_popover: fn(String) -> msg,
   on_join: msg,
@@ -424,6 +448,8 @@ fn voice_block(
         p,
         c,
         in_call_members,
+        peer_levels,
+        self_level,
         popover_open,
         on_open_voice_popover,
         on_join,
@@ -480,6 +506,8 @@ fn live_voice_block(
   p: Palette,
   c: Channel,
   ms: List(Member),
+  peer_levels: Dict(String, Float),
+  self_level: Float,
   popover_open: Option(String),
   on_open_voice_popover: fn(String) -> msg,
   on_join: msg,
@@ -553,7 +581,14 @@ fn live_voice_block(
         list.flatten([
           [connector_line(p)],
           list.map(ms, fn(m) {
-            voice_member_row(p, m, popover_open, on_open_voice_popover)
+            voice_member_row(
+              p,
+              m,
+              peer_levels,
+              self_level,
+              popover_open,
+              on_open_voice_popover,
+            )
           }),
         ]),
       ),
@@ -585,19 +620,40 @@ fn connector_line(p: Palette) -> Element(msg) {
 fn voice_member_row(
   p: Palette,
   m: Member,
+  peer_levels: Dict(String, Float),
+  self_level: Float,
   popover_open: Option(String),
   on_open_voice_popover: fn(String) -> msg,
 ) -> Element(msg) {
-  let MemberId(id_str) = m.id
-  let dot_color = case m.status {
-    MutedP -> p.text_faint
-    Speaking -> p.live
-    _ -> p.accent
-  }
-  let speaking = m.status == Speaking
+  // The voice subsystem keys peers by *full* pubkey hex throughout —
+  // FFI peer node table, voice.peers state, voice.peer_levels, popover
+  // identity, and per-peer volume RPCs all line up on this string.
+  // Member.id is short_pubkey for display elsewhere (members rail,
+  // message authoring), so this row derives the full hex on demand.
+  let peer_key = sunset.bits_to_hex(m.pubkey)
   let muted = m.status == MutedP
+  // Real audio level: 0..1, driven by the FFI's per-peer RMS smoother
+  // (or the local mic level for self). When muted, force to 0 so the
+  // bar matches the "muted" affordance instead of pretending audio is
+  // flowing.
+  let raw_level = case m.you {
+    True -> self_level
+    False ->
+      dict.get(peer_levels, peer_key)
+      |> result.unwrap(0.0)
+  }
+  let level = case muted {
+    True -> 0.0
+    False -> raw_level
+  }
+  let speaking = level >. voice_meter.speaking_threshold()
+  let dot_color = case muted, speaking {
+    True, _ -> p.text_faint
+    False, True -> p.live
+    False, False -> p.accent
+  }
   let active = case popover_open {
-    Some(open_id) -> open_id == id_str
+    Some(open_id) -> open_id == peer_key
     None -> False
   }
   let bg = case active {
@@ -608,7 +664,16 @@ fn voice_member_row(
     [
       attribute.attribute("data-testid", "voice-member"),
       attribute.attribute("data-voice-name", m.name),
-      event.on_click(on_open_voice_popover(id_str)),
+      attribute.attribute("data-peer-hex", peer_key),
+      attribute.attribute(
+        "data-voice-level",
+        voice_meter.level_to_attribute(level),
+      ),
+      attribute.attribute("data-voice-speaking", case speaking {
+        True -> "true"
+        False -> "false"
+      }),
+      event.on_click(on_open_voice_popover(peer_key)),
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),
@@ -671,50 +736,74 @@ fn voice_member_row(
             ],
             [html.text("muted")],
           )
-        False -> waveform_placeholder(p, speaking)
+        False -> waveform_meter(p, level)
       },
     ],
   )
 }
 
-fn waveform_placeholder(p: Palette, speaking: Bool) -> Element(msg) {
-  // V1: a flat row of 12 thin bars; the live animation is deferred.
-  let color = case speaking {
-    True -> p.accent
-    False -> p.text_faint
-  }
-  let bars =
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-    |> list.map(fn(_) {
-      html.span(
-        [
-          ui.css([
-            #("display", "inline-block"),
-            #("width", "2px"),
-            #("height", case speaking {
-              True -> "10px"
-              False -> "2px"
-            }),
-            #("background", color),
-            #("border-radius", "1px"),
-            #("opacity", case speaking {
-              True -> "0.85"
-              False -> "0.4"
-            }),
-          ]),
-        ],
-        [],
-      )
-    })
+/// 12-bar VU-meter visualisation of an audio level (0..1). Bar `i`
+/// scales between `min_height` and `max_height` proportional to where
+/// `level` falls along its slot — so bars light up left-to-right as
+/// the level climbs, and the trailing bars fade out as it drops. Drives
+/// off the smoothed FFI level so the user can see who is talking.
+fn waveform_meter(p: Palette, level: Float) -> Element(msg) {
+  let bars_count = 12
   html.span(
     [
+      attribute.attribute("data-testid", "voice-waveform"),
       ui.css([
         #("display", "inline-flex"),
         #("align-items", "center"),
         #("gap", "1px"),
+        #("height", "12px"),
       ]),
     ],
-    bars,
+    list.index_map(list.repeat(Nil, bars_count), fn(_, i) {
+      meter_bar(p, level, i, bars_count)
+    }),
+  )
+}
+
+fn meter_bar(p: Palette, level: Float, i: Int, n: Int) -> Element(msg) {
+  // Treat each bar as covering its slot of the 0..1 range. A bar is
+  // fully lit when `level >= (i+1)/n`, fully dark when `level <= i/n`,
+  // and partially lit in between — same shape as a hardware VU meter.
+  let slot_lo = int.to_float(i) /. int.to_float(n)
+  let slot_hi = int.to_float(i + 1) /. int.to_float(n)
+  let fill = case level <=. slot_lo {
+    True -> 0.0
+    False ->
+      case level >=. slot_hi {
+        True -> 1.0
+        False -> { level -. slot_lo } /. { slot_hi -. slot_lo }
+      }
+  }
+  // Map fill (0..1) into a height that's still a 1 px sliver at idle
+  // so the meter is visible as a row of dots before audio arrives.
+  let min_h = 1.5
+  let max_h = 11.0
+  let h = min_h +. fill *. { max_h -. min_h }
+  let opacity = case fill <. 0.05 {
+    True -> "0.3"
+    False -> "0.95"
+  }
+  let color = case fill >. 0.0 {
+    True -> p.accent
+    False -> p.text_faint
+  }
+  html.span(
+    [
+      ui.css([
+        #("display", "inline-block"),
+        #("width", "2px"),
+        #("border-radius", "1px"),
+        #("background", color),
+        #("opacity", opacity),
+        #("height", voice_meter.float_to_px(h)),
+      ]),
+    ],
+    [],
   )
 }
 
@@ -748,9 +837,11 @@ fn self_control_bar(
   on_join: msg,
   on_mute: msg,
   on_deafen: msg,
+  on_toggle_denoise: msg,
   self_in_call: Bool,
   self_muted: Bool,
   self_deafened: Bool,
+  denoise_on: Bool,
 ) -> Element(msg) {
   let _ = on_join
   // Fixed 64px height with a 1px border-top so this row aligns visually
@@ -843,6 +934,21 @@ fn self_control_bar(
         self_deafened,
         Some(on_deafen),
       ),
+      // Denoise toggle. Defaults to on; the warn highlight fires when
+      // the user has explicitly turned RNNoise off (i.e. opted into
+      // raw audio), so it sits visually beside mute / deafen as another
+      // "you're in a non-default state" indicator.
+      self_btn_with_testid(
+        p,
+        case denoise_on {
+          True -> "Disable noise reduction"
+          False -> "Enable noise reduction"
+        },
+        denoise_icon(denoise_on),
+        !denoise_on,
+        Some(on_toggle_denoise),
+        "voice-denoise-toggle",
+      ),
       case self_in_call {
         True -> leave_btn(p, on_leave)
         False -> element.fragment([])
@@ -858,6 +964,17 @@ fn self_btn(
   active: Bool,
   on_click: Option(msg),
 ) -> Element(msg) {
+  self_btn_with_testid(p, title, icon, active, on_click, "")
+}
+
+fn self_btn_with_testid(
+  p: Palette,
+  title: String,
+  icon: Element(msg),
+  active: Bool,
+  on_click: Option(msg),
+  testid: String,
+) -> Element(msg) {
   let bg = case active {
     True -> p.warn_soft
     False -> p.surface_alt
@@ -869,6 +986,16 @@ fn self_btn(
   let click_attr = case on_click {
     Some(msg) -> [event.on_click(msg)]
     None -> []
+  }
+  let testid_attr = case testid {
+    "" -> []
+    id -> [
+      attribute.attribute("data-testid", id),
+      attribute.attribute("aria-pressed", case active {
+        True -> "true"
+        False -> "false"
+      }),
+    ]
   }
   html.button(
     list.flatten([
@@ -891,6 +1018,7 @@ fn self_btn(
         ]),
       ],
       click_attr,
+      testid_attr,
     ]),
     [icon],
   )
@@ -1014,6 +1142,69 @@ fn headphones_icon() -> Element(msg) {
         [],
       ),
     ],
+  )
+}
+
+/// Denoise / "noise reduction" icon: a sparkle (RNNoise is ML, sparkles
+/// read as "smart filtering" in product UI), with a diagonal slash when
+/// the toggle is off so the disabled state reads at a glance.
+fn denoise_icon(on: Bool) -> Element(msg) {
+  let sparkle =
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "path",
+      [
+        attribute.attribute(
+          "d",
+          "M8 2.5l1.1 3.4 3.4 1.1-3.4 1.1L8 11.5l-1.1-3.4L3.5 7l3.4-1.1L8 2.5z",
+        ),
+        attribute.attribute("fill", "currentColor"),
+        attribute.attribute("fill-opacity", "0.85"),
+      ],
+      [],
+    )
+  let small_sparkle =
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "path",
+      [
+        attribute.attribute(
+          "d",
+          "M12.5 11l.5 1.5L14.5 13l-1.5.5L12.5 15l-.5-1.5L10.5 13l1.5-.5L12.5 11z",
+        ),
+        attribute.attribute("fill", "currentColor"),
+        attribute.attribute("fill-opacity", "0.65"),
+      ],
+      [],
+    )
+  let slash = case on {
+    True -> element.fragment([])
+    False ->
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "line",
+        [
+          attribute.attribute("x1", "2"),
+          attribute.attribute("y1", "14"),
+          attribute.attribute("x2", "14"),
+          attribute.attribute("y2", "2"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.6"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      )
+  }
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "14"),
+      attribute.attribute("height", "14"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [sparkle, small_sparkle, slash],
   )
 }
 

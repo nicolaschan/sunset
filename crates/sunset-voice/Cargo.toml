@@ -29,6 +29,7 @@ bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
 hkdf.workspace = true
+nnnoiseless.workspace = true
 postcard.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true

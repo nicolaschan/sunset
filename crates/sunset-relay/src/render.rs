@@ -116,13 +116,31 @@ pub fn render_dashboard(snap: &DashboardSnapshot) -> String {
 }
 
 /// JSON identity. Hex-only field values, no escaping needed.
+///
+/// The optional `webtransport_cert_sha256` field appears only when the
+/// relay successfully bound a UDP listener and generated its self-signed
+/// WT cert. Old clients (which don't know about the field) keep
+/// working off `address` (the legacy WS URL). Newer clients use this
+/// hash to pin the relay's WT cert in `serverCertificateHashes`, and
+/// build the actual WT URL themselves from the hostname they used to
+/// reach the descriptor — see
+/// `sunset_relay_resolver::Resolver::resolve_with_fallback`.
 pub fn render_identity(snap: &IdentitySnapshot) -> String {
-    format!(
-        "{{\"ed25519\":\"{}\",\"x25519\":\"{}\",\"address\":\"{}\"}}\n",
-        hex::encode(snap.ed25519_public),
-        hex::encode(snap.x25519_public),
-        snap.dial_url,
-    )
+    let mut out = String::from("{");
+    out.push_str(&format!(
+        "\"ed25519\":\"{}\",",
+        hex::encode(snap.ed25519_public)
+    ));
+    out.push_str(&format!(
+        "\"x25519\":\"{}\",",
+        hex::encode(snap.x25519_public)
+    ));
+    out.push_str(&format!("\"address\":\"{}\"", snap.dial_url));
+    if let Some(cert_hex) = &snap.webtransport_cert_sha256 {
+        out.push_str(&format!(",\"webtransport_cert_sha256\":\"{cert_hex}\""));
+    }
+    out.push_str("}\n");
+    out
 }
 
 // --- helpers ---
@@ -229,6 +247,7 @@ mod tests {
             ed25519_public: [0xab; 32],
             x25519_public: [0xcd; 32],
             dial_url: "ws://relay.example:8443".into(),
+            webtransport_cert_sha256: None,
         };
         let json = render_identity(&snap);
         assert_eq!(
@@ -236,6 +255,29 @@ mod tests {
             "{\"ed25519\":\"abababababababababababababababababababababababababababababababab\",\
              \"x25519\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\
              \"address\":\"ws://relay.example:8443\"}\n"
+        );
+    }
+
+    #[test]
+    fn identity_json_includes_webtransport_cert_when_present() {
+        let cert_hex = "ee".repeat(32);
+        let snap = IdentitySnapshot {
+            ed25519_public: [0xab; 32],
+            x25519_public: [0xcd; 32],
+            dial_url: "ws://relay.example:8443".into(),
+            webtransport_cert_sha256: Some(cert_hex.clone()),
+        };
+        let json = render_identity(&snap);
+        assert!(
+            json.contains(&format!("\"webtransport_cert_sha256\":\"{cert_hex}\"")),
+            "missing wt cert field in: {json}"
+        );
+        // Crucially: the JSON must NOT carry a fully-formed URL — the
+        // descriptor's job is identity material only; the resolver
+        // builds the URL from user-typed authority.
+        assert!(
+            !json.contains("webtransport_address"),
+            "descriptor must not ship a URL, only the cert hash: {json}"
         );
     }
 

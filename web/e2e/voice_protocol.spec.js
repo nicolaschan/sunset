@@ -101,20 +101,25 @@ function freshSeedHex() {
 
 const ROOM = "voice-test-room";
 
-// One 20 ms PCM frame of continuous 440 Hz sine at amplitude 0.5.
-// `counter` advances the phase by exactly one frame so consecutive
-// counters produce a continuous tone (which Opus is built to encode
-// efficiently and reproduce faithfully). Matches the Rust
-// `synth_pcm_with_counter`.
+// One 20 ms PCM frame of continuous 440 Hz sine at amplitude 0.5,
+// interleaved L/R stereo (1920 samples). `counter` advances the
+// phase by exactly one frame per channel so consecutive frames form
+// a continuous tone (which Opus is built to encode efficiently and
+// reproduce faithfully). Matches the Rust `synth_pcm_with_counter`
+// and the shape `voice_inject_pcm` expects since stereo became the
+// capture path.
 function syntheticPcm(counter) {
   const FREQ_HZ = 440;
   const SR = 48000;
-  const FRAME = 960;
-  const arr = new Float32Array(FRAME);
-  const offset = counter * FRAME;
-  for (let i = 0; i < FRAME; i++) {
+  const FRAME_PER_CH = 960;
+  const CHANNELS = 2;
+  const arr = new Float32Array(FRAME_PER_CH * CHANNELS);
+  const offset = counter * FRAME_PER_CH;
+  for (let i = 0; i < FRAME_PER_CH; i++) {
     const t = (offset + i) / SR;
-    arr[i] = 0.5 * Math.sin(2 * Math.PI * FREQ_HZ * t);
+    const s = 0.5 * Math.sin(2 * Math.PI * FREQ_HZ * t);
+    arr[i * CHANNELS] = s;
+    arr[i * CHANNELS + 1] = s;
   }
   return arr;
 }
@@ -197,12 +202,13 @@ test("alice's opus frames arrive at bob with real audio energy", async ({ browse
   expect(goodFrames, "bob should receive at least one Opus-decoded frame from alice with non-trivial RMS").not.toBeNull();
   expect(goodFrames.length).toBeGreaterThan(0);
 
-  // Verify the frame shape matches the contract: 960 samples (20 ms
-  // at 48 kHz mono). RMS is the energy check; checksum is just
-  // exposed so distinctness can be eyeballed across consecutive
-  // frames.
+  // Verify the frame shape matches the contract: 1920 samples
+  // (20 ms × 2 channels interleaved L/R, since the receiver always
+  // decodes through a 2-channel decoder). RMS is the energy check;
+  // checksum is just exposed so distinctness can be eyeballed
+  // across consecutive frames.
   const frame = goodFrames[0];
-  expect(frame.len).toBe(960);
+  expect(frame.len).toBe(1920);
   expect(typeof frame.checksum).toBe("string");
   expect(frame.checksum).toHaveLength(64);
 

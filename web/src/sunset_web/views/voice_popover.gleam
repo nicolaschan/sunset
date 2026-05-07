@@ -1,8 +1,8 @@
 //// Floating popover that opens when the user clicks an in-call
 //// member in the voice channel detail block.
 ////
-//// Shows the peer's status, a placeholder waveform, and three
-//// per-peer controls:
+//// Shows the peer's status, a level-driven waveform reflecting their
+//// live audio, and three per-peer controls:
 ////   * Volume slider — 0–100% for the local user, 0–200% for others.
 ////   * Denoise toggle — strip background noise from this peer's
 ////     incoming stream (or your outgoing stream, on the self row).
@@ -20,10 +20,11 @@ import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
   type Member, type VoiceSettings, Direct, MutedP, NoRelay, OneHop, SelfRelay,
-  Speaking, TwoHop, ViaPeer,
+  TwoHop, ViaPeer,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
+import sunset_web/views/voice_meter
 
 pub type Placement {
   Floating
@@ -35,9 +36,12 @@ pub fn view(
   placement placement: Placement,
   member m: Member,
   settings settings: VoiceSettings,
+  voice_quality voice_quality: String,
+  level level: Float,
   on_close on_close: msg,
   on_set_volume on_set_volume: fn(Int) -> msg,
   on_toggle_denoise on_toggle_denoise: msg,
+  on_set_voice_quality on_set_voice_quality: fn(String) -> msg,
   on_toggle_deafen on_toggle_deafen: msg,
   on_reset on_reset: msg,
 ) -> Element(msg) {
@@ -48,9 +52,18 @@ pub fn view(
   }
 
   let body_children = [
-    header(p, m, settings, on_close),
-    waveform_strip(p, m, settings),
-    body(p, m, settings, max_volume, on_set_volume, on_toggle_denoise),
+    header(p, m, settings, level, on_close),
+    waveform_strip(p, m, settings, level),
+    body(
+      p,
+      m,
+      settings,
+      voice_quality,
+      max_volume,
+      on_set_volume,
+      on_toggle_denoise,
+      on_set_voice_quality,
+    ),
     case is_self {
       True -> element.fragment([])
       False -> footer(p, settings, on_toggle_deafen, on_reset)
@@ -99,12 +112,18 @@ fn header(
   p: Palette,
   m: Member,
   settings: VoiceSettings,
+  level: Float,
   on_close: msg,
 ) -> Element(msg) {
-  let status_text = case m.status {
-    Speaking -> "speaking"
-    MutedP -> "muted"
-    _ -> "in call"
+  // Drive the "speaking" header text from real audio level rather than
+  // the static presence enum — m.status is a coarse online/away/muted
+  // flag, not a moment-to-moment voice activity signal.
+  let muted = m.status == MutedP
+  let speaking = !muted && level >. voice_meter.speaking_threshold()
+  let status_text = case muted, speaking {
+    True, _ -> "muted"
+    False, True -> "speaking"
+    False, False -> "in call"
   }
   let relay_text = relay_label(m)
   html.div(
@@ -294,47 +313,41 @@ fn waveform_strip(
   p: Palette,
   m: Member,
   settings: VoiceSettings,
+  level: Float,
 ) -> Element(msg) {
-  // V1 visual: a 36-bar amplitude bar set scaled by speaking + volume.
-  let speaking = m.status == Speaking && !settings.deafened
-  let intensity = case speaking {
-    True -> int_to_intensity(settings.volume)
-    False -> 0.0
+  // 36-bar level visualisation driven by the smoothed FFI level. When
+  // muted (either remote-muted via voice state, or muted-for-me on a
+  // peer row) we force the level to 0 so the bars sit flat — not a
+  // "this peer is silent" lie, since the audio really is being
+  // suppressed locally.
+  let muted = m.status == MutedP || { !m.you && settings.deafened }
+  let effective_level = case muted {
+    True -> 0.0
+    False -> level
   }
+  let speaking = effective_level >. voice_meter.speaking_threshold()
   html.div(
     [
+      attribute.attribute("data-testid", "voice-popover-waveform"),
+      attribute.attribute(
+        "data-voice-level",
+        voice_meter.level_to_attribute(effective_level),
+      ),
+      attribute.attribute("data-voice-speaking", case speaking {
+        True -> "true"
+        False -> "false"
+      }),
       ui.css([
         #("padding", "10px 14px 6px 14px"),
         #("background", p.surface_alt),
       ]),
     ],
-    [bars(p, intensity, speaking)],
+    [bars(p, effective_level)],
   )
 }
 
-fn int_to_intensity(volume: Int) -> Float {
-  // 0-200 → 0.0-2.0
-  case volume <= 0 {
-    True -> 0.0
-    False -> {
-      // Manual-ish convert; we don't need precision — rough scale.
-      let _ = volume
-      1.0
-    }
-  }
-}
-
-fn bars(p: Palette, intensity: Float, speaking: Bool) -> Element(msg) {
-  let _ = intensity
+fn bars(p: Palette, level: Float) -> Element(msg) {
   let bars_count = 36
-  let color = case speaking {
-    True -> p.accent
-    False -> p.text_faint
-  }
-  let opacity = case speaking {
-    True -> "0.85"
-    False -> "0.35"
-  }
   let bars_list = list_repeat_index(bars_count)
   html.div(
     [
@@ -347,19 +360,25 @@ fn bars(p: Palette, intensity: Float, speaking: Bool) -> Element(msg) {
       ]),
     ],
     bars_list
-      |> list_map(fn(i) { single_bar(color, opacity, i, speaking) }),
+      |> list_map(fn(i) { single_bar(p, level, i, bars_count) }),
   )
 }
 
-fn single_bar(
-  color: String,
-  opacity: String,
-  i: Int,
-  speaking: Bool,
-) -> Element(msg) {
-  let height = case speaking {
-    True -> bar_height(i)
-    False -> "2px"
+fn single_bar(p: Palette, level: Float, i: Int, n: Int) -> Element(msg) {
+  // Each bar is shaped by a sinusoidal envelope (peak in the middle,
+  // tapered at the edges) so the strip reads as a waveform — and the
+  // whole envelope scales with the live audio level so it grows as the
+  // peer talks louder. At idle, every bar collapses to a 2 px dot.
+  let envelope = arch_envelope(i, n)
+  let max_h = 4.0 +. envelope *. 28.0
+  let h = 2.0 +. level *. max_h
+  let opacity = case level >. 0.02 {
+    True -> "0.85"
+    False -> "0.35"
+  }
+  let color = case level >. voice_meter.speaking_threshold() {
+    True -> p.accent
+    False -> p.text_faint
   }
   html.span(
     [
@@ -369,20 +388,27 @@ fn single_bar(
         #("border-radius", "2px"),
         #("background", color),
         #("opacity", opacity),
-        #("height", height),
+        #("height", voice_meter.float_to_px(h)),
       ]),
     ],
     [],
   )
 }
 
-fn bar_height(i: Int) -> String {
-  // Arch shape: low at edges, peak in the middle.
-  let mid = case i < 18 {
-    True -> i * 2
-    False -> { 36 - i } * 2
+fn arch_envelope(i: Int, n: Int) -> Float {
+  // Tent: 0 at the edges, 1 at the centre. Cheap stand-in for a sin
+  // shape; reads as a smooth arch when rendered with 36 bars.
+  let mid = int.to_float(n) /. 2.0
+  let pos = int.to_float(i) +. 0.5
+  let dist = case pos <. mid {
+    True -> mid -. pos
+    False -> pos -. mid
   }
-  int.to_string(mid + 4) <> "px"
+  let normalised = 1.0 -. dist /. mid
+  case normalised <. 0.0 {
+    True -> 0.0
+    False -> normalised
+  }
 }
 
 fn list_repeat_index(n: Int) -> List(Int) {
@@ -422,10 +448,16 @@ fn body(
   p: Palette,
   m: Member,
   settings: VoiceSettings,
+  voice_quality: String,
   max_volume: Int,
   on_set_volume: fn(Int) -> msg,
   on_toggle_denoise: msg,
+  on_set_voice_quality: fn(String) -> msg,
 ) -> Element(msg) {
+  let quality_row = case m.you {
+    True -> quality_control(p, voice_quality, on_set_voice_quality)
+    False -> element.fragment([])
+  }
   html.div(
     [
       ui.css([
@@ -438,6 +470,131 @@ fn body(
     [
       volume_control(p, m, settings, max_volume, on_set_volume),
       denoise_control(p, m, settings, on_toggle_denoise),
+      quality_row,
+    ],
+  )
+}
+
+/// Self-row only: send-side Opus quality preset. Three radio buttons
+/// covering `"voice"` / `"high"` / `"maximum"`. Persisted by
+/// `voice.ffi.mjs` through localStorage so the choice survives
+/// reload + reapplies on the next `voice_start`.
+fn quality_control(
+  p: Palette,
+  current: String,
+  on_set: fn(String) -> msg,
+) -> Element(msg) {
+  let presets = [
+    #("voice", "Voice", "24 kbps mono — best for slow networks"),
+    #("high", "High", "96 kbps stereo — balanced"),
+    #("maximum", "Maximum", "510 kbps stereo — transparent"),
+  ]
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("gap", "8px"),
+      ]),
+    ],
+    [
+      control_label(p, "Send quality"),
+      html.div(
+        [
+          ui.css([
+            #("font-size", "11.25px"),
+            #("color", p.text_faint),
+            #("margin-bottom", "2px"),
+          ]),
+        ],
+        [
+          html.text(
+            "Opus codec settings for your outgoing audio. Other peers always hear you in stereo.",
+          ),
+        ],
+      ),
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "6px"),
+          ]),
+        ],
+        list_map(presets, fn(preset) {
+          let #(label, title, desc) = preset
+          let checked = label == current
+          html.label(
+            [
+              attribute.attribute(
+                "data-testid",
+                "voice-popover-quality-" <> label,
+              ),
+              event.on_click(on_set(label)),
+              ui.css([
+                #("display", "flex"),
+                #("align-items", "flex-start"),
+                #("gap", "8px"),
+                #("padding", "6px 8px"),
+                #(
+                  "border",
+                  "1px solid "
+                    <> case checked {
+                    True -> p.accent
+                    False -> p.border
+                  },
+                ),
+                #("border-radius", "6px"),
+                #("cursor", "pointer"),
+                #("background", case checked {
+                  True -> p.surface_alt
+                  False -> "transparent"
+                }),
+              ]),
+            ],
+            [
+              html.input([
+                attribute.attribute("type", "radio"),
+                attribute.attribute("name", "voice-popover-quality"),
+                attribute.value(label),
+                attribute.checked(checked),
+                ui.css([#("accent-color", p.accent), #("margin-top", "2px")]),
+              ]),
+              html.div(
+                [
+                  ui.css([
+                    #("display", "flex"),
+                    #("flex-direction", "column"),
+                    #("gap", "1px"),
+                    #("flex", "1"),
+                  ]),
+                ],
+                [
+                  html.span(
+                    [
+                      ui.css([
+                        #("font-size", "12.75px"),
+                        #("font-weight", "600"),
+                        #("color", p.text),
+                      ]),
+                    ],
+                    [html.text(title)],
+                  ),
+                  html.span(
+                    [
+                      ui.css([
+                        #("font-size", "11.25px"),
+                        #("color", p.text_faint),
+                      ]),
+                    ],
+                    [html.text(desc)],
+                  ),
+                ],
+              ),
+            ],
+          )
+        }),
+      ),
     ],
   )
 }
