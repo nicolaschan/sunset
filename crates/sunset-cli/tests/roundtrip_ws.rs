@@ -20,10 +20,7 @@ async fn ws_roundtrip_two_clients() {
             alice.set_self_name("alice");
             bob.set_self_name("bob");
 
-            alice
-                .add_relay(url.clone())
-                .await
-                .expect("alice add_relay");
+            alice.add_relay(url.clone()).await.expect("alice add_relay");
             bob.add_relay(url.clone()).await.expect("bob add_relay");
 
             alice.join_room("alpha").await.expect("alice join");
@@ -45,7 +42,9 @@ async fn ws_roundtrip_two_clients() {
             .await;
             assert!(saw.is_some(), "bob never saw alice's message");
 
-            bob.send_text("hi alice".to_owned()).await.expect("bob send");
+            bob.send_text("hi alice".to_owned())
+                .await
+                .expect("bob send");
             let saw = eventually(Duration::from_secs(10), || {
                 let v = alice.snapshot_room("alpha")?;
                 if v.messages.iter().any(|m| m.body == "hi alice") {

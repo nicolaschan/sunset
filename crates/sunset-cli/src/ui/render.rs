@@ -230,7 +230,8 @@ mod tests {
             buffer: "/help",
             cursor: 5,
         };
-        term.draw(|f| draw(f, &top, Some(&view), &composer)).unwrap();
+        term.draw(|f| draw(f, &top, Some(&view), &composer))
+            .unwrap();
         let lines = buffer_lines(term.backend().buffer());
         assert!(lines[0].contains("sunset.chat"), "title: {}", lines[0]);
         assert!(lines[0].contains("alpha"), "title room: {}", lines[0]);

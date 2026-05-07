@@ -150,7 +150,11 @@ impl Client {
             self.set_active(name);
             return Ok(());
         }
-        let open_room = self.peer.open_room(name).await.map_err(|e| format!("{e}"))?;
+        let open_room = self
+            .peer
+            .open_room(name)
+            .await
+            .map_err(|e| format!("{e}"))?;
 
         let view = Rc::new(RefCell::new(RoomView {
             name: name.to_owned(),

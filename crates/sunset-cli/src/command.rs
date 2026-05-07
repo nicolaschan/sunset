@@ -92,7 +92,10 @@ mod tests {
 
     #[test]
     fn bare_text_is_send() {
-        assert_eq!(parse("hello world"), Command::Send("hello world".to_owned()));
+        assert_eq!(
+            parse("hello world"),
+            Command::Send("hello world".to_owned())
+        );
     }
 
     #[test]
