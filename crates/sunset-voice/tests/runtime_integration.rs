@@ -1325,9 +1325,20 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                     }
 
                     // Wait for at least 25 frames to be delivered. The
-                    // jitter pump runs every 20 ms; 25 × 20 ms = 500 ms,
-                    // well under any per-frame UX budget.
-                    tokio::time::timeout(Duration::from_millis(800), async {
+                    // jitter pump runs every 20 ms; 25 × 20 ms = 500 ms
+                    // theoretical floor. The 2 s ceiling here is a
+                    // *test-patience* timeout, not a UX assertion: the
+                    // real-user-visible contract for this test is
+                    // "≥ 25 of 30 frames survive Opus + RNNoise"
+                    // (audio quality / drop rate), not "audio is ready
+                    // within X ms" (which other tests cover). Under
+                    // 2-thread `cargo test` parallelism on a busy CI
+                    // runner the jitter pump's 20 ms tokio::time::sleep
+                    // wakeups are sometimes delayed past the original
+                    // 800 ms ceiling — bumping to 2 s keeps the
+                    // throughput/quality assertion intact while
+                    // tolerating CI scheduling variance.
+                    tokio::time::timeout(Duration::from_millis(2000), async {
                         loop {
                             if *delivered_rms_count.borrow() >= 25 {
                                 return;
@@ -1336,7 +1347,7 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                         }
                     })
                     .await
-                    .expect("at least 25 frames delivered within 800ms");
+                    .expect("at least 25 frames delivered within 2 s");
 
                     drop(runtime);
                 }
