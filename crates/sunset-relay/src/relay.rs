@@ -221,14 +221,23 @@ impl Relay {
         let wt_transport =
             SpawningAcceptor::new(wt_raw_inbound, wt_connector, wt_promote, handshake_timeout);
 
-        // The dial-host SAN list determines which hostnames can be used
-        // to reach this WT listener. Tests dial 127.0.0.1; production
-        // dials by external hostname (set via the relay config's
-        // listen_addr or — eventually — a dedicated `webtransport_san`
-        // setting). For now we always include `127.0.0.1` and
-        // `localhost` plus the listen address's literal IP if it's not
-        // already in that list.
-        let mut wt_sans: Vec<String> = vec!["127.0.0.1".into(), "localhost".into()];
+        // The dial-host SAN list determines which hostnames the
+        // browser is allowed to dial when reaching this WT listener.
+        // Despite the W3C spec saying `serverCertificateHashes`
+        // *replaces* chain validation, Chrome's implementation still
+        // enforces the dialed hostname being in the cert's SAN — so
+        // production deployments behind a public hostname must include
+        // that hostname here. Default is `["127.0.0.1", "localhost"]`
+        // (sufficient for tests and loopback dev); operators set
+        // `webtransport_san` in the relay config TOML to add their
+        // public hostname.
+        //
+        // We also append the listen address's literal IP when it's
+        // explicit and non-loopback — e.g. binding `203.0.113.1:8443`
+        // makes the cert valid for that IP automatically. When binding
+        // `0.0.0.0` (the production shape behind a proxy) the listen IP
+        // is meaningless and we don't append it.
+        let mut wt_sans: Vec<String> = config.webtransport_san.clone();
         let listen_ip = bound.ip().to_string();
         if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
             wt_sans.push(listen_ip);
