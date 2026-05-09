@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-markdown", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-sync-webrtc-browser", "crates/sunset-sync-webtransport-native", "crates/sunset-sync-webtransport-browser", "crates/sunset-voice", "crates/sunset-web-wasm", "crates/sunset-relay", "crates/sunset-relay-resolver"]
+members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-sync", "crates/sunset-markdown", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-sync-webrtc-browser", "crates/sunset-sync-webtransport-native", "crates/sunset-sync-webtransport-browser", "crates/sunset-voice", "crates/sunset-web-wasm", "crates/sunset-relay", "crates/sunset-relay-resolver", "crates/sunset-cli"]
 resolver = "2"
 
 [workspace.package]
@@ -98,6 +98,10 @@ tokio-rusqlite = { version = "0.6", features = ["bundled"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 url = "2"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sunset-store = { path = "crates/sunset-store" }
 sunset-store-fs = { path = "crates/sunset-store-fs" }
 sunset-store-memory = { path = "crates/sunset-store-memory" }
@@ -111,6 +115,7 @@ sunset-sync-webrtc-browser = { path = "crates/sunset-sync-webrtc-browser" }
 sunset-sync-webtransport-native = { path = "crates/sunset-sync-webtransport-native" }
 sunset-sync-webtransport-browser = { path = "crates/sunset-sync-webtransport-browser" }
 sunset-relay-resolver = { path = "crates/sunset-relay-resolver" }
+sunset-relay = { path = "crates/sunset-relay" }
 sunset-voice = { path = "crates/sunset-voice" }
 wtransport = "0.7"
 proptest = "1"
