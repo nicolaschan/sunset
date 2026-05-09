@@ -186,6 +186,7 @@ async fn alice_to_bob_via_two_relays() {
                 &alice_room,
                 0,
                 sent_at,
+                sunset_core::ChannelLabel::default_general(),
                 MessageBody::Text(body.to_owned()),
                 &mut OsRng,
             )
@@ -324,6 +325,7 @@ async fn failover_when_relay_a_dies() {
                 &alice_room,
                 0,
                 1,
+                sunset_core::ChannelLabel::default_general(),
                 MessageBody::Text("msg-1 (both relays alive)".to_owned()),
                 &mut OsRng,
             )
@@ -360,6 +362,7 @@ async fn failover_when_relay_a_dies() {
                 &alice_room,
                 0,
                 2,
+                sunset_core::ChannelLabel::default_general(),
                 MessageBody::Text("msg-2 (after relay A killed)".to_owned()),
                 &mut OsRng,
             )

@@ -1,7 +1,7 @@
 //! JS marshaling for the reaction tracker's snapshot callbacks.
 
 use js_sys::Map;
-use sunset_core::ReactionSnapshot;
+use sunset_core::{ChannelLabel, ReactionSnapshot};
 use sunset_store::Hash;
 use wasm_bindgen::prelude::*;
 
@@ -11,11 +11,16 @@ use wasm_bindgen::prelude::*;
 /// ```ts
 /// {
 ///   target_hex: string,
+///   channel: string,
 ///   reactions: Map<emoji_string, Map<author_pubkey_hex, sent_at_ms>>
 /// }
 /// ```
 ///
-pub fn snapshot_to_js(target: &Hash, snapshot: &ReactionSnapshot) -> JsValue {
+pub fn snapshot_to_js(
+    target: &Hash,
+    channel: &ChannelLabel,
+    snapshot: &ReactionSnapshot,
+) -> JsValue {
     let map = Map::new();
     for (emoji, authors) in snapshot {
         let inner = Map::new();
@@ -32,6 +37,11 @@ pub fn snapshot_to_js(target: &Hash, snapshot: &ReactionSnapshot) -> JsValue {
         &obj,
         &JsValue::from_str("target_hex"),
         &JsValue::from_str(&target.to_hex()),
+    );
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("channel"),
+        &JsValue::from_str(channel.as_str()),
     );
     let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("reactions"), &map.into());
     obj.into()

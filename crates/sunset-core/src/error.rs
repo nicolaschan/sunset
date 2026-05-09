@@ -34,6 +34,9 @@ pub enum Error {
     #[error("emoji exceeds 64-byte limit: {len} bytes")]
     EmojiTooLong { len: usize },
 
+    #[error("invalid channel label: {0}")]
+    BadChannel(String),
+
     #[error("store: {0}")]
     Store(String),
 

@@ -211,6 +211,7 @@ fn messages_list(
 
   html.div(
     [
+      attribute.attribute("data-testid", "messages-list"),
       attribute.class("scroll-area"),
       ui.css([
         #("flex", "1 1 auto"),

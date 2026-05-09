@@ -18,6 +18,19 @@ pub type ChannelId {
   ChannelId(String)
 }
 
+/// Default text channel every room starts with. Mirrors the
+/// `ChannelLabel::default()` on the Rust side — messages with no
+/// explicit channel land here, and the channels rail always shows
+/// it even before any traffic is observed.
+pub const default_channel_name: String = "general"
+
+/// `ChannelId` for the default channel. Sugar over
+/// `ChannelId(default_channel_name)` so call sites don't have to
+/// stitch the two constants together.
+pub fn default_channel_id() -> ChannelId {
+  ChannelId(default_channel_name)
+}
+
 pub type MemberId {
   MemberId(String)
 }
@@ -154,6 +167,11 @@ pub type Message {
     initials: String,
     time: String,
     body: String,
+    /// Channel label this message belongs to, mirrored from the
+    /// signed `ChannelLabel` on the wire. v1 routes the messages
+    /// list through this field — anything not matching the active
+    /// `current_channel` is filtered out before render.
+    channel: String,
     seen_by: Int,
     you: Bool,
     pending: Bool,
@@ -172,6 +190,10 @@ pub type MessageView {
     initials: String,
     time: String,
     body: String,
+    /// Same `channel` as the source `Message` — re-emitted on the view
+    /// type so post-resolve filtering still works without a second
+    /// lookup back to the raw list.
+    channel: String,
     seen_by: Int,
     you: Bool,
     pending: Bool,
