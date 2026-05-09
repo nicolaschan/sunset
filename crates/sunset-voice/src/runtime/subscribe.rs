@@ -123,6 +123,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                             in_call: entry.in_call,
                             talking: entry.talking,
                             is_muted: entry.is_muted,
+                            in_voice_channel: entry.in_voice_channel,
                         };
                         inner.peer_state_sink.emit(&state);
                     }

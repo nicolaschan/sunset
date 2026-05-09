@@ -294,10 +294,16 @@ export function wasmVoiceStart(client, roomHandle, callback) {
             const hex = uint8ToHex(new Uint8Array(peerId));
             dropPeer(hex);
           },
-          (peerId, inCall, talking, isMuted) => {
+          (peerId, inCall, talking, isMuted, inVoiceChannel) => {
             const hex = uint8ToHex(new Uint8Array(peerId));
             if (window.__voicePeerStateHandler) {
-              window.__voicePeerStateHandler(hex, inCall, talking, isMuted);
+              window.__voicePeerStateHandler(
+                hex,
+                inCall,
+                talking,
+                isMuted,
+                inVoiceChannel,
+              );
             }
           },
         );

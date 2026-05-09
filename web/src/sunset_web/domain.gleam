@@ -237,8 +237,21 @@ pub type Sheet {
 
 /// Live peer state emitted by the voice runtime's PeerStateSink, keyed
 /// by peer pubkey hex. Updated from `on_voice_peer_state` callbacks.
+///
+/// `in_voice_channel` is the broader "this peer is in the voice
+/// channel" signal — true once we've seen their durable presence
+/// entry, regardless of whether we have an active P2P connection.
+/// `in_call` is the narrower "we have audio flow with this peer"
+/// signal (frame or ephemeral heartbeat alive). Pre-connection
+/// (`in_voice_channel=true && in_call=false`) is the "joined but not
+/// connected yet" state the rail visually distinguishes.
 pub type VoicePeerStateUI {
-  VoicePeerStateUI(in_call: Bool, talking: Bool, is_muted: Bool)
+  VoicePeerStateUI(
+    in_call: Bool,
+    talking: Bool,
+    is_muted: Bool,
+    in_voice_channel: Bool,
+  )
 }
 
 /// Top-level voice subsystem state on the Lustre model.
