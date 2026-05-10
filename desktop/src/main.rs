@@ -9,7 +9,12 @@ fn main() {
         )
         .init();
 
-    tauri::Builder::default()
-        .run(tauri::generate_context!())
-        .expect("failed to launch sunset-desktop");
+    // Surface the underlying error (display unavailable, IPC init failure,
+    // tauri.conf.json schema mismatch, etc.) instead of swallowing it inside
+    // a generic `expect` panic. The runtime exit-code lets shells / launchers
+    // pick it up too.
+    if let Err(err) = tauri::Builder::default().run(tauri::generate_context!()) {
+        tracing::error!(error = %err, "sunset-desktop tauri runtime exited with error");
+        std::process::exit(1);
+    }
 }

@@ -123,10 +123,21 @@ jobs:
       - name: no clippy suppressions in source
         run: |
           ./scripts/check-no-clippy-allow.sh
-      # Clippy needs `desktop/dist/` populated because the Tauri build
-      # macros embed it at compile time. Use the Nix-built webDist for
-      # determinism (same artefact CI publishes to Pages).
-      - name: Stage webDist into desktop/dist
+      # `desktop/` is a separate Cargo workspace, so it can't inherit
+      # `[lints]` from the root via `workspace = true`. We mirror the policy
+      # by hand and gate drift here. See `scripts/check-desktop-lints.sh`.
+      - name: lint policy parity (desktop ↔ workspace)
+        run: |
+          ./scripts/check-desktop-lints.sh
+      # `cargo clippy` runs in the dev shell, *outside* the Nix sandbox, so
+      # it needs `desktop/dist/` materialised on disk before
+      # `tauri::generate_context!()` expands. (The `nix build .#sunset-desktop`
+      # step below stages dist on its own via the derivation's preBuild —
+      # those two staging passes are not redundant: one is for the dev-shell
+      # clippy run, the other is for the sandboxed build.) Stage from the
+      # same Nix-built webDist artefact CI publishes to Pages so dev shell
+      # and Nix builds share the same input.
+      - name: Stage webDist into desktop/dist (for clippy)
         run: |
           nix build .#web
           rm -rf desktop/dist

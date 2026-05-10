@@ -17,6 +17,21 @@ name: Release Desktop
 # The Linux flake build (`nix build .#sunset-desktop`) and `nix run
 # .#desktop` use the same `desktop/Cargo.toml` and the same `webDist`
 # input, so dev shell and CI never diverge — the only delta is bundling.
+#
+# Hermeticity caveat (CLAUDE.md "every dependency goes through the flake"):
+# the `bundle` matrix uses `dtolnay/rust-toolchain@stable` + native package
+# managers (apt on Linux, host-bundled toolchain on macOS / Windows) plus
+# `tauri-action`'s vendored `tauri-cli`. None of those flow through the
+# flake. The reasons:
+#   * Windows runners can't easily run Nix (native-only).
+#   * Tauri's bundler downloads platform helpers (linuxdeploy +
+#     appimagetool, dmg-builder, wix) at build time — wrapping all three
+#     hermetically per platform is a large investment we haven't made yet.
+#   * Linux dev runs (`nix run .#desktop`) and CI lint gates DO go through
+#     the flake (`Tests / desktop` runs `nix build .#sunset-desktop`),
+#     which catches the bulk of regressions.
+# Bundling-only artefacts diverging from the Nix-built binary on a given
+# Linux release would be a real bug; tracking it is on the roadmap.
 
 on:
   push:
@@ -125,9 +140,14 @@ jobs:
       # macOS, msi + nsis exe on Windows), and uploads the resulting
       # installers to a draft GitHub Release named `sunset.chat <tag>`.
       # The `projectPath` makes it operate on `desktop/`.
+      #
+      # Pinned to a specific tag (not the floating `@v0`) so CLI behaviour
+      # doesn't shift under us between releases. Bump deliberately when
+      # `desktop/Cargo.lock`'s tauri / tauri-cli versions move; mismatched
+      # CLI vs library versions can produce subtly different bundles.
       - name: Build and bundle (tauri-action)
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

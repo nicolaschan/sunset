@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' tauri: ipc: http://ipc.localhost; script-src 'self' 'wasm-unsafe-eval' tauri: ipc: http://ipc.localhost; connect-src 'self' tauri: ipc: http://ipc.localhost data: blob: ws: wss: https:; worker-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; media-src 'self' blob: data:"
     }
   },
   "bundle": {
@@ -40,7 +40,12 @@
     ],
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libsoup-3.0-0",
+          "libglib2.0-0"
+        ]
       }
     }
   }

@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Bake the desktop app's icon assets from `web/priv/apple-touch-icon.svg`.
+# Regenerate the desktop app's icon assets from `web/priv/apple-touch-icon.svg`.
 #
-# Tauri 2's bundler reads icons from `desktop/icons/` per the paths declared
-# in `desktop/tauri.conf.json`. Rather than commit the rendered binary
-# artefacts, we regenerate them from the source SVG using `rsvg-convert`
-# (SVG→PNG) plus `cargo tauri icon` (PNG→multi-format: icon.icns / icon.ico /
-# sized PNGs). Both tools come from the Nix dev shell — see `flake.nix`'s
-# `devShells.default.buildInputs`.
+# The rendered icons (`desktop/icons/{32x32,128x128,128x128@2x,icon.png}`,
+# `icon.icns`, `icon.ico`) **are committed** to the repo. We don't bake them
+# at every build — Tauri's compile-time embedding wants them on disk before
+# `cargo build` runs, and committing them keeps `cargo build -p sunset-desktop`
+# working from a clean clone without first hitting `librsvg` / `cargo-tauri`.
+# Run this script after editing the source SVG; CI does not re-run it.
 #
-# Idempotent: skips work when the cached output is up to date with the SVG.
+# Tooling comes from the Nix dev shell — `rsvg-convert` (SVG→PNG, from
+# `pkgs.librsvg`) plus `cargo tauri icon` (PNG→multi-format, from
+# `pkgs.cargo-tauri`). Run inside `nix develop` or via `nix develop --command`.
+#
+# Idempotent: skips work when the stamp is newer than the source SVG and
+# every required output is present.
 set -euo pipefail
 
 # Resolve the workspace root from this script's location so it works whether

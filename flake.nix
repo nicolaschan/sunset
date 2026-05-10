@@ -382,23 +382,27 @@
           cargoLock.lockFile = ./desktop/Cargo.lock;
           doCheck = false;
 
-          nativeBuildInputs = [
-            pkgs.pkg-config
-            # Tauri's bundled webview launches via gdk-pixbuf / gsettings; the
-            # gapps wrapper sets GIO_EXTRA_MODULES, GDK_PIXBUF_MODULE_FILE,
-            # XDG_DATA_DIRS, etc. on the resulting binary so the
-            # `getUserMedia`-driven voice path can reach the system speech
-            # subsystems at runtime. (`wrapGAppsHook` was renamed to
-            # `wrapGAppsHook3` in nixpkgs; we still build against GTK3.)
-            pkgs.wrapGAppsHook3
-          ];
-          buildInputs = [
-            pkgs.glib
-            pkgs.gtk3
-            pkgs.libsoup_3
-            pkgs.webkitgtk_4_1
-            pkgs.openssl
-          ];
+          # Linux: WRY (Tauri 2's webview backend) calls into WebKitGTK 4.1
+          # via libsoup 3; we link against those at build time and dynamic-link
+          # at run time. macOS uses WKWebView (bundled in the OS), so neither
+          # GTK nor WebKitGTK belong in the build inputs there. Gate the
+          # platform-specific deps so `nix build .#sunset-desktop` and
+          # `nix flake check` evaluate cleanly on darwin too.
+          nativeBuildInputs = [ pkgs.pkg-config ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              # `wrapGAppsHook3` (renamed from `wrapGAppsHook` in nixpkgs)
+              # threads GIO_EXTRA_MODULES / GDK_PIXBUF_MODULE_FILE / XDG_DATA_DIRS
+              # into the binary's wrapper so the `getUserMedia` voice path can
+              # reach system speech subsystems at runtime.
+              pkgs.wrapGAppsHook3
+            ];
+          buildInputs = [ pkgs.openssl ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.glib
+              pkgs.gtk3
+              pkgs.libsoup_3
+              pkgs.webkitgtk_4_1
+            ];
 
           # Stage `webDist` as `dist/` next to `tauri.conf.json`. The path
           # in `desktop/tauri.conf.json` (`build.frontendDist = "./dist"`)
@@ -450,16 +454,11 @@
             # PNGs) from a single 1024x1024 source PNG. Also useful for `cargo tauri
             # dev` and `cargo tauri build` from a dev shell.
             pkgs.cargo-tauri
-            # Native libraries the `sunset-desktop` Tauri shell links against on
-            # Linux (WebKitGTK 4.1 is what Tauri 2 targets; libsoup 3 is its
-            # required HTTP backend). pkg-config locates them; openssl is dragged
-            # in transitively by reqwest in some Tauri-plugin trees.
+            # `pkg-config` + `openssl` are needed on every host: pkg-config locates
+            # the native libs the Tauri shell links to; openssl is pulled in by a
+            # few transitive deps (reqwest, etc.).
             pkgs.pkg-config
             pkgs.openssl
-            pkgs.glib
-            pkgs.gtk3
-            pkgs.libsoup_3
-            pkgs.webkitgtk_4_1
             # Required by `sunset-voice/build.rs` to compile vendored
             # libopus into wasm32 object files. We use unwrapped
             # binaries because Nix's `cc-wrapper` injects host-only
@@ -467,6 +466,14 @@
             clangForWasm
             llvmArForWasm
             pkgs.lld
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            # WebKitGTK 4.1 + GTK 3 + libsoup 3 are the native libraries WRY
+            # (Tauri 2's webview backend) links against on Linux. macOS uses
+            # WKWebView from the OS, so these don't apply there.
+            pkgs.glib
+            pkgs.gtk3
+            pkgs.libsoup_3
+            pkgs.webkitgtk_4_1
           ];
           shellHook = ''
             ${if webHexDeps != null
@@ -496,6 +503,15 @@
             export SUNSET_WEB_DIST="''${SUNSET_WEB_DIST:-${webVoiceUiTestDist}}"
             # Make sunset-relay available in the dev shell for Playwright tests.
             export PATH="${pkgs.lib.makeBinPath [ sunsetRelayPkg ]}:$PATH"
+            # `desktop/dist/` is git-ignored (regenerated content) but the
+            # Tauri compile-time embedding (`tauri::generate_context!()`)
+            # demands it on disk before `cargo build -p sunset-desktop` runs.
+            # Stage the prod webDist as a symlink so a fresh clone + `cargo
+            # run` from `desktop/` works without manual `nix build .#web`
+            # bootstrap. CI's `Stage webDist into desktop/dist` step in
+            # `test.yml` does the same thing for the sandboxed clippy run.
+            mkdir -p desktop
+            ln -sfn ${webDist} desktop/dist
           '';
         };
 
