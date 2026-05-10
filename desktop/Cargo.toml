@@ -1,0 +1,40 @@
+[package]
+name = "sunset-desktop"
+description = "sunset.chat — native desktop wrapper around the web client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+# Standalone workspace so `desktop/` keeps its own `Cargo.lock` rather than
+# polluting the root workspace lockfile with the Tauri / webview-platform
+# dependency tree. The root `Cargo.toml` lists `desktop` under
+# `workspace.exclude` to mirror this on its side.
+[workspace]
+
+# Mirror of the root `Cargo.toml`'s `[workspace.lints]` (which we can't
+# inherit from across workspace boundaries — `desktop/` keeps a separate
+# Cargo.lock, see the `[workspace]` table above). Keep these in sync —
+# `scripts/check-no-clippy-allow.sh` and the desktop CI job depend on the
+# same `-D warnings` policy as the rest of the tree, so any drift here
+# silently weakens the gate for this crate.
+[lints.rust]
+unused_must_use = "deny"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+enum_glob_use = "deny"
+needless_pass_by_value = "deny"
+
+[[bin]]
+name = "sunset-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }

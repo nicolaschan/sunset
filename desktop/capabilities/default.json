@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities granted to the main window of sunset.chat. The web client is fully self-contained — it speaks to relays directly over WebSocket / WebTransport / WebRTC and persists identity / state in localStorage. No native bridges are required, so this capability set is intentionally minimal.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

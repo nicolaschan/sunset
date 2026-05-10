@@ -1,0 +1,168 @@
+name: Release Desktop
+
+# Build and publish desktop installers (.deb / .AppImage / .dmg / .msi /
+# .exe) on tag push. Triggered manually from the Actions tab for testing
+# (no release is created on workflow_dispatch — artifacts only).
+#
+# Runtime split:
+#   * `build-web` produces the canonical web bundle once via Nix on Linux
+#     (Gleam → JS + sunset-web-wasm). The same bundle is shared with the
+#     web Pages deploy and is the single source of truth for the desktop
+#     wrapper — no JS / Gleam / WASM is rebuilt per-platform.
+#   * `bundle-*` jobs download the bundle, drop it into `desktop/dist/`,
+#     and run `cargo tauri build` natively per platform. Each platform's
+#     bundler (linuxdeploy / dmg / wix) needs the host toolchain, so they
+#     can't share a runner.
+#
+# The Linux flake build (`nix build .#sunset-desktop`) and `nix run
+# .#desktop` use the same `desktop/Cargo.toml` and the same `webDist`
+# input, so dev shell and CI never diverge — the only delta is bundling.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-web:
+    name: Build web bundle (Nix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # Pure performance optimisation; intermittent `socket hang up` from
+      # install.determinate.systems must not fail the job.
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
+        continue-on-error: true
+      - name: Build web bundle
+        run: nix build .#web
+      # `nix build` produces a read-only result/ symlink into /nix/store; the
+      # downstream cargo-tauri build needs a writable directory it can read.
+      - name: Stage artefact
+        run: |
+          mkdir -p web-dist
+          cp -rL result/. web-dist/
+          chmod -R u+w web-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web-dist
+          retention-days: 7
+
+  bundle:
+    name: Bundle ${{ matrix.label }}
+    needs: build-web
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            platform: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            tauri-args: ""
+          - label: macos-aarch64
+            platform: macos-latest
+            rust-target: aarch64-apple-darwin
+            tauri-args: "--target aarch64-apple-darwin"
+          - label: macos-x86_64
+            platform: macos-latest
+            rust-target: x86_64-apple-darwin
+            tauri-args: "--target x86_64-apple-darwin"
+          - label: windows-x86_64
+            platform: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            tauri-args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      # Tauri 2 native deps. WebKitGTK 4.1 + GTK 3 + libsoup 3 are required
+      # at build *and* run time on Linux. macOS and Windows ship their
+      # webview in the OS — no system deps needed beyond the Rust toolchain.
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            patchelf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop -> target
+          key: ${{ matrix.label }}
+
+      - name: Download web bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: desktop/dist
+
+      # tauri-action invokes `cargo tauri build` under the hood, fetches
+      # tauri-cli at the version pinned by `desktop/Cargo.toml`, runs
+      # platform-native bundlers (deb + AppImage on Linux, dmg + .app on
+      # macOS, msi + nsis exe on Windows), and uploads the resulting
+      # installers to a draft GitHub Release named `sunset.chat <tag>`.
+      # The `projectPath` makes it operate on `desktop/`.
+      - name: Build and bundle (tauri-action)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: "sunset.chat ${{ github.ref_name }}"
+          releaseBody: |
+            sunset.chat ${{ github.ref_name }} — desktop installers.
+
+            See the [README](https://github.com/${{ github.repository }}#desktop)
+            for `nix run` instructions on Linux / macOS.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.tauri-args }}
+
+      # On manual workflow_dispatch (no tag) we still want to confirm the
+      # bundle builds, but there's no release to upload to. Build directly
+      # via `cargo tauri build` and stash the artefacts so a developer can
+      # inspect them from the Actions UI.
+      - name: Build only (manual dispatch)
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install tauri-cli --version "^2.11" --locked
+          cd desktop
+          cargo tauri build ${{ matrix.tauri-args }}
+
+      - name: Upload bundle artefacts
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.label }}
+          path: |
+            desktop/target/release/bundle/
+            desktop/target/${{ matrix.rust-target }}/release/bundle/
+          if-no-files-found: warn
+          retention-days: 14

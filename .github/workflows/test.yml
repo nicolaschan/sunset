@@ -98,6 +98,46 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  desktop:
+    name: Desktop crate (sunset-desktop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # Pure performance optimization (warm Nix cache); intermittent
+      # `socket hang up` from install.determinate.systems must not fail
+      # the job — the actual build/test steps run cleanly without it.
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
+        continue-on-error: true
+      # `desktop/` is a leaf crate outside the main workspace (its
+      # tauri / webview-platform deps live in `desktop/Cargo.lock`,
+      # see `Cargo.toml`'s `workspace.exclude`). Run its lint and
+      # build gates directly against `desktop/Cargo.toml`.
+      - name: cargo fmt --check (desktop)
+        run: |
+          nix develop --command bash -c 'cd desktop && cargo fmt --check'
+      - name: no clippy suppressions in source
+        run: |
+          ./scripts/check-no-clippy-allow.sh
+      # Clippy needs `desktop/dist/` populated because the Tauri build
+      # macros embed it at compile time. Use the Nix-built webDist for
+      # determinism (same artefact CI publishes to Pages).
+      - name: Stage webDist into desktop/dist
+        run: |
+          nix build .#web
+          rm -rf desktop/dist
+          cp -rL result desktop/dist
+          chmod -R u+w desktop/dist
+      - name: cargo clippy (desktop) --all-targets -- -D warnings
+        run: |
+          nix develop --command bash -c 'cd desktop && cargo clippy --all-targets -- -D warnings'
+      - name: nix build .#sunset-desktop
+        run: nix build .#sunset-desktop
+
   e2e-voice:
     name: Playwright voice e2e
     runs-on: ubuntu-latest
