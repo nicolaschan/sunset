@@ -119,9 +119,10 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                         drop(state);
                         // Drop per-peer playback resources.
                         inner.frame_sink.borrow().drop_peer(&ev.peer);
-                        // Drop per-peer jitter buffer so re-entry starts fresh.
-                        inner.jitter.borrow_mut().remove(&ev.peer);
-                        inner.last_delivered.borrow_mut().remove(&ev.peer);
+                        // Forget the last seq we delivered so re-entry
+                        // starts fresh (the host-side jitter buffer is
+                        // also reset via `drop_peer`).
+                        inner.last_delivered_seq.borrow_mut().remove(&ev.peer);
                     }
                 }
                 else => return,

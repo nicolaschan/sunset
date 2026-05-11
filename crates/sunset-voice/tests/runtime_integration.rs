@@ -22,7 +22,7 @@ use sunset_voice::runtime::{
 };
 
 /// Type alias to avoid clippy::type_complexity.
-type DeliveredSink = Rc<RefCell<Vec<(PeerId, Vec<f32>)>>>;
+type DeliveredSink = Rc<RefCell<Vec<(PeerId, u32, Vec<f32>)>>>;
 /// Type alias to avoid clippy::type_complexity.
 type DroppedSink = Rc<RefCell<Vec<PeerId>>>;
 /// Type alias to avoid clippy::type_complexity.
@@ -169,10 +169,10 @@ struct RecordingFrameSink {
     dropped: DroppedSink,
 }
 impl FrameSink for RecordingFrameSink {
-    fn deliver(&self, peer: &PeerId, pcm: &[f32]) {
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]) {
         self.delivered
             .borrow_mut()
-            .push((peer.clone(), pcm.to_vec()));
+            .push((peer.clone(), seq, pcm.to_vec()));
     }
     fn drop_peer(&self, peer: &PeerId) {
         self.dropped.borrow_mut().push(peer.clone());
@@ -445,11 +445,103 @@ async fn send_pcm_drops_frames_when_muted() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
+async fn subscribe_decodes_frame_and_delivers_to_sink() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (alice, room) = make_identity_and_room(4);
             let (bob, _) = make_identity_and_room(5);
+            let alice_pk = alice.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: delivered.clone(),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.subscribe);
+
+            // Yield to let the subscribe task start up and register its sink.
+            tokio::task::yield_now().await;
+
+            // Alice publishes one Frame as if she were on the network.
+            let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
+            let mut enc =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+            let bytes = enc.encode(&pcm).unwrap();
+            let pkt = sunset_voice::packet::VoicePacket::Frame {
+                codec_id: sunset_voice::CODEC_ID.to_string(),
+                seq: 42,
+                sender_time_ms: 1000,
+                payload: bytes,
+            };
+            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(42);
+            let ev =
+                sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng).unwrap();
+            let payload = postcard::to_stdvec(&ev).unwrap();
+            let room_fp = room.fingerprint().to_hex();
+            let sender_pk = hex::encode(alice_pk.as_bytes());
+            let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
+
+            // Inject as if it came through the bus from alice.
+            let dgram = SignedDatagram {
+                verifying_key: alice_pk.clone(),
+                name,
+                payload: Bytes::from(payload),
+                signature: Bytes::new(),
+            };
+            bob_bus_impl.inject(dgram).await;
+
+            // Wait for the subscribe loop to decode + deliver. The decoder
+            // upmixes mono Opus to stereo, so the delivered PCM is the
+            // mono-source frame interleaved L=R, length 1920.
+            let alice_peer = PeerId(alice_pk.clone());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !delivered.borrow().is_empty() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("frame delivered to sink within 1s");
+
+            let snapshot = delivered.borrow();
+            assert_eq!(snapshot.len(), 1, "exactly one frame delivered");
+            let (peer, seq, pcm) = &snapshot[0];
+            assert_eq!(peer, &alice_peer);
+            assert_eq!(*seq, 42, "wire seq must be propagated to sink");
+            assert_eq!(
+                pcm.len(),
+                sunset_voice::FRAME_SAMPLES_PER_CHANNEL * sunset_voice::PLAYBACK_CHANNELS as usize
+            );
+            assert!(pcm.iter().all(|s| s.is_finite()));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deafened_skips_decode_and_delivery() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(60);
+            let (bob, _) = make_identity_and_room(61);
             let alice_pk = alice.store_verifying_key();
 
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
@@ -474,31 +566,27 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
                 frame_sink,
                 peer_state_sink,
             );
+            runtime.set_deafened(true);
             tokio::task::spawn_local(tasks.subscribe);
-
-            // Yield to let the subscribe task start up and register its sink.
             tokio::task::yield_now().await;
 
-            // Alice publishes one Frame as if she were on the network.
             let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
             let mut enc =
                 sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
             let bytes = enc.encode(&pcm).unwrap();
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
-                seq: 1,
+                seq: 7,
                 sender_time_ms: 1000,
                 payload: bytes,
             };
-            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(42);
+            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(7);
             let ev =
                 sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng).unwrap();
             let payload = postcard::to_stdvec(&ev).unwrap();
             let room_fp = room.fingerprint().to_hex();
             let sender_pk = hex::encode(alice_pk.as_bytes());
             let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
-
-            // Inject as if it came through the bus from alice.
             let dgram = SignedDatagram {
                 verifying_key: alice_pk.clone(),
                 name,
@@ -507,20 +595,13 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
             };
             bob_bus_impl.inject(dgram).await;
 
-            // Wait for the subscribe loop to push the frame into the jitter buffer.
-            let alice_peer = PeerId(alice_pk.clone());
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    if runtime.test_jitter_len(&alice_peer) >= 1 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("frame pushed to jitter within 1s");
-
-            assert_eq!(runtime.test_jitter_len(&alice_peer), 1);
+            // Wait a tick — if the deafened gate is broken, the sink
+            // would receive a frame here. Then verify nothing arrived.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                delivered.borrow().is_empty(),
+                "deafened receiver must not deliver any frames"
+            );
         })
         .await;
 }
@@ -966,133 +1047,6 @@ async fn voice_presence_publisher_emits_periodically() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let (alice, room) = make_identity_and_room(10);
-            let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
-            let bus: Rc<dyn DynBus> = bus_impl;
-            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
-                calls: Rc::new(RefCell::new(vec![])),
-            });
-            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
-            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
-                delivered: delivered.clone(),
-                dropped: Rc::new(RefCell::new(vec![])),
-            });
-            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
-                events: Rc::new(RefCell::new(vec![])),
-            });
-            let (runtime, tasks) = VoiceRuntime::new(
-                bus,
-                room,
-                alice.clone(),
-                dialer,
-                frame_sink,
-                peer_state_sink,
-            );
-
-            let peer = PeerId(alice.store_verifying_key());
-            let frame1: Vec<f32> = (0..960).map(|i| i as f32 * 0.001).collect();
-            let frame2: Vec<f32> = (0..960).map(|i| i as f32 * 0.002).collect();
-
-            // Push two frames directly into the jitter buffer.
-            runtime.test_push_frame(peer.clone(), frame1.clone());
-            runtime.test_push_frame(peer.clone(), frame2.clone());
-
-            tokio::task::spawn_local(tasks.jitter_pump);
-
-            // Poll for 1st delivery (frame1).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if !delivered.borrow().is_empty() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("1st frame delivered");
-            assert_eq!(delivered.borrow()[0].1, frame1);
-
-            // Poll for 2nd delivery (frame2).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() >= 2 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("2nd frame delivered");
-            assert_eq!(delivered.borrow()[1].1, frame2);
-
-            // Poll for 3rd delivery (repeat-last = frame2, first underrun).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() >= 3 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("3rd frame delivered (repeat last)");
-            assert_eq!(
-                delivered.borrow()[2].1,
-                frame2,
-                "first underrun = repeat last"
-            );
-
-            // Poll for 4th delivery (silence, second underrun).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() >= 4 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("4th frame delivered (silence)");
-            let silence = vec![0.0_f32; 960];
-            assert_eq!(
-                delivered.borrow()[3].1,
-                silence,
-                "second underrun = silence"
-            );
-
-            // Push a new frame — next pump cycle delivers it normally.
-            // We track how many frames have been delivered so far to find frame3's position.
-            let frame3: Vec<f32> = (0..960).map(|i| i as f32 * 0.003).collect();
-            // Push frame3 immediately after observing the silence delivery.
-            // The next pump tick will pick it up and deliver it normally.
-            runtime.test_push_frame(peer.clone(), frame3.clone());
-            let base_len = delivered.borrow().len();
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() > base_len {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("frame3 delivered");
-            // Find frame3 in the delivered list — it may not be at index 4 if extra
-            // silence frames were pumped before we pushed it.
-            let deliveries = delivered.borrow();
-            let frame3_pos = deliveries
-                .iter()
-                .position(|(_, f)| f == &frame3)
-                .expect("frame3 must appear in delivered list");
-            assert_eq!(deliveries[frame3_pos].1, frame3);
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn dropping_runtime_terminates_all_tasks() {
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -1126,7 +1080,6 @@ async fn dropping_runtime_terminates_all_tasks() {
                 tokio::task::spawn_local(tasks.subscribe),
                 tokio::task::spawn_local(tasks.combiner),
                 tokio::task::spawn_local(tasks.auto_connect),
-                tokio::task::spawn_local(tasks.jitter_pump),
                 tokio::task::spawn_local(tasks.voice_presence_publisher),
             ];
 
@@ -1198,7 +1151,6 @@ async fn dropping_runtime_terminates_all_tasks() {
                 "subscribe",
                 "combiner",
                 "auto_connect",
-                "jitter_pump",
                 "voice_presence_publisher",
             ];
             for (i, h) in handles.into_iter().enumerate() {
@@ -1218,7 +1170,9 @@ async fn dropping_runtime_terminates_all_tasks() {
 /// off the inbound PCM is delivered raw (modulo Opus quantization), with
 /// denoise on the same packets are attenuated by RNNoise. The test feeds
 /// pseudo-random noise through a real encrypt → bus → decrypt → decode →
-/// jitter → sink loop and compares RMS energy at the sink.
+/// sink loop and compares RMS energy at the sink. The runtime has no
+/// internal buffer between decode and sink — frames arrive synchronously
+/// with the subscribe loop's `inject` calls.
 #[tokio::test(flavor = "current_thread")]
 async fn set_denoise_toggle_attenuates_inbound_noise() {
     async fn run(denoise_on: bool) -> f32 {
@@ -1247,7 +1201,7 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                         count: Rc<RefCell<usize>>,
                     }
                     impl FrameSink for RmsSink {
-                        fn deliver(&self, _peer: &PeerId, pcm: &[f32]) {
+                        fn deliver(&self, _peer: &PeerId, _seq: u32, pcm: &[f32]) {
                             let s: f32 = pcm.iter().map(|s| s * s).sum();
                             let rms = (s / pcm.len() as f32).sqrt();
                             *self.sum.borrow_mut() += rms;
@@ -1275,7 +1229,6 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                     assert_eq!(runtime.is_denoise_enabled(), denoise_on);
 
                     tokio::task::spawn_local(tasks.subscribe);
-                    tokio::task::spawn_local(tasks.jitter_pump);
                     tokio::task::yield_now().await;
 
                     // Feed deterministic pseudo-random noise at amplitude
@@ -1325,14 +1278,10 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                     }
 
                     // Wait for at least 25 frames to be delivered. The
-                    // jitter pump runs every 20 ms; 25 × 20 ms = 500 ms
-                    // of audio, well under any per-frame UX budget. The
-                    // 2-second wall budget is a CI tolerance — the
-                    // delivery cadence is paced by tokio::time::sleep
-                    // and runner load can stretch that real-time
-                    // significantly without affecting the user-visible
-                    // denoise behaviour we're verifying. Locally this
-                    // path completes in ~2s.
+                    // runtime delivers synchronously inside the subscribe
+                    // loop now (no buffer in between), so the 2-second
+                    // wall budget is loose CI tolerance — locally this
+                    // path completes in milliseconds.
                     tokio::time::timeout(Duration::from_secs(2), async {
                         loop {
                             if *delivered_rms_count.borrow() >= 25 {

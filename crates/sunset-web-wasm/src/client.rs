@@ -417,13 +417,6 @@ impl Client {
         crate::voice::observed_voice_peers(&self.voice)
     }
 
-    /// Per-peer jitter buffer depth as `[{peer_id, depth}]`. Indicates
-    /// frames received but not yet drained by the jitter pump.
-    #[cfg(feature = "test-hooks")]
-    pub fn voice_jitter_depths(&self) -> Result<JsValue, JsError> {
-        crate::voice::jitter_depths(&self.voice)
-    }
-
     /// Peers currently connected at the engine level (i.e. PeerHello
     /// completed). Returns `Uint8Array[]`. Useful for distinguishing
     /// "WebRTC handshake complete" from "WebRTC handshake hung".

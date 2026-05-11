@@ -3,7 +3,7 @@
 //! `VoiceRuntime`) lets every task observe the upgrade failure and exit.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -53,17 +53,14 @@ pub(crate) struct RuntimeInner {
     /// connection yet.
     pub voice_presence_liveness: Arc<Liveness>,
 
-    /// Per-peer jitter buffers (`VecDeque<Vec<f32>>`). Used by the
-    /// subscribe loop (push) and the jitter pump (pop).
-    pub jitter: RefCell<HashMap<PeerId, VecDeque<Vec<f32>>>>,
-    pub last_delivered: RefCell<HashMap<PeerId, LastDelivered>>,
+    /// Last per-peer wire sequence number delivered to the
+    /// `FrameSink`. The runtime keeps no audio buffer of its own —
+    /// the host's playback path absorbs jitter. This map is read by
+    /// test hooks (`observed_voice_peers`) so a peer remains "seen
+    /// via frames" even when nothing else stores their PCM.
+    pub last_delivered_seq: RefCell<HashMap<PeerId, u64>>,
     pub auto_connect_state: RefCell<HashMap<PeerId, AutoConnectState>>,
     pub last_emitted: RefCell<HashMap<PeerId, EmittedState>>,
-}
-
-pub(crate) struct LastDelivered {
-    pub pcm: Vec<f32>,
-    pub underruns: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

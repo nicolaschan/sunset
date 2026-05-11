@@ -1,7 +1,10 @@
 //! Subscribe loop: opens a Bus subscription with prefix `voice/<fp>/`,
 //! decrypts each `EncryptedVoicePacket`, dispatches by enum:
-//! - `Frame` → feed `frame_liveness` + push decoded PCM to per-peer
-//!   jitter buffer.
+//! - `Frame` → feed `frame_liveness` + decode/denoise + deliver
+//!   directly to the `FrameSink`. No intermediate jitter buffer:
+//!   the host (e.g. the browser playback worklet) absorbs network
+//!   jitter at the audio clock. When `deafened` is set, skip the
+//!   decode entirely.
 //! - `Heartbeat` → feed `membership_liveness` + record `is_muted` so
 //!   the combiner can emit it.
 
@@ -15,7 +18,7 @@ use sunset_core::bus::BusEvent;
 use sunset_core::identity::IdentityKey;
 use sunset_sync::PeerId;
 
-use super::{JITTER_MAX_DEPTH, state::RuntimeInner};
+use super::state::RuntimeInner;
 use crate::packet::{EncryptedVoicePacket, VoicePacket, decrypt};
 use crate::runtime::traits::VoicePeerState;
 
@@ -76,11 +79,19 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 VoicePacket::Frame {
                     payload,
                     sender_time_ms,
+                    seq,
                     ..
                 } => {
                     let st =
                         SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sender_time_ms);
                     inner.frame_liveness.observe(peer.clone(), st).await;
+                    // Deafened: skip decode + delivery. We still feed
+                    // `frame_liveness` above so the combiner can keep
+                    // the peer's `talking`/`in_call` state honest while
+                    // we're not listening.
+                    if *inner.deafened.borrow() {
+                        continue;
+                    }
                     match decoder.decode(&payload) {
                         Ok(mut pcm) => {
                             // Denoise per peer when enabled. Each peer
@@ -98,13 +109,17 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                                     tracing::warn!(error = %e, "denoise skipped");
                                 }
                             }
-                            let mut jitter = inner.jitter.borrow_mut();
-                            let q = jitter.entry(peer).or_default();
-                            q.push_back(pcm);
-                            // Cap at JITTER_MAX_DEPTH.
-                            while q.len() > JITTER_MAX_DEPTH {
-                                q.pop_front();
-                            }
+                            // Track per-peer last-delivered seq so
+                            // `talking`/`observed` queries have a peer
+                            // entry even when the host's playback path
+                            // is the only buffer. The low 32 bits of
+                            // the wire seq are passed to the sink for
+                            // sequence-indexed buffering downstream.
+                            inner
+                                .last_delivered_seq
+                                .borrow_mut()
+                                .insert(peer.clone(), seq);
+                            inner.frame_sink.borrow().deliver(&peer, seq as u32, &pcm);
                         }
                         Err(e) => tracing::warn!(error = %e, "decode failed"),
                     }
