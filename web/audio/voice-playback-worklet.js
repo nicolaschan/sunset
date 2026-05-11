@@ -83,10 +83,17 @@ class VoicePlaybackProcessor extends AudioWorkletProcessor {
     // after a Playing → Underrun transition.
     this.fadeInPos = FADE_SAMPLES;
     this.fadeOutPos = FADE_SAMPLES;
-    // Last L/R sample actually written. Anchors the fade-out so it
-    // starts continuous with what the listener just heard.
+    // Last L/R sample actually written. Updated on every emitted
+    // sample so a Playing → Underrun transition has a fresh anchor.
     this.lastL = 0;
     this.lastR = 0;
+    // Frozen anchor for the active fade-out — snapshotted from
+    // (lastL, lastR) at the moment Underrun begins, then held
+    // constant for the whole fade window. Without this snapshot the
+    // fade-out would multiply each successive sample's value by the
+    // ramp, compounding into a faster-than-cosine decay.
+    this.fadeOutAnchorL = 0;
+    this.fadeOutAnchorR = 0;
 
     this.port.onmessage = (e) => {
       const msg = e.data;
@@ -162,13 +169,15 @@ class VoicePlaybackProcessor extends AudioWorkletProcessor {
         // Silent until enough buffered (handled in onmessage).
         // outL, outR remain 0.
       } else if (this.state === STATE_UNDERRUN) {
-        // Fade the last actually-written sample value down to zero,
-        // then silence. This is unambiguously continuous: at
-        // fadeOutPos=0 the multiplier is 1 → outL=lastL exactly.
+        // Fade the anchored sample value down to zero, then
+        // silence. The anchor is the lastL/lastR captured at the
+        // moment we entered Underrun, NOT the per-sample lastL —
+        // using the per-sample value compounds the ramp, which
+        // attenuates faster than the documented cosine.
         if (this.fadeOutPos < FADE_SAMPLES) {
           const m = this.fadeMul(FADE_SAMPLES - this.fadeOutPos);
-          outL = this.lastL * m;
-          outR = this.lastR * m;
+          outL = this.fadeOutAnchorL * m;
+          outR = this.fadeOutAnchorR * m;
           this.fadeOutPos++;
         }
         // else: silence (0).
@@ -176,10 +185,13 @@ class VoicePlaybackProcessor extends AudioWorkletProcessor {
         // STATE_PLAYING — need a head frame.
         if (!this.head) {
           if (this.buf.size === 0) {
-            // Buffer dried up mid-playback. Transition and re-do
+            // Buffer dried up mid-playback. Snapshot the current
+            // last-emitted value as the fade-out anchor and re-do
             // this sample under the Underrun branch.
             this.state = STATE_UNDERRUN;
             this.fadeOutPos = 0;
+            this.fadeOutAnchorL = this.lastL;
+            this.fadeOutAnchorR = this.lastR;
             i--;
             continue;
           }
