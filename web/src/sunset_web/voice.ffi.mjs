@@ -23,10 +23,24 @@ const LEVEL_DISPATCH_INTERVAL_MS = 80;
 // Speech RMS sits in 0.05–0.2 territory; multiply so realistic speech
 // reaches ~1.0 on the bar without clipping for louder bursts.
 const LEVEL_RMS_GAIN = 4.0;
+// How long the level meter waits past the last delivered frame before
+// it starts decaying toward zero on a timer. Frames arrive every
+// ~20 ms when audio is flowing, so a small grace window prevents the
+// decay tick from racing real audio. Past this, the periodic decay
+// runs even with zero packets arriving — matches user intuition that
+// "no audio = level drops".
+const LEVEL_DECAY_AFTER_MS = 30;
+// Decay tick interval. 20 ms matches the natural frame cadence; with
+// alpha=0.35 the EMA halves roughly every two ticks (~40 ms) and
+// reaches sub-0.05 from a 0.5 peak in ~150 ms, which is below the
+// 3-second budget the level-meter e2e test asserts.
+const LEVEL_DECAY_TICK_MS = 20;
 const peerLevelEma = new Map(); // peerHex -> last EMA value (0..1)
 const peerLevelLastDispatchMs = new Map(); // peerHex -> ms
+const peerLastFrameMs = new Map(); // peerHex -> ms of last delivered frame
 let selfLevelEma = 0;
 let selfLevelLastDispatchMs = 0;
+let levelDecayTimer = null;
 
 // Test-only handle. The bundled module is otherwise unreachable from
 // page.evaluate() because Lustre's prod build inlines it into sunset_web.js
@@ -78,6 +92,7 @@ export async function startCapture(client) {
   ensureCtx();
   await ctx.audioWorklet.addModule("/audio/voice-capture-worklet.js");
   await ctx.audioWorklet.addModule("/audio/voice-playback-worklet.js");
+  startLevelDecayTimer();
   captureStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: true,
@@ -140,6 +155,7 @@ function updatePeerLevel(peerHex, pcm) {
   const prev = peerLevelEma.get(peerHex) ?? 0;
   const next = LEVEL_EMA_ALPHA * normalized + (1 - LEVEL_EMA_ALPHA) * prev;
   peerLevelEma.set(peerHex, next);
+  peerLastFrameMs.set(peerHex, Date.now());
   const now = Date.now();
   const last = peerLevelLastDispatchMs.get(peerHex) ?? 0;
   if (now - last >= LEVEL_DISPATCH_INTERVAL_MS) {
@@ -151,6 +167,46 @@ function updatePeerLevel(peerHex, pcm) {
         console.warn("peer level handler failed", err);
       }
     }
+  }
+}
+
+// Periodic decay tick. Without the old Rust-side jitter pump, the
+// peer level EMA stops receiving updates the instant frames stop
+// arriving — which would leave the meter stuck at the last value
+// instead of dropping when the peer falls silent. This ticker
+// applies the same single-pole decay (toward zero) the EMA used to
+// get from silence-padded frames at the pump cadence.
+function tickPeerLevelDecay() {
+  const now = Date.now();
+  for (const [hex, prev] of peerLevelEma) {
+    const lastFrame = peerLastFrameMs.get(hex) ?? 0;
+    if (now - lastFrame < LEVEL_DECAY_AFTER_MS) continue;
+    if (prev < 0.001) continue; // already effectively zero
+    const next = (1 - LEVEL_EMA_ALPHA) * prev;
+    peerLevelEma.set(hex, next);
+    const lastDispatch = peerLevelLastDispatchMs.get(hex) ?? 0;
+    if (now - lastDispatch >= LEVEL_DISPATCH_INTERVAL_MS) {
+      peerLevelLastDispatchMs.set(hex, now);
+      if (window.__voicePeerLevelHandler) {
+        try {
+          window.__voicePeerLevelHandler(hex, next);
+        } catch (err) {
+          console.warn("peer level handler failed", err);
+        }
+      }
+    }
+  }
+}
+
+function startLevelDecayTimer() {
+  if (levelDecayTimer !== null) return;
+  levelDecayTimer = setInterval(tickPeerLevelDecay, LEVEL_DECAY_TICK_MS);
+}
+
+function stopLevelDecayTimer() {
+  if (levelDecayTimer !== null) {
+    clearInterval(levelDecayTimer);
+    levelDecayTimer = null;
   }
 }
 
@@ -196,6 +252,8 @@ export function stopCapture() {
   peers.clear();
   peerLevelEma.clear();
   peerLevelLastDispatchMs.clear();
+  peerLastFrameMs.clear();
+  stopLevelDecayTimer();
   flushSelfLevelToZero();
 }
 
@@ -259,6 +317,7 @@ export function dropPeer(peerHex) {
   flushPeerLevelToZero(peerHex);
   peerLevelEma.delete(peerHex);
   peerLevelLastDispatchMs.delete(peerHex);
+  peerLastFrameMs.delete(peerHex);
 }
 
 export function setPeerVolume(peerHex, gain) {
