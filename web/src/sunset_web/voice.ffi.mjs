@@ -220,7 +220,7 @@ function stopCaptureSource() {
   }
 }
 
-export function deliverFrame(peerHex, pcm) {
+export function deliverFrame(peerHex, seq, pcm) {
   if (!ctx) return;
   let slot = peers.get(peerHex);
   if (!slot) {
@@ -240,7 +240,10 @@ export function deliverFrame(peerHex, pcm) {
   // — postMessage with the [pcm.buffer] transfer list neuters the
   // Float32Array on this side, so any later reads would see length 0.
   updatePeerLevel(peerHex, pcm);
-  slot.worklet.port.postMessage(pcm, [pcm.buffer]);
+  // The worklet maintains a sequence-indexed jitter buffer; pass seq
+  // so it can detect gaps and absorb reordering. The buffer is
+  // transferred to avoid a copy.
+  slot.worklet.port.postMessage({ seq, pcm }, [pcm.buffer]);
 }
 
 export function dropPeer(peerHex) {
@@ -286,9 +289,9 @@ export function wasmVoiceStart(client, roomHandle, callback) {
       try {
         client.voice_start(
           roomHandle,
-          (peerId, pcm) => {
+          (peerId, seq, pcm) => {
             const hex = uint8ToHex(new Uint8Array(peerId));
-            deliverFrame(hex, new Float32Array(pcm));
+            deliverFrame(hex, seq >>> 0, new Float32Array(pcm));
           },
           (peerId) => {
             const hex = uint8ToHex(new Uint8Array(peerId));
