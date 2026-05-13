@@ -106,8 +106,8 @@ test("granted microphone allows voice join", async ({ browser }) => {
   if (await toggle.isVisible()) await toggle.click();
   await page.locator('[data-testid="voice-channel-row"]').first().click();
 
-  // The leave button (universal across phone minibar and desktop self-control
-  // bar) appears once self_in_call is true.
+  // The leave button in the voice minibar at the top of the chat panel
+  // (same on phone and desktop) appears once self_in_call is true.
   await expect(page.locator('[data-testid="voice-leave"]')).toBeVisible({
     timeout: 2_000,
   });
