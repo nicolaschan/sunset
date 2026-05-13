@@ -7,4 +7,5 @@
 //!
 //! See `docs/superpowers/specs/2026-05-12-sunset-sync-quic-design.md`.
 
+mod cert;
 mod wire;
