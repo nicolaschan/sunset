@@ -149,8 +149,8 @@ mod tests {
             loop {
                 let mut bufs = [IoSliceMut::new(&mut storage)];
                 let mut meta = [RecvMeta::default()];
-                let _ = std::future::poll_fn(|cx| hole_pump.poll_recv(cx, &mut bufs, &mut meta))
-                    .await;
+                let _ =
+                    std::future::poll_fn(|cx| hole_pump.poll_recv(cx, &mut bufs, &mut meta)).await;
             }
         });
 
@@ -164,11 +164,10 @@ mod tests {
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender.send_to(&wire, listener_addr).await.unwrap();
 
-        let (src, body) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), probe_rx.recv())
-                .await
-                .expect("probe channel timed out")
-                .expect("probe channel closed");
+        let (src, body) = tokio::time::timeout(std::time::Duration::from_secs(2), probe_rx.recv())
+            .await
+            .expect("probe channel timed out")
+            .expect("probe channel closed");
         assert!(src.ip().is_loopback(), "got src {src:?}");
         assert_eq!(&body[..MAGIC.len()], &MAGIC);
         let decoded = Probe::decode(&body).unwrap().unwrap();

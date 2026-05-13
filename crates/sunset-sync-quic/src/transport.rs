@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::spawn_local;
 
 use sunset_store::VerifyingKey;
@@ -23,7 +23,7 @@ use sunset_sync::{
     Signaler,
 };
 
-use crate::cert::{generate as generate_cert, SelfSignedCert};
+use crate::cert::{SelfSignedCert, generate as generate_cert};
 use crate::connection::QuicRawConnection;
 use crate::coordinator::HolepunchCoordinator;
 use crate::discovery::discover;
@@ -102,8 +102,7 @@ impl QuicRawTransport {
             HolepunchSocket::new(std_udp, probe_tx)
                 .map_err(|e| SyncError::Transport(format!("holepunch socket: {e}")))?,
         );
-        let cert = generate_cert()
-            .map_err(|e| SyncError::Transport(format!("cert gen: {e}")))?;
+        let cert = generate_cert().map_err(|e| SyncError::Transport(format!("cert gen: {e}")))?;
         let server_config = build_server_config(&cert)
             .map_err(|e| SyncError::Transport(format!("build server config: {e}")))?;
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
@@ -239,11 +238,7 @@ impl QuicRawTransport {
     async fn run_accept_router(self) {
         while let Some(incoming) = self.endpoint.accept().await {
             let remote_addr = incoming.remote_address();
-            let target = self
-                .inner
-                .borrow_mut()
-                .accept_routes
-                .remove(&remote_addr);
+            let target = self.inner.borrow_mut().accept_routes.remove(&remote_addr);
             if let Some(tx) = target {
                 let _ = tx.send(incoming);
             } else {
@@ -346,19 +341,26 @@ impl QuicRawTransport {
             let incoming = match tokio::time::timeout(HANDSHAKE_BUDGET, accept_rx.recv()).await {
                 Ok(Some(i)) => i,
                 Ok(None) => {
-                    self.inner.borrow_mut().accept_routes.remove(&confirmed.addr);
+                    self.inner
+                        .borrow_mut()
+                        .accept_routes
+                        .remove(&confirmed.addr);
                     return Err(SyncError::Transport(
                         "quic accept: incoming channel closed".into(),
                     ));
                 }
                 Err(_) => {
-                    self.inner.borrow_mut().accept_routes.remove(&confirmed.addr);
-                    return Err(SyncError::Transport(
-                        "quic accept: incoming timeout".into(),
-                    ));
+                    self.inner
+                        .borrow_mut()
+                        .accept_routes
+                        .remove(&confirmed.addr);
+                    return Err(SyncError::Transport("quic accept: incoming timeout".into()));
                 }
             };
-            self.inner.borrow_mut().accept_routes.remove(&confirmed.addr);
+            self.inner
+                .borrow_mut()
+                .accept_routes
+                .remove(&confirmed.addr);
             let connecting = incoming
                 .accept()
                 .map_err(|e| SyncError::Transport(format!("quic accept incoming: {e}")))?;
@@ -459,8 +461,7 @@ fn pubkey_array(vk: &VerifyingKey) -> SyncResult<[u8; 32]> {
 
 fn rand_bytes_16() -> SyncResult<[u8; 16]> {
     let mut out = [0u8; 16];
-    getrandom::fill(&mut out)
-        .map_err(|e| SyncError::Transport(format!("getrandom: {e}")))?;
+    getrandom::fill(&mut out).map_err(|e| SyncError::Transport(format!("getrandom: {e}")))?;
     Ok(out)
 }
 

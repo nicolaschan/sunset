@@ -62,7 +62,10 @@ async fn loopback_holepunch_reliable_and_datagram_roundtrip() {
                 .send_unreliable(Bytes::from_static(b"dgram"))
                 .await
                 .expect("bob send_unreliable");
-            let dg = a_conn.recv_unreliable().await.expect("alice recv_unreliable");
+            let dg = a_conn
+                .recv_unreliable()
+                .await
+                .expect("alice recv_unreliable");
             assert_eq!(dg.as_ref(), b"dgram");
 
             a_conn.close().await.expect("close alice");

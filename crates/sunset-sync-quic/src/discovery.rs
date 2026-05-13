@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use stunclient::StunClient;
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::{UdpSocket, lookup_host};
 
 /// Enumerate local-interface socket addrs stamped with `port`.
 pub fn local_candidates(port: u16) -> Vec<SocketAddr> {
@@ -85,7 +85,9 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         let cands = local_candidates(port);
         assert!(
-            cands.iter().any(|s| s.ip().is_loopback() && s.port() == port),
+            cands
+                .iter()
+                .any(|s| s.ip().is_loopback() && s.port() == port),
             "expected loopback in {cands:?}"
         );
     }
@@ -96,7 +98,9 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         let cands = discover(&socket, &[]).await;
         assert!(
-            cands.iter().any(|s| s.ip().is_loopback() && s.port() == port),
+            cands
+                .iter()
+                .any(|s| s.ip().is_loopback() && s.port() == port),
             "expected loopback in {cands:?}"
         );
     }

@@ -153,8 +153,8 @@ mod tests {
     use std::io::IoSliceMut;
 
     use super::*;
-    use quinn::udp::RecvMeta;
     use quinn::AsyncUdpSocket;
+    use quinn::udp::RecvMeta;
 
     /// Build a HolepunchSocket on 127.0.0.1 with its own probe channel,
     /// plus a tokio task that drives poll_recv to route probes.
@@ -195,10 +195,8 @@ mod tests {
         let a = HolepunchCoordinator::new(a_sock, session, a_pk, b_pk, vec![b_addr], a_rx);
         let b = HolepunchCoordinator::new(b_sock, session, b_pk, a_pk, vec![a_addr], b_rx);
 
-        let (a_res, b_res) = tokio::join!(
-            a.run(Duration::from_secs(3)),
-            b.run(Duration::from_secs(3))
-        );
+        let (a_res, b_res) =
+            tokio::join!(a.run(Duration::from_secs(3)), b.run(Duration::from_secs(3)));
         let a_path = a_res.expect("a path");
         let b_path = b_res.expect("b path");
         assert_eq!(a_path.addr, b_addr);
@@ -217,7 +215,8 @@ mod tests {
         let (_unused_tx, rx) = mpsc::unbounded_channel();
         // Reachable but ignored: a port we know is closed on loopback.
         let blackhole: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let coord = HolepunchCoordinator::new(sock, [0u8; 16], [0u8; 32], [0u8; 32], vec![blackhole], rx);
+        let coord =
+            HolepunchCoordinator::new(sock, [0u8; 16], [0u8; 32], [0u8; 32], vec![blackhole], rx);
         let err = coord
             .run(Duration::from_millis(800))
             .await

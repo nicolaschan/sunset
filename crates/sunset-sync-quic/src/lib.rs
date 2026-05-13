@@ -16,5 +16,5 @@ mod transport;
 mod verifier;
 mod wire;
 
-pub use connection::{QuicRawConnection, MAX_DATAGRAM_PAYLOAD};
+pub use connection::{MAX_DATAGRAM_PAYLOAD, QuicRawConnection};
 pub use transport::QuicRawTransport;
