@@ -1056,11 +1056,16 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
             })
             .await
             .expect("4th frame delivered (silence)");
+            // Silence padding mirrors the shape of the last real frame.
+            // Since the test pushed 960-sample frames, silence is 960
+            // samples; the playback path pushes 1920-sample stereo frames
+            // and silence there is 1920 samples (covered separately by
+            // `jitter_pump_silence_matches_stereo_frame_shape`).
             let silence = vec![0.0_f32; 960];
             assert_eq!(
                 delivered.borrow()[3].1,
                 silence,
-                "second underrun = silence"
+                "second underrun = silence at last-frame size"
             );
 
             // Push a new frame — next pump cycle delivers it normally.
@@ -1088,6 +1093,83 @@ async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
                 .position(|(_, f)| f == &frame3)
                 .expect("frame3 must appear in delivered list");
             assert_eq!(deliveries[frame3_pos].1, frame3);
+        })
+        .await;
+}
+
+/// The decoder always produces stereo (`FRAME_SAMPLES_PER_CHANNEL * 2` =
+/// 1920 samples) regardless of the sender's encoder preset, so the
+/// playback worklet sees a fixed frame size. The jitter pump's silence
+/// underrun must mirror that shape — otherwise the FrameSink sees a
+/// mono silence frame appear out of nowhere between two stereo frames,
+/// which surfaces as an audible glitch in the playback worklet and as
+/// a `frames[0].len = 960` flake in the e2e voice quality test that
+/// installs a recorder mid-call.
+#[tokio::test(flavor = "current_thread")]
+async fn jitter_pump_silence_matches_stereo_frame_shape() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(12);
+            let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
+            let bus: Rc<dyn DynBus> = bus_impl;
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: delivered.clone(),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+            let (runtime, tasks) = VoiceRuntime::new(
+                bus,
+                room,
+                alice.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+
+            let peer = PeerId(alice.store_verifying_key());
+            let stereo_len = sunset_voice::FRAME_SAMPLES_PER_CHANNEL * 2;
+            let stereo_frame: Vec<f32> = (0..stereo_len).map(|i| i as f32 * 0.001).collect();
+            assert_eq!(stereo_frame.len(), 1920);
+
+            // Push exactly one real stereo frame, then let the pump
+            // underrun twice: first underrun repeats the last frame,
+            // second underrun is silence.
+            runtime.test_push_frame(peer.clone(), stereo_frame.clone());
+
+            tokio::task::spawn_local(tasks.jitter_pump);
+
+            tokio::time::timeout(Duration::from_millis(200), async {
+                loop {
+                    if delivered.borrow().len() >= 3 {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("3 deliveries (real + repeat + silence)");
+
+            let deliveries = delivered.borrow();
+            assert_eq!(deliveries[0].1, stereo_frame, "first delivery = real");
+            assert_eq!(
+                deliveries[1].1, stereo_frame,
+                "first underrun = repeat last (stereo, 1920)"
+            );
+            assert_eq!(
+                deliveries[2].1.len(),
+                stereo_len,
+                "second underrun = silence shaped like the last real frame"
+            );
+            assert!(
+                deliveries[2].1.iter().all(|s| *s == 0.0),
+                "silence is all zeros"
+            );
         })
         .await;
 }

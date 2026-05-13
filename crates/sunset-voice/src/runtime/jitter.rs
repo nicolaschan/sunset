@@ -8,7 +8,6 @@ use futures::FutureExt;
 
 use super::JITTER_PUMP_INTERVAL;
 use super::state::{LastDelivered, RuntimeInner};
-use crate::FRAME_SAMPLES;
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
@@ -41,12 +40,19 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                         rec.underruns = 0;
                         to_deliver.push((peer.clone(), frame));
                     } else if let Some(rec) = last.get_mut(peer) {
-                        // Underrun: repeat once, then silence.
+                        // Underrun: repeat once, then silence. Silence
+                        // matches the shape of the last real frame so the
+                        // playback worklet (and any FrameSink wrapper) sees
+                        // a consistent frame size — decoded frames are
+                        // always FRAME_SAMPLES_PER_CHANNEL * PLAYBACK_CHANNELS
+                        // (1920 stereo) regardless of the sender's preset,
+                        // and the silence padding must match or downstream
+                        // observers see a mono frame appear out of nowhere.
                         rec.underruns = rec.underruns.saturating_add(1);
                         let pcm = if rec.underruns == 1 {
                             rec.pcm.clone()
                         } else {
-                            vec![0.0_f32; FRAME_SAMPLES]
+                            vec![0.0_f32; rec.pcm.len()]
                         };
                         to_deliver.push((peer.clone(), pcm));
                     }
