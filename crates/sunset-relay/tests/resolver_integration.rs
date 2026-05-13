@@ -91,15 +91,24 @@ async fn resolves_loopback_host_port_to_canonical_peeraddr() {
             // Fallback URL must always be the legacy WS form, byte-for-byte.
             assert_eq!(resolved.fallback, ws_canonical);
             // Primary should be the WT URL when the relay successfully
-            // bound UDP — it does on 127.0.0.1 in tests.
+            // bound UDP — it does on 127.0.0.1 in tests. The URL is
+            // built from the user-typed authority + the descriptor's
+            // `webtransport_cert_sha256` (NOT the descriptor's bind
+            // address — that was the prod regression we're guarding
+            // against).
             assert!(
-                resolved.primary.starts_with("wt://"),
-                "expected WT URL as primary, got: {}",
+                resolved.primary.starts_with(&format!("wt://{host_port}#")),
+                "primary must use the user-typed authority, got: {}",
                 resolved.primary,
             );
             assert!(
                 resolved.primary.contains("cert-sha256="),
                 "primary lacks cert-sha256 fragment: {}",
+                resolved.primary,
+            );
+            assert!(
+                !resolved.primary.contains("0.0.0.0"),
+                "primary leaked relay's bind address: {}",
                 resolved.primary,
             );
         })

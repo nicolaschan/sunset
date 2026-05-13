@@ -64,12 +64,11 @@ test("real-mic capture: bob receives ≥ 40 frames from alice within 5 s", async
   const alice = await openPeer(browser, relay.addr);
   const bob = await openPeer(browser, relay.addr);
 
-  // On Desktop the self_control_bar appears instead of the voice-minibar.
-  // The self_control_bar appears when self_in_call && active_voice_channel.
-  // We assert via the data-testid="voice-leave" button which is in both.
+  // The voice minibar at the top of the chat panel carries the
+  // voice-leave button on both phone and desktop once self_in_call
+  // flips true — use it as the "we're in call" gate.
   const aliceVoiceRow = alice.page.locator('[data-testid="voice-channel-row"]').first();
   await aliceVoiceRow.click();
-  // Wait for the leave button to confirm we're in call (Desktop shows self_control_bar).
   await expect(alice.page.locator('[data-testid="voice-leave"]')).toBeVisible({
     timeout: 2_000,
   });

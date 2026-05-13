@@ -22,7 +22,7 @@ use sunset_voice::runtime::{
 };
 
 /// Type alias to avoid clippy::type_complexity.
-type DeliveredSink = Rc<RefCell<Vec<(PeerId, Vec<f32>)>>>;
+type DeliveredSink = Rc<RefCell<Vec<(PeerId, u32, Vec<f32>)>>>;
 /// Type alias to avoid clippy::type_complexity.
 type DroppedSink = Rc<RefCell<Vec<PeerId>>>;
 /// Type alias to avoid clippy::type_complexity.
@@ -169,10 +169,10 @@ struct RecordingFrameSink {
     dropped: DroppedSink,
 }
 impl FrameSink for RecordingFrameSink {
-    fn deliver(&self, peer: &PeerId, pcm: &[f32]) {
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]) {
         self.delivered
             .borrow_mut()
-            .push((peer.clone(), pcm.to_vec()));
+            .push((peer.clone(), seq, pcm.to_vec()));
     }
     fn drop_peer(&self, peer: &PeerId) {
         self.dropped.borrow_mut().push(peer.clone());
@@ -353,7 +353,9 @@ async fn send_pcm_publishes_frame_when_unmuted() {
             );
             let mut rx = tx.subscribe();
 
-            let pcm: Vec<f32> = (0..960).map(|i| (i as f32) / 1000.0).collect();
+            // Default quality is `Maximum` (stereo): 1920 interleaved
+            // samples per frame.
+            let pcm: Vec<f32> = (0..1920).map(|i| (i as f32) / 1000.0).collect();
             runtime.send_pcm(&pcm);
 
             let frame = tokio::time::timeout(Duration::from_secs(1), async {
@@ -378,8 +380,11 @@ async fn send_pcm_publishes_frame_when_unmuted() {
             let decoded = decoder.decode(&bytes).unwrap();
             // Opus is lossy; we just need the frame to round-trip
             // through encrypt → bus → decrypt → decode and produce
-            // the right-sized PCM frame.
-            assert_eq!(decoded.len(), sunset_voice::FRAME_SAMPLES);
+            // the right-sized stereo PCM frame.
+            assert_eq!(
+                decoded.len(),
+                sunset_voice::FRAME_SAMPLES_PER_CHANNEL * sunset_voice::PLAYBACK_CHANNELS as usize
+            );
             assert!(decoded.iter().all(|s| s.is_finite()));
         })
         .await;
@@ -440,11 +445,103 @@ async fn send_pcm_drops_frames_when_muted() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
+async fn subscribe_decodes_frame_and_delivers_to_sink() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (alice, room) = make_identity_and_room(4);
             let (bob, _) = make_identity_and_room(5);
+            let alice_pk = alice.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: delivered.clone(),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.subscribe);
+
+            // Yield to let the subscribe task start up and register its sink.
+            tokio::task::yield_now().await;
+
+            // Alice publishes one Frame as if she were on the network.
+            let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
+            let mut enc =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+            let bytes = enc.encode(&pcm).unwrap();
+            let pkt = sunset_voice::packet::VoicePacket::Frame {
+                codec_id: sunset_voice::CODEC_ID.to_string(),
+                seq: 42,
+                sender_time_ms: 1000,
+                payload: bytes,
+            };
+            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(42);
+            let ev =
+                sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng).unwrap();
+            let payload = postcard::to_stdvec(&ev).unwrap();
+            let room_fp = room.fingerprint().to_hex();
+            let sender_pk = hex::encode(alice_pk.as_bytes());
+            let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
+
+            // Inject as if it came through the bus from alice.
+            let dgram = SignedDatagram {
+                verifying_key: alice_pk.clone(),
+                name,
+                payload: Bytes::from(payload),
+                signature: Bytes::new(),
+            };
+            bob_bus_impl.inject(dgram).await;
+
+            // Wait for the subscribe loop to decode + deliver. The decoder
+            // upmixes mono Opus to stereo, so the delivered PCM is the
+            // mono-source frame interleaved L=R, length 1920.
+            let alice_peer = PeerId(alice_pk.clone());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !delivered.borrow().is_empty() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("frame delivered to sink within 1s");
+
+            let snapshot = delivered.borrow();
+            assert_eq!(snapshot.len(), 1, "exactly one frame delivered");
+            let (peer, seq, pcm) = &snapshot[0];
+            assert_eq!(peer, &alice_peer);
+            assert_eq!(*seq, 42, "wire seq must be propagated to sink");
+            assert_eq!(
+                pcm.len(),
+                sunset_voice::FRAME_SAMPLES_PER_CHANNEL * sunset_voice::PLAYBACK_CHANNELS as usize
+            );
+            assert!(pcm.iter().all(|s| s.is_finite()));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deafened_skips_decode_and_delivery() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(60);
+            let (bob, _) = make_identity_and_room(61);
             let alice_pk = alice.store_verifying_key();
 
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
@@ -469,30 +566,27 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
                 frame_sink,
                 peer_state_sink,
             );
+            runtime.set_deafened(true);
             tokio::task::spawn_local(tasks.subscribe);
-
-            // Yield to let the subscribe task start up and register its sink.
             tokio::task::yield_now().await;
 
-            // Alice publishes one Frame as if she were on the network.
             let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
-            let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
+            let mut enc =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
             let bytes = enc.encode(&pcm).unwrap();
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
-                seq: 1,
+                seq: 7,
                 sender_time_ms: 1000,
                 payload: bytes,
             };
-            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(42);
+            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(7);
             let ev =
                 sunset_voice::packet::encrypt(&room, 0, &alice.public(), &pkt, &mut rng).unwrap();
             let payload = postcard::to_stdvec(&ev).unwrap();
             let room_fp = room.fingerprint().to_hex();
             let sender_pk = hex::encode(alice_pk.as_bytes());
             let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
-
-            // Inject as if it came through the bus from alice.
             let dgram = SignedDatagram {
                 verifying_key: alice_pk.clone(),
                 name,
@@ -501,20 +595,13 @@ async fn subscribe_decrypts_frame_and_pushes_to_jitter() {
             };
             bob_bus_impl.inject(dgram).await;
 
-            // Wait for the subscribe loop to push the frame into the jitter buffer.
-            let alice_peer = PeerId(alice_pk.clone());
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    if runtime.test_jitter_len(&alice_peer) >= 1 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("frame pushed to jitter within 1s");
-
-            assert_eq!(runtime.test_jitter_len(&alice_peer), 1);
+            // Wait a tick — if the deafened gate is broken, the sink
+            // would receive a frame here. Then verify nothing arrived.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                delivered.borrow().is_empty(),
+                "deafened receiver must not deliver any frames"
+            );
         })
         .await;
 }
@@ -642,7 +729,8 @@ async fn combiner_evicts_peer_seen_only_via_frames() {
 
             // Inject one frame from alice — no heartbeat ever.
             let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
-            let mut enc = sunset_voice::VoiceEncoder::new().unwrap();
+            let mut enc =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
             let bytes = enc.encode(&pcm).unwrap();
             let now_ms: u64 = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
@@ -812,6 +900,82 @@ async fn auto_connect_skips_dial_when_self_pk_is_larger() {
         .await;
 }
 
+/// `voice_presence_membership` consumes the durable presence stream
+/// and feeds `voice_presence_liveness`, which the combiner reads to
+/// flip `in_voice_channel` to `true`. Critically, this should fire
+/// *without* any ephemeral traffic — modelling the case where peer A
+/// is in the voice channel (publishing presence) but no P2P
+/// connection has been established yet, so neither frames nor
+/// heartbeats reach us.
+#[tokio::test(flavor = "current_thread")]
+async fn membership_marks_in_voice_channel_without_p2p_traffic() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // bob's runtime; alice is the remote peer whose presence is injected.
+            let (bob, alice, room) = make_pair_self_smaller(20, 21);
+            let alice_pk = alice.store_verifying_key();
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let events: EventSink = Rc::new(RefCell::new(vec![]));
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: events.clone(),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.combiner);
+            tokio::task::spawn_local(tasks.voice_presence_membership);
+
+            tokio::task::yield_now().await;
+
+            // Inject one durable presence entry from alice. No frames,
+            // no heartbeats — this models "alice is in the channel but
+            // I'm not connected to her".
+            let entry = make_presence_entry(&alice, &room);
+            bob_bus_impl.inject_durable(entry).await;
+
+            // Wait for the combiner to emit a state where in_voice_channel
+            // is true (and in_call is false — no P2P traffic).
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(ev) = events.borrow().last().cloned() {
+                        if ev.in_voice_channel {
+                            return ev;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("in_voice_channel emit within 2s");
+
+            assert_eq!(result.peer, PeerId(alice_pk));
+            assert!(
+                result.in_voice_channel,
+                "expected in_voice_channel=true after presence-only event"
+            );
+            assert!(
+                !result.in_call,
+                "in_call must remain false without ephemeral heartbeats / frames"
+            );
+            assert!(!result.talking, "talking must remain false without frames");
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn voice_presence_publisher_emits_periodically() {
     tokio::task::LocalSet::new()
@@ -883,133 +1047,6 @@ async fn voice_presence_publisher_emits_periodically() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn jitter_pump_delivers_at_20ms_cadence_and_pads_silence() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let (alice, room) = make_identity_and_room(10);
-            let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
-            let bus: Rc<dyn DynBus> = bus_impl;
-            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
-                calls: Rc::new(RefCell::new(vec![])),
-            });
-            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
-            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
-                delivered: delivered.clone(),
-                dropped: Rc::new(RefCell::new(vec![])),
-            });
-            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
-                events: Rc::new(RefCell::new(vec![])),
-            });
-            let (runtime, tasks) = VoiceRuntime::new(
-                bus,
-                room,
-                alice.clone(),
-                dialer,
-                frame_sink,
-                peer_state_sink,
-            );
-
-            let peer = PeerId(alice.store_verifying_key());
-            let frame1: Vec<f32> = (0..960).map(|i| i as f32 * 0.001).collect();
-            let frame2: Vec<f32> = (0..960).map(|i| i as f32 * 0.002).collect();
-
-            // Push two frames directly into the jitter buffer.
-            runtime.test_push_frame(peer.clone(), frame1.clone());
-            runtime.test_push_frame(peer.clone(), frame2.clone());
-
-            tokio::task::spawn_local(tasks.jitter_pump);
-
-            // Poll for 1st delivery (frame1).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if !delivered.borrow().is_empty() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("1st frame delivered");
-            assert_eq!(delivered.borrow()[0].1, frame1);
-
-            // Poll for 2nd delivery (frame2).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() >= 2 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("2nd frame delivered");
-            assert_eq!(delivered.borrow()[1].1, frame2);
-
-            // Poll for 3rd delivery (repeat-last = frame2, first underrun).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() >= 3 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("3rd frame delivered (repeat last)");
-            assert_eq!(
-                delivered.borrow()[2].1,
-                frame2,
-                "first underrun = repeat last"
-            );
-
-            // Poll for 4th delivery (silence, second underrun).
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() >= 4 {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("4th frame delivered (silence)");
-            let silence = vec![0.0_f32; 960];
-            assert_eq!(
-                delivered.borrow()[3].1,
-                silence,
-                "second underrun = silence"
-            );
-
-            // Push a new frame — next pump cycle delivers it normally.
-            // We track how many frames have been delivered so far to find frame3's position.
-            let frame3: Vec<f32> = (0..960).map(|i| i as f32 * 0.003).collect();
-            // Push frame3 immediately after observing the silence delivery.
-            // The next pump tick will pick it up and deliver it normally.
-            runtime.test_push_frame(peer.clone(), frame3.clone());
-            let base_len = delivered.borrow().len();
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if delivered.borrow().len() > base_len {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("frame3 delivered");
-            // Find frame3 in the delivered list — it may not be at index 4 if extra
-            // silence frames were pumped before we pushed it.
-            let deliveries = delivered.borrow();
-            let frame3_pos = deliveries
-                .iter()
-                .position(|(_, f)| f == &frame3)
-                .expect("frame3 must appear in delivered list");
-            assert_eq!(deliveries[frame3_pos].1, frame3);
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn dropping_runtime_terminates_all_tasks() {
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -1043,7 +1080,6 @@ async fn dropping_runtime_terminates_all_tasks() {
                 tokio::task::spawn_local(tasks.subscribe),
                 tokio::task::spawn_local(tasks.combiner),
                 tokio::task::spawn_local(tasks.auto_connect),
-                tokio::task::spawn_local(tasks.jitter_pump),
                 tokio::task::spawn_local(tasks.voice_presence_publisher),
             ];
 
@@ -1115,7 +1151,6 @@ async fn dropping_runtime_terminates_all_tasks() {
                 "subscribe",
                 "combiner",
                 "auto_connect",
-                "jitter_pump",
                 "voice_presence_publisher",
             ];
             for (i, h) in handles.into_iter().enumerate() {
@@ -1129,4 +1164,154 @@ async fn dropping_runtime_terminates_all_tasks() {
             }
         })
         .await;
+}
+
+/// `set_denoise(false)` plumbs through to the receiver path: with denoise
+/// off the inbound PCM is delivered raw (modulo Opus quantization), with
+/// denoise on the same packets are attenuated by RNNoise. The test feeds
+/// pseudo-random noise through a real encrypt → bus → decrypt → decode →
+/// sink loop and compares RMS energy at the sink. The runtime has no
+/// internal buffer between decode and sink — frames arrive synchronously
+/// with the subscribe loop's `inject` calls.
+#[tokio::test(flavor = "current_thread")]
+async fn set_denoise_toggle_attenuates_inbound_noise() {
+    async fn run(denoise_on: bool) -> f32 {
+        let delivered_rms_sum = Rc::new(RefCell::new(0.0_f32));
+        let delivered_rms_count = Rc::new(RefCell::new(0_usize));
+
+        tokio::task::LocalSet::new()
+            .run_until({
+                let delivered_rms_sum = delivered_rms_sum.clone();
+                let delivered_rms_count = delivered_rms_count.clone();
+                async move {
+                    let (alice, room) = make_identity_and_room(33);
+                    let (bob, _) = make_identity_and_room(34);
+                    let alice_pk = alice.store_verifying_key();
+
+                    let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+                    let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+                    let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                        calls: Rc::new(RefCell::new(vec![])),
+                    });
+
+                    // Custom sink that accumulates RMS so we don't need to
+                    // hold every f32 of every frame.
+                    struct RmsSink {
+                        sum: Rc<RefCell<f32>>,
+                        count: Rc<RefCell<usize>>,
+                    }
+                    impl FrameSink for RmsSink {
+                        fn deliver(&self, _peer: &PeerId, _seq: u32, pcm: &[f32]) {
+                            let s: f32 = pcm.iter().map(|s| s * s).sum();
+                            let rms = (s / pcm.len() as f32).sqrt();
+                            *self.sum.borrow_mut() += rms;
+                            *self.count.borrow_mut() += 1;
+                        }
+                        fn drop_peer(&self, _peer: &PeerId) {}
+                    }
+                    let frame_sink: Rc<dyn FrameSink> = Rc::new(RmsSink {
+                        sum: delivered_rms_sum.clone(),
+                        count: delivered_rms_count.clone(),
+                    });
+                    let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                        events: Rc::new(RefCell::new(vec![])),
+                    });
+
+                    let (runtime, tasks) = VoiceRuntime::new(
+                        bob_bus,
+                        room.clone(),
+                        bob.clone(),
+                        dialer,
+                        frame_sink,
+                        peer_state_sink,
+                    );
+                    runtime.set_denoise(denoise_on);
+                    assert_eq!(runtime.is_denoise_enabled(), denoise_on);
+
+                    tokio::task::spawn_local(tasks.subscribe);
+                    tokio::task::yield_now().await;
+
+                    // Feed deterministic pseudo-random noise at amplitude
+                    // 0.05 (well below clipping). 30 frames = 600 ms,
+                    // enough for RNNoise to settle past its fade-in window.
+                    // Mono encoder; decoder upmixes to stereo, so the
+                    // RMS sink sees 1920-sample stereo frames either
+                    // way and the on/off comparison is fair.
+                    let mut enc =
+                        sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+                    let mut rng_seed: u32 = 0xBEEF_F00D;
+                    for seq in 0..30 {
+                        let mut pcm = vec![0.0_f32; sunset_voice::FRAME_SAMPLES_PER_CHANNEL];
+                        for s in pcm.iter_mut() {
+                            rng_seed = rng_seed.wrapping_mul(48271) % 0x7FFF_FFFF;
+                            let n = (rng_seed as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0;
+                            *s = n * 0.05;
+                        }
+                        let bytes = enc.encode(&pcm).unwrap();
+                        let pkt = sunset_voice::packet::VoicePacket::Frame {
+                            codec_id: sunset_voice::CODEC_ID.to_string(),
+                            seq,
+                            sender_time_ms: 1000 + seq * 20,
+                            payload: bytes,
+                        };
+                        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seq);
+                        let ev = sunset_voice::packet::encrypt(
+                            &room,
+                            0,
+                            &alice.public(),
+                            &pkt,
+                            &mut rng,
+                        )
+                        .unwrap();
+                        let payload = postcard::to_stdvec(&ev).unwrap();
+                        let room_fp = room.fingerprint().to_hex();
+                        let sender_pk = hex::encode(alice_pk.as_bytes());
+                        let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
+                        bob_bus_impl
+                            .inject(SignedDatagram {
+                                verifying_key: alice_pk.clone(),
+                                name,
+                                payload: Bytes::from(payload),
+                                signature: Bytes::new(),
+                            })
+                            .await;
+                    }
+
+                    // Wait for at least 25 frames to be delivered. The
+                    // runtime delivers synchronously inside the subscribe
+                    // loop now (no buffer in between), so the 2-second
+                    // wall budget is loose CI tolerance — locally this
+                    // path completes in milliseconds.
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if *delivered_rms_count.borrow() >= 25 {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("at least 25 frames delivered within 2s");
+
+                    drop(runtime);
+                }
+            })
+            .await;
+        let total = *delivered_rms_sum.borrow();
+        let count = *delivered_rms_count.borrow();
+        total / count as f32
+    }
+
+    let off_rms = run(false).await;
+    let on_rms = run(true).await;
+    // Denoising should drop the inbound RMS substantially. Same input
+    // signal, same Opus codec; the only difference is the RNNoise stage.
+    assert!(
+        off_rms > 0.001,
+        "raw path should preserve audible energy: {off_rms}"
+    );
+    assert!(
+        on_rms * 2.0 < off_rms,
+        "denoise on should attenuate inbound noise vs off: on={on_rms}, off={off_rms}",
+    );
 }

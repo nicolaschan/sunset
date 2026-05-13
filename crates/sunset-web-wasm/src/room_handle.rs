@@ -39,10 +39,17 @@ impl RoomHandle {
 
 #[wasm_bindgen]
 impl RoomHandle {
-    pub async fn send_message(&self, body: String, sent_at_ms: f64) -> Result<String, JsError> {
+    pub async fn send_message(
+        &self,
+        channel: String,
+        body: String,
+        sent_at_ms: f64,
+    ) -> Result<String, JsError> {
+        let channel = sunset_core::ChannelLabel::try_new(channel)
+            .map_err(|e| JsError::new(&format!("send_message channel: {e}")))?;
         let value_hash = self
             .inner
-            .send_text(body, sent_at_ms as u64)
+            .send_text_in_channel(channel, body, sent_at_ms as u64)
             .await
             .map_err(|e| JsError::new(&format!("send_text: {e}")))?;
         Ok(value_hash.to_hex())
@@ -64,11 +71,38 @@ impl RoomHandle {
 
     pub fn on_receipt(&self, callback: js_sys::Function) {
         self.inner
-            .on_receipt(move |for_hash, from_pubkey, sent_at_ms| {
-                let incoming =
-                    crate::messages::receipt_to_js(for_hash.to_hex(), from_pubkey, sent_at_ms);
+            .on_receipt(move |for_hash, from_pubkey, channel, sent_at_ms| {
+                let incoming = crate::messages::receipt_to_js(
+                    for_hash.to_hex(),
+                    from_pubkey,
+                    channel,
+                    sent_at_ms,
+                );
                 let _ = callback.call1(&JsValue::NULL, &JsValue::from(incoming));
             });
+    }
+
+    /// Sorted snapshot of channels the decode loop has observed in this
+    /// room so far. Always contains `"general"`.
+    pub fn observed_channels(&self) -> js_sys::Array {
+        let arr = js_sys::Array::new();
+        for c in self.inner.observed_channels() {
+            arr.push(&JsValue::from_str(c.as_str()));
+        }
+        arr
+    }
+
+    /// Register a JS callback that fires (immediately with the current
+    /// sorted snapshot, then again on every change) with an Array of
+    /// channel name strings.
+    pub fn on_channels_changed(&self, callback: js_sys::Function) {
+        self.inner.on_channels_changed(move |chans| {
+            let arr = js_sys::Array::new();
+            for c in chans {
+                arr.push(&JsValue::from_str(c.as_str()));
+            }
+            let _ = callback.call1(&JsValue::NULL, &arr);
+        });
     }
 
     pub fn on_members_changed(&self, callback: js_sys::Function) {
@@ -107,18 +141,22 @@ impl RoomHandle {
     }
 
     pub fn on_reactions_changed(&self, callback: js_sys::Function) {
-        self.inner.on_reactions_changed(move |target, snapshot| {
-            let payload = crate::reactions::snapshot_to_js(target, snapshot);
-            let _ = callback.call1(&JsValue::NULL, &payload);
-        });
+        self.inner
+            .on_reactions_changed(move |target, channel, snapshot| {
+                let payload = crate::reactions::snapshot_to_js(target, channel, snapshot);
+                let _ = callback.call1(&JsValue::NULL, &payload);
+            });
     }
 
     pub async fn send_reaction(
         &self,
+        channel: String,
         target_value_hash_hex: String,
         emoji: String,
         action: String,
     ) -> Result<(), JsError> {
+        let channel = sunset_core::ChannelLabel::try_new(channel)
+            .map_err(|e| JsError::new(&format!("send_reaction channel: {e}")))?;
         let action = match action.as_str() {
             "add" => sunset_core::ReactionAction::Add,
             "remove" => sunset_core::ReactionAction::Remove,
@@ -143,7 +181,7 @@ impl RoomHandle {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         self.inner
-            .send_reaction(target, emoji, action, now_ms)
+            .send_reaction_in_channel(channel, target, emoji, action, now_ms)
             .await
             .map_err(|e| JsError::new(&format!("send_reaction: {e}")))?;
         Ok(())

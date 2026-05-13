@@ -187,23 +187,33 @@ test("composer regains focus after a channel switch", async ({
   const { ctx, page, composer } = await openChat(browser, "focus-channel");
   await expect(composer).toBeFocused({ timeout: 5_000 });
 
+  // The channels rail derives from observed channels + the always-
+  // present default. To exercise SelectChannel we need at least one
+  // additional channel. Type a name into the rail's new-channel input
+  // and press Enter — this also switches the active channel (so the
+  // original #general row becomes the click target below).
+  await page.getByTestId("new-channel-input").fill("links");
+  await page.getByTestId("new-channel-input").press("Enter");
+
+  // NewChannel triggers an async focus-composer effect; wait for it to
+  // settle before blurring so we don't race it. Without this wait, the
+  // blur lands first and the focus effect refocuses the composer right
+  // after, leaving toBeNotFocused racing forever.
+  await expect(composer).toBeFocused({ timeout: 5_000 });
+
   await page.evaluate(() => {
     const el = document.activeElement;
     if (el && typeof el.blur === "function") el.blur();
   });
   await expect(composer).not.toBeFocused();
 
-  // Click any text-channel button in the rail other than the one
-  // currently active. The rail buttons render with `# <name>` text;
-  // pick a stable fixture entry.
-  const sageRoots = page.getByRole("button", { name: /sage-roots/ });
-  if ((await sageRoots.count()) > 0) {
-    await sageRoots.first().click();
-  } else {
-    // Fallback: click whichever non-active text channel exists.
-    const channelButtons = page.locator("button").filter({ hasText: "#" });
-    await channelButtons.nth(1).click();
-  }
+  // Click the original (now non-active) #general channel row to
+  // exercise SelectChannel; the reducer should refocus the composer.
+  await page
+    .locator('[data-testid="channels-rail"] button')
+    .filter({ hasText: /general/ })
+    .first()
+    .click();
 
   await expect
     .poll(async () => composer.evaluate((el) => el === document.activeElement), {

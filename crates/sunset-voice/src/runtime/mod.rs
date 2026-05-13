@@ -35,10 +35,14 @@ pub use traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const FRAME_STALE_AFTER: Duration = Duration::from_millis(1000);
 const MEMBERSHIP_STALE_AFTER: Duration = Duration::from_secs(5);
-const JITTER_MAX_DEPTH: usize = 8;
-const JITTER_PUMP_INTERVAL: Duration = Duration::from_millis(20);
 pub(crate) const VOICE_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const VOICE_PRESENCE_TTL: Duration = Duration::from_secs(6);
+/// Stale-after window for the durable-presence-driven `in_voice_channel`
+/// signal. Set slightly larger than `VOICE_PRESENCE_TTL` so that a single
+/// missed republish doesn't drop a peer from the roster — the durable
+/// entry's `expires_at` is the floor and the relayed propagation latency
+/// is non-zero.
+const VOICE_PRESENCE_STALE_AFTER: Duration = Duration::from_secs(8);
 
 pub(crate) fn voice_presence_name(room_fp_hex: &str, sender_pk_hex: &str) -> bytes::Bytes {
     bytes::Bytes::from(format!("voice-presence/{room_fp_hex}/{sender_pk_hex}"))
@@ -57,8 +61,12 @@ pub struct VoiceTasks {
     pub subscribe: futures::future::LocalBoxFuture<'static, ()>,
     pub combiner: futures::future::LocalBoxFuture<'static, ()>,
     pub auto_connect: futures::future::LocalBoxFuture<'static, ()>,
-    pub jitter_pump: futures::future::LocalBoxFuture<'static, ()>,
     pub voice_presence_publisher: futures::future::LocalBoxFuture<'static, ()>,
+    /// Subscribes to durable `voice-presence/<room_fp>/` entries and
+    /// observes them into `voice_presence_liveness`. Emits the
+    /// `in_voice_channel` signal via the combiner so the UI knows
+    /// about peers who are in the channel but not yet connected.
+    pub voice_presence_membership: futures::future::LocalBoxFuture<'static, ()>,
 }
 
 impl VoiceRuntime {
@@ -77,6 +85,7 @@ impl VoiceRuntime {
 
         let frame_liveness = Liveness::new(FRAME_STALE_AFTER);
         let membership_liveness = Liveness::new(MEMBERSHIP_STALE_AFTER);
+        let voice_presence_liveness = Liveness::new(VOICE_PRESENCE_STALE_AFTER);
 
         let inner = Rc::new(state::RuntimeInner {
             identity,
@@ -86,16 +95,19 @@ impl VoiceRuntime {
             frame_sink: RefCell::new(frame_sink),
             peer_state_sink,
             encoder: RefCell::new(
-                VoiceEncoder::new().expect("opus encoder construction must succeed"),
+                VoiceEncoder::new(crate::VoiceQuality::default())
+                    .expect("opus encoder construction must succeed"),
             ),
             seq: RefCell::new(0),
             rng: RefCell::new(ChaCha20Rng::seed_from_u64(now_nanos)),
             muted: RefCell::new(false),
             deafened: RefCell::new(false),
+            denoise: RefCell::new(true),
+            denoisers: RefCell::new(Default::default()),
             frame_liveness,
             membership_liveness,
-            jitter: RefCell::new(Default::default()),
-            last_delivered: RefCell::new(Default::default()),
+            voice_presence_liveness,
+            last_delivered_seq: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
             last_emitted: RefCell::new(Default::default()),
         });
@@ -105,8 +117,8 @@ impl VoiceRuntime {
             subscribe: subscribe::spawn(Rc::downgrade(&inner)),
             combiner: combiner::spawn(Rc::downgrade(&inner)),
             auto_connect: auto_connect::spawn(Rc::downgrade(&inner)),
-            jitter_pump: jitter::spawn(Rc::downgrade(&inner)),
             voice_presence_publisher: voice_presence_publisher::spawn(Rc::downgrade(&inner)),
+            voice_presence_membership: voice_presence_membership::spawn(Rc::downgrade(&inner)),
         };
 
         (VoiceRuntime { inner }, tasks)
@@ -114,16 +126,31 @@ impl VoiceRuntime {
 
     /// Capture-path entry. Encodes one frame, encrypts, publishes via
     /// `Bus::publish_ephemeral`. Drops the frame silently if `muted`.
+    ///
+    /// Expected `pcm` length depends on the encoder's quality preset
+    /// (mono = `FRAME_SAMPLES_PER_CHANNEL`, stereo = that × 2). The
+    /// caller is the worklet bridge in `sunset-web-wasm/src/voice`,
+    /// which always sends interleaved stereo (1920 samples) — when
+    /// the active preset is mono we downmix here so the encoder gets
+    /// the shape it expects.
     pub fn send_pcm(&self, pcm: &[f32]) {
         if *self.inner.muted.borrow() {
             return;
         }
-        if pcm.len() != crate::FRAME_SAMPLES {
-            return;
-        }
+        let expected = self.inner.encoder.borrow().samples_per_frame();
+        let stereo_in = crate::FRAME_SAMPLES_PER_CHANNEL * 2;
+        let pcm_owned: Vec<f32> = match (pcm.len(), expected) {
+            // Caller already matches: pass through.
+            (n, e) if n == e => pcm.to_vec(),
+            // Stereo capture from JS, mono encoder: downmix L+R/2.
+            (n, e) if n == stereo_in && e == crate::FRAME_SAMPLES_PER_CHANNEL => {
+                pcm.chunks_exact(2).map(|p| 0.5 * (p[0] + p[1])).collect()
+            }
+            _ => return,
+        };
 
         let inner = self.inner.clone();
-        let pcm = pcm.to_vec();
+        let pcm = pcm_owned;
         // Spawn the publish — Bus::publish_ephemeral is async. We
         // can't .await synchronously here.
         spawn_local(async move {
@@ -189,6 +216,30 @@ impl VoiceRuntime {
         *self.inner.deafened.borrow_mut() = deafened;
     }
 
+    /// Toggle receiver-side RNNoise denoising. Defaults to `true` (on)
+    /// at runtime construction. Off bypasses the denoiser entirely;
+    /// previously-built per-peer state is kept so re-enabling resumes
+    /// where it left off rather than starting from scratch.
+    pub fn set_denoise(&self, denoise: bool) {
+        *self.inner.denoise.borrow_mut() = denoise;
+    }
+
+    /// Switch the active send-side quality preset. Rebuilds the
+    /// encoder; existing encoder state (predictor history, FEC) is
+    /// dropped, which means the very next encoded frame will be
+    /// indistinguishable from the start of a fresh stream — fine
+    /// since this is a one-shot reconfig, not a per-frame thing.
+    pub fn set_quality(&self, quality: crate::VoiceQuality) -> Result<(), crate::Error> {
+        let new_encoder = VoiceEncoder::new(quality)?;
+        *self.inner.encoder.borrow_mut() = new_encoder;
+        Ok(())
+    }
+
+    /// Currently active send-side quality preset.
+    pub fn quality(&self) -> crate::VoiceQuality {
+        self.inner.encoder.borrow().quality()
+    }
+
     /// Stop the runtime. Dropping `self` has the same effect — all tasks
     /// observe the `Weak` upgrade failure and exit cleanly.
     pub fn stop(self) {
@@ -202,26 +253,11 @@ impl VoiceRuntime {
         *self.inner.muted.borrow()
     }
 
-    /// Test-only: report jitter buffer depth for a peer.
+    /// Read denoise toggle state. Gated behind `test-hooks`; production
+    /// code reads `inner.denoise` directly.
     #[cfg(feature = "test-hooks")]
-    pub fn test_jitter_len(&self, peer: &sunset_sync::PeerId) -> usize {
-        self.inner
-            .jitter
-            .borrow()
-            .get(peer)
-            .map(|q| q.len())
-            .unwrap_or(0)
-    }
-
-    /// Test-only: push a PCM frame directly into the jitter buffer.
-    #[cfg(feature = "test-hooks")]
-    pub fn test_push_frame(&self, peer: sunset_sync::PeerId, pcm: Vec<f32>) {
-        self.inner
-            .jitter
-            .borrow_mut()
-            .entry(peer)
-            .or_default()
-            .push_back(pcm);
+    pub fn is_denoise_enabled(&self) -> bool {
+        *self.inner.denoise.borrow()
     }
 
     /// Test-only: swap the `FrameSink` with a new implementation (e.g.
@@ -244,6 +280,7 @@ impl VoiceRuntime {
                 in_call: s.in_call,
                 talking: s.talking,
                 is_muted: s.is_muted,
+                in_voice_channel: s.in_voice_channel,
             })
             .collect()
     }
@@ -263,31 +300,24 @@ impl VoiceRuntime {
     }
 
     /// Test-only: peers for which the subscribe loop has decoded at
-    /// least one inbound voice payload (Frame or Heartbeat). Frames go
-    /// to `jitter`; Heartbeats land in `last_emitted`. The union of
-    /// these two maps' keys tells us which peers the receiver has
-    /// actually heard from over the WebRTC datachannel.
+    /// least one inbound voice payload (Frame or Heartbeat). Frames
+    /// land in `last_delivered_seq` (after decode + sink delivery);
+    /// Heartbeats land in `last_emitted`. The union of these two
+    /// maps' keys tells us which peers the receiver has actually
+    /// heard from over the WebRTC datachannel.
     #[cfg(feature = "test-hooks")]
     pub fn observed_voice_peers(&self) -> Vec<sunset_sync::PeerId> {
-        let mut peers: std::collections::HashSet<sunset_sync::PeerId> =
-            self.inner.jitter.borrow().keys().cloned().collect();
+        let mut peers: std::collections::HashSet<sunset_sync::PeerId> = self
+            .inner
+            .last_delivered_seq
+            .borrow()
+            .keys()
+            .cloned()
+            .collect();
         for k in self.inner.last_emitted.borrow().keys() {
             peers.insert(k.clone());
         }
         peers.into_iter().collect()
-    }
-
-    /// Test-only: depth of each per-peer jitter buffer. Useful for
-    /// distinguishing R4 (frames flowing) from R5 (combiner not
-    /// observing them).
-    #[cfg(feature = "test-hooks")]
-    pub fn jitter_depths(&self) -> Vec<(sunset_sync::PeerId, usize)> {
-        self.inner
-            .jitter
-            .borrow()
-            .iter()
-            .map(|(p, q)| (p.clone(), q.len()))
-            .collect()
     }
 
     /// Test-only: return clones of the frame and membership `Liveness`
@@ -319,6 +349,6 @@ fn spawn_local<F: std::future::Future<Output = ()> + 'static>(f: F) {
 mod auto_connect;
 mod combiner;
 mod heartbeat;
-mod jitter;
 mod subscribe;
+mod voice_presence_membership;
 mod voice_presence_publisher;

@@ -19,6 +19,19 @@ pub struct Config {
     pub identity_secret_path: PathBuf,
     pub peers: Vec<String>,
     pub accept_handshake_timeout_secs: u64,
+    /// Subject Alternative Names baked into the relay's self-signed
+    /// WebTransport cert. The browser dials
+    /// `https://<webtransport_san[i]>:<port>/` and Chrome's
+    /// WebTransport implementation (despite the W3C spec saying
+    /// `serverCertificateHashes` *replaces* chain validation) still
+    /// requires the dialed hostname to appear in the cert's SAN.
+    /// Defaults are `["127.0.0.1", "localhost"]` — fine for tests and
+    /// loopback dev. Public deployments MUST add their public
+    /// hostname (e.g. `["relay.example.com", "127.0.0.1", "localhost"]`),
+    /// and after a SAN list change the persisted PEM files at
+    /// `<data_dir>/wt-cert.pem` + `wt-key.pem` must be deleted to force
+    /// a fresh cert on next startup.
+    pub webtransport_san: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +50,7 @@ struct RawConfig {
     #[serde(default)]
     peers: Vec<String>,
     accept_handshake_timeout_secs: Option<u64>,
+    webtransport_san: Option<Vec<String>>,
 }
 
 impl Config {
@@ -77,6 +91,10 @@ impl Config {
 
         let accept_handshake_timeout_secs = raw.accept_handshake_timeout_secs.unwrap_or(15);
 
+        let webtransport_san = raw
+            .webtransport_san
+            .unwrap_or_else(|| vec!["127.0.0.1".to_string(), "localhost".to_string()]);
+
         Ok(Config {
             listen_addr,
             data_dir,
@@ -84,6 +102,7 @@ impl Config {
             identity_secret_path,
             peers: raw.peers,
             accept_handshake_timeout_secs,
+            webtransport_san,
         })
     }
 }
@@ -159,5 +178,38 @@ mod tests {
         "#;
         let c = Config::from_toml(toml).unwrap();
         assert_eq!(c.accept_handshake_timeout_secs, 1);
+    }
+
+    #[test]
+    fn webtransport_san_defaults_include_loopback() {
+        let c = Config::defaults().unwrap();
+        // Out of the box, the WT cert is valid for loopback dialing
+        // — sufficient for tests and same-host dev. Operators behind
+        // a public hostname must set `webtransport_san` explicitly.
+        assert!(c.webtransport_san.iter().any(|s| s == "127.0.0.1"));
+        assert!(c.webtransport_san.iter().any(|s| s == "localhost"));
+    }
+
+    #[test]
+    fn webtransport_san_overridable_from_toml() {
+        // Production-shaped config: the relay binds 0.0.0.0 and is
+        // reached at a public hostname. Without setting this, the
+        // self-signed WT cert wouldn't carry the public hostname in
+        // its SAN, and Chrome's WebTransport (with hash pinning)
+        // still requires SAN match — so dials to
+        // `https://relay.example.com:8443/` would fail.
+        let toml = r#"
+            listen_addr = "0.0.0.0:8443"
+            webtransport_san = ["relay.example.com", "127.0.0.1", "localhost"]
+        "#;
+        let c = Config::from_toml(toml).unwrap();
+        assert_eq!(
+            c.webtransport_san,
+            vec![
+                "relay.example.com".to_string(),
+                "127.0.0.1".to_string(),
+                "localhost".to_string()
+            ]
+        );
     }
 }

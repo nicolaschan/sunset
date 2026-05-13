@@ -12,8 +12,14 @@ cd "$(dirname "$0")/.."
 # tree; if that ever changes, extend the pattern accordingly.
 pattern='#\[(allow|expect)\([^]]*clippy::'
 
-if hits=$(grep -RnE --include='*.rs' "$pattern" crates 2>/dev/null); then
-  echo "Workspace policy violation: clippy lint suppressions are not permitted." >&2
+# `desktop/` is a leaf Tauri crate outside the main workspace (it has its
+# own Cargo.lock — see root `Cargo.toml`'s `workspace.exclude`). It still
+# vendors the same lint policy in `desktop/Cargo.toml` and ships first-
+# party Rust source we own, so it gets the same suppression ban.
+sources=(crates desktop/src desktop/build.rs)
+
+if hits=$(grep -RnE --include='*.rs' "$pattern" "${sources[@]}" 2>/dev/null); then
+  echo "Source policy violation: clippy lint suppressions are not permitted." >&2
   echo "" >&2
   echo "$hits" >&2
   echo "" >&2
@@ -21,4 +27,4 @@ if hits=$(grep -RnE --include='*.rs' "$pattern" crates 2>/dev/null); then
   exit 1
 fi
 
-echo "OK: no #[allow(clippy::...)] / #[expect(clippy::...)] in crates/."
+echo "OK: no #[allow(clippy::...)] / #[expect(clippy::...)] in ${sources[*]}."

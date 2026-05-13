@@ -69,12 +69,12 @@ async function dismissDrawerIfPresent(page) {
 async function joinVoice(page) {
   await openChannelsRail(page);
   await page.locator('[data-testid="voice-channel-row"]').first().click();
-  // Both layouts render the leave button once self_in_call is true:
-  // the phone minibar uses voice-leave, and the desktop self_control_bar
-  // uses the same testid (channels.gleam ~825). `self_in_call` flips only
-  // after `voice_start()` resolves Ok on the WASM side (the Gleam UI
-  // dispatches `VoiceStarted` from the FFI success callback), so this
-  // visibility assertion is also a "voice runtime ready" gate.
+  // Phone and desktop now share the same voice minibar at the top of
+  // the chat panel; the leave button there carries data-testid
+  // "voice-leave". `self_in_call` flips only after `voice_start()`
+  // resolves Ok on the WASM side (the Gleam UI dispatches
+  // `VoiceStarted` from the FFI success callback), so this visibility
+  // assertion is also a "voice runtime ready" gate.
   await expect(page.locator('[data-testid="voice-leave"]')).toBeVisible({
     timeout: 2_000,
   });
@@ -156,11 +156,11 @@ test("self-mute stops frames at bob; unmute resumes", async ({ browser }) => {
     { timeout: 3_000 },
   );
 
-  // Alice mutes via the mic button. Both phone (minibar) and desktop
-  // (self_control_bar) layouts render exactly one "Mute mic" button.
-  // After the click the title flips to "Unmute mic" — wait for that so
-  // we know the Lustre effect (which calls voice_set_muted on the WASM
-  // client) has actually run.
+  // Alice mutes via the mic button. The unified voice minibar renders
+  // exactly one "Mute mic" button on both viewports. After the click
+  // the title flips to "Unmute mic" — wait for that so we know the
+  // Lustre effect (which calls voice_set_muted on the WASM client) has
+  // actually run.
   await alice.page.getByTitle("Mute mic").click();
   await expect(alice.page.getByTitle("Unmute mic")).toBeVisible({
     timeout: 1_000,

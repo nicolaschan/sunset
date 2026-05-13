@@ -98,6 +98,57 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  desktop:
+    name: Desktop crate (sunset-desktop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # Pure performance optimization (warm Nix cache); intermittent
+      # `socket hang up` from install.determinate.systems must not fail
+      # the job — the actual build/test steps run cleanly without it.
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
+        continue-on-error: true
+      # `desktop/` is a leaf crate outside the main workspace (its
+      # tauri / webview-platform deps live in `desktop/Cargo.lock`,
+      # see `Cargo.toml`'s `workspace.exclude`). Run its lint and
+      # build gates directly against `desktop/Cargo.toml`.
+      - name: cargo fmt --check (desktop)
+        run: |
+          nix develop --command bash -c 'cd desktop && cargo fmt --check'
+      - name: no clippy suppressions in source
+        run: |
+          ./scripts/check-no-clippy-allow.sh
+      # `desktop/` is a separate Cargo workspace, so it can't inherit
+      # `[lints]` from the root via `workspace = true`. We mirror the policy
+      # by hand and gate drift here. See `scripts/check-desktop-lints.sh`.
+      - name: lint policy parity (desktop ↔ workspace)
+        run: |
+          ./scripts/check-desktop-lints.sh
+      # `cargo clippy` runs in the dev shell, *outside* the Nix sandbox, so
+      # it needs `desktop/dist/` materialised on disk before
+      # `tauri::generate_context!()` expands. (The `nix build .#sunset-desktop`
+      # step below stages dist on its own via the derivation's preBuild —
+      # those two staging passes are not redundant: one is for the dev-shell
+      # clippy run, the other is for the sandboxed build.) Stage from the
+      # same Nix-built webDist artefact CI publishes to Pages so dev shell
+      # and Nix builds share the same input.
+      - name: Stage webDist into desktop/dist (for clippy)
+        run: |
+          nix build .#web
+          rm -rf desktop/dist
+          cp -rL result desktop/dist
+          chmod -R u+w desktop/dist
+      - name: cargo clippy (desktop) --all-targets -- -D warnings
+        run: |
+          nix develop --command bash -c 'cd desktop && cargo clippy --all-targets -- -D warnings'
+      - name: nix build .#sunset-desktop
+        run: nix build .#sunset-desktop
+
   e2e-voice:
     name: Playwright voice e2e
     runs-on: ubuntu-latest

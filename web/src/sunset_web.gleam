@@ -28,8 +28,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Reaction, type Room, ChannelId, MemberId, Reaction, Room,
-  RoomId, VoiceModel, VoicePeerStateUI,
+  type ChannelId, type Reaction, type Room, ChannelId, Reaction, Room, RoomId,
+  VoiceModel, VoicePeerStateUI,
 }
 import sunset_web/fixture
 import sunset_web/markdown
@@ -92,6 +92,13 @@ pub type RoomState {
     receipts: Dict(String, Dict(String, Int)),
     reactions: Dict(String, List(Reaction)),
     current_channel: ChannelId,
+    /// Channels the rail draws for this room. Seeded with the default
+    /// text channel + a fixture voice channel; merged with the live
+    /// observed-channel set from the wasm side as `ChannelsObserved`
+    /// events arrive. Sort order: default text channel first, then
+    /// the rest of the observed text channels alphabetically, then
+    /// any voice channels at the end.
+    channels: List(domain.Channel),
     draft: String,
     selected_msg_id: Option(String),
     reacting_to: Option(String),
@@ -112,7 +119,8 @@ fn empty_room_state() -> RoomState {
     members: [],
     receipts: dict.new(),
     reactions: dict.new(),
-    current_channel: ChannelId(fixture.initial_channel_id),
+    current_channel: domain.default_channel_id(),
+    channels: initial_channels(),
     draft: "",
     selected_msg_id: None,
     reacting_to: None,
@@ -120,6 +128,32 @@ fn empty_room_state() -> RoomState {
     peer_status_popover: None,
     revealed_spoilers: set.new(),
   )
+}
+
+/// Initial channel list every room starts with: the default text
+/// channel (always present, even before any traffic is observed) plus
+/// the placeholder voice channel. Voice is out of scope for the
+/// channels-within-rooms PR; we keep the rail entry so the existing
+/// voice flows keep rendering. The id/name match
+/// `fixture.channels()`'s voice entry so the live in_call overlay
+/// (computed from real members in the render path) lines up by id.
+fn initial_channels() -> List(domain.Channel) {
+  [
+    domain.Channel(
+      id: domain.default_channel_id(),
+      name: domain.default_channel_name,
+      kind: domain.TextChannel,
+      in_call: 0,
+      unread: 0,
+    ),
+    domain.Channel(
+      id: ChannelId("voice"),
+      name: "Voice Channel",
+      kind: domain.Voice,
+      in_call: 0,
+      unread: 0,
+    ),
+  ]
 }
 
 pub type Model {
@@ -190,6 +224,11 @@ pub type Model {
     rooms: Dict(String, RoomState),
     /// Voice subsystem state: self_in_call, mute, deafen, per-peer live state.
     voice: domain.VoiceModel,
+    /// Send-side Opus quality preset (`"voice"` / `"high"` / `"maximum"`).
+    /// Persisted to localStorage; the JS bridge re-applies on every
+    /// `voice_start`. Read from the store at model init so the radio
+    /// in the self-row popover renders the right initial selection.
+    voice_quality: String,
     /// IntentId of the relay whose popover is currently open. Client-wide
     /// (not per-room) because relays are a client-level concept.
     relays_popover: option.Option(Float),
@@ -252,6 +291,9 @@ pub type Msg {
   ToggleMemberDenoise(String)
   ToggleMemberDeafen(String)
   ResetMemberVoice(String)
+  /// Self-row popover radio: change the active send-side Opus
+  /// quality preset (`"voice"` / `"high"` / `"maximum"`).
+  SetVoiceQuality(String)
   // sunset-web-wasm bridge wiring:
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
@@ -259,10 +301,26 @@ pub type Msg {
   /// A room's wasm-side handle is ready; register callbacks + start presence.
   RoomOpened(name: String, handle: RoomHandle)
   IncomingMsg(room: String, im: IncomingMessage)
+  /// Live channel set observed for the named room. Fired immediately on
+  /// callback registration with the current sorted snapshot, then
+  /// again on every change. The reducer merges these into
+  /// `state.channels` (preserving any existing per-channel UI state +
+  /// the Lounge voice placeholder).
+  ChannelsObserved(name: String, channels: List(String))
+  /// User typed a fresh channel name into the rail's "+ new channel"
+  /// input and pressed Enter. Inserts a local-only Channel into the
+  /// rail and switches `state.current_channel` to it so SubmitDraft
+  /// will route the next message into that channel.
+  NewChannel(name: String)
   IncomingReceipt(
     room: String,
     message_id: String,
     from_pubkey: String,
+    /// Channel label of the Text this Receipt acknowledges.
+    /// v1 ignores it (receipts apply per-message, not per-channel),
+    /// but it rides on the Msg so a future per-channel receipt view
+    /// has the data without changing the bridge plumbing.
+    channel: String,
     delivered_at_ms: Int,
   )
   SubmitDraft
@@ -288,12 +346,16 @@ pub type Msg {
   LeaveVoice
   ToggleSelfMute
   ToggleSelfDeafen
+  ToggleSelfDenoise
   VoicePeerStateChanged(
     peer_hex: String,
     in_call: Bool,
     talking: Bool,
     is_muted: Bool,
+    in_voice_channel: Bool,
   )
+  VoicePeerLevelChanged(peer_hex: String, level: Float)
+  VoiceSelfLevelChanged(level: Float)
   SetPeerVolume(peer_hex: String, gain: Float)
   ToggleMuteForPeer(peer_hex: String)
   VoicePermissionDenied(message: String)
@@ -359,7 +421,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
-      voice_settings: seed_voice_settings(),
+      voice_settings: dict.new(),
       client: None,
       intents: dict.new(),
       viewport: initial_viewport,
@@ -370,9 +432,13 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         self_in_call: None,
         self_muted: False,
         self_deafened: False,
+        denoise: True,
         peers: dict.new(),
+        peer_levels: dict.new(),
+        self_level: 0.0,
         permission_error: None,
       ),
+      voice_quality: voice.voice_get_quality(),
       relays_popover: None,
       name_map: dict.new(),
       self_name: storage.read_self_name(),
@@ -444,8 +510,26 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
 
   let install_voice_handler_eff =
     effect.from(fn(dispatch) {
-      voice.install_voice_state_handler(fn(hex, in_call, talking, is_muted) {
-        dispatch(VoicePeerStateChanged(hex, in_call, talking, is_muted))
+      voice.install_voice_state_handler(
+        fn(hex, in_call, talking, is_muted, in_voice_channel) {
+          dispatch(VoicePeerStateChanged(
+            hex,
+            in_call,
+            talking,
+            is_muted,
+            in_voice_channel,
+          ))
+        },
+      )
+    })
+
+  let install_voice_level_handlers_eff =
+    effect.from(fn(dispatch) {
+      voice.install_voice_peer_level_handler(fn(hex, level) {
+        dispatch(VoicePeerLevelChanged(hex, level))
+      })
+      voice.install_voice_self_level_handler(fn(level) {
+        dispatch(VoiceSelfLevelChanged(level))
       })
     })
 
@@ -469,27 +553,10 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       ticker_eff,
       attach_shortcuts_eff,
       install_voice_handler_eff,
+      install_voice_level_handlers_eff,
       initial_compose_reset_eff,
     ]),
   )
-}
-
-/// Seed per-member voice tweaks for every in-call member: full
-/// volume, denoise on, not locally muted. Keyed by member name so
-/// callers don't need to thread MemberId through the popover wiring.
-fn seed_voice_settings() -> Dict(String, domain.VoiceSettings) {
-  fixture.members()
-  |> list.fold(dict.new(), fn(d, m) {
-    case m.in_call {
-      True ->
-        dict.insert(
-          d,
-          m.name,
-          domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
-        )
-      False -> d
-    }
-  })
 }
 
 fn member_voice_settings(
@@ -500,6 +567,24 @@ fn member_voice_settings(
     Ok(s) -> s
     Error(_) ->
       domain.VoiceSettings(volume: 100, denoise: True, deafened: False)
+  }
+}
+
+/// Smoothed audio level (0..1) for the popover's waveform. Self uses
+/// the local mic level; peers use the playback-level dict keyed by the
+/// member's full pubkey hex.
+fn peer_level_for_member(
+  voice: domain.VoiceModel,
+  m: domain.Member,
+  peer_hex: String,
+) -> Float {
+  case m.you {
+    True -> voice.self_level
+    False ->
+      case dict.get(voice.peer_levels, peer_hex) {
+        Ok(l) -> l
+        Error(_) -> 0.0
+      }
   }
 }
 
@@ -612,6 +697,7 @@ pub fn resolve_messages(
       initials: m.initials,
       time: m.time,
       body: m.body,
+      channel: m.channel,
       seen_by: m.seen_by,
       you: m.you,
       pending: m.pending,
@@ -619,6 +705,77 @@ pub fn resolve_messages(
       details: m.details,
     )
   })
+}
+
+/// Merge a fresh observed-channel snapshot into the rail's existing
+/// channel list. Each observed string becomes (or reuses) a
+/// `TextChannel`; existing per-channel UI state (unread / in_call) is
+/// preserved by id-lookup. The default text channel is always
+/// included even if the snapshot doesn't carry it. Voice channels in
+/// the previous list are kept as-is — voice rail entries don't come
+/// from the wasm side. Output is sorted via `sort_channels`.
+pub fn merge_observed_channels(
+  existing: List(domain.Channel),
+  observed: List(String),
+) -> List(domain.Channel) {
+  let voice_existing = list.filter(existing, fn(c) { c.kind == domain.Voice })
+  let observed_text =
+    list.map(observed, fn(label) {
+      let id = ChannelId(label)
+      case list.find(existing, fn(c) { c.id == id }) {
+        Ok(prev) -> prev
+        Error(_) ->
+          domain.Channel(
+            id: id,
+            name: label,
+            kind: domain.TextChannel,
+            in_call: 0,
+            unread: 0,
+          )
+      }
+    })
+  let with_default = case
+    list.any(observed_text, fn(c) { c.id == domain.default_channel_id() })
+  {
+    True -> observed_text
+    False -> [
+      // Reuse the existing default-channel record (preserving unread,
+      // etc.) if we already have one in `existing`.
+      case list.find(existing, fn(c) { c.id == domain.default_channel_id() }) {
+        Ok(prev) -> prev
+        Error(_) ->
+          domain.Channel(
+            id: domain.default_channel_id(),
+            name: domain.default_channel_name,
+            kind: domain.TextChannel,
+            in_call: 0,
+            unread: 0,
+          )
+      },
+      ..observed_text
+    ]
+  }
+  sort_channels(list.append(with_default, voice_existing))
+}
+
+/// Canonical channel ordering for the rail:
+///   1. Default text channel first (if present).
+///   2. Other text channels alphabetically by name.
+///   3. Voice channels at the end, alphabetically by name.
+/// Stable for already-sorted input.
+pub fn sort_channels(cs: List(domain.Channel)) -> List(domain.Channel) {
+  let default_id = domain.default_channel_id()
+  let default_first =
+    list.filter(cs, fn(c) { c.id == default_id && c.kind == domain.TextChannel })
+  let other_text =
+    cs
+    |> list.filter(fn(c) { c.kind == domain.TextChannel && c.id != default_id })
+    |> list.sort(fn(a, b) { string.compare(a.name, b.name) })
+  let voice =
+    cs
+    |> list.filter(fn(c) { c.kind == domain.Voice })
+    |> list.sort(fn(a, b) { string.compare(a.name, b.name) })
+  list.flatten([default_first, other_text, voice])
 }
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortInitials")
@@ -1109,11 +1266,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let wire_eff =
         effect.from(fn(dispatch) {
           sunset.on_message(handle, fn(im) { dispatch(IncomingMsg(name, im)) })
+          sunset.on_channels_changed(handle, fn(chans) {
+            dispatch(ChannelsObserved(name, chans))
+          })
           sunset.on_receipt(handle, fn(r) {
             dispatch(IncomingReceipt(
               name,
               sunset.rec_for_value_hash_hex(r),
               hex_encode(sunset.rec_from_pubkey(r)),
+              sunset.rec_channel(r),
               sunset.rec_sent_at_ms(r),
             ))
           })
@@ -1145,6 +1306,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               initials: short_initials(sunset.inc_author_pubkey(im)),
               time: format_time_ms(sunset.inc_sent_at_ms(im)),
               body: sunset.inc_body(im),
+              channel: sunset.inc_channel(im),
               seen_by: 0,
               you: sunset.inc_is_self(im),
               pending: False,
@@ -1184,10 +1346,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               case body {
                 "" -> #(model, effect.none())
                 _ -> {
+                  let ChannelId(channel_str) = state.current_channel
                   let send_eff =
                     effect.from(fn(dispatch) {
                       sunset.send_message(
                         handle,
+                        channel_str,
                         body,
                         current_time_ms(),
                         fn(r) { dispatch(MessageSent(r)) },
@@ -1218,7 +1382,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     }
     MessageSent(_) -> #(model, effect.none())
-    IncomingReceipt(name, message_id, from_pubkey, delivered_at_ms) -> {
+    IncomingReceipt(name, message_id, from_pubkey, _channel, delivered_at_ms) -> {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
@@ -1237,6 +1401,48 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             effect.none(),
           )
         }
+      }
+    }
+    ChannelsObserved(name, chans) -> {
+      case dict.get(model.rooms, name) {
+        Error(_) -> #(model, effect.none())
+        Ok(state) -> {
+          let new_channels = merge_observed_channels(state.channels, chans)
+          let new_state = RoomState(..state, channels: new_channels)
+          #(
+            Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
+            effect.none(),
+          )
+        }
+      }
+    }
+    NewChannel(raw) -> {
+      let trimmed = string.trim(raw)
+      case trimmed {
+        "" -> #(model, effect.none())
+        _ ->
+          with_active_room(model, fn(state) {
+            let new_id = ChannelId(trimmed)
+            let new_channel =
+              domain.Channel(
+                id: new_id,
+                name: trimmed,
+                kind: domain.TextChannel,
+                in_call: 0,
+                unread: 0,
+              )
+            let merged = case
+              list.any(state.channels, fn(c) { c.id == new_id })
+            {
+              True -> state.channels
+              False -> [new_channel, ..state.channels]
+            }
+            let sorted = sort_channels(merged)
+            #(
+              RoomState(..state, channels: sorted, current_channel: new_id),
+              effect.from(fn(_) { composer.focus_textarea("composer-textarea") }),
+            )
+          })
       }
     }
     MembersUpdated(name, ms) -> {
@@ -1454,6 +1660,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         eff,
       )
     }
+    SetVoiceQuality(label) -> {
+      // Persist + apply. The JS bridge writes localStorage and pushes
+      // the change to the active encoder (no-op if voice isn't
+      // started yet — the value is reapplied on next `voice_start`).
+      let eff = case model.client {
+        Some(c) -> effect.from(fn(_) { voice.voice_set_quality(c, label) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice_quality: label), eff)
+    }
     ViewportChanged(v) -> {
       // Crossing the boundary in either direction closes any open drawer.
       // Sheets intentionally survive: DetailsSheet and VoiceSheet render
@@ -1512,12 +1728,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let send_eff = case dict.get(model.rooms, active_name) {
         Ok(state) ->
           case state.handle {
-            Some(handle) ->
+            Some(handle) -> {
+              let ChannelId(channel_str) = state.current_channel
               effect.from(fn(dispatch) {
-                sunset.send_reaction(handle, target, emoji, action, fn(r) {
-                  dispatch(ReactionSent(r))
-                })
+                sunset.send_reaction(
+                  handle,
+                  channel_str,
+                  target,
+                  emoji,
+                  action,
+                  fn(r) { dispatch(ReactionSent(r)) },
+                )
               })
+            }
             None -> effect.none()
           }
         Error(_) -> effect.none()
@@ -1583,16 +1806,32 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     VoiceStarted(room_id) -> {
       let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
-      #(Model(..model, voice: new_voice), effect.none())
+      // Each voice_start spawns a fresh runtime that defaults to
+      // denoise on. Push the model's current value so a user who turned
+      // denoise off in a previous session sees the same state on rejoin.
+      let eff = case model.client, model.voice.denoise {
+        Some(client), False ->
+          effect.from(fn(_) { voice.voice_set_denoise(client, False) })
+        _, _ -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
     }
 
     LeaveVoice -> {
+      // Clear peer state + levels so a fresh join doesn't reuse stale
+      // bars / talking flags. The FFI's stopCapture flushes its own
+      // EMA state and dispatches one final 0 per peer, but we reset
+      // here too so the UI is clean immediately on click rather than
+      // racing the FFI callback.
       let new_voice =
         VoiceModel(
           ..model.voice,
           self_in_call: None,
           self_muted: False,
           self_deafened: False,
+          peers: dict.new(),
+          peer_levels: dict.new(),
+          self_level: 0.0,
         )
       let eff = case model.client {
         Some(client) -> effect.from(fn(_) { voice.voice_stop(client) })
@@ -1623,7 +1862,18 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(Model(..model, voice: new_voice), eff)
     }
 
-    VoicePeerStateChanged(hex, in_call, talking, is_muted) -> {
+    ToggleSelfDenoise -> {
+      let new_denoise = !model.voice.denoise
+      let new_voice = VoiceModel(..model.voice, denoise: new_denoise)
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) { voice.voice_set_denoise(client, new_denoise) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice: new_voice), eff)
+    }
+
+    VoicePeerStateChanged(hex, in_call, talking, is_muted, in_voice_channel) -> {
       let new_peers =
         dict.insert(
           model.voice.peers,
@@ -1632,9 +1882,21 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             in_call: in_call,
             talking: talking,
             is_muted: is_muted,
+            in_voice_channel: in_voice_channel,
           ),
         )
       let new_voice = VoiceModel(..model.voice, peers: new_peers)
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    VoicePeerLevelChanged(hex, level) -> {
+      let new_levels = dict.insert(model.voice.peer_levels, hex, level)
+      let new_voice = VoiceModel(..model.voice, peer_levels: new_levels)
+      #(Model(..model, voice: new_voice), effect.none())
+    }
+
+    VoiceSelfLevelChanged(level) -> {
+      let new_voice = VoiceModel(..model.voice, self_level: level)
       #(Model(..model, voice: new_voice), effect.none())
     }
 
@@ -1825,6 +2087,15 @@ fn room_view_with_state(
   let resolved_messages =
     resolve_messages(model.name_map, messages_with_live_reactions)
 
+  // Filter the message list down to the active channel before passing
+  // to main_panel. Reactions/details still index by message id so the
+  // hidden messages stay reachable through the details panel if it
+  // happens to point at one (rare in practice — the UI nearly always
+  // closes details when switching channels).
+  let ChannelId(active_channel_str) = state.current_channel
+  let filtered_resolved_messages =
+    list.filter(resolved_messages, fn(m) { m.channel == active_channel_str })
+
   let detail_msg = case state.sheet {
     Some(domain.DetailsSheet(message_id: id)) ->
       find_message(resolved_messages, id)
@@ -1984,26 +2255,47 @@ fn room_view_with_state(
     None -> element.fragment([])
   }
 
-  // Derive in_call status from real voice state: a member is in_call if
-  // their id (short pubkey hex) appears as a key in model.voice.peers with
-  // in_call = True. Self is in_call if model.voice.self_in_call is Some.
-  // Falls back to fixture.members() when state.members is empty (pre-connect).
-  let members_for_channels = case state.members {
-    [] -> fixture.members()
-    ms ->
-      list.map(ms, fn(m) {
-        let MemberId(id_str) = m.id
-        let in_call_from_voice = case m.you {
-          True -> option.is_some(model.voice.self_in_call)
-          False ->
-            case dict.get(model.voice.peers, id_str) {
-              Ok(ps) -> ps.in_call
-              Error(_) -> False
-            }
-        }
-        domain.Member(..m, in_call: in_call_from_voice)
-      })
-  }
+  // Derive voice-channel membership + muted status from real voice
+  // state. The voice runtime keys peer state by *full* pubkey hex (32
+  // bytes / 64 chars); Member.id is the truncated short_pubkey used
+  // for display, so we look up by `hex_encode(m.pubkey)` rather than
+  // the MemberId.
+  //
+  // We surface the *broader* "in voice channel" signal here (so the
+  // rail shows everyone announcing presence, not just peers we have
+  // a P2P connection to) by mapping it into `Member.in_call`. The
+  // narrower "connected" signal — i.e. `voice.peers[hex].in_call` —
+  // stays in `model.voice.peers`, threaded straight through to the
+  // channels view so each row can distinguish "connected"
+  // (audio flowing) from "in channel but not connected yet"
+  // (presence seen, P2P still pending).
+  //
+  // For self the two coincide: if I'm in the call, I'm trivially
+  // connected to myself.
+  //
+  // No fixture fallback: pre-connect we just render an empty roster.
+  // The voice rail is idle; the channel goes live only when real
+  // peers start arriving.
+  let members_for_channels =
+    list.map(state.members, fn(m) {
+      let peer_hex = hex_encode(m.pubkey)
+      let #(in_voice_channel_now, is_muted_now) = case m.you {
+        True -> #(
+          option.is_some(model.voice.self_in_call),
+          model.voice.self_muted,
+        )
+        False ->
+          case dict.get(model.voice.peers, peer_hex) {
+            Ok(ps) -> #(ps.in_voice_channel, ps.is_muted)
+            Error(_) -> #(False, False)
+          }
+      }
+      let next_status = case is_muted_now {
+        True -> domain.MutedP
+        False -> m.status
+      }
+      domain.Member(..m, in_call: in_voice_channel_now, status: next_status)
+    })
 
   let details_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.DetailsSheet(message_id: id)) ->
@@ -2031,7 +2323,9 @@ fn room_view_with_state(
 
   let voice_sheet_el = case model.viewport, state.sheet {
     domain.Phone, Some(domain.VoiceSheet(member_name: id_str)) ->
-      case list.find(members_for_channels, fn(m) { m.id == MemberId(id_str) }) {
+      case
+        list.find(members_for_channels, fn(m) { hex_encode(m.pubkey) == id_str })
+      {
         Ok(m) ->
           bottom_sheet.view(
             palette: palette,
@@ -2043,11 +2337,14 @@ fn room_view_with_state(
               placement: voice_popover.InSheet,
               member: m,
               settings: member_voice_settings(model.voice_settings, id_str),
+              voice_quality: model.voice_quality,
+              level: peer_level_for_member(model.voice, m, id_str),
               on_close: CloseVoicePopover,
               on_set_volume: fn(v) {
                 SetPeerVolume(id_str, int.to_float(v) /. 100.0)
               },
               on_toggle_denoise: ToggleMemberDenoise(id_str),
+              on_set_voice_quality: SetVoiceQuality,
               on_toggle_deafen: ToggleMuteForPeer(id_str),
               on_reset: ResetMemberVoice(id_str),
             ),
@@ -2106,26 +2403,61 @@ fn room_view_with_state(
   // Use real voice model state: show minibar when user is in call.
   let user_in_call = option.is_some(model.voice.self_in_call)
 
-  let active_voice_channel_name =
-    list.find(fixture.channels(), fn(c) {
-      c.kind == domain.Voice && c.in_call > 0
+  // Derive the live in-call count for the voice channel from real
+  // members rather than the rail's stored placeholder, so the rail
+  // shows "live" iff somebody (including self) is actually connected.
+  let live_voice_count =
+    list.fold(members_for_channels, 0, fn(acc, m) {
+      case m.in_call {
+        True -> acc + 1
+        False -> acc
+      }
     })
-    |> result.map(fn(c) { c.name })
-    |> result.unwrap("voice")
 
-  let voice_minibar_el = case model.viewport, user_in_call {
-    domain.Phone, True ->
+  // state.channels is the source of truth for the rail (driven by
+  // observed channels + the always-present default + the voice
+  // placeholder). Overlay the live in_call count onto the voice
+  // entry so the rail's live-roster branch fires only when somebody
+  // is actually connected.
+  let channels_for_view =
+    list.map(state.channels, fn(c) {
+      case c.kind {
+        domain.Voice -> domain.Channel(..c, in_call: live_voice_count)
+        _ -> c
+      }
+    })
+
+  let active_voice_channel_name =
+    list.find(channels_for_view, fn(c) { c.kind == domain.Voice })
+    |> result.map(fn(c) { c.name })
+    |> result.unwrap("Voice Channel")
+
+  // Self peer hex for the minibar's "open my own popover" affordance.
+  // Falls back to "self" when there's no client (pre-bootstrap, never
+  // actually rendered because the minibar requires user_in_call).
+  let self_peer_hex_for_minibar =
+    model.client
+    |> option.map(client_pubkey_hex)
+    |> option.unwrap("self")
+
+  // Single in-call bar across both viewports: a strip at the top of
+  // the chat panel showing the connected channel + mute / deafen /
+  // leave. The denoise toggle (and per-peer volume / send quality)
+  // live in the user's own voice popover, opened by tapping the
+  // channel name in the bar.
+  let voice_minibar_el = case user_in_call {
+    True ->
       voice_minibar.view(
         palette: palette,
         channel_name: active_voice_channel_name,
-        on_open: OpenVoicePopover("u3"),
+        on_open: OpenVoicePopover(self_peer_hex_for_minibar),
         on_mute: ToggleSelfMute,
         on_deafen: ToggleSelfDeafen,
         on_leave: LeaveVoice,
         self_muted: model.voice.self_muted,
         self_deafened: model.voice.self_deafened,
       )
-    _, _ -> element.fragment([])
+    False -> element.fragment([])
   }
 
   shell.view(
@@ -2165,24 +2497,25 @@ fn room_view_with_state(
     channels.view(
       palette: palette,
       room: active_room,
-      channels: fixture.channels(),
+      channels: channels_for_view,
       members: members_for_channels,
+      voice_peers: model.voice.peers,
+      peer_levels: model.voice.peer_levels,
+      self_level: model.voice.self_level,
       current_channel: state.current_channel,
       voice_popover_open: case state.sheet {
         Some(domain.VoiceSheet(member_name: name)) -> Some(name)
         _ -> None
       },
       on_select_channel: SelectChannel,
+      on_new_channel: NewChannel,
+      noop: NoOp,
       on_open_voice_popover: OpenVoicePopover,
       viewport: model.viewport,
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
       on_join_voice: JoinVoice(active_room.id),
       on_leave_voice: LeaveVoice,
-      on_mute_self: ToggleSelfMute,
-      on_deafen_self: ToggleSelfDeafen,
       self_in_call: option.is_some(model.voice.self_in_call),
-      self_muted: model.voice.self_muted,
-      self_deafened: model.voice.self_deafened,
       relays: relays_view.relays_for_view(model.intents),
       on_open_relay: OpenRelayPopover,
     ),
@@ -2190,7 +2523,7 @@ fn room_view_with_state(
       palette: palette,
       viewport: model.viewport,
       current_channel: state.current_channel,
-      messages: resolved_messages,
+      messages: filtered_resolved_messages,
       draft: state.draft,
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
@@ -2277,7 +2610,9 @@ fn voice_popover_overlay(
 ) -> Element(Msg) {
   case model.viewport, state.sheet {
     domain.Desktop, Some(domain.VoiceSheet(member_name: id_str)) ->
-      case list.find(members_for_channels, fn(m) { m.id == MemberId(id_str) }) {
+      case
+        list.find(members_for_channels, fn(m) { hex_encode(m.pubkey) == id_str })
+      {
         Error(_) -> element.fragment([])
         Ok(m) ->
           voice_popover.view(
@@ -2285,11 +2620,14 @@ fn voice_popover_overlay(
             placement: voice_popover.Floating,
             member: m,
             settings: member_voice_settings(model.voice_settings, id_str),
+            voice_quality: model.voice_quality,
+            level: peer_level_for_member(model.voice, m, id_str),
             on_close: CloseVoicePopover,
             on_set_volume: fn(v) {
               SetPeerVolume(id_str, int.to_float(v) /. 100.0)
             },
             on_toggle_denoise: ToggleMemberDenoise(id_str),
+            on_set_voice_quality: SetVoiceQuality,
             on_toggle_deafen: ToggleMuteForPeer(id_str),
             on_reset: ResetMemberVoice(id_str),
           )

@@ -92,8 +92,8 @@ pub(crate) fn voice_start(
     wasm_bindgen_futures::spawn_local(tasks.subscribe);
     wasm_bindgen_futures::spawn_local(tasks.combiner);
     wasm_bindgen_futures::spawn_local(tasks.auto_connect);
-    wasm_bindgen_futures::spawn_local(tasks.jitter_pump);
     wasm_bindgen_futures::spawn_local(tasks.voice_presence_publisher);
+    wasm_bindgen_futures::spawn_local(tasks.voice_presence_membership);
 
     *cell.borrow_mut() = Some(ActiveVoice {
         runtime,
@@ -112,19 +112,26 @@ pub(crate) fn voice_stop(cell: &VoiceCell) -> Result<(), JsError> {
     Ok(())
 }
 
+/// Number of samples the JS-side capture worklet hands us per
+/// frame: `FRAME_SAMPLES_PER_CHANNEL × 2` interleaved L/R. We
+/// always capture stereo from JS regardless of the active quality
+/// preset; the runtime downmixes to mono when the preset selects
+/// `OPUS_APPLICATION_VOIP`.
+const STEREO_SAMPLES_PER_FRAME: usize = sunset_voice::FRAME_SAMPLES_PER_CHANNEL * 2;
+
 pub(crate) fn voice_input(cell: &VoiceCell, pcm: &Float32Array) -> Result<(), JsError> {
     let slot = cell.borrow();
     let v = slot
         .as_ref()
         .ok_or_else(|| JsError::new("voice not started"))?;
-    if pcm.length() as usize != sunset_voice::FRAME_SAMPLES {
+    if pcm.length() as usize != STEREO_SAMPLES_PER_FRAME {
         return Err(JsError::new(&format!(
-            "voice_input: expected {} samples, got {}",
-            sunset_voice::FRAME_SAMPLES,
+            "voice_input: expected {} samples (stereo interleaved), got {}",
+            STEREO_SAMPLES_PER_FRAME,
             pcm.length()
         )));
     }
-    let mut buf = vec![0.0_f32; sunset_voice::FRAME_SAMPLES];
+    let mut buf = vec![0.0_f32; STEREO_SAMPLES_PER_FRAME];
     pcm.copy_to(&mut buf);
     v.runtime.send_pcm(&buf);
     Ok(())
@@ -140,6 +147,32 @@ pub(crate) fn voice_set_deafened(cell: &VoiceCell, deafened: bool) {
     if let Some(v) = cell.borrow().as_ref() {
         v.runtime.set_deafened(deafened);
     }
+}
+
+pub(crate) fn voice_set_denoise(cell: &VoiceCell, denoise: bool) {
+    if let Some(v) = cell.borrow().as_ref() {
+        v.runtime.set_denoise(denoise);
+    }
+}
+
+/// Switch the active send-side voice quality preset. Accepts
+/// `"voice"`, `"high"`, `"maximum"` (case-sensitive). Returns an
+/// error if voice isn't started or the label is unknown.
+pub(crate) fn voice_set_quality(cell: &VoiceCell, label: &str) -> Result<(), JsError> {
+    let quality = sunset_voice::VoiceQuality::from_str_label(label)
+        .ok_or_else(|| JsError::new(&format!("unknown voice quality: {label}")))?;
+    let slot = cell.borrow();
+    let v = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    v.runtime
+        .set_quality(quality)
+        .map_err(|e| JsError::new(&format!("set_quality failed: {e}")))
+}
+
+/// Read back the active send-side voice quality preset (label).
+pub(crate) fn voice_quality(cell: &VoiceCell) -> Option<&'static str> {
+    cell.borrow().as_ref().map(|v| v.runtime.quality().as_str())
 }
 
 // ---------- Test-hooks helpers (compiled in only with feature "test-hooks") ----------
@@ -201,6 +234,12 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
             &JsValue::from_f64(frame.rms as f64),
         )
         .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("seq"),
+            &JsValue::from_f64(frame.seq as f64),
+        )
+        .unwrap();
         arr.push(&obj);
     }
     Ok(arr.into())
@@ -230,29 +269,6 @@ pub(crate) fn observed_voice_peers(cell: &VoiceCell) -> Result<JsValue, JsError>
     let arr = Array::new();
     for peer in v.runtime.observed_voice_peers() {
         arr.push(&Uint8Array::from(peer.0.as_bytes()));
-    }
-    Ok(arr.into())
-}
-
-#[cfg(feature = "test-hooks")]
-pub(crate) fn jitter_depths(cell: &VoiceCell) -> Result<JsValue, JsError> {
-    use js_sys::{Array, Object, Uint8Array};
-    let slot = cell.borrow();
-    let v = slot
-        .as_ref()
-        .ok_or_else(|| JsError::new("voice not started"))?;
-    let arr = Array::new();
-    for (peer, depth) in v.runtime.jitter_depths() {
-        let obj = Object::new();
-        let id = Uint8Array::from(peer.0.as_bytes());
-        js_sys::Reflect::set(&obj, &JsValue::from_str("peer_id"), &id).unwrap();
-        js_sys::Reflect::set(
-            &obj,
-            &JsValue::from_str("depth"),
-            &JsValue::from_f64(depth as f64),
-        )
-        .unwrap();
-        arr.push(&obj);
     }
     Ok(arr.into())
 }

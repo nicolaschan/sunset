@@ -134,6 +134,7 @@ async fn alice_encrypts_bob_decrypts() {
                 &alice_room,
                 0,
                 sent_at,
+                sunset_core::ChannelLabel::default_general(),
                 MessageBody::Text(body.to_owned()),
                 &mut OsRng,
             )

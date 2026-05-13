@@ -28,6 +28,15 @@ const CERT_FILE: &str = "wt-cert.pem";
 /// Filename for the PEM-encoded private key under `data_dir`.
 const KEY_FILE: &str = "wt-key.pem";
 
+/// Filename for the SAN list under `data_dir`. One SAN per line, in the
+/// same order they were passed to `load_or_generate`. We compare the
+/// requested SAN list against this on load and regenerate the cert if
+/// they differ — without it, an operator who edits
+/// `webtransport_san` in the relay config TOML would have to remember
+/// to delete the persisted PEM files manually for the new hostname to
+/// take effect.
+const SAN_FILE: &str = "wt-cert.sans";
+
 /// How long an on-disk cert is considered fresh enough to reuse. Set to
 /// 13 days so the next-generation cert is created and persisted at
 /// least one day before the current cert's 14-day validity expires.
@@ -46,10 +55,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    // Materialise the SAN list once — `Identity::self_signed` consumes
+    // the iterator, and we also need it for the sidecar comparison.
+    let sans: Vec<String> = subject_alt_names
+        .into_iter()
+        .map(|s| s.as_ref().to_string())
+        .collect();
+
     let cert_path = data_dir.join(CERT_FILE);
     let key_path = data_dir.join(KEY_FILE);
+    let san_path = data_dir.join(SAN_FILE);
 
-    if let Some(identity) = try_load_fresh(&cert_path, &key_path).await? {
+    if let Some(identity) = try_load_fresh(&cert_path, &key_path, &san_path, &sans).await? {
         tracing::debug!(
             cert_path = %cert_path.display(),
             "wt cert: reusing persisted identity"
@@ -57,11 +74,12 @@ where
         return Ok(identity);
     }
 
-    let identity = Identity::self_signed(subject_alt_names)
+    let identity = Identity::self_signed(&sans)
         .map_err(|e| Error::Identity(format!("wt self-signed: {e}")))?;
-    persist(&identity, &cert_path, &key_path).await?;
+    persist(&identity, &cert_path, &key_path, &san_path, &sans).await?;
     tracing::info!(
         cert_path = %cert_path.display(),
+        sans = ?sans,
         "wt cert: generated and persisted new self-signed identity"
     );
     Ok(identity)
@@ -71,7 +89,12 @@ where
 /// `Err`) when the files are missing or stale, so the caller can fall
 /// through to regeneration; `Err` is reserved for IO errors that
 /// shouldn't be silently swallowed (e.g. `data_dir` is unreadable).
-async fn try_load_fresh(cert_path: &Path, key_path: &Path) -> Result<Option<Identity>> {
+async fn try_load_fresh(
+    cert_path: &Path,
+    key_path: &Path,
+    san_path: &Path,
+    requested_sans: &[String],
+) -> Result<Option<Identity>> {
     if !cert_path.exists() || !key_path.exists() {
         return Ok(None);
     }
@@ -92,6 +115,36 @@ async fn try_load_fresh(cert_path: &Path, key_path: &Path) -> Result<Option<Iden
         );
         return Ok(None);
     }
+    // Compare against the SAN list the persisted cert was generated with.
+    // Missing sidecar = legacy on-disk state (pre-SAN-tracking), regen so
+    // operators picking up this version on top of older data dirs get a
+    // fresh cert that matches their config's `webtransport_san`.
+    let persisted_sans = match tokio::fs::read_to_string(san_path).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                cert_path = %cert_path.display(),
+                "wt cert: SAN sidecar missing, regenerating to track current SAN list"
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(Error::Io(e)),
+    };
+    let persisted: Vec<&str> = persisted_sans.lines().filter(|l| !l.is_empty()).collect();
+    if persisted.len() != requested_sans.len()
+        || !persisted
+            .iter()
+            .zip(requested_sans.iter())
+            .all(|(a, b)| *a == b.as_str())
+    {
+        tracing::info!(
+            cert_path = %cert_path.display(),
+            persisted_sans = ?persisted,
+            requested_sans = ?requested_sans,
+            "wt cert: SAN list changed, regenerating"
+        );
+        return Ok(None);
+    }
     match Identity::load_pemfiles(cert_path, key_path).await {
         Ok(id) => Ok(Some(id)),
         Err(e) => {
@@ -106,7 +159,13 @@ async fn try_load_fresh(cert_path: &Path, key_path: &Path) -> Result<Option<Iden
     }
 }
 
-async fn persist(identity: &Identity, cert_path: &PathBuf, key_path: &PathBuf) -> Result<()> {
+async fn persist(
+    identity: &Identity,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+    san_path: &PathBuf,
+    sans: &[String],
+) -> Result<()> {
     if let Some(parent) = cert_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -121,6 +180,12 @@ async fn persist(identity: &Identity, cert_path: &PathBuf, key_path: &PathBuf) -
         .await
         .map_err(|e| Error::Identity(format!("wt key write: {e}")))?;
     set_mode_0600(key_path).await?;
+    // SAN sidecar — one entry per line, in the same order as the
+    // requested list. `try_load_fresh` reads this back to detect SAN
+    // list changes between startups.
+    let mut sans_text = sans.join("\n");
+    sans_text.push('\n');
+    tokio::fs::write(san_path, sans_text).await?;
     Ok(())
 }
 
@@ -198,5 +263,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn san_change_triggers_regeneration() {
+        // Operators set `webtransport_san` in the relay config to add a
+        // public hostname. If the on-disk persisted cert was generated
+        // for a different SAN list (e.g. the previous default
+        // `["127.0.0.1", "localhost"]`), Chrome's WT hash-pin still
+        // requires SAN match — so we MUST regenerate when the SAN list
+        // differs from what's persisted. Otherwise the operator would
+        // need to delete the cert files manually after each config
+        // change, which is footgun-y.
+        let dir = tempfile::tempdir().unwrap();
+        let id_loopback = load_or_generate(dir.path(), ["127.0.0.1", "localhost"])
+            .await
+            .unwrap();
+        let h_loopback = id_loopback.certificate_chain().as_slice()[0].hash();
+
+        // Same SAN list → reuses cert.
+        let id_loopback_again = load_or_generate(dir.path(), ["127.0.0.1", "localhost"])
+            .await
+            .unwrap();
+        assert_eq!(
+            id_loopback.certificate_chain().as_slice()[0]
+                .hash()
+                .as_ref(),
+            id_loopback_again.certificate_chain().as_slice()[0]
+                .hash()
+                .as_ref()
+        );
+
+        // Different SAN list → regenerates.
+        let id_with_public =
+            load_or_generate(dir.path(), ["relay.example.com", "127.0.0.1", "localhost"])
+                .await
+                .unwrap();
+        let h_public = id_with_public.certificate_chain().as_slice()[0].hash();
+        assert_ne!(
+            h_loopback.as_ref(),
+            h_public.as_ref(),
+            "SAN-list change must trigger a fresh cert"
+        );
+
+        // Calling again with the same new SAN list reuses the new cert.
+        let id_with_public_again =
+            load_or_generate(dir.path(), ["relay.example.com", "127.0.0.1", "localhost"])
+                .await
+                .unwrap();
+        assert_eq!(
+            h_public.as_ref(),
+            id_with_public_again.certificate_chain().as_slice()[0]
+                .hash()
+                .as_ref(),
+        );
     }
 }

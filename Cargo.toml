@@ -1,5 +1,12 @@
 [workspace]
 members = ["crates/sunset-store", "crates/sunset-store-memory", "crates/sunset-store-fs", "crates/sunset-store-indexeddb", "crates/sunset-sync", "crates/sunset-markdown", "crates/sunset-noise", "crates/sunset-core", "crates/sunset-core-wasm", "crates/sunset-sync-ws-native", "crates/sunset-sync-ws-browser", "crates/sunset-sync-webrtc-browser", "crates/sunset-sync-webtransport-native", "crates/sunset-sync-webtransport-browser", "crates/sunset-voice", "crates/sunset-web-wasm", "crates/sunset-relay", "crates/sunset-relay-resolver"]
+# `desktop/` is a leaf Tauri shell with its own `Cargo.lock` (see its own
+# `[workspace]` table). We keep it out of the main workspace because its
+# dependency tree (tauri + native-webview platform crates) is large, host-
+# arch-only, and orthogonal to the wasm-targeting sunset crates that all
+# share this lockfile. Reconsider when the shell starts importing sunset
+# crates directly (Tauri commands calling into sunset-core, etc.).
+exclude = ["desktop"]
 resolver = "2"
 
 [workspace.package]
@@ -23,6 +30,10 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "f
 hkdf = "0.12"
 js-sys = "0.3"
 libm = "0.2"
+# Pinned to =0.3.0: 0.4+ have a quality regression on speech.
+# default-features = false drops the `bin` feature that pulls clap, anyhow,
+# dasp, hound — none of which we need for the library API.
+nnnoiseless = { version = "=0.3.0", default-features = false }
 console_error_panic_hook = "0.1"
 rand_chacha = { version = "0.3", default-features = false }
 rand_core = "0.6"

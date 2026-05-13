@@ -3,7 +3,7 @@
 //! `VoiceRuntime`) lets every task observe the upgrade failure and exit.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -13,9 +13,9 @@ use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
-use crate::VoiceEncoder;
 use crate::runtime::dyn_bus::DynBus;
 use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink};
+use crate::{Denoiser, VoiceEncoder};
 
 pub(crate) struct RuntimeInner {
     pub identity: Identity,
@@ -33,21 +33,34 @@ pub(crate) struct RuntimeInner {
 
     pub muted: RefCell<bool>,
     pub deafened: RefCell<bool>,
+    /// Receiver-side RNNoise denoiser toggle. Defaults to true (on).
+    /// Toggle via `VoiceRuntime::set_denoise`. When false, `denoisers`
+    /// is left intact so flipping back on resumes with the existing
+    /// per-peer state instead of starting cold.
+    pub denoise: RefCell<bool>,
+    /// Per-peer denoiser state. Lazily inserted on first frame from a
+    /// peer; entries are kept for the lifetime of the runtime so peers
+    /// that briefly disappear and return don't lose their tuning.
+    pub denoisers: RefCell<HashMap<PeerId, Denoiser>>,
 
     pub frame_liveness: Arc<Liveness>,
     pub membership_liveness: Arc<Liveness>,
+    /// Tracks "this peer published a fresh durable `voice-presence`
+    /// entry recently" — the source of truth for `in_voice_channel`.
+    /// Independent of frame/heartbeat liveness because presence
+    /// propagates through the sync layer (relay-replicated CRDT) and
+    /// reaches us regardless of whether we've established a P2P
+    /// connection yet.
+    pub voice_presence_liveness: Arc<Liveness>,
 
-    /// Per-peer jitter buffers (`VecDeque<Vec<f32>>`). Used by the
-    /// subscribe loop (push) and the jitter pump (pop).
-    pub jitter: RefCell<HashMap<PeerId, VecDeque<Vec<f32>>>>,
-    pub last_delivered: RefCell<HashMap<PeerId, LastDelivered>>,
+    /// Last per-peer wire sequence number delivered to the
+    /// `FrameSink`. The runtime keeps no audio buffer of its own —
+    /// the host's playback path absorbs jitter. This map is read by
+    /// test hooks (`observed_voice_peers`) so a peer remains "seen
+    /// via frames" even when nothing else stores their PCM.
+    pub last_delivered_seq: RefCell<HashMap<PeerId, u64>>,
     pub auto_connect_state: RefCell<HashMap<PeerId, AutoConnectState>>,
     pub last_emitted: RefCell<HashMap<PeerId, EmittedState>>,
-}
-
-pub(crate) struct LastDelivered {
-    pub pcm: Vec<f32>,
-    pub underruns: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,8 +87,10 @@ pub(crate) struct EmittedState {
     pub in_call: bool,
     pub talking: bool,
     pub is_muted: bool,
+    pub in_voice_channel: bool,
     pub frame_alive: bool,
     pub membership_alive: bool,
+    pub presence_alive: bool,
 }
 
 impl RuntimeInner {
@@ -96,8 +111,10 @@ impl RuntimeInner {
             in_call: false,
             talking: false,
             is_muted: false,
+            in_voice_channel: false,
             frame_alive: false,
             membership_alive: false,
+            presence_alive: false,
         });
         if entry.is_muted != is_muted {
             entry.is_muted = is_muted;

@@ -88,6 +88,21 @@ Two non-obvious correctness rules that exist because the wrong shape is easy to 
 1. **Broadcast happens inside the inner `Mutex<Inner>` critical section** (in `insert`, `delete_expired`, `gc_blobs`), and `subscribe` registers its `Weak<Subscription>` inside the same critical section. This is what serializes "history snapshot vs. live channel" and prevents an event from being delivered both ways or neither way. Don't move broadcasts outside the lock.
 2. **Per-subscription channel must stay unbounded** (`mpsc::UnboundedSender`). Because `broadcast` runs under the inner mutex, switching to a bounded channel would let a slow subscriber stall every writer. The invariant is documented in `subscription.rs`; preserve it.
 
+## Desktop client (`desktop/`)
+
+Tauri 2 shell that wraps the same Gleam web bundle (`webDist`) inside the platform webview (WebKitGTK on Linux, WKWebView on macOS, WebView2 on Windows). No JS / Gleam / WASM is duplicated — the `flake.nix` `sunsetDesktopPkg` derivation copies `webDist` into `desktop/dist/` immediately before `cargo build` so `tauri::generate_context!()` embeds it at compile time.
+
+`desktop/` lives **outside** the main Cargo workspace and keeps its own `Cargo.lock`. Its tauri / webview-platform dependency tree is large, host-arch-only, and unrelated to the wasm-targeting sunset crates that share the root `Cargo.lock`. The root `Cargo.toml` lists `desktop` under `workspace.exclude`; the desktop crate carries an empty `[workspace]` table to mirror that. CI lints (`cargo fmt --check`, `cargo clippy ... -D warnings`, `scripts/check-no-clippy-allow.sh`) gate the desktop crate just like the workspace — its lint config in `desktop/Cargo.toml` mirrors the workspace policy verbatim. `scripts/check-desktop-lints.sh` (also in CI) fails when the two `[lints]` blocks drift, so policy changes have to be made in both places intentionally.
+
+`desktop/dist/` is regenerated content (the embedded web bundle) and is git-ignored. The dev-shell hook symlinks it to `${webDist}` automatically on `nix develop` entry, so `cargo run -p sunset-desktop` works from a clean clone without a manual bootstrap step.
+
+Useful commands:
+
+- `nix run .#desktop` — launch the native client locally.
+- `nix build .#sunset-desktop` — produce the binary at `result/bin/sunset-desktop`.
+- `desktop/scripts/bake-icons.sh` — regenerate `desktop/icons/*.png` / `.ico` / `.icns` from `web/priv/apple-touch-icon.svg`. Run after touching the source SVG.
+- `.github/workflows/release-desktop.yml` — tag-driven cross-platform release pipeline (Linux deb + AppImage, macOS dmg, Windows msi). On `workflow_dispatch` it runs in dry-bundle mode and uploads bundles as Actions artefacts instead of creating a release.
+
 ## Workflow notes
 
 - **Use git worktrees for all implementation work.** Use the `superpowers:using-git-worktrees` skill before starting any feature or plan execution. Worktrees live under `.worktrees/` (gitignored). Plans are executed via the superpowers subagent-driven-development flow with two-stage review (spec compliance → code quality).

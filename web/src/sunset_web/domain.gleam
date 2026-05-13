@@ -18,6 +18,19 @@ pub type ChannelId {
   ChannelId(String)
 }
 
+/// Default text channel every room starts with. Mirrors the
+/// `ChannelLabel::default()` on the Rust side — messages with no
+/// explicit channel land here, and the channels rail always shows
+/// it even before any traffic is observed.
+pub const default_channel_name: String = "general"
+
+/// `ChannelId` for the default channel. Sugar over
+/// `ChannelId(default_channel_name)` so call sites don't have to
+/// stitch the two constants together.
+pub fn default_channel_id() -> ChannelId {
+  ChannelId(default_channel_name)
+}
+
 pub type MemberId {
   MemberId(String)
 }
@@ -154,6 +167,11 @@ pub type Message {
     initials: String,
     time: String,
     body: String,
+    /// Channel label this message belongs to, mirrored from the
+    /// signed `ChannelLabel` on the wire. v1 routes the messages
+    /// list through this field — anything not matching the active
+    /// `current_channel` is filtered out before render.
+    channel: String,
     seen_by: Int,
     you: Bool,
     pending: Bool,
@@ -172,6 +190,10 @@ pub type MessageView {
     initials: String,
     time: String,
     body: String,
+    /// Same `channel` as the source `Message` — re-emitted on the view
+    /// type so post-resolve filtering still works without a second
+    /// lookup back to the raw list.
+    channel: String,
     seen_by: Int,
     you: Bool,
     pending: Bool,
@@ -215,8 +237,21 @@ pub type Sheet {
 
 /// Live peer state emitted by the voice runtime's PeerStateSink, keyed
 /// by peer pubkey hex. Updated from `on_voice_peer_state` callbacks.
+///
+/// `in_voice_channel` is the broader "this peer is in the voice
+/// channel" signal — true once we've seen their durable presence
+/// entry, regardless of whether we have an active P2P connection.
+/// `in_call` is the narrower "we have audio flow with this peer"
+/// signal (frame or ephemeral heartbeat alive). Pre-connection
+/// (`in_voice_channel=true && in_call=false`) is the "joined but not
+/// connected yet" state the rail visually distinguishes.
 pub type VoicePeerStateUI {
-  VoicePeerStateUI(in_call: Bool, talking: Bool, is_muted: Bool)
+  VoicePeerStateUI(
+    in_call: Bool,
+    talking: Bool,
+    is_muted: Bool,
+    in_voice_channel: Bool,
+  )
 }
 
 /// Top-level voice subsystem state on the Lustre model.
@@ -226,8 +261,20 @@ pub type VoiceModel {
     self_in_call: option.Option(RoomId),
     self_muted: Bool,
     self_deafened: Bool,
-    /// Per-peer state keyed by pubkey hex string.
+    /// Receiver-side RNNoise denoising. Default `True`; the runtime
+    /// starts with denoising on, so the UI toggle reflects that.
+    denoise: Bool,
+    /// Per-peer state keyed by full pubkey hex string.
     peers: Dict(String, VoicePeerStateUI),
+    /// Per-peer smoothed playback level keyed by full pubkey hex
+    /// (0..1, normalised so realistic speech reaches ~1.0). Updated
+    /// from `__voicePeerLevelHandler` every ~80 ms while audio is
+    /// flowing; drives the voice rail's waveform so the user can see
+    /// who is talking.
+    peer_levels: Dict(String, Float),
+    /// Smoothed local mic level (0..1). Drives the self row's
+    /// waveform.
+    self_level: Float,
     /// Set when mic permission is denied; cleared by `ResetVoiceError`.
     permission_error: option.Option(String),
   )

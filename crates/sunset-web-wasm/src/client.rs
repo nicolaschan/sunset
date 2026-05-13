@@ -282,8 +282,8 @@ impl Client {
     /// Update the display name carried in every open room's presence
     /// heartbeats. Persists for the lifetime of the Client (the Gleam
     /// layer is responsible for localStorage). Idempotent.
-    pub fn set_self_name(&self, name: String) {
-        self.inner.set_self_name(&name);
+    pub fn set_self_name(&self, name: &str) {
+        self.inner.set_self_name(name);
     }
 
     /// Start voice in the given room. The `room_handle` must have been
@@ -341,6 +341,27 @@ impl Client {
     /// tracking continues.
     pub fn voice_set_deafened(&self, deafened: bool) {
         crate::voice::voice_set_deafened(&self.voice, deafened);
+    }
+
+    /// Toggle receiver-side RNNoise denoising. Defaults to on at runtime
+    /// startup; pass `false` to bypass the denoiser without tearing down
+    /// per-peer state, so flipping back on resumes from where it left off.
+    pub fn voice_set_denoise(&self, denoise: bool) {
+        crate::voice::voice_set_denoise(&self.voice, denoise);
+    }
+
+    /// Switch the active send-side voice quality preset. Accepts
+    /// `"voice"` (24 kbps mono VOIP), `"high"` (96 kbps stereo), or
+    /// `"maximum"` (510 kbps stereo, the default). Returns an error
+    /// if voice isn't started or the label is unknown.
+    pub fn voice_set_quality(&self, label: &str) -> Result<(), JsError> {
+        crate::voice::voice_set_quality(&self.voice, label)
+    }
+
+    /// Read back the active quality preset as one of `"voice"`,
+    /// `"high"`, `"maximum"`, or `null` if voice isn't started.
+    pub fn voice_quality(&self) -> Option<String> {
+        crate::voice::voice_quality(&self.voice).map(str::to_string)
     }
 
     // ---- Test hooks (compiled in only with feature "test-hooks") ----
@@ -401,13 +422,6 @@ impl Client {
     #[cfg(feature = "test-hooks")]
     pub fn voice_observed_voice_peers(&self) -> Result<JsValue, JsError> {
         crate::voice::observed_voice_peers(&self.voice)
-    }
-
-    /// Per-peer jitter buffer depth as `[{peer_id, depth}]`. Indicates
-    /// frames received but not yet drained by the jitter pump.
-    #[cfg(feature = "test-hooks")]
-    pub fn voice_jitter_depths(&self) -> Result<JsValue, JsError> {
-        crate::voice::jitter_depths(&self.voice)
     }
 
     /// Peers currently connected at the engine level (i.e. PeerHello
