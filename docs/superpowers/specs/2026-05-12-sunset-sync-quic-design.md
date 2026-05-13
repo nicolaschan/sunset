@@ -223,8 +223,7 @@ The accept task runs the holepunch + QUIC handshake and pushes the resulting `Qu
 ### Integration
 
 1. **`tests/holepunch_loopback.rs`** — two `QuicRawTransport` instances on `127.0.0.1`, sharing a `MemoryStore`-backed `RelaySignaler`. Side A calls `connect(quic://<B>)`, side B's `accept()` returns the matching connection. Both roundtrip a reliable message and a datagram. This is the *honest* end-to-end test: no probe-loop bypass, no stub signaler — the real holepunch protocol runs over loopback.
-2. **`tests/symmetric_simultaneous_open.rs`** — both sides simultaneously call `connect(quic://<other>)`. The pubkey tiebreak picks one as the QUIC client; the other's `connect()` returns the same underlying connection via the dispatcher's "duplicate connect" arm. This exercises the glare case.
-3. **`tests/stun_unreachable_falls_back_to_local.rs`** — STUN servers set to `[]`, both peers on loopback. Holepunch still completes; the test asserts the working candidate is a loopback addr.
+2. **`tests/stun_skipped.rs`** — STUN servers set to `[]`, both peers on loopback. Holepunch still completes; the test asserts the working candidate is a loopback addr (via `QuicRawConnection::remote_addr`).
 
 ### Non-tests
 
@@ -242,6 +241,7 @@ CLAUDE.md's debugging-discipline rules apply verbatim.
 - 0-RTT resumption (quinn supports it; we don't need it on v1, and the engine doesn't expose a "warm" connection request).
 - Per-peer self-signed cert tied to Ed25519 identity (replace `NoiseTransport` for this transport).
 - Path migration — quinn supports it; we don't actively probe alternate paths after the initial confirm.
+- **True simultaneous-open glare resolution.** `sunset_core::RelaySignaler` uses Noise_KK and creates an `Initiator` slot the first time it sends to a peer; if both peers start sending to each other before either has responded, both `decrypt_inbound` calls hit the `Initiator` branch and try to parse the peer's msg1 as a msg2, which fails. This is a property of the *signaler*, not this transport. Practical impact is low — natural latency staggers most calls — but it does mean the v1 `tests/symmetric_simultaneous_open.rs` envisioned earlier in this spec is omitted: it can't pass without a KK-glare fix in `sunset-core`. The `WebRtcRawTransport` has the same limitation. v2 should add KK-glare resolution to `RelaySignaler` (deterministic "higher pubkey discards their Initiator" rule).
 
 ## Acceptance checklist
 
