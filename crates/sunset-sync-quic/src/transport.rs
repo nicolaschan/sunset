@@ -358,9 +358,9 @@ impl QuicRawTransport {
                 .map_err(|e| SyncError::Transport(format!("quic connect: {e}")))?
         } else {
             let _ = confirmed.addr; // unused on the responder side; the
-                                   // pre-registered accept_waiter (step
-                                   // 3a) holds whatever Incoming the
-                                   // QUIC client sends.
+            // pre-registered accept_waiter (step
+            // 3a) holds whatever Incoming the
+            // QUIC client sends.
             let mut accept_rx = accept_rx_opt
                 .expect("accept_rx must exist when !is_initiator (pre-registered in step 3a)");
             let incoming = match tokio::time::timeout(HANDSHAKE_BUDGET, accept_rx.recv()).await {
