@@ -306,6 +306,23 @@ impl QuicRawTransport {
             remote_candidates.session_id
         };
 
+        // 3a. If we'll be the QUIC responder, pre-register our accept
+        //     waiter NOW — before holepunch runs. The QUIC client may
+        //     send its Initial packet within milliseconds of confirming
+        //     its side of the holepunch, and that can land at the
+        //     responder's accept_router before the responder finishes
+        //     holepunch on its side. With no waiter registered, the
+        //     accept_router refuses the Incoming and the client's
+        //     handshake fails. Registering early keeps an unbounded
+        //     buffer ready to catch the Incoming.
+        let accept_rx_opt = if is_initiator {
+            None
+        } else {
+            let (accept_tx, accept_rx) = mpsc::unbounded_channel();
+            self.inner.borrow_mut().accept_waiters.push_back(accept_tx);
+            Some(accept_rx)
+        };
+
         // 4. Register probe route + run coordinator.
         let (probe_tx, coord_rx) = mpsc::unbounded_channel();
         let probe_key = (shared_session_id, remote_pk);
@@ -340,10 +357,12 @@ impl QuicRawTransport {
                 .await
                 .map_err(|e| SyncError::Transport(format!("quic connect: {e}")))?
         } else {
-            let _ = confirmed.addr; // unused on the responder side now;
-                                   // accept_router routes FIFO (see Inner doc).
-            let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
-            self.inner.borrow_mut().accept_waiters.push_back(accept_tx);
+            let _ = confirmed.addr; // unused on the responder side; the
+                                   // pre-registered accept_waiter (step
+                                   // 3a) holds whatever Incoming the
+                                   // QUIC client sends.
+            let mut accept_rx = accept_rx_opt
+                .expect("accept_rx must exist when !is_initiator (pre-registered in step 3a)");
             let incoming = match tokio::time::timeout(HANDSHAKE_BUDGET, accept_rx.recv()).await {
                 Ok(Some(i)) => i,
                 Ok(None) => {
