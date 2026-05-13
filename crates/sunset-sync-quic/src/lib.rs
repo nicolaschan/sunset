@@ -9,4 +9,5 @@
 
 mod cert;
 mod discovery;
+mod socket;
 mod wire;
