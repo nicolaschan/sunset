@@ -6,3 +6,5 @@
 //! probes for a working UDP path, then layers QUIC on top.
 //!
 //! See `docs/superpowers/specs/2026-05-12-sunset-sync-quic-design.md`.
+
+mod wire;
