@@ -969,88 +969,88 @@ fn composer(
             [
               attach_button(p, on_pick_images),
               html.textarea(
-            [
-              attribute.id("composer-textarea"),
-              attribute.autofocus(True),
-              attribute.placeholder("Message #" <> channel_name),
-              attribute.attribute("rows", "1"),
-              event.on_input(on_draft),
-              event.advanced("keydown", {
-                use key <- decode.subfield(["key"], decode.string)
-                use shift <- decode.subfield(["shiftKey"], decode.bool)
-                use meta <- decode.subfield(["metaKey"], decode.bool)
-                use ctrl <- decode.subfield(["ctrlKey"], decode.bool)
-                let mod = meta || ctrl
-                // For Enter (no shift): prevent default so the browser does not
-                // insert a newline into the textarea before Lustre clears it.
-                // For all other keys let the browser's default action proceed.
-                decode.success(case key, shift, mod {
-                  "Enter", False, _ ->
-                    event.handler(
-                      on_submit,
-                      prevent_default: True,
-                      stop_propagation: False,
-                    )
-                  "b", _, True ->
-                    event.handler(
-                      on_shortcut("**", "", "**", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "B", _, True ->
-                    event.handler(
-                      on_shortcut("**", "", "**", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "i", _, True ->
-                    event.handler(
-                      on_shortcut("*", "", "*", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "I", _, True ->
-                    event.handler(
-                      on_shortcut("*", "", "*", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "k", _, True ->
-                    event.handler(
-                      on_shortcut("[", "", "](url)", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "K", _, True ->
-                    event.handler(
-                      on_shortcut("[", "", "](url)", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  _, _, _ ->
-                    event.handler(
-                      noop,
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                })
-              }),
-              ui.css([
-                #("flex", "1"),
-                #("border", "none"),
-                #("background", "transparent"),
-                #("font-family", "inherit"),
-                #("font-size", "16.25px"),
-                #("color", p.text),
-                #("outline", "none"),
-                #("resize", "none"),
-                #("overflow", "hidden"),
-                #("padding", "0"),
-                #("line-height", "1.4"),
-              ]),
-            ],
-            draft,
-          ),
+                [
+                  attribute.id("composer-textarea"),
+                  attribute.autofocus(True),
+                  attribute.placeholder("Message #" <> channel_name),
+                  attribute.attribute("rows", "1"),
+                  event.on_input(on_draft),
+                  event.advanced("keydown", {
+                    use key <- decode.subfield(["key"], decode.string)
+                    use shift <- decode.subfield(["shiftKey"], decode.bool)
+                    use meta <- decode.subfield(["metaKey"], decode.bool)
+                    use ctrl <- decode.subfield(["ctrlKey"], decode.bool)
+                    let mod = meta || ctrl
+                    // For Enter (no shift): prevent default so the browser does not
+                    // insert a newline into the textarea before Lustre clears it.
+                    // For all other keys let the browser's default action proceed.
+                    decode.success(case key, shift, mod {
+                      "Enter", False, _ ->
+                        event.handler(
+                          on_submit,
+                          prevent_default: True,
+                          stop_propagation: False,
+                        )
+                      "b", _, True ->
+                        event.handler(
+                          on_shortcut("**", "", "**", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "B", _, True ->
+                        event.handler(
+                          on_shortcut("**", "", "**", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "i", _, True ->
+                        event.handler(
+                          on_shortcut("*", "", "*", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "I", _, True ->
+                        event.handler(
+                          on_shortcut("*", "", "*", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "k", _, True ->
+                        event.handler(
+                          on_shortcut("[", "", "](url)", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "K", _, True ->
+                        event.handler(
+                          on_shortcut("[", "", "](url)", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      _, _, _ ->
+                        event.handler(
+                          noop,
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                    })
+                  }),
+                  ui.css([
+                    #("flex", "1"),
+                    #("border", "none"),
+                    #("background", "transparent"),
+                    #("font-family", "inherit"),
+                    #("font-size", "16.25px"),
+                    #("color", p.text),
+                    #("outline", "none"),
+                    #("resize", "none"),
+                    #("overflow", "hidden"),
+                    #("padding", "0"),
+                    #("line-height", "1.4"),
+                  ]),
+                ],
+                draft,
+              ),
               html.span(
                 [
                   ui.css([
@@ -1218,7 +1218,9 @@ fn attachment_strip(
             #("gap", "8px"),
           ]),
         ],
-        list.index_map(pending, fn(att, i) { attachment_thumb(p, att, i, on_remove) }),
+        list.index_map(pending, fn(att, i) {
+          attachment_thumb(p, att, i, on_remove)
+        }),
       )
   }
 }

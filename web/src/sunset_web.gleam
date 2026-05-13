@@ -1189,10 +1189,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           |> list.index_map(fn(a, i) { #(i, a) })
           |> list.filter(fn(p) { p.0 != idx })
           |> list.map(fn(p) { p.1 })
-        #(
-          RoomState(..state, pending_attachments: kept),
-          effect.none(),
-        )
+        #(RoomState(..state, pending_attachments: kept), effect.none())
       })
     IdentityReady(seed) -> {
       let create_client_eff =

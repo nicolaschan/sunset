@@ -162,9 +162,7 @@ pub fn inc_images(msg: IncomingMessage) -> List(#(String, String))
 /// The list is empty if the user cancelled or picked nothing
 /// browser-renderable.
 @external(javascript, "./sunset.ffi.mjs", "pickImages")
-pub fn pick_images(
-  callback: fn(List(#(String, String))) -> Nil,
-) -> Nil
+pub fn pick_images(callback: fn(List(#(String, String))) -> Nil) -> Nil
 
 /// Build a `data:<mime>;base64,<payload>` URL string for use as an
 /// `<img src>`. The FFI side does the string concatenation so the
