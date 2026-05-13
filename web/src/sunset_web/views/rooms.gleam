@@ -10,7 +10,7 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ConnStatus, type Room, type RoomId, Connected, Offline, Reconnecting,
+  type Room, type RoomId, Connected, Offline, Reconnecting,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -499,7 +499,6 @@ fn room_full(
           ]),
         ],
         [
-          conn_dot(p, r.status),
           html.div(
             [
               ui.css([
@@ -636,10 +635,46 @@ fn room_mini(
     True -> p.accent_soft
     False -> "transparent"
   }
-  let dot = case r.status {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
+  // Collapsed-rail rooms: a status indicator only appears when the
+  // room is *not* Connected — Connected is the default and showing a
+  // dot for it adds noise without information. Reconnecting → amber
+  // dot; Offline → muted gray dot.
+  let problem_dot = case r.status {
+    Connected -> element.fragment([])
+    Reconnecting ->
+      html.span(
+        [
+          attribute.title("Reconnecting"),
+          ui.css([
+            #("position", "absolute"),
+            #("top", "2px"),
+            #("right", "2px"),
+            #("width", "7px"),
+            #("height", "7px"),
+            #("border-radius", "999px"),
+            #("background", p.warn),
+            #("border", "1.5px solid " <> p.surface),
+          ]),
+        ],
+        [],
+      )
+    Offline ->
+      html.span(
+        [
+          attribute.title("Offline"),
+          ui.css([
+            #("position", "absolute"),
+            #("top", "2px"),
+            #("right", "2px"),
+            #("width", "7px"),
+            #("height", "7px"),
+            #("border-radius", "999px"),
+            #("background", p.text_faint),
+            #("border", "1.5px solid " <> p.surface),
+          ]),
+        ],
+        [],
+      )
   }
   html.button(
     [
@@ -664,20 +699,7 @@ fn room_mini(
       ]),
     ],
     [
-      html.span(
-        [
-          ui.css([
-            #("position", "absolute"),
-            #("top", "2px"),
-            #("right", "2px"),
-            #("width", "7px"),
-            #("height", "7px"),
-            #("border-radius", "999px"),
-            #("background", dot),
-          ]),
-        ],
-        [],
-      ),
+      problem_dot,
       html.span([], [html.text(string.uppercase(string.slice(r.name, 0, 1)))]),
       case r.unread {
         0 -> element.fragment([])
@@ -705,27 +727,6 @@ fn room_mini(
           )
       },
     ],
-  )
-}
-
-fn conn_dot(p: Palette, s: ConnStatus) -> Element(msg) {
-  let c = case s {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
-  }
-  html.span(
-    [
-      ui.css([
-        #("width", "7px"),
-        #("height", "7px"),
-        #("border-radius", "999px"),
-        #("background", c),
-        #("display", "inline-block"),
-        #("flex-shrink", "0"),
-      ]),
-    ],
-    [],
   )
 }
 
@@ -797,18 +798,28 @@ fn you_row(
       ]),
     ],
     [
-      html.span(
-        [
-          ui.css([
-            #("color", p.live),
-            #("font-size", "12.5px"),
-            #("line-height", "1"),
-          ]),
-        ],
-        [html.text("●")],
-      ),
+      // Collapsed rail centers a small avatar tile; expanded shows
+      // "you" + your_name. The rail's "you are signed in" affordance is
+      // the row itself + the surrounding chrome — no status dot needed.
       case collapsed {
-        True -> element.fragment([])
+        True ->
+          html.span(
+            [
+              ui.css([
+                #("display", "inline-flex"),
+                #("align-items", "center"),
+                #("justify-content", "center"),
+                #("width", "28px"),
+                #("height", "28px"),
+                #("border-radius", "999px"),
+                #("background", p.surface_alt),
+                #("color", p.text_muted),
+                #("font-size", "13px"),
+                #("font-weight", "600"),
+              ]),
+            ],
+            [html.text(string.uppercase(string.slice(your_name, 0, 1)))],
+          )
         False ->
           html.span(
             [

@@ -105,9 +105,16 @@ fn member_row(
   on_open: fn(domain.MemberId) -> msg,
   dim: Bool,
 ) -> Element(msg) {
+  // Universal presence semantics:
+  //   * Speaking / Online → green (palette ok = palette live)
+  //   * Away → amber (warn)
+  //   * Muted / Offline → muted gray
+  // No accent / sunset color in the presence dot — sunset is reserved
+  // for branding / CTAs, and using it for status was making "online"
+  // hard to recognize at a glance.
   let dot_color = case m.status {
-    Speaking -> p.live
-    Online -> p.live
+    Speaking -> p.ok
+    Online -> p.ok
     Away -> p.warn
     MutedP -> p.text_faint
     OfflineP -> p.text_faint
@@ -152,15 +159,29 @@ fn member_row(
     ),
     list.flatten([
       [
+        // Offline members render a hollow ring rather than a filled
+        // dot — same shape, but visually reads as "this is off" without
+        // the user having to remember which gray means what.
         html.span(
           [
-            ui.css([
-              #("width", "7px"),
-              #("height", "7px"),
-              #("border-radius", "999px"),
-              #("background", dot_color),
-              #("flex-shrink", "0"),
-            ]),
+            ui.css(case m.status {
+              OfflineP -> [
+                #("width", "7px"),
+                #("height", "7px"),
+                #("border-radius", "999px"),
+                #("background", "transparent"),
+                #("border", "1.5px solid " <> dot_color),
+                #("box-sizing", "border-box"),
+                #("flex-shrink", "0"),
+              ]
+              _ -> [
+                #("width", "7px"),
+                #("height", "7px"),
+                #("border-radius", "999px"),
+                #("background", dot_color),
+                #("flex-shrink", "0"),
+              ]
+            }),
           ],
           [],
         ),

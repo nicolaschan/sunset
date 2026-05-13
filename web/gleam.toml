@@ -53,11 +53,12 @@ rel = "stylesheet"
 href = "https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap"
 
 # theme-color paints the browser-chrome (URL bar, address bar) with
-# the sunset accent colour. Not split light/dark — the warm terracotta
-# reads correctly under either system theme.
+# the sunset accent colour. Not split light/dark — the deep clay reads
+# correctly under either system theme. Keep this in sync with
+# `theme.gleam`'s light-palette `accent` token.
 [[tools.lustre.html.meta]]
 name = "theme-color"
-content = "#bb5a3a"
+content = "#b04a2a"
 
 # Standalone display when the page is launched from the home screen
 # (PWA install). The `apple-mobile-web-app-*` variants are Apple's

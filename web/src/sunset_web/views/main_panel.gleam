@@ -21,7 +21,7 @@ import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
   type Attachment, type ChannelId, type Member, type MessageView, type Reaction,
-  Away, ChannelId, Direct, OfflineP, OneHop, Online, SelfRelay, Speaking,
+  ChannelId, OfflineP,
 }
 import sunset_web/markdown
 import sunset_web/sunset
@@ -1161,39 +1161,33 @@ fn you_tag(p: Palette) -> Element(msg) {
   )
 }
 
-/// Pick the color for a message author's name based on the matching
-/// member's connection state. Lookup is by `m.author == member.name`
-/// (both hold the resolved display name, or the short-pubkey fallback
-/// when no name has been set).
+/// Pick the color for a message author's name. The previous
+/// implementation also encoded transport state (Direct vs OneHop) as
+/// a color, which was confusing — readers couldn't tell from the chat
+/// scrollback whether a name was amber because the peer was "away" or
+/// "via-relay". That dimension is dropped; transport state stays
+/// discoverable from the members rail glyphs and the per-message
+/// details panel.
 ///
-/// Mapping:
-///   * own messages → palette accent (so "you" stands out)
-///   * online + direct WebRTC → palette ok (green; healthy mesh)
-///   * online + via-relay → palette warn (amber; not direct)
-///   * speaking → palette live (matches the voice-rail dot)
-///   * away → palette warn
-///   * offline → palette text_faint
-///   * fallback (no member match yet) → palette text
+/// What remains:
+///
+///   * own messages → palette accent (so the user can spot their own
+///     messages in the scrollback at a glance — own-name is identity,
+///     not status, so the brand accent is appropriate here)
+///   * offline author → text_faint
+///   * everyone else → text
 fn author_color(p: Palette, m: MessageView, members: List(Member)) -> String {
   case m.you {
     True -> p.accent
     False ->
       case list.find(members, fn(mem) { mem.name == m.author }) {
         Error(_) -> p.text
-        Ok(mem) -> color_for_member(p, mem)
+        Ok(mem) ->
+          case mem.status {
+            OfflineP -> p.text_faint
+            _ -> p.text
+          }
       }
-  }
-}
-
-fn color_for_member(p: Palette, mem: Member) -> String {
-  case mem.status, mem.relay {
-    OfflineP, _ -> p.text_faint
-    Away, _ -> p.warn
-    Speaking, _ -> p.live
-    Online, Direct -> p.ok
-    Online, OneHop -> p.warn
-    Online, SelfRelay -> p.text
-    _, _ -> p.text
   }
 }
 

@@ -237,20 +237,48 @@ fn rail_row(p: Palette, r: Relay, on_open: fn(Float) -> msg) -> Element(msg) {
   )
 }
 
+/// Relay rail per-row indicator. The relay-list IS a transport
+/// diagnostic, so unlike most rows in the UI we always show some glyph
+/// here — but with universal status semantics: filled green for
+/// connected, filled amber for actively retrying, hollow gray for
+/// cancelled (so the eye reads it as "off" without looking up the
+/// color). Connecting and Backoff share the amber fill; the popover
+/// breaks them out with a text label.
 fn conn_dot(p: Palette, s: RelayConnState) -> Element(msg) {
-  let c = case s {
-    RelayConnected -> p.live
-    RelayConnecting -> p.warn
-    RelayBackoff -> p.warn
-    RelayCancelled -> p.text_faint
+  case s {
+    RelayConnected -> filled_dot(p.ok)
+    RelayConnecting -> filled_dot(p.warn)
+    RelayBackoff -> filled_dot(p.warn)
+    RelayCancelled -> hollow_dot(p.text_faint)
   }
+}
+
+fn filled_dot(color: String) -> Element(msg) {
   html.span(
     [
       ui.css([
         #("width", "7px"),
         #("height", "7px"),
         #("border-radius", "999px"),
-        #("background", c),
+        #("background", color),
+        #("display", "inline-block"),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [],
+  )
+}
+
+fn hollow_dot(color: String) -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("width", "7px"),
+        #("height", "7px"),
+        #("border-radius", "999px"),
+        #("background", "transparent"),
+        #("border", "1.5px solid " <> color),
+        #("box-sizing", "border-box"),
         #("display", "inline-block"),
         #("flex-shrink", "0"),
       ]),
@@ -398,11 +426,11 @@ fn header(p: Palette, host: String, on_close: msg) -> Element(msg) {
 }
 
 fn status_pill(p: Palette, state: RelayConnState, label: String) -> Element(msg) {
-  let bg = case state {
-    RelayConnected -> p.live
-    RelayConnecting -> p.warn
-    RelayBackoff -> p.warn
-    RelayCancelled -> p.text_faint
+  let #(bg, fg) = case state {
+    RelayConnected -> #(p.ok_soft, p.ok)
+    RelayConnecting -> #(p.warn_soft, p.warn)
+    RelayBackoff -> #(p.warn_soft, p.warn)
+    RelayCancelled -> #(p.surface_alt, p.text_faint)
   }
   html.span(
     [
@@ -412,7 +440,7 @@ fn status_pill(p: Palette, state: RelayConnState, label: String) -> Element(msg)
         #("padding", "2px 8px"),
         #("border-radius", "999px"),
         #("background", bg),
-        #("color", p.accent_ink),
+        #("color", fg),
         #("font-size", "13px"),
         #("font-weight", "600"),
       ]),
