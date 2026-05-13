@@ -293,16 +293,27 @@ impl QuicRawTransport {
             }
         };
 
-        // 3. Register probe route + run coordinator.
+        // 3. Pick the shared session_id deterministically (lower-pubkey
+        //    side's session wins). Both peers compute the same value
+        //    without an extra round-trip. Probes use this shared id;
+        //    Candidates carries each side's own choice for the tiebreak.
+        let is_initiator = local_pk < remote_pk;
+        let shared_session_id = if is_initiator {
+            session_id
+        } else {
+            remote_candidates.session_id
+        };
+
+        // 4. Register probe route + run coordinator.
         let (probe_tx, coord_rx) = mpsc::unbounded_channel();
-        let probe_key = (session_id, remote_pk);
+        let probe_key = (shared_session_id, remote_pk);
         self.inner
             .borrow_mut()
             .probe_routes
             .insert(probe_key, probe_tx);
         let confirmed = HolepunchCoordinator::new(
             Arc::clone(&self.socket),
-            session_id,
+            shared_session_id,
             local_pk,
             remote_pk,
             remote_candidates.addresses.clone(),
@@ -316,8 +327,7 @@ impl QuicRawTransport {
         })?;
         self.inner.borrow_mut().probe_routes.remove(&probe_key);
 
-        // 4. QUIC handshake.
-        let is_initiator = local_pk < remote_pk;
+        // 5. QUIC handshake.
         let quic_conn = if is_initiator {
             let client_config = build_client_config(remote_candidates.server_cert_sha256)?;
             let connecting = self
@@ -357,17 +367,33 @@ impl QuicRawTransport {
                 .map_err(|e| SyncError::Transport(format!("quic accept finalize: {e}")))?
         };
 
-        // 5. Open / accept the persistent reliable bidi stream.
+        // 6. Open / accept the persistent reliable bidi stream.
+        //
+        // quinn's `open_bi` returns immediately without notifying the
+        // peer — the stream is only visible to the responder once we
+        // write a frame on it. So the initiator writes a 1-byte
+        // stream-open marker; the responder reads it and discards.
+        // After this exchange the bidi stream is fully established and
+        // both sides exchange length-prefixed SyncMessage frames.
         let (send, recv) = if is_initiator {
-            quic_conn
+            let (mut s, r) = quic_conn
                 .open_bi()
                 .await
-                .map_err(|e| SyncError::Transport(format!("quic open_bi: {e}")))?
+                .map_err(|e| SyncError::Transport(format!("quic open_bi: {e}")))?;
+            s.write_all(&[0u8])
+                .await
+                .map_err(|e| SyncError::Transport(format!("quic open marker: {e}")))?;
+            (s, r)
         } else {
-            quic_conn
+            let (s, mut r) = quic_conn
                 .accept_bi()
                 .await
-                .map_err(|e| SyncError::Transport(format!("quic accept_bi: {e}")))?
+                .map_err(|e| SyncError::Transport(format!("quic accept_bi: {e}")))?;
+            let mut marker = [0u8; 1];
+            r.read_exact(&mut marker)
+                .await
+                .map_err(|e| SyncError::Transport(format!("quic open marker read: {e}")))?;
+            (s, r)
         };
 
         Ok(QuicRawConnection::new(quic_conn, send, recv))
