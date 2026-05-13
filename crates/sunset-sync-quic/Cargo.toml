@@ -1,0 +1,36 @@
+[package]
+name = "sunset-sync-quic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hex.workspace = true
+network-interface.workspace = true
+postcard.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+sha2.workspace = true
+stunclient.workspace = true
+sunset-sync.workspace = true
+sunset-store.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros", "net", "time"] }
+tracing.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+sunset-noise.workspace = true
+sunset-core.workspace = true
+sunset-store-memory.workspace = true
+sunset-sync = { workspace = true, features = ["test-helpers"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "net"] }
