@@ -12,6 +12,7 @@ workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 network-interface.workspace = true
 postcard.workspace = true
