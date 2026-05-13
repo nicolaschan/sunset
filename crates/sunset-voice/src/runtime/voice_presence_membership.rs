@@ -64,15 +64,15 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         // event triggered the sweep — which could be never in a
         // 2-peer call after one departs.
         //
-        // We use `tokio::time::sleep` rather than
-        // `tokio::time::interval` here because Interval depends on
-        // `std::time::Instant` which panics on wasm32; the rest of
-        // the runtime (heartbeat, jitter pump, presence publisher)
-        // uses the same sleep-loop pattern for the same reason.
+        // We use a sleep-loop rather than `tokio::time::interval`
+        // because Interval depends on `std::time::Instant` which
+        // panics on wasm32. The cfg-gated `sleep` helper below
+        // routes through `wasmtimer::tokio::sleep` on wasm — same
+        // pattern as heartbeat, jitter pump, and presence publisher.
         let sweep_self_peer = PeerId(self_pk.clone());
 
         loop {
-            let sleep = tokio::time::sleep(VOICE_PRESENCE_REFRESH_INTERVAL);
+            let sleep = sleep(VOICE_PRESENCE_REFRESH_INTERVAL);
             tokio::pin!(sleep);
 
             tokio::select! {
@@ -117,4 +117,13 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         }
     }
     .boxed_local()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep(d: std::time::Duration) {
+    wasmtimer::tokio::sleep(d).await;
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep(d: std::time::Duration) {
+    tokio::time::sleep(d).await;
 }
