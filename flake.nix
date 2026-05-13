@@ -365,6 +365,72 @@
           cargo = rustToolchain;
           rustc = rustToolchain;
         };
+
+        # Native cross-platform desktop wrapper around the web client. The
+        # Tauri shell renders the same `webDist` Gleam UI inside the platform
+        # webview (WebKitGTK on Linux, WKWebView on macOS, WebView2 on
+        # Windows). No JS / Gleam / WASM is duplicated — `webDist` is the
+        # single source of truth, copied into `desktop/dist/` immediately
+        # before `cargo build` so `tauri::generate_context!()` can embed it.
+        sunsetDesktopPkg = pkgs.rustPlatform.buildRustPackage {
+          pname = "sunset-desktop";
+          version = "0.1.0";
+          # `desktop/` carries its own `Cargo.lock` (see `Cargo.toml`'s
+          # `workspace.exclude = ["desktop"]`) so its tauri / webview-platform
+          # deps don't bloat the wasm-targeting workspace lockfile.
+          src = ./desktop;
+          cargoLock.lockFile = ./desktop/Cargo.lock;
+          doCheck = false;
+
+          # Linux: WRY (Tauri 2's webview backend) calls into WebKitGTK 4.1
+          # via libsoup 3; we link against those at build time and dynamic-link
+          # at run time. macOS uses WKWebView (bundled in the OS), so neither
+          # GTK nor WebKitGTK belong in the build inputs there. Gate the
+          # platform-specific deps so `nix build .#sunset-desktop` and
+          # `nix flake check` evaluate cleanly on darwin too.
+          nativeBuildInputs = [ pkgs.pkg-config ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              # `wrapGAppsHook3` (renamed from `wrapGAppsHook` in nixpkgs)
+              # threads GIO_EXTRA_MODULES / GDK_PIXBUF_MODULE_FILE / XDG_DATA_DIRS
+              # into the binary's wrapper so the `getUserMedia` voice path can
+              # reach system speech subsystems at runtime.
+              pkgs.wrapGAppsHook3
+            ];
+          buildInputs = [ pkgs.openssl ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.glib
+              pkgs.gtk3
+              pkgs.libsoup_3
+              pkgs.webkitgtk_4_1
+            ];
+
+          # Stage `webDist` as `dist/` next to `tauri.conf.json`. The path
+          # in `desktop/tauri.conf.json` (`build.frontendDist = "./dist"`)
+          # resolves relative to that file, so this is what the Tauri build
+          # macros embed at compile time.
+          preBuild = ''
+            rm -rf dist
+            cp -rL ${webDist} dist
+            chmod -R u+w dist
+          '';
+
+          # Tauri ships its own runtime data files in `target/...`; the
+          # binary itself is what we want.
+          postInstall = ''
+            # rustPlatform installs `target/release/<bin>` into `$out/bin/`,
+            # but it also copies `share/` examples that we don't need.
+            rm -rf $out/share || true
+          '';
+
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+
+          meta = {
+            description = "sunset.chat — native desktop wrapper around the web client";
+            mainProgram = "sunset-desktop";
+            platforms = pkgs.lib.platforms.linux ++ pkgs.lib.platforms.darwin;
+          };
+        };
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = [
@@ -380,6 +446,19 @@
             pkgs.wasm-bindgen-cli
             pkgs.wasm-pack
             pkgs.sox
+            # `librsvg` provides `rsvg-convert` for the SVG→PNG bake step
+            # in `desktop/scripts/bake-icons.sh` (Tauri icon assets).
+            pkgs.librsvg
+            # `cargo-tauri` is the Tauri 2 CLI used by `desktop/scripts/bake-icons.sh`
+            # to materialise multi-format icon assets (icon.icns / icon.ico / sized
+            # PNGs) from a single 1024x1024 source PNG. Also useful for `cargo tauri
+            # dev` and `cargo tauri build` from a dev shell.
+            pkgs.cargo-tauri
+            # `pkg-config` + `openssl` are needed on every host: pkg-config locates
+            # the native libs the Tauri shell links to; openssl is pulled in by a
+            # few transitive deps (reqwest, etc.).
+            pkgs.pkg-config
+            pkgs.openssl
             # Required by `sunset-voice/build.rs` to compile vendored
             # libopus into wasm32 object files. We use unwrapped
             # binaries because Nix's `cc-wrapper` injects host-only
@@ -387,6 +466,14 @@
             clangForWasm
             llvmArForWasm
             pkgs.lld
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            # WebKitGTK 4.1 + GTK 3 + libsoup 3 are the native libraries WRY
+            # (Tauri 2's webview backend) links against on Linux. macOS uses
+            # WKWebView from the OS, so these don't apply there.
+            pkgs.glib
+            pkgs.gtk3
+            pkgs.libsoup_3
+            pkgs.webkitgtk_4_1
           ];
           shellHook = ''
             ${if webHexDeps != null
@@ -416,11 +503,21 @@
             export SUNSET_WEB_DIST="''${SUNSET_WEB_DIST:-${webVoiceUiTestDist}}"
             # Make sunset-relay available in the dev shell for Playwright tests.
             export PATH="${pkgs.lib.makeBinPath [ sunsetRelayPkg ]}:$PATH"
+            # `desktop/dist/` is git-ignored (regenerated content) but the
+            # Tauri compile-time embedding (`tauri::generate_context!()`)
+            # demands it on disk before `cargo build -p sunset-desktop` runs.
+            # Stage the prod webDist as a symlink so a fresh clone + `cargo
+            # run` from `desktop/` works without manual `nix build .#web`
+            # bootstrap. CI's `Stage webDist into desktop/dist` step in
+            # `test.yml` does the same thing for the sandboxed clippy run.
+            mkdir -p desktop
+            ln -sfn ${webDist} desktop/dist
           '';
         };
 
         packages = {
           sunset-relay = sunsetRelayPkg;
+          sunset-desktop = sunsetDesktopPkg;
           sunset-web-wasm = sunsetWebWasmPkg;
           sunset-web-wasm-test-hooks = sunsetWebWasmTestHooksPkg;
           web-voice-test-dist = webVoiceTestDist;
@@ -510,6 +607,11 @@
             type = "app";
             program = "${webTestRunnerVoice}/bin/sunset-web-test-voice";
             meta.description = "Run voice protocol e2e tests (test-hooks WASM build)";
+          };
+          desktop = {
+            type = "app";
+            program = "${sunsetDesktopPkg}/bin/sunset-desktop";
+            meta.description = "Launch the sunset.chat native desktop client (Tauri shell around the web bundle)";
           };
         };
       });

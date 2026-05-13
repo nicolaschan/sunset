@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "sunset.chat",
+  "version": "0.1.0",
+  "identifier": "chat.sunset.desktop",
+  "build": {
+    "frontendDist": "./dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "sunset.chat",
+        "width": 1100,
+        "height": 800,
+        "minWidth": 480,
+        "minHeight": 400,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' tauri: ipc: http://ipc.localhost; script-src 'self' 'wasm-unsafe-eval' tauri: ipc: http://ipc.localhost; connect-src 'self' tauri: ipc: http://ipc.localhost data: blob: ws: wss: https:; worker-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; media-src 'self' blob: data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage", "rpm", "dmg", "app", "msi", "nsis"],
+    "category": "SocialNetworking",
+    "shortDescription": "End-to-end encrypted peer-to-peer chat",
+    "longDescription": "sunset.chat — peer-to-peer end-to-end encrypted chat. Native desktop wrapper around the web client.",
+    "publisher": "sunset.chat",
+    "homepage": "https://sunset.chat",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libsoup-3.0-0",
+          "libglib2.0-0"
+        ]
+      }
+    }
+  }
+}
