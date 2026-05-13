@@ -92,7 +92,6 @@ pub(crate) fn voice_start(
     wasm_bindgen_futures::spawn_local(tasks.subscribe);
     wasm_bindgen_futures::spawn_local(tasks.combiner);
     wasm_bindgen_futures::spawn_local(tasks.auto_connect);
-    wasm_bindgen_futures::spawn_local(tasks.jitter_pump);
     wasm_bindgen_futures::spawn_local(tasks.voice_presence_publisher);
     wasm_bindgen_futures::spawn_local(tasks.voice_presence_membership);
 
@@ -235,6 +234,12 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
             &JsValue::from_f64(frame.rms as f64),
         )
         .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("seq"),
+            &JsValue::from_f64(frame.seq as f64),
+        )
+        .unwrap();
         arr.push(&obj);
     }
     Ok(arr.into())
@@ -264,29 +269,6 @@ pub(crate) fn observed_voice_peers(cell: &VoiceCell) -> Result<JsValue, JsError>
     let arr = Array::new();
     for peer in v.runtime.observed_voice_peers() {
         arr.push(&Uint8Array::from(peer.0.as_bytes()));
-    }
-    Ok(arr.into())
-}
-
-#[cfg(feature = "test-hooks")]
-pub(crate) fn jitter_depths(cell: &VoiceCell) -> Result<JsValue, JsError> {
-    use js_sys::{Array, Object, Uint8Array};
-    let slot = cell.borrow();
-    let v = slot
-        .as_ref()
-        .ok_or_else(|| JsError::new("voice not started"))?;
-    let arr = Array::new();
-    for (peer, depth) in v.runtime.jitter_depths() {
-        let obj = Object::new();
-        let id = Uint8Array::from(peer.0.as_bytes());
-        js_sys::Reflect::set(&obj, &JsValue::from_str("peer_id"), &id).unwrap();
-        js_sys::Reflect::set(
-            &obj,
-            &JsValue::from_str("depth"),
-            &JsValue::from_f64(depth as f64),
-        )
-        .unwrap();
-        arr.push(&obj);
     }
     Ok(arr.into())
 }

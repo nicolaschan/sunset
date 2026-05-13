@@ -1,76 +1,229 @@
 // AudioWorkletProcessor that receives 1920-sample (20 ms × 2 ch)
-// interleaved L/R stereo PCM frames via postMessage, deinterleaves
-// them, and writes them out into the audio engine's 128-sample
-// stereo quanta as the rendering pipeline pulls.
+// interleaved L/R stereo PCM frames via postMessage and drains them
+// at the audio device clock, smoothing over network jitter and
+// dropped packets so the listener doesn't hear clicks.
 //
-// The producer is `sunset_voice::VoiceDecoder`, which is fixed at
-// 2-channel decode regardless of the sender's quality preset (mono
-// Opus packets are auto-upmixed to stereo at decode time). That
-// means this worklet's input shape is constant, so we don't need to
-// renegotiate channel counts when a peer changes their send-side
-// quality.
+// Why this lives in the worklet and not the Rust side:
+// `process()` is paced by the device sample-rate crystal. A
+// JS / Rust wall-clock timer (e.g. tokio::time::sleep(20ms)) drifts
+// against that crystal — when it fires late under load or in a
+// backgrounded tab, the worklet's queue empties between ticks and
+// the listener hears the gap. Driving consumption from `process()`
+// makes that whole class of bug impossible.
 //
-// Underflow (queue empty when the engine pulls) is filled with zeros
-// for the missing samples. The runtime's jitter pump tries to keep
-// the queue topped up — sustained underflow means the network or
-// decoder is behind the consumer, which is audible and is what we
-// want a real user to hear.
+// Design (spec: docs/superpowers/specs/2026-05-10-voice-smooth-jitter-buffer-design.md):
+//
+//   - Buffer: Map<seq, Float32Array>. Sequence numbers come from the
+//     wire (`VoicePacket::Frame::seq`, truncated to u32). Frames
+//     arrive nearly in order over WebRTC but the seq-indexed map
+//     handles reorders inside the playout-depth window for free.
+//   - States: Warmup | Playing | Underrun.
+//   - Cosine fades at every Playing↔Underrun transition kill the
+//     phase / step discontinuities that produce clicks. The
+//     fade-out fades the *last emitted sample value* down to zero
+//     (not the lastFrame's samples) so the fade is unambiguously
+//     continuous with what the listener just heard.
+//   - Target playout depth = 3 frames (60 ms). Trades 60 ms of
+//     latency for click-free playback under typical network jitter.
+//   - Max depth = 10 frames (200 ms). Beyond this we drop oldest
+//     because we're either receiving a burst-catch-up or the
+//     sender's clock is meaningfully faster than ours; better to
+//     drop than grow unbounded.
 
 const FRAME_SAMPLES_PER_CHANNEL = 960;
 const CHANNELS = 2;
 const FRAME_TOTAL = FRAME_SAMPLES_PER_CHANNEL * CHANNELS;
 
+// Number of buffered frames before playback starts (Warmup → Playing)
+// and the same threshold for recovering from Underrun → Playing.
+const TARGET_PLAYOUT_DEPTH = 3;
+
+// Hard cap on buffered frames. If we hit it, the lowest-seq entry is
+// dropped — handles sustained sender-faster-than-receiver clock drift
+// and rare burst arrivals where multiple frames land in one event-loop
+// turn.
+const MAX_DEPTH = 10;
+
+// Cosine fade window in *sample pairs* (one pair = one L+R sample).
+// 240 pairs at 48 kHz = 5 ms. Short enough to not noticeably stretch
+// gaps, long enough to be inaudible as a transient (the ear's
+// transient threshold for music is ~10 ms; speech is even more
+// forgiving).
+const FADE_SAMPLES = 240;
+
+const STATE_WARMUP = 0;
+const STATE_PLAYING = 1;
+const STATE_UNDERRUN = 2;
+
+// Modular comparison for u32 wire seqs. Treat `a` and `b` as living
+// on a number line; ((a - b) | 0) is the signed 32-bit difference
+// (JS bitwise ops sign-extend). Positive means a is "after" b.
+function seqGt(a, b) {
+  return ((a - b) | 0) > 0;
+}
+
 class VoicePlaybackProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.queue = []; // array of Float32Array (interleaved L/R)
+    // Map<seq, Float32Array(FRAME_TOTAL)>. Key is u32.
+    this.buf = new Map();
+    // Smallest seq we'll accept. Below this is "already played";
+    // null until first pop.
+    this.expectedSeq = null;
+    // The frame we're currently emitting. `headIdx` is the within-
+    // frame sample-pair offset.
     this.head = null;
-    this.headIdx = 0; // sample-pair index into head (0..FRAME_SAMPLES_PER_CHANNEL)
+    this.headIdx = 0;
+    // State machine.
+    this.state = STATE_WARMUP;
+    // Fade window positions (in sample pairs). FADE_SAMPLES = no
+    // fade active. fadeIn ramps 0..1 across the first FADE_SAMPLES
+    // samples after a Warmup/Underrun → Playing transition.
+    // fadeOut ramps 1..0 across the first FADE_SAMPLES samples
+    // after a Playing → Underrun transition.
+    this.fadeInPos = FADE_SAMPLES;
+    this.fadeOutPos = FADE_SAMPLES;
+    // Last L/R sample actually written. Updated on every emitted
+    // sample so a Playing → Underrun transition has a fresh anchor.
+    this.lastL = 0;
+    this.lastR = 0;
+    // Frozen anchor for the active fade-out — snapshotted from
+    // (lastL, lastR) at the moment Underrun begins, then held
+    // constant for the whole fade window. Without this snapshot the
+    // fade-out would multiply each successive sample's value by the
+    // ramp, compounding into a faster-than-cosine decay.
+    this.fadeOutAnchorL = 0;
+    this.fadeOutAnchorR = 0;
+
     this.port.onmessage = (e) => {
-      // Defensive: only accept Float32Arrays of the expected length.
+      const msg = e.data;
       if (
-        e.data instanceof Float32Array &&
-        e.data.length === FRAME_TOTAL
+        !msg ||
+        typeof msg.seq !== "number" ||
+        !(msg.pcm instanceof Float32Array) ||
+        msg.pcm.length !== FRAME_TOTAL
       ) {
-        this.queue.push(e.data);
+        return;
+      }
+      const seq = msg.seq >>> 0;
+      const pcm = msg.pcm;
+
+      // Drop frames we've already played past.
+      if (this.expectedSeq !== null && !seqGt(seq, this.expectedSeq - 1)) {
+        return;
+      }
+
+      this.buf.set(seq, pcm);
+
+      // Cap at MAX_DEPTH by evicting smallest seq. Map preserves
+      // insertion order but we want smallest-by-seq; scan once on
+      // overflow (rare).
+      while (this.buf.size > MAX_DEPTH) {
+        let minSeq = null;
+        for (const k of this.buf.keys()) {
+          if (minSeq === null || seqGt(minSeq, k)) minSeq = k;
+        }
+        if (minSeq !== null) this.buf.delete(minSeq);
+        else break;
+      }
+
+      if (
+        (this.state === STATE_WARMUP || this.state === STATE_UNDERRUN) &&
+        this.buf.size >= TARGET_PLAYOUT_DEPTH
+      ) {
+        this.state = STATE_PLAYING;
+        this.fadeInPos = 0;
       }
     };
   }
 
+  popSmallest() {
+    if (this.buf.size === 0) return null;
+    let minSeq = null;
+    for (const k of this.buf.keys()) {
+      if (minSeq === null || seqGt(minSeq, k)) minSeq = k;
+    }
+    const pcm = this.buf.get(minSeq);
+    this.buf.delete(minSeq);
+    this.expectedSeq = (minSeq + 1) >>> 0;
+    return pcm;
+  }
+
+  // Cosine ramp 0..1. pos ∈ [0, FADE_SAMPLES] → m ∈ [0, 1].
+  fadeMul(pos) {
+    return 0.5 - 0.5 * Math.cos((Math.PI * pos) / FADE_SAMPLES);
+  }
+
   process(_inputs, outputs) {
-    // outputs[0] is an array of channels. With a 2-channel destination
-    // (set by the AudioContext) we get [L, R].
     const channels = outputs[0];
     if (!channels || channels.length === 0) return true;
     const left = channels[0];
     const right = channels[1] ?? channels[0];
-
     const n = left.length;
-    let i = 0;
-    while (i < n) {
-      if (!this.head) {
-        if (this.queue.length === 0) {
-          // Underflow — pad the rest of this quantum with silence on
-          // both channels.
-          left.fill(0, i);
-          if (right !== left) right.fill(0, i);
-          return true;
+
+    for (let i = 0; i < n; i++) {
+      let outL = 0;
+      let outR = 0;
+
+      if (this.state === STATE_WARMUP) {
+        // Silent until enough buffered (handled in onmessage).
+        // outL, outR remain 0.
+      } else if (this.state === STATE_UNDERRUN) {
+        // Fade the anchored sample value down to zero, then
+        // silence. The anchor is the lastL/lastR captured at the
+        // moment we entered Underrun, NOT the per-sample lastL —
+        // using the per-sample value compounds the ramp, which
+        // attenuates faster than the documented cosine.
+        if (this.fadeOutPos < FADE_SAMPLES) {
+          const m = this.fadeMul(FADE_SAMPLES - this.fadeOutPos);
+          outL = this.fadeOutAnchorL * m;
+          outR = this.fadeOutAnchorR * m;
+          this.fadeOutPos++;
         }
-        this.head = this.queue.shift();
-        this.headIdx = 0;
+        // else: silence (0).
+      } else {
+        // STATE_PLAYING — need a head frame.
+        if (!this.head) {
+          if (this.buf.size === 0) {
+            // Buffer dried up mid-playback. Snapshot the current
+            // last-emitted value as the fade-out anchor and re-do
+            // this sample under the Underrun branch.
+            this.state = STATE_UNDERRUN;
+            this.fadeOutPos = 0;
+            this.fadeOutAnchorL = this.lastL;
+            this.fadeOutAnchorR = this.lastR;
+            i--;
+            continue;
+          }
+          this.head = this.popSmallest();
+          this.headIdx = 0;
+        }
+
+        const off = this.headIdx * CHANNELS;
+        outL = this.head[off];
+        outR = this.head[off + 1];
+
+        if (this.fadeInPos < FADE_SAMPLES) {
+          // Ramp 0 → 1 over FADE_SAMPLES. At fadeInPos=0 the
+          // multiplier is 0, so the first sample after a transition
+          // is silent — continuous with the silence we just
+          // emitted in Warmup or post-fade-out Underrun.
+          const m = this.fadeMul(this.fadeInPos);
+          outL *= m;
+          outR *= m;
+          this.fadeInPos++;
+        }
+
+        this.headIdx++;
+        if (this.headIdx === FRAME_SAMPLES_PER_CHANNEL) {
+          this.head = null;
+        }
       }
-      const remainingPairs = FRAME_SAMPLES_PER_CHANNEL - this.headIdx;
-      const take = Math.min(remainingPairs, n - i);
-      for (let k = 0; k < take; k++) {
-        const off = (this.headIdx + k) * CHANNELS;
-        left[i + k] = this.head[off];
-        if (right !== left) right[i + k] = this.head[off + 1];
-      }
-      this.headIdx += take;
-      i += take;
-      if (this.headIdx === FRAME_SAMPLES_PER_CHANNEL) {
-        this.head = null;
-      }
+
+      left[i] = outL;
+      if (right !== left) right[i] = outR;
+      this.lastL = outL;
+      this.lastR = outR;
     }
     return true;
   }

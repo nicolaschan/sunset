@@ -17,21 +17,23 @@ use sunset_voice::FrameSink;
 const RING_PER_PEER: usize = 1024;
 
 /// A single recorded frame: length in samples, SHA-256 checksum
-/// (hex) of the raw f32 bytes, and root-mean-square amplitude.
+/// (hex) of the raw f32 bytes, root-mean-square amplitude, and the
+/// wire sequence number (low 32 bits of `VoicePacket::Frame::seq`).
 ///
 /// `checksum` is a stuck-frame tripwire — distinct decoded frames
 /// land at distinct checksums even after Opus, so consecutive
-/// identical checksums catch jitter-pump stuttering. It also doubles
-/// as a "frame is not silence" signal: zero-PCM has a known checksum.
+/// identical checksums catch stuttering. It also doubles as a
+/// "frame is not silence" signal: zero-PCM has a known checksum.
 ///
 /// `rms` is a "real-audio-vs-silence" signal: an Opus-decoded sine
-/// wave at amplitude 0.5 lands around RMS 0.35, while silence /
-/// underrun-padding lands at 0.
+/// wave at amplitude 0.5 lands around RMS 0.35, while silence lands
+/// at 0.
 #[derive(Clone)]
 pub struct RecordedFrame {
     pub len: u32,
     pub checksum: String,
     pub rms: f32,
+    pub seq: u32,
 }
 
 struct Inner {
@@ -66,7 +68,7 @@ impl RecordingFrameSink {
 }
 
 impl FrameSink for RecordingFrameSink {
-    fn deliver(&self, peer: &PeerId, pcm: &[f32]) {
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]) {
         let mut hasher = sha2::Sha256::new();
         for s in pcm {
             hasher.update(s.to_le_bytes());
@@ -78,6 +80,7 @@ impl FrameSink for RecordingFrameSink {
             len: pcm.len() as u32,
             checksum,
             rms,
+            seq,
         };
         let mut inner = self.inner.borrow_mut();
         let q = inner.frames.entry(peer.clone()).or_default();
@@ -86,7 +89,7 @@ impl FrameSink for RecordingFrameSink {
         }
         q.push_back(frame);
         drop(inner);
-        self.forward.deliver(peer, pcm);
+        self.forward.deliver(peer, seq, pcm);
     }
 
     fn drop_peer(&self, peer: &PeerId) {

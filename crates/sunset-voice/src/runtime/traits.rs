@@ -41,10 +41,17 @@ pub trait Dialer {
     async fn ensure_direct(&self, peer: PeerId);
 }
 
-/// Sink for decoded PCM frames the runtime hands out at the jitter
-/// pump cadence. PCM is `FRAME_SAMPLES` (960) f32 mono @ 48 kHz.
+/// Sink for decoded PCM frames the runtime delivers immediately on
+/// network arrival. PCM is `FRAME_SAMPLES_PER_CHANNEL * 2` (1920) f32
+/// interleaved L/R stereo @ 48 kHz.
+///
+/// `seq` is the low 32 bits of `VoicePacket::Frame::seq`, exposed so
+/// the host can do sequence-indexed buffering (e.g. a worklet-side
+/// jitter buffer) and detect gaps. The runtime itself does no
+/// buffering — frames arrive at network cadence and the host is
+/// responsible for pacing playback against its audio clock.
 pub trait FrameSink {
-    fn deliver(&self, peer: &PeerId, pcm: &[f32]);
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]);
     /// Peer transitioned from in-call to gone. Host should release
     /// per-peer playback resources (worklet node, gain node, etc.).
     fn drop_peer(&self, peer: &PeerId);
