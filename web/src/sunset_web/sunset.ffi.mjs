@@ -146,19 +146,49 @@ export function onIntentChanged(client, callback) {
   });
 }
 
-export async function sendMessage(room, channel, body, sentAtMs, callback) {
+export async function sendMessage(
+  room,
+  channel,
+  body,
+  images,
+  sentAtMs,
+  callback,
+) {
   try {
-    const valueHashHex = await room.send_message(channel, body, sentAtMs);
+    // `images` arrives as a Gleam List of #(mime_type, data_base64) tuples
+    // packaged as 2-elem Gleam dynamic arrays. Convert to plain JS objects
+    // before crossing the wasm boundary — see `room_handle.rs::images_from_js`.
+    const imagesArray = gleamListToImageArray(images);
+    const valueHashHex = await room.send_message(
+      channel,
+      body,
+      imagesArray,
+      sentAtMs,
+    );
     callback(new Ok(valueHashHex));
   } catch (e) {
     callback(new GError(String(e)));
   }
 }
 
+/// Convert a Gleam `List(#(String, String))` of (mime, base64) pairs
+/// into the `Array<{ mime_type, data_base64 }>` shape the wasm side
+/// expects. Gleam's stdlib List exposes a `toArray()` view; each tuple
+/// is materialized as an array-like with `[0]` = mime, `[1]` = base64.
+function gleamListToImageArray(list) {
+  return list.toArray().map((pair) => ({
+    mime_type: pair[0],
+    data_base64: pair[1],
+  }));
+}
+
 export function onMessage(room, callback) {
   room.on_message((incoming) => {
     // Copy fields into a plain JS object so we can free the wasm-bindgen
     // wrapper immediately and avoid GC-delayed memory accumulation.
+    // `images` is already a plain JS Array of `{ mime_type, data_base64 }`
+    // objects (built in `messages.rs::images_to_js`), so we can keep
+    // the reference directly.
     const plain = {
       author_pubkey: incoming.author_pubkey,
       epoch_id: incoming.epoch_id,
@@ -167,6 +197,7 @@ export function onMessage(room, callback) {
       body: incoming.body,
       value_hash_hex: incoming.value_hash_hex,
       is_self: incoming.is_self,
+      images: incoming.images,
     };
     incoming.free();
     callback(plain);
@@ -237,6 +268,15 @@ export function incBody(msg) { return msg.body; }
 export function incValueHashHex(msg) { return msg.value_hash_hex; }
 export function incIsSelf(msg) { return msg.is_self; }
 export function incChannel(msg) { return msg.channel; }
+
+/// Convert the message's `images` JS Array into a Gleam
+/// `List(#(String, String))` of `(mime_type, data_base64)` pairs.
+/// Each `<img>` rendered by the timeline picks its `src` as
+/// `"data:" + mime_type + ";base64," + data_base64`.
+export function incImages(msg) {
+  const pairs = (msg.images ?? []).map((e) => [e.mime_type, e.data_base64]);
+  return toList(pairs);
+}
 
 // Presence + membership FFI shims.
 
@@ -445,4 +485,109 @@ export function heartbeatIntervalMsFromUrl() {
   if (raw === null) return 0;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/// Image attachment picker. The first time it's called we lazily create
+/// a hidden `<input type="file" multiple accept="image/*">` and reuse
+/// it for every subsequent open — Safari and Firefox both insist the
+/// click come from a user-gesture handler, so the input has to live in
+/// the DOM, not be created on demand inside a Promise.
+let imagePickerInput = null;
+function getImagePickerInput() {
+  if (imagePickerInput && document.body.contains(imagePickerInput)) {
+    return imagePickerInput;
+  }
+  const el = document.createElement("input");
+  el.type = "file";
+  el.multiple = true;
+  // Browser-renderable raster formats only: jpeg, png, webp, gif.
+  // The user picker filters to these, and the composer side double-
+  // checks before adding to the staging area.
+  el.accept = "image/jpeg,image/png,image/webp,image/gif";
+  el.setAttribute("data-testid", "composer-image-input");
+  el.style.position = "fixed";
+  el.style.left = "-9999px";
+  el.style.top = "-9999px";
+  el.style.width = "1px";
+  el.style.height = "1px";
+  el.style.opacity = "0";
+  el.style.pointerEvents = "none";
+  document.body.appendChild(el);
+  imagePickerInput = el;
+  return el;
+}
+
+/// Open the OS image picker. `callback` is invoked exactly once per
+/// open: with a Gleam `List(#(String, String))` of `(mime_type,
+/// data_base64)` pairs, possibly empty (user cancelled or picked
+/// nothing). Each image is read via FileReader as a data URI and the
+/// `data:.../;base64,` prefix is stripped.
+export function pickImages(callback) {
+  const input = getImagePickerInput();
+  // Reset value so picking the same file twice in a row still fires
+  // `change`. (Without this, the browser silently dedupes.)
+  input.value = "";
+  const onChange = async () => {
+    input.removeEventListener("change", onChange);
+    input.removeEventListener("cancel", onCancel);
+    const files = Array.from(input.files ?? []);
+    try {
+      const pairs = await Promise.all(files.map(readImage));
+      const valid = pairs.filter((p) => p !== null);
+      callback(toList(valid));
+    } catch (e) {
+      console.warn("pickImages: readImage failed", e);
+      callback(toList([]));
+    }
+  };
+  const onCancel = () => {
+    input.removeEventListener("change", onChange);
+    input.removeEventListener("cancel", onCancel);
+    callback(toList([]));
+  };
+  input.addEventListener("change", onChange);
+  // `cancel` is the modern event when the user dismisses the picker
+  // without selecting; older browsers just never fire `change`.
+  input.addEventListener("cancel", onCancel);
+  input.click();
+}
+
+const ALLOWED_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+]);
+
+function readImage(file) {
+  if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+    console.warn(`pickImages: skipping ${file.name} (type=${file.type})`);
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const result = fr.result;
+      if (typeof result !== "string") {
+        resolve(null);
+        return;
+      }
+      // result is `"data:<mime>;base64,<payload>"` — strip the prefix.
+      const comma = result.indexOf(",");
+      if (comma < 0) {
+        resolve(null);
+        return;
+      }
+      resolve([file.type, result.slice(comma + 1)]);
+    };
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(file);
+  });
+}
+
+/// Programmatically build a data URL from a `(mime_type, data_base64)`
+/// Gleam tuple. Used by the timeline renderer so the Gleam side doesn't
+/// have to concatenate strings byte-by-byte at render time.
+export function imageDataUrl(mimeType, dataBase64) {
+  return `data:${mimeType};base64,${dataBase64}`;
 }

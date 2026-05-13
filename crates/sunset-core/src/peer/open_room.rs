@@ -87,7 +87,23 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         body: String,
         sent_at_ms: u64,
     ) -> crate::Result<sunset_store::Hash> {
-        use crate::compose_text;
+        self.send_post_in_channel(channel, body, Vec::new(), sent_at_ms)
+            .await
+    }
+
+    /// Compose and insert a chat post (text + optional image attachments)
+    /// under `channel`. An image-only post is fine — pass `body = ""`
+    /// with a non-empty `images`. Returns the composed entry's
+    /// `value_hash`.
+    pub async fn send_post_in_channel(
+        &self,
+        channel: ChannelLabel,
+        body: String,
+        images: Vec<crate::ImageAttachment>,
+        sent_at_ms: u64,
+    ) -> crate::Result<sunset_store::Hash> {
+        use crate::compose_post;
+        use crate::message::PostPayload;
         use rand_chacha::ChaCha20Rng;
         use rand_core::SeedableRng;
 
@@ -98,13 +114,16 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             .ok_or_else(|| crate::Error::Other("peer dropped".into()))?;
 
         let mut rng = ChaCha20Rng::from_entropy();
-        let composed = compose_text(
+        let composed = compose_post(
             peer.identity(),
             &self.inner.room,
             crate::V1_EPOCH_ID,
             sent_at_ms,
             channel,
-            &body,
+            &PostPayload {
+                text: &body,
+                images: &images,
+            },
             &mut rng,
         )?;
 
@@ -253,7 +272,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                 {
                     let cbs = callbacks.borrow();
                     match &decoded.body {
-                        crate::MessageBody::Text(_) => {
+                        crate::MessageBody::Text { .. } => {
                             if let Some(cb) = cbs.on_message.as_ref() {
                                 cb(&decoded, is_self);
                             }
@@ -297,7 +316,7 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                 // The receipt inherits the target Text's channel so a
                 // sender filtering its UI to e.g. #links sees the ack
                 // arrive in the same channel.
-                if let crate::MessageBody::Text(_) = &decoded.body {
+                if let crate::MessageBody::Text { .. } = &decoded.body {
                     if !is_self && acked.insert(entry.value_hash) {
                         send_receipt(
                             &store,

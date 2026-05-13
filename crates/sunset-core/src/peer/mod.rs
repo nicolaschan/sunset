@@ -410,8 +410,8 @@ mod tests {
                 let received: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
                 let received_clone = received.clone();
                 room.on_message(move |decoded, is_self| {
-                    if let crate::MessageBody::Text(t) = &decoded.body {
-                        received_clone.borrow_mut().push((t.clone(), is_self));
+                    if let crate::MessageBody::Text { text, .. } = &decoded.body {
+                        received_clone.borrow_mut().push((text.clone(), is_self));
                     }
                 });
 
@@ -457,7 +457,7 @@ mod tests {
                     crate::V1_EPOCH_ID,
                     1_700_000_000_000,
                     crate::ChannelLabel::default_general(),
-                    crate::MessageBody::Text("from-other".to_owned()),
+                    crate::MessageBody::text("from-other"),
                     &mut rng,
                 )
                 .expect("compose_message");
@@ -543,10 +543,10 @@ mod tests {
                     Rc::new(RefCell::new(Vec::new()));
                 let received_cb = received.clone();
                 room.on_message(move |decoded, _is_self| {
-                    if let crate::MessageBody::Text(t) = &decoded.body {
+                    if let crate::MessageBody::Text { text, .. } = &decoded.body {
                         received_cb
                             .borrow_mut()
-                            .push((decoded.channel.as_str().to_owned(), t.clone()));
+                            .push((decoded.channel.as_str().to_owned(), text.clone()));
                     }
                 });
 

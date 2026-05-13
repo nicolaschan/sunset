@@ -160,6 +160,14 @@ pub type VoiceSettings {
   )
 }
 
+/// A single image attached to a message. `mime_type` is one of the
+/// browser-renderable types accepted by the composer (`image/jpeg`,
+/// `image/png`, `image/webp`, `image/gif`); `data_base64` is the
+/// payload with the `data:<mime>;base64,` prefix stripped.
+pub type Attachment {
+  Attachment(mime_type: String, data_base64: String)
+}
+
 pub type Message {
   Message(
     id: String,
@@ -177,6 +185,9 @@ pub type Message {
     pending: Bool,
     reactions: List(Reaction),
     details: DetailsOpt,
+    /// Image attachments. Empty for text-only messages. Rendered
+    /// inline below the body in the message timeline.
+    attachments: List(Attachment),
   )
 }
 
@@ -199,6 +210,9 @@ pub type MessageView {
     pending: Bool,
     reactions: List(Reaction),
     details: DetailsOpt,
+    /// Mirror of `Message.attachments`. Re-emitted on the view type so
+    /// the timeline doesn't have to re-look up the source Message.
+    attachments: List(Attachment),
   )
 }
 

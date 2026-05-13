@@ -135,7 +135,7 @@ async fn alice_encrypts_bob_decrypts() {
                 0,
                 sent_at,
                 sunset_core::ChannelLabel::default_general(),
-                MessageBody::Text(body.to_owned()),
+                MessageBody::text(body),
                 &mut OsRng,
             )
             .unwrap();
@@ -191,7 +191,7 @@ async fn alice_encrypts_bob_decrypts() {
             assert_eq!(decoded.author_key, alice.public());
             assert_eq!(decoded.room_fingerprint, bob_room.fingerprint());
             assert_eq!(decoded.epoch_id, 0);
-            assert_eq!(decoded.body, MessageBody::Text(body.to_owned()));
+            assert_eq!(decoded.body, MessageBody::text(body));
             assert_eq!(decoded.sent_at_ms, sent_at);
 
             // ---- a third party who never joined cannot decrypt ----

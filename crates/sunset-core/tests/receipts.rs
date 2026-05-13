@@ -41,7 +41,7 @@ async fn receipt_round_trip_between_two_identities() {
     // 3. Bob's bridge logic: decode Alice's Text. Since author != self,
     //    Bob composes a Receipt referencing the text's value_hash.
     let decoded = decode_message(&room, &text.entry, &text.block).unwrap();
-    assert!(matches!(decoded.body, MessageBody::Text(_)));
+    assert!(matches!(decoded.body, MessageBody::Text { .. }));
     let receipt = compose_receipt(
         &bob,
         &room,

@@ -256,6 +256,7 @@ pub fn messages() -> List(Message) {
           ],
         ),
       ),
+      attachments: [],
     ),
     Message(
       id: "m2",
@@ -284,6 +285,7 @@ pub fn messages() -> List(Message) {
           ],
         ),
       ),
+      attachments: [],
     ),
     Message(
       id: "m3",
@@ -311,6 +313,7 @@ pub fn messages() -> List(Message) {
           ],
         ),
       ),
+      attachments: [],
     ),
     Message(
       id: "m4",
@@ -344,6 +347,7 @@ pub fn messages() -> List(Message) {
           ],
         ),
       ),
+      attachments: [],
     ),
     Message(
       id: "m5",
@@ -369,6 +373,7 @@ pub fn messages() -> List(Message) {
           receipts: [Receipt(name: "tomo", time: "5:51:18 pm", relay: TwoHop)],
         ),
       ),
+      attachments: [],
     ),
     Message(
       id: "m6",
@@ -394,6 +399,7 @@ pub fn messages() -> List(Message) {
           receipts: [],
         ),
       ),
+      attachments: [],
     ),
     Message(
       id: "m7",
@@ -407,6 +413,7 @@ pub fn messages() -> List(Message) {
       pending: True,
       reactions: [],
       details: NoDetails,
+      attachments: [],
     ),
   ]
 }

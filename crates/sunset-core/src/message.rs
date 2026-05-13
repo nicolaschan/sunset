@@ -11,7 +11,7 @@ use sunset_store::{ContentBlock, Hash, SignedKvEntry};
 use crate::canonical::signing_payload;
 use crate::crypto::aead::{aead_decrypt, aead_encrypt, build_msg_aad, derive_msg_key, fresh_nonce};
 use crate::crypto::envelope::{
-    ChannelLabel, EncryptedMessage, MessageBody, ReactionAction, SignedMessage,
+    ChannelLabel, EncryptedMessage, ImageAttachment, MessageBody, ReactionAction, SignedMessage,
     inner_sig_payload_bytes,
 };
 use crate::crypto::room::{Room, RoomFingerprint};
@@ -93,8 +93,18 @@ pub fn compose_message<R: CryptoRngCore + ?Sized>(
     Ok(ComposedMessage { entry, block })
 }
 
-/// Compose a chat text message. Convenience wrapper over
-/// `compose_message` with `MessageBody::Text`.
+/// Bundle of the user-authored portion of a chat post — text body and
+/// inline image attachments. Bundled into a single struct so
+/// [`compose_post`] stays below clippy's `too_many_arguments` threshold
+/// (mirroring the same trick [`ReactionPayload`] uses for reactions).
+#[derive(Clone, Debug, Default)]
+pub struct PostPayload<'a> {
+    pub text: &'a str,
+    pub images: &'a [ImageAttachment],
+}
+
+/// Compose a chat text message with no image attachments. Convenience
+/// wrapper over [`compose_post`].
 pub fn compose_text<R: CryptoRngCore + ?Sized>(
     identity: &Identity,
     room: &Room,
@@ -104,13 +114,39 @@ pub fn compose_text<R: CryptoRngCore + ?Sized>(
     text: &str,
     rng: &mut R,
 ) -> Result<ComposedMessage> {
+    compose_post(
+        identity,
+        room,
+        epoch_id,
+        sent_at_ms,
+        channel,
+        &PostPayload { text, images: &[] },
+        rng,
+    )
+}
+
+/// Compose a chat post that may carry inline image attachments. An
+/// image-only post is fine — pass `payload.text = ""` with a non-empty
+/// `payload.images`.
+pub fn compose_post<R: CryptoRngCore + ?Sized>(
+    identity: &Identity,
+    room: &Room,
+    epoch_id: u64,
+    sent_at_ms: u64,
+    channel: ChannelLabel,
+    payload: &PostPayload<'_>,
+    rng: &mut R,
+) -> Result<ComposedMessage> {
     compose_message(
         identity,
         room,
         epoch_id,
         sent_at_ms,
         channel,
-        MessageBody::Text(text.to_owned()),
+        MessageBody::Text {
+            text: payload.text.to_owned(),
+            images: payload.images.to_vec(),
+        },
         rng,
     )
 }
@@ -283,7 +319,7 @@ mod tests {
             0,
             1_700_000_000_000,
             ChannelLabel::default_general(),
-            MessageBody::Text("hi".to_owned()),
+            MessageBody::text("hi"),
             &mut OsRng,
         )
         .unwrap();
@@ -291,7 +327,7 @@ mod tests {
         assert_eq!(decoded.author_key, id.public());
         assert_eq!(decoded.room_fingerprint, room.fingerprint());
         assert_eq!(decoded.epoch_id, 0);
-        assert_eq!(decoded.body, MessageBody::Text("hi".to_owned()));
+        assert_eq!(decoded.body, MessageBody::text("hi"));
         assert_eq!(decoded.sent_at_ms, 1_700_000_000_000);
     }
 
@@ -305,7 +341,7 @@ mod tests {
             0,
             1,
             ChannelLabel::default_general(),
-            MessageBody::Text("x".to_owned()),
+            MessageBody::text("x"),
             &mut OsRng,
         )
         .unwrap();
@@ -323,7 +359,7 @@ mod tests {
             0,
             1,
             ChannelLabel::default_general(),
-            MessageBody::Text("x".to_owned()),
+            MessageBody::text("x"),
             &mut OsRng,
         )
         .unwrap();
@@ -341,7 +377,7 @@ mod tests {
             0,
             1,
             ChannelLabel::default_general(),
-            MessageBody::Text("x".to_owned()),
+            MessageBody::text("x"),
             &mut OsRng,
         )
         .unwrap();
@@ -361,7 +397,7 @@ mod tests {
             0,
             1,
             ChannelLabel::default_general(),
-            MessageBody::Text("x".to_owned()),
+            MessageBody::text("x"),
             &mut OsRng,
         )
         .unwrap();
@@ -389,7 +425,7 @@ mod tests {
             0,
             1,
             ChannelLabel::default_general(),
-            MessageBody::Text("real".to_owned()),
+            MessageBody::text("real"),
             &mut OsRng,
         )
         .unwrap();
@@ -476,7 +512,7 @@ mod tests {
         )
         .unwrap();
         let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
-        assert_eq!(decoded.body, MessageBody::Text("hi".to_owned()));
+        assert_eq!(decoded.body, MessageBody::text("hi"));
     }
 
     #[test]
@@ -603,7 +639,7 @@ mod tests {
         .unwrap();
         let decoded = decode_message(&room, &composed.entry, &composed.block).unwrap();
         assert_eq!(decoded.channel.as_str(), "links");
-        assert_eq!(decoded.body, MessageBody::Text("hi".to_owned()));
+        assert_eq!(decoded.body, MessageBody::text("hi"));
     }
 
     #[test]
@@ -779,7 +815,7 @@ mod tests {
             0,
             1,
             ChannelLabel::default_general(),
-            MessageBody::Text("x".to_owned()),
+            MessageBody::text("x"),
             &mut OsRng,
         )
         .unwrap();
