@@ -5,10 +5,17 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use stunclient::StunClient;
 use tokio::net::{UdpSocket, lookup_host};
+
+/// Per-server timeout for `stun_candidates`. STUN queries share the
+/// single UDP socket and so must run sequentially; an unresponsive
+/// server would otherwise stall the entire candidate-discovery phase
+/// of `QuicRawTransport::bind` for tens of seconds.
+const STUN_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Enumerate local-interface socket addrs stamped with `port`.
 pub fn local_candidates(port: u16) -> Vec<SocketAddr> {
@@ -37,6 +44,12 @@ pub fn local_candidates(port: u16) -> Vec<SocketAddr> {
 
 /// Best-effort STUN-reflexive address lookup over the bound socket.
 /// Returns an empty `Vec` if all STUN servers fail or the list is empty.
+///
+/// STUN queries against distinct servers are run sequentially because
+/// they all share one UDP socket: parallel `query_external_address_async`
+/// calls would race on the recv path. (DNS resolution is the same way.)
+/// If parallel discovery becomes desirable, route the responses through
+/// the same packet-routing layer as the probe handler.
 pub async fn stun_candidates(socket: &UdpSocket, stun_servers: &[String]) -> Vec<SocketAddr> {
     let mut out = HashSet::new();
     for server in stun_servers {
@@ -49,12 +62,16 @@ pub async fn stun_candidates(socket: &UdpSocket, stun_servers: &[String]) -> Vec
         };
         for addr in resolved {
             let client = StunClient::new(addr);
-            match client.query_external_address_async(socket).await {
-                Ok(reflexive) => {
+            let q = client.query_external_address_async(socket);
+            match tokio::time::timeout(STUN_QUERY_TIMEOUT, q).await {
+                Ok(Ok(reflexive)) => {
                     out.insert(reflexive);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!("stun query {addr}: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("stun query {addr}: timed out after {STUN_QUERY_TIMEOUT:?}");
                 }
             }
         }

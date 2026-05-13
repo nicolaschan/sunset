@@ -245,11 +245,32 @@ impl QuicRawTransport {
 
     async fn run_accept_router(self) {
         while let Some(incoming) = self.endpoint.accept().await {
-            let target = self.inner.borrow_mut().accept_waiters.pop_front();
-            if let Some(tx) = target {
-                let _ = tx.send(incoming);
-            } else {
-                incoming.refuse();
+            // Walk the FIFO, popping dead waiters (responders that
+            // pre-registered but errored before awaiting their rx)
+            // until we find a live one or run out. If we run out, the
+            // Incoming is refused (no one's listening).
+            let mut incoming = Some(incoming);
+            loop {
+                let tx = match self.inner.borrow_mut().accept_waiters.pop_front() {
+                    Some(t) => t,
+                    None => break,
+                };
+                if tx.is_closed() {
+                    continue;
+                }
+                let i = incoming.take().expect("incoming present in loop");
+                match tx.send(i) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        // Receiver was dropped between is_closed() and
+                        // send(). Recover the Incoming and try the next
+                        // waiter.
+                        incoming = Some(e.0);
+                    }
+                }
+            }
+            if let Some(i) = incoming {
+                i.refuse();
             }
         }
     }
@@ -357,10 +378,10 @@ impl QuicRawTransport {
                 .await
                 .map_err(|e| SyncError::Transport(format!("quic connect: {e}")))?
         } else {
-            let _ = confirmed.addr; // unused on the responder side; the
-            // pre-registered accept_waiter (step
-            // 3a) holds whatever Incoming the
-            // QUIC client sends.
+            // confirmed.addr is unused on the responder side: the
+            // pre-registered accept_waiter (step 3a) holds whatever
+            // Incoming the QUIC client sends, regardless of source addr.
+            let _ = confirmed;
             let mut accept_rx = accept_rx_opt
                 .expect("accept_rx must exist when !is_initiator (pre-registered in step 3a)");
             let incoming = match tokio::time::timeout(HANDSHAKE_BUDGET, accept_rx.recv()).await {

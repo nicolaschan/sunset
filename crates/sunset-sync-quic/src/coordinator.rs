@@ -34,6 +34,12 @@ pub struct HolepunchCoordinator {
     local_pk: [u8; 32],
     remote_pk: [u8; 32],
     remote_candidates: Vec<SocketAddr>,
+    /// Nonces we've issued in outbound Pings (matching nonce in a
+    /// received Pong confirms the path). The set is bounded by the
+    /// coordinator's lifetime — at the default 250 ms tick and 5 s
+    /// budget, this holds at most ~20 entries, so a HashSet without
+    /// eviction is fine. If `HANDSHAKE_BUDGET` ever grows substantially,
+    /// switch to a ring buffer.
     pending_nonces: HashSet<[u8; 16]>,
     probe_rx: mpsc::UnboundedReceiver<(SocketAddr, Bytes)>,
 }

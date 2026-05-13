@@ -12,9 +12,16 @@ use serde::{Deserialize, Serialize};
 /// First 4 bytes of every holepunch probe datagram. Probes are
 /// recognized at the [`quinn::AsyncUdpSocket`] layer before quinn sees
 /// them; quinn never has to disambiguate.
+///
+/// The trailing `1` is the wire-format version (ASCII). A future
+/// breaking change to [`Probe`]'s layout bumps to `b"SnP2"` etc.; the
+/// peer rejects unknown MAGICs (and we never accidentally decode a v1
+/// probe as v2 because the prefix-match fails).
 pub const MAGIC: [u8; 4] = *b"SnP1";
 
-/// Per-(peer, session) probe datagram.
+/// Per-(peer, session) probe datagram. Versioned via [`MAGIC`] — when
+/// adding/removing fields, bump `MAGIC` so old peers reject the new
+/// shape rather than postcard-misdecoding it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Probe {
     pub session_id: [u8; 16],
