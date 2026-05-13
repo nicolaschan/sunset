@@ -59,7 +59,15 @@ type ProbeRouteTable = HashMap<ProbeRouteKey, mpsc::UnboundedSender<ProbeBytes>>
 struct Inner {
     per_peer: HashMap<PeerId, mpsc::UnboundedSender<Candidates>>,
     probe_routes: ProbeRouteTable,
-    accept_routes: HashMap<SocketAddr, mpsc::UnboundedSender<quinn::Incoming>>,
+    /// FIFO queue of acceptor tasks awaiting the next QUIC `Incoming`.
+    /// Source-address routing is unreliable on multi-homed hosts: the
+    /// holepunch probe and the QUIC initial can take different paths,
+    /// giving the responder a `confirmed.addr` that doesn't match the
+    /// `Incoming.remote_address()`. The v1 contract is "at most one
+    /// concurrent acceptor per transport"; multi-peer concurrent
+    /// inbound is a known limitation (NoiseTransport on top catches
+    /// any cross-routing via its identity binding).
+    accept_waiters: std::collections::VecDeque<mpsc::UnboundedSender<quinn::Incoming>>,
     completed_tx: mpsc::UnboundedSender<SyncResult<QuicRawConnection>>,
     probe_rx: Option<mpsc::UnboundedReceiver<ProbeBytes>>,
     dispatcher_started: bool,
@@ -127,7 +135,7 @@ impl QuicRawTransport {
             inner: Rc::new(RefCell::new(Inner {
                 per_peer: HashMap::new(),
                 probe_routes: HashMap::new(),
-                accept_routes: HashMap::new(),
+                accept_waiters: std::collections::VecDeque::new(),
                 completed_tx,
                 probe_rx: Some(probe_rx),
                 dispatcher_started: false,
@@ -237,8 +245,7 @@ impl QuicRawTransport {
 
     async fn run_accept_router(self) {
         while let Some(incoming) = self.endpoint.accept().await {
-            let remote_addr = incoming.remote_address();
-            let target = self.inner.borrow_mut().accept_routes.remove(&remote_addr);
+            let target = self.inner.borrow_mut().accept_waiters.pop_front();
             if let Some(tx) = target {
                 let _ = tx.send(incoming);
             } else {
@@ -333,34 +340,21 @@ impl QuicRawTransport {
                 .await
                 .map_err(|e| SyncError::Transport(format!("quic connect: {e}")))?
         } else {
+            let _ = confirmed.addr; // unused on the responder side now;
+                                   // accept_router routes FIFO (see Inner doc).
             let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
-            self.inner
-                .borrow_mut()
-                .accept_routes
-                .insert(confirmed.addr, accept_tx);
+            self.inner.borrow_mut().accept_waiters.push_back(accept_tx);
             let incoming = match tokio::time::timeout(HANDSHAKE_BUDGET, accept_rx.recv()).await {
                 Ok(Some(i)) => i,
                 Ok(None) => {
-                    self.inner
-                        .borrow_mut()
-                        .accept_routes
-                        .remove(&confirmed.addr);
                     return Err(SyncError::Transport(
                         "quic accept: incoming channel closed".into(),
                     ));
                 }
                 Err(_) => {
-                    self.inner
-                        .borrow_mut()
-                        .accept_routes
-                        .remove(&confirmed.addr);
                     return Err(SyncError::Transport("quic accept: incoming timeout".into()));
                 }
             };
-            self.inner
-                .borrow_mut()
-                .accept_routes
-                .remove(&confirmed.addr);
             let connecting = incoming
                 .accept()
                 .map_err(|e| SyncError::Transport(format!("quic accept incoming: {e}")))?;
