@@ -2440,8 +2440,13 @@ fn room_view_with_state(
     |> option.map(client_pubkey_hex)
     |> option.unwrap("self")
 
-  let voice_minibar_el = case model.viewport, user_in_call {
-    domain.Phone, True ->
+  // Single in-call bar across both viewports: a strip at the top of
+  // the chat panel showing the connected channel + mute / deafen /
+  // leave. The denoise toggle (and per-peer volume / send quality)
+  // live in the user's own voice popover, opened by tapping the
+  // channel name in the bar.
+  let voice_minibar_el = case user_in_call {
+    True ->
       voice_minibar.view(
         palette: palette,
         channel_name: active_voice_channel_name,
@@ -2452,7 +2457,7 @@ fn room_view_with_state(
         self_muted: model.voice.self_muted,
         self_deafened: model.voice.self_deafened,
       )
-    _, _ -> element.fragment([])
+    False -> element.fragment([])
   }
 
   shell.view(
@@ -2510,13 +2515,7 @@ fn room_view_with_state(
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
       on_join_voice: JoinVoice(active_room.id),
       on_leave_voice: LeaveVoice,
-      on_mute_self: ToggleSelfMute,
-      on_deafen_self: ToggleSelfDeafen,
-      on_toggle_denoise: ToggleSelfDenoise,
       self_in_call: option.is_some(model.voice.self_in_call),
-      self_muted: model.voice.self_muted,
-      self_deafened: model.voice.self_deafened,
-      denoise_on: model.voice.denoise,
       relays: relays_view.relays_for_view(model.intents),
       on_open_relay: OpenRelayPopover,
     ),

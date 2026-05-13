@@ -1,10 +1,10 @@
 // voice_denoise.spec.js — RNNoise receiver-side denoise toggle.
 //
 // Asserts two contracts:
-//   1. The toggle UI is present once the user joins voice, defaults to
-//      enabled (aria-pressed="false" because the warn highlight only
-//      fires for the *non-default* off state), and round-trips through
-//      Lustre + the WASM client without throwing.
+//   1. The toggle UI is present once the user opens their own voice
+//      popover, defaults to enabled (aria-pressed="true" — the popover
+//      switch reads the live state directly, no inversion), and
+//      round-trips through Lustre + the WASM client without throwing.
 //   2. Toggling off and back on doesn't crash the receive path: noise
 //      frames keep arriving on the peer regardless of denoise state.
 //      (Quality of denoising is covered by the Rust integration tests
@@ -12,8 +12,9 @@
 //      test here is wire-through only.)
 //
 // Pattern lifted from voice_mute_deafen.spec.js: spawn a relay, open
-// two browser contexts, join voice, then drive the desktop self-control
-// bar's denoise button.
+// two browser contexts, join voice, then open the user's own voice
+// popover (by tapping the channel name in the minibar) and drive the
+// denoise toggle there.
 
 import { test, expect, devices } from "@playwright/test";
 import {
@@ -32,10 +33,9 @@ test.afterAll(async () => {
   teardownRelay(relay);
 });
 
-// Desktop viewport so the self_control_bar (which holds the denoise
-// button) renders. The phone minibar layout doesn't expose denoise
-// controls — the user opens a voice sheet to access them — and that
-// path is out of scope for this initial wire-through test.
+// Desktop viewport: the voice minibar at the top of the chat panel
+// renders identically on phone and desktop, but driving it from a
+// desktop context is faster than booting a phone emulator.
 async function openPeer(browser, relayAddr) {
   const ctx = await browser.newContext({
     ...devices["Desktop Chrome"],
@@ -77,13 +77,12 @@ async function joinVoice(page) {
 test("denoise toggle defaults on, flips state via aria-pressed, and survives noise traffic", async ({
   browser,
 }, testInfo) => {
-  // The denoise toggle lives in the desktop self_control_bar today;
-  // the phone minibar doesn't expose it yet (the runtime still applies
-  // denoising — it just isn't user-toggleable from the phone UI). Skip
-  // on the mobile project so the UI assertions don't fail spuriously.
+  // Phone and desktop now share the same minibar + popover for voice
+  // controls. Run the wire-through against Desktop to keep startup
+  // fast (no mobile emulation overhead).
   test.skip(
     testInfo.project.name === "mobile-chrome",
-    "denoise toggle UI is desktop-only for now",
+    "wire-through covered by Desktop run; mobile-chrome would just duplicate",
   );
 
   const alice = await openPeer(browser, relay.addr);
@@ -92,17 +91,17 @@ test("denoise toggle defaults on, flips state via aria-pressed, and survives noi
   await joinVoice(alice.page);
   await joinVoice(bob.page);
 
-  const denoiseBtn = bob.page.locator('[data-testid="voice-denoise-toggle"]');
-  await expect(denoiseBtn).toBeVisible({ timeout: 2_000 });
-  // Default: denoise on. The button only highlights for the
-  // non-default state, so aria-pressed reads "false" while denoise is
-  // active. (See `self_control_bar` in channels.gleam for the
-  // pass-`!denoise_on` rationale.)
-  await expect(denoiseBtn).toHaveAttribute("aria-pressed", "false");
-  await expect(denoiseBtn).toHaveAttribute(
-    "title",
-    "Disable noise reduction",
+  // Open bob's own voice popover by tapping the channel name in the
+  // minibar — that's the user path to per-self controls (denoise,
+  // volume, send quality).
+  await bob.page.locator('[data-testid="voice-minibar"]').click();
+  const denoiseBtn = bob.page.locator(
+    '[data-testid="voice-popover-denoise"]',
   );
+  await expect(denoiseBtn).toBeVisible({ timeout: 2_000 });
+  // Default: denoise on. The popover switch mirrors the live state,
+  // so aria-pressed reads "true" while denoise is active.
+  await expect(denoiseBtn).toHaveAttribute("aria-pressed", "true");
 
   // Receiver-side wire-through: install bob's frame recorder so we
   // can confirm frames keep arriving as denoise is toggled.
@@ -146,11 +145,7 @@ test("denoise toggle defaults on, flips state via aria-pressed, and survives noi
 
   // Toggle denoise off via the actual UI button.
   await denoiseBtn.click();
-  await expect(denoiseBtn).toHaveAttribute("aria-pressed", "true");
-  await expect(denoiseBtn).toHaveAttribute(
-    "title",
-    "Enable noise reduction",
-  );
+  await expect(denoiseBtn).toHaveAttribute("aria-pressed", "false");
 
   // Frames continue to flow with denoise off.
   const beforeOff = await bob.page.evaluate(
@@ -176,7 +171,7 @@ test("denoise toggle defaults on, flips state via aria-pressed, and survives noi
 
   // Toggle back on and verify frames still flow.
   await denoiseBtn.click();
-  await expect(denoiseBtn).toHaveAttribute("aria-pressed", "false");
+  await expect(denoiseBtn).toHaveAttribute("aria-pressed", "true");
   const beforeOn = await bob.page.evaluate(
     ([bytes]) =>
       window.sunsetClient.voice_recorded_frames(new Uint8Array(bytes)).length,

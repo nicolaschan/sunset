@@ -347,23 +347,22 @@ test("channels and main column bottom borders line up", async ({ page }, testInf
 
 test("column-bottom rows share a top y-coordinate", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
-  // Rooms rail's pinned 'you' row, channels rail's self-control bar, and
-  // main panel's composer all sit at the bottom of their column. Their
-  // top borders must align horizontally so the layout reads as a single
-  // bottom seam across the screen.
+  // Rooms rail's pinned 'you' row and main panel's composer both sit
+  // at the bottom of their column at a fixed height — their top borders
+  // must align horizontally so the layout reads as a single bottom seam
+  // across the screen. (The channels rail no longer has a fixed bottom
+  // row: the in-call self-controls moved to the voice minibar at the
+  // top of the chat panel, so the rail ends in a scrollable list.)
   const tops = await page.evaluate(() => {
     const rooms = document.querySelectorAll("aside")[0];
-    const channels = document.querySelectorAll("aside")[1];
     const main = document.querySelector("main");
     const lastChild = (parent) => parent.children[parent.children.length - 1];
     return {
       rooms: lastChild(rooms).getBoundingClientRect().top,
-      channels: lastChild(channels).getBoundingClientRect().top,
       main: lastChild(main).getBoundingClientRect().top,
     };
   });
-  expect(Math.abs(tops.rooms - tops.channels)).toBeLessThanOrEqual(1);
-  expect(Math.abs(tops.channels - tops.main)).toBeLessThanOrEqual(1);
+  expect(Math.abs(tops.rooms - tops.main)).toBeLessThanOrEqual(1);
 });
 
 test("channels header has no online subtitle", async ({ page }) => {

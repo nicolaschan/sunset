@@ -87,8 +87,9 @@ test("voice channel roster: both peers visible, waveform tracks real audio", asy
 
   // Channel header reads "Voice Channel" — the rename is part of the
   // user-visible deliverable. Scope to the voice-channel-row testid
-  // because the desktop self-controls bar at the bottom also renders
-  // the channel name (so a bare `getByText` would match twice).
+  // because the voice minibar at the top of the chat panel also
+  // renders the channel name once self_in_call flips true (so a bare
+  // `getByText` would match twice after joining).
   await expect(
     alice.page.locator('[data-testid="voice-channel-row"]'),
   ).toContainText("Voice Channel");
