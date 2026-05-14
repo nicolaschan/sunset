@@ -11,7 +11,7 @@ use sunset_sync::MultiTransport;
 
 use crate::client::{RtcT, WsT};
 
-/// Decode a JS `Array<{ mime_type, data_base64 }>` into a
+/// Decode a JS `Array<{ data_base64 }>` of staged attachments into a
 /// `Vec<ImageAttachment>`, **running each entry through
 /// `ImageAttachment::preprocess`** so the bytes that hit the wire are
 /// the normalised JPEG (or pass-through GIF / WebP for animated
@@ -20,20 +20,16 @@ use crate::client::{RtcT, WsT};
 ///
 /// The JS bridge keeps the raw bytes around for the composer's
 /// thumbnail strip; what crosses this boundary is the post-preprocess
-/// wire form. Errors (`Error::HeicUnsupported`, `Error::Decode`, etc.)
-/// surface back to JS as `JsError` strings the UI can render in a
-/// toast.
+/// wire form. The JS-side `mime_type` field is sent but ignored — the
+/// sniffer trusts magic bytes (browsers mis-label HEIC and renamed
+/// files). Errors surface back to JS as `JsError` strings the caller
+/// can render.
 fn images_from_js(arr: &js_sys::Array) -> Result<Vec<ImageAttachment>, JsError> {
     let len = arr.length() as usize;
     let mut out = Vec::with_capacity(len);
     let b64 = base64::engine::general_purpose::STANDARD;
     for i in 0..arr.length() {
         let item = arr.get(i);
-        // We still read `mime_type` so older bridges / tests don't
-        // break on the missing-field check, but the value is purely
-        // advisory; the sniffer trusts magic bytes.
-        let _ = js_sys::Reflect::get(&item, &JsValue::from_str("mime_type"))
-            .map_err(|_| JsError::new(&format!("images[{i}]: missing mime_type")))?;
         let data = js_sys::Reflect::get(&item, &JsValue::from_str("data_base64"))
             .map_err(|_| JsError::new(&format!("images[{i}]: missing data_base64")))?
             .as_string()
