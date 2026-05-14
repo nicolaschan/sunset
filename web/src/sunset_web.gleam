@@ -240,9 +240,13 @@ pub type Model {
     /// `voice_start`. Read from the store at model init so the radio
     /// in the self-row popover renders the right initial selection.
     voice_quality: String,
-    /// IntentId of the relay whose popover is currently open. Client-wide
-    /// (not per-room) because relays are a client-level concept.
-    relays_popover: option.Option(Float),
+    /// IntentId of the relay whose popover is currently open + the
+    /// click's `clientY` (so the desktop popover can anchor near the
+    /// row that opened it instead of being pinned to the viewport
+    /// bottom). `None` for clicks that don't carry a Y (synthetic
+    /// events, keyboard activation). Client-wide (not per-room)
+    /// because relays are a client-level concept.
+    relays_popover: option.Option(#(Float, option.Option(Float))),
     /// Peer display-name map, keyed by full hex pubkey. Rebuilt from each
     /// room's member list on MembersUpdated. Used by display_name() to
     /// resolve a peer's chosen name with short_pubkey fallback.
@@ -304,7 +308,10 @@ pub type Msg {
   CloseVoicePopover
   OpenPeerStatusPopover(domain.MemberId)
   ClosePeerStatusPopover
-  OpenRelayPopover(Float)
+  /// Open the relay popover anchored at the click's `clientY` on
+  /// desktop. `None` for the anchor when the trigger doesn't carry a
+  /// mouse Y (mobile sheet placement ignores the anchor).
+  OpenRelayPopover(id: Float, anchor_y: option.Option(Float))
   CloseRelayPopover
   Tick(Int)
   SetMemberVolume(String, Int)
@@ -1673,8 +1680,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       with_active_room(model, fn(state) {
         #(RoomState(..state, peer_status_popover: None), effect.none())
       })
-    OpenRelayPopover(id) -> #(
-      Model(..model, relays_popover: option.Some(id)),
+    OpenRelayPopover(id, anchor_y) -> #(
+      Model(..model, relays_popover: option.Some(#(id, anchor_y))),
       effect.none(),
     )
     CloseRelayPopover -> #(
@@ -2458,7 +2465,7 @@ fn room_view_with_state(
   }
 
   let relay_sheet_el = case model.viewport, model.relays_popover {
-    domain.Phone, Some(id) -> {
+    domain.Phone, Some(#(id, _anchor_y)) -> {
       let rs = relays_view.relays_for_view(model.intents)
       case list.find(rs, fn(r) { r.id == id }) {
         Ok(r) ->
@@ -2747,7 +2754,7 @@ fn peer_status_popover_overlay(
 
 fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
   case model.viewport, model.relays_popover {
-    domain.Desktop, Some(id) -> {
+    domain.Desktop, Some(#(id, anchor_y)) -> {
       let rs = relays_view.relays_for_view(model.intents)
       case list.find(rs, fn(r) { r.id == id }) {
         Ok(r) ->
@@ -2757,11 +2764,12 @@ fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
             now_ms: model.now_ms,
             placement: relays_view.Floating(
               // Sit just to the LEFT of the right rail (where the
-              // relays section now lives). The right column is 220px
-              // wide when the members rail is showing — and the relay
-              // popover only opens when that rail is visible — plus
-              // an 8px gap to match other floating overlays.
+              // relays section lives), anchored vertically next to the
+              // row that opened it. `anchor_y` is the click's
+              // `clientY`; the popover code clamps it to keep the
+              // popover fully on-screen.
               anchor_right_px: members_rail_width_px + 8,
+              anchor_y: anchor_y,
             ),
             on_close: CloseRelayPopover,
           )

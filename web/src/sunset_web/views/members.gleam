@@ -6,6 +6,7 @@
 
 import gleam/int
 import gleam/list
+import gleam/option.{type Option}
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
@@ -22,7 +23,7 @@ pub fn view(
   members ms: List(Member),
   relays relays: List(Relay),
   on_open_status on_open: fn(domain.MemberId) -> msg,
-  on_open_relay on_open_relay: fn(Float) -> msg,
+  on_open_relay on_open_relay: fn(Float, Option(Float)) -> msg,
 ) -> Element(msg) {
   let in_call_others = ms |> list.filter(fn(m) { m.in_call && !m.you })
   let online_not_in_call =
@@ -106,7 +107,7 @@ pub fn view(
 fn relay_section(
   p: Palette,
   relays: List(Relay),
-  on_open_relay: fn(Float) -> msg,
+  on_open_relay: fn(Float, Option(Float)) -> msg,
 ) -> Element(msg) {
   html.div(
     [
@@ -177,13 +178,17 @@ fn member_row(
     Speaking -> "600"
     _ -> "400"
   }
-  // Member name color matches the per-author hue used in the chat
-  // scrollback, so a glance at the right rail tells you what color
-  // each speaker's messages will be down in the chat. Offline members
-  // stay muted gray so the eye reads the section as inactive.
-  let color = case m.status {
-    OfflineP -> p.text_faint
-    _ -> theme.hue_for_identity(p, m.name)
+  // Member name color matches the chat author color so a glance at
+  // the right rail tells you what color each speaker's messages will
+  // be down in the chat:
+  //   * YOU → palette accent (same as own-message author name)
+  //   * offline → muted gray (the section reads as inactive)
+  //   * everyone else → stable per-author hue keyed off the display
+  //     name (must match `main_panel.author_color`'s lookup key)
+  let color = case m.you, m.status {
+    True, _ -> p.accent
+    False, OfflineP -> p.text_faint
+    False, _ -> theme.hue_for_identity(p, m.name)
   }
 
   // Click anywhere on the row opens the per-peer status popover.

@@ -4,6 +4,8 @@
 //// view functions land in subsequent changes.
 
 import gleam/dict.{type Dict}
+import gleam/dynamic/decode
+import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option}
@@ -152,71 +154,39 @@ pub fn relays_for_view(intents: Dict(Float, IntentSnapshot)) -> List(Relay) {
   |> list.map(from_intent)
 }
 
-pub fn rail_section(
-  palette p: Palette,
-  relays rs: List(Relay),
-  on_open on_open: fn(Float) -> msg,
-) -> Element(msg) {
-  case rs {
-    [] -> element.fragment([])
-    _ ->
-      html.div(
-        [
-          attribute.attribute("data-testid", "relays-section"),
-          ui.css([
-            #("display", "flex"),
-            #("flex-direction", "column"),
-            #("gap", "4px"),
-          ]),
-        ],
-        [
-          html.div(
-            [
-              ui.css([
-                #("padding", "0 12px 4px 12px"),
-                #("font-size", "13.125px"),
-                #("font-weight", "600"),
-                #("color", p.text_faint),
-                #("text-transform", "uppercase"),
-                #("letter-spacing", "0.04em"),
-              ]),
-            ],
-            [html.text("Relays")],
-          ),
-          html.div(
-            [
-              ui.css([
-                #("display", "flex"),
-                #("flex-direction", "column"),
-                #("gap", "1px"),
-              ]),
-            ],
-            list.map(rs, fn(r) { rail_row(p, r, on_open) }),
-          ),
-        ],
-      )
-  }
-}
-
 /// Public single-row renderer. Used by the members rail's "Relays"
 /// section, which composes its own surrounding `section_title` chrome
 /// rather than wrapping the whole `rail_section` (whose title styling
 /// belongs to the channels rail's visual rhythm).
+///
+/// `on_open` receives the click's `clientY` (or `None` for synthetic /
+/// keyboard activations) so the popover can anchor near the row.
 pub fn row(
   palette p: Palette,
   relay r: Relay,
-  on_open on_open: fn(Float) -> msg,
+  on_open on_open: fn(Float, Option(Float)) -> msg,
 ) -> Element(msg) {
   rail_row(p, r, on_open)
 }
 
-fn rail_row(p: Palette, r: Relay, on_open: fn(Float) -> msg) -> Element(msg) {
+fn rail_row(
+  p: Palette,
+  r: Relay,
+  on_open: fn(Float, Option(Float)) -> msg,
+) -> Element(msg) {
   html.button(
     [
       attribute.attribute("data-testid", "relay-row"),
       attribute.attribute("data-relay-host", r.host),
       attribute.attribute("data-relay-state", state_attr(r.state)),
-      event.on_click(on_open(r.id)),
+      // Capture clientY off the MouseEvent so the popover can anchor
+      // vertically next to the row instead of pinning itself to the
+      // viewport bottom (the previous fixed-bottom layout was visually
+      // disconnected from a click anywhere but the bottommost row).
+      event.on("click", {
+        use cy <- decode.subfield(["clientY"], decode.float)
+        decode.success(on_open(r.id, option.Some(cy)))
+      }),
       // Padding matches `members.member_row` (5px 10px) so the leading
       // status dot lines up vertically across the Online / Offline /
       // Relays sections in the right rail.
@@ -318,14 +288,20 @@ fn state_attr(s: RelayConnState) -> String {
 }
 
 pub type Placement {
-  /// Desktop floating popover. `anchor_right_px` is the distance from
-  /// the right edge of the viewport to the popover's right edge — set
-  /// by the caller to the right-rail width + small gap so the popover
-  /// docks next to the relays section in the members rail instead of
-  /// floating in the middle of the chat. Threaded as a number rather
-  /// than baked in because the right column's width depends on whether
-  /// the per-message details panel is open.
-  Floating(anchor_right_px: Int)
+  /// Desktop floating popover.
+  ///
+  /// `anchor_right_px` is the distance from the right edge of the
+  /// viewport to the popover's right edge — set by the caller to the
+  /// right-rail width + small gap so the popover docks next to the
+  /// relays section in the members rail.
+  ///
+  /// `anchor_y` is the click's `clientY` (pixels from the viewport
+  /// top) when the user clicked a row, or `None` when the popover is
+  /// being opened without mouse coordinates (synthetic event,
+  /// keyboard activation). When provided, the popover anchors next
+  /// to the row that opened it; otherwise it falls back to a
+  /// bottom-anchored placement.
+  Floating(anchor_right_px: Int, anchor_y: Option(Float))
   InSheet
 }
 
@@ -364,27 +340,24 @@ pub fn popover(
     )
 
   case placement {
-    Floating(anchor_right_px) ->
+    Floating(anchor_right_px, anchor_y) ->
       html.div(
         [
           attribute.attribute("data-testid", "relay-popover"),
-          ui.css([
-            #("position", "fixed"),
-            // Bottom-anchored: the relays section is the last block in
-            // the members rail, so a bottom-aligned popover reads as
-            // tied to that section even though we don't measure the row
-            // exactly. The 14px gap matches the page's other floating
-            // overlays.
-            #("bottom", "14px"),
-            #("right", int.to_string(anchor_right_px) <> "px"),
-            #("width", "300px"),
-            #("background", p.surface),
-            #("color", p.text),
-            #("border", "1px solid " <> p.border),
-            #("border-radius", "10px"),
-            #("box-shadow", p.shadow_lg),
-            #("z-index", "20"),
-          ]),
+          ui.css(list.append(
+            [
+              #("position", "fixed"),
+              #("right", int.to_string(anchor_right_px) <> "px"),
+              #("width", "300px"),
+              #("background", p.surface),
+              #("color", p.text),
+              #("border", "1px solid " <> p.border),
+              #("border-radius", "10px"),
+              #("box-shadow", p.shadow_lg),
+              #("z-index", "20"),
+            ],
+            anchor_styles(anchor_y),
+          )),
         ],
         [body],
       )
@@ -401,6 +374,30 @@ pub fn popover(
         ],
         [body],
       )
+  }
+}
+
+/// Vertical placement for the floating popover.
+///
+/// When the click carried a `clientY`, anchor the popover near the
+/// row that opened it: align the popover's top with the click,
+/// clamped via `clamp()` so the popover never escapes the viewport.
+/// Without a click Y (synthetic event), fall back to bottom-anchored
+/// placement at the same 14px gap the page's other floating overlays
+/// use.
+///
+/// Popover height is roughly 200px depending on contents; the clamp
+/// uses 220px of bottom padding so a near-bottom click still leaves
+/// room for the body to render fully.
+fn anchor_styles(anchor_y: Option(Float)) -> List(#(String, String)) {
+  case anchor_y {
+    option.None -> [#("bottom", "14px")]
+    option.Some(y) -> [
+      #(
+        "top",
+        "clamp(8px, " <> float.to_string(y) <> "px, calc(100dvh - 220px))",
+      ),
+    ]
   }
 }
 
