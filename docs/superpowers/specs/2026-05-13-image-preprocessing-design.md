@@ -207,20 +207,25 @@ impl ImageAttachment {
 
 ### Wasm boundary change
 
-Today `sunset-web-wasm::RoomHandle::send_message` takes a JS array of `{ mime_type, data_base64 }`. The JS layer does a `FileReader.readAsDataURL` round-trip and ships base64 across the boundary. Now that we're preprocessing, we want raw bytes to cross the boundary so we can decode them directly.
+The original spec proposed changing the JS↔wasm boundary to carry raw `Uint8Array`s. **Shipped:** the boundary still carries `{ mime_type, data_base64 }` objects, and the Rust side base64-decodes before preprocessing. Rationale: the Gleam composer's pending-attachment strip already needs the base64 data URL for thumbnail rendering, so re-using the same string across the boundary keeps the JS side and the Gleam `Attachment` type unchanged. The cost is one base64-decode pass on send (microseconds), well below the JPEG encode cost; the benefit is a much smaller diff that doesn't touch the composer UI or any Gleam types.
 
-Change:
+Actual shape (`crates/sunset-web-wasm/src/room_handle.rs`):
 
 ```rust
-// crates/sunset-web-wasm/src/room_handle.rs
 fn images_from_js(arr: &js_sys::Array) -> Result<Vec<ImageAttachment>, JsError> {
     let mut out = Vec::with_capacity(arr.length() as usize);
+    let b64 = base64::engine::general_purpose::STANDARD;
     for i in 0..arr.length() {
-        // Each entry is a Uint8Array of the raw file bytes.
-        let bytes_js: js_sys::Uint8Array = arr.get(i).dyn_into()
-            .map_err(|_| JsError::new(&format!("images[{i}]: expected Uint8Array")))?;
-        let bytes = bytes_js.to_vec();
-        let attachment = ImageAttachment::preprocess(&bytes)
+        let item = arr.get(i);
+        let _ = js_sys::Reflect::get(&item, &JsValue::from_str("mime_type"))
+            .map_err(|_| JsError::new(&format!("images[{i}]: missing mime_type")))?;
+        let data = js_sys::Reflect::get(&item, &JsValue::from_str("data_base64"))
+            .map_err(|_| JsError::new(&format!("images[{i}]: missing data_base64")))?
+            .as_string()
+            .ok_or_else(|| JsError::new(&format!("images[{i}].data_base64 must be a string")))?;
+        let raw = b64.decode(&data)
+            .map_err(|e| JsError::new(&format!("images[{i}]: base64 decode: {e}")))?;
+        let attachment = ImageAttachment::preprocess(&raw)
             .map_err(|e| JsError::new(&format!("images[{i}]: {e}")))?;
         out.push(attachment);
     }
@@ -228,29 +233,25 @@ fn images_from_js(arr: &js_sys::Array) -> Result<Vec<ImageAttachment>, JsError> 
 }
 ```
 
-And on the JS side, `pickImages()` switches from `readAsDataURL` to `arrayBuffer()` and passes `Uint8Array`s through. The Gleam `Attachment` type stops carrying `data_base64` for outbound use — it becomes a transient `{mime, bytes}` that the JS bridge consumes and discards once preprocessing is done. (The receive path is unchanged; it still gets `{mime_type, data_base64}` objects out of the wasm side.)
+The browser-supplied `mime_type` is read but discarded; the sniffer trusts magic bytes only (browsers lie about HEIC).
 
 ### Web composer accept list
 
-Update `web/src/sunset_web/sunset.ffi.mjs:506` from
-`"image/jpeg,image/png,image/webp,image/gif"` to
-`"image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif"`.
-
-(The trailing `.heic`/`.heif` filename hints help Safari/Chrome when MIME detection misses.)
+**Shipped:** unchanged at `"image/jpeg,image/png,image/webp,image/gif"`. The original spec proposed adding `image/heic,image/heif`; that change is held back pending the HEIC licence decision because surfacing HEIC in the picker while the wasm side rejects it is bad UX (user picks file → silently nothing happens). When HEIC decode lands, both sides flip in the same PR.
 
 ## E2E
 
-Add to `web/e2e/images.spec.js`:
+Shipped in `web/e2e/images.spec.js`:
 
-1. ~~**HEIC upload smokes through.**~~ Deferred pending HEIC licence decision. Replaced with: **HEIC upload surfaces a helpful error** — pick an HEIC file, assert the composer renders the "please convert to JPEG" message rather than silently dropping the file or shipping HEIC bytes.
-2. **Big-image resize cap.** Pick a 4096×4096 PNG fixture → assert the sent attachment's `src` decodes to a JPEG ≤ 2048 px on its longest edge. (Decode via a tiny `Image` in the page and assert `naturalWidth` / `naturalHeight`.)
-3. **GIF passthrough.** Pick a single-frame GIF (or animated GIF if a fixture exists) → assert the rendered `src` is `data:image/gif;base64,…` and the base64 payload byte-length matches the input (modulo base64 padding).
-4. **PNG → JPEG transcode.** Pick a PNG → assert the rendered `src` starts with `data:image/jpeg;base64,…`, even though the source was PNG.
+1. **PNG → JPEG transcode** (existing `two browsers exchange…` test, updated): pick a PNG, send, assert the receiver's `<img src>` starts with `data:image/jpeg;base64,…` and `el.decode()` produces a real JPEG at the expected dimensions. Replaces the old byte-for-byte PNG round-trip assertion (which no longer holds under preprocessing).
+2. **Oversize PNG resized to cap** (new): generate a 3000×2000 PNG in-browser via `<canvas>.toBlob()` (so no fixture file ships in git), upload via `setInputFiles`, assert the receiver gets a JPEG with longest edge == 2048 px and aspect ratio preserved within 1 px.
+3. **GIF byte-for-byte pass-through** (existing tests, tightened): both `image-only send` and `removing a staged image` now assert `src.endsWith(GIF_1X1_BASE64)`, locking in that GIF stays a GIF unchanged.
+4. **HEIC error surfacing** — *deferred.* The wasm side returns `Error::HeicUnsupported` if HEIC bytes reach it, but the composer doesn't surface send errors to the user today (`MessageSent(_)` is a no-op in `web/src/sunset_web.gleam`). Adding the error-toast plumbing is scope creep for this PR; the rejection is verified at the unit level (`sunset_image::heic_inputs_surface_distinct_error`, `sunset_core::image_attachment_preprocess_surfaces_heic_unsupported`). The composer accept list keeps HEIC out of the picker so the path is unreachable in normal flow.
 
 These tests obey CLAUDE.md test discipline:
 - They drive the actual file picker via Playwright's `setInputFiles`.
-- Timeouts are tight (a 4 MP resize on WASM should complete in well under 2 s; if it doesn't, the perf is a real bug worth catching).
-- No mocks past the integration boundary — real wasm bundle, real `heic` decoder, real `image` encoder.
+- Timeouts are tight (the 3000×2000 → 2048 resize + JPEG encode runs in ~6 s on host hardware; the e2e budget is 30 s to give CI hardware headroom without masking real perf regressions).
+- No mocks past the integration boundary — real wasm bundle, real `image` encoder.
 
 ## What we explicitly do *not* do
 
@@ -260,11 +261,12 @@ These tests obey CLAUDE.md test discipline:
 - **Quality / size knobs in the UI.** The crate exposes `Config` for testing, but production clients use `Default`. If we want a "high quality / data saver" toggle later, it goes through `Config` without API changes.
 - **AVIF / JXL encode.** Decode of AVIF-in-HEIF arrives "for free" via `heic`'s `av1` feature; encode stays JPEG-only for now (universal browser support, no extra deps).
 
-## Open questions (none blocking)
+## Open follow-ups (none blocking this PR)
 
-1. **EXIF orientation handling**: does `image 0.25` apply orientation automatically on decode, or do we need a small inline parser? Implementation task validates this; if not, we vendor a ~30-line orientation pre-rotate before resize.
-2. **Best HEIC fixture source.** Smallest viable HEIC for a test? Either generate one in CI (heic crate may have a fixture we can re-use; check its BSD-3 LICENSE) or capture a 64×64 single-frame HEVC HEIC by hand and commit it.
-3. **Wasm bundle-size budget.** Adding `image` + `heic` will bump the bundle. `heic` is small (pure Rust, no_std); `image` with only jpeg/png/webp/gif features is moderate (~150–250 KB pre-gzip historically). We measure and report; if it crosses a threshold we set lazily-instantiated wasm or a separate worker chunk in a follow-up.
+1. **HEIC licence decision** (see "HEIC licensing decision" above). Until this is resolved, iPhone users on default camera settings can't upload directly.
+2. **EXIF orientation handling.** `image::load_from_memory_with_format` does *not* auto-apply EXIF orientation. The right fix is to decode through `image::ImageReader` + call `decoder.orientation()` + `image.apply_orientation(orientation)`. Deferred to a follow-up; in practice the symptom is iPhone photos appearing sideways after preprocessing.
+3. **Composer error UX.** `MessageSent(_)` is a no-op today. If preprocessing rejects an attachment (HEIC, corrupt JPEG, unknown format) the composer clears and the user sees nothing. A small toast / inline error in the composer would close the loop. Tracked separately because it's a UX scope of its own (applies to all send failures, not just preprocessing).
+4. **Wasm bundle-size budget.** Adding `image` (with jpeg/png/webp/gif features) bumps the wasm bundle. Historical sizing for the `image` crate's relevant codecs is ~150–250 KB pre-gzip. We haven't measured the delta on this branch; if it crosses a sensible threshold we look at lazy instantiation or a separate worker chunk in a follow-up.
 
 ## Migration mechanics
 
