@@ -10,7 +10,7 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ConnStatus, type Room, type RoomId, Connected, Offline, Reconnecting,
+  type Room, type RoomId, Connected, Offline, Reconnecting,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -499,7 +499,6 @@ fn room_full(
           ]),
         ],
         [
-          conn_dot(p, r.status),
           html.div(
             [
               ui.css([
@@ -636,10 +635,46 @@ fn room_mini(
     True -> p.accent_soft
     False -> "transparent"
   }
-  let dot = case r.status {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
+  // Collapsed-rail rooms: a status indicator only appears when the
+  // room is *not* Connected — Connected is the default and showing a
+  // dot for it adds noise without information. Reconnecting → amber
+  // dot; Offline → muted gray dot.
+  let problem_dot = case r.status {
+    Connected -> element.fragment([])
+    Reconnecting ->
+      html.span(
+        [
+          attribute.title("Reconnecting"),
+          ui.css([
+            #("position", "absolute"),
+            #("top", "2px"),
+            #("right", "2px"),
+            #("width", "7px"),
+            #("height", "7px"),
+            #("border-radius", "999px"),
+            #("background", p.warn),
+            #("border", "1.5px solid " <> p.surface),
+          ]),
+        ],
+        [],
+      )
+    Offline ->
+      html.span(
+        [
+          attribute.title("Offline"),
+          ui.css([
+            #("position", "absolute"),
+            #("top", "2px"),
+            #("right", "2px"),
+            #("width", "7px"),
+            #("height", "7px"),
+            #("border-radius", "999px"),
+            #("background", p.text_faint),
+            #("border", "1.5px solid " <> p.surface),
+          ]),
+        ],
+        [],
+      )
   }
   html.button(
     [
@@ -664,20 +699,7 @@ fn room_mini(
       ]),
     ],
     [
-      html.span(
-        [
-          ui.css([
-            #("position", "absolute"),
-            #("top", "2px"),
-            #("right", "2px"),
-            #("width", "7px"),
-            #("height", "7px"),
-            #("border-radius", "999px"),
-            #("background", dot),
-          ]),
-        ],
-        [],
-      ),
+      problem_dot,
       html.span([], [html.text(string.uppercase(string.slice(r.name, 0, 1)))]),
       case r.unread {
         0 -> element.fragment([])
@@ -705,27 +727,6 @@ fn room_mini(
           )
       },
     ],
-  )
-}
-
-fn conn_dot(p: Palette, s: ConnStatus) -> Element(msg) {
-  let c = case s {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
-  }
-  html.span(
-    [
-      ui.css([
-        #("width", "7px"),
-        #("height", "7px"),
-        #("border-radius", "999px"),
-        #("background", c),
-        #("display", "inline-block"),
-        #("flex-shrink", "0"),
-      ]),
-    ],
-    [],
   )
 }
 
@@ -797,16 +798,13 @@ fn you_row(
       ]),
     ],
     [
-      html.span(
-        [
-          ui.css([
-            #("color", p.live),
-            #("font-size", "12.5px"),
-            #("line-height", "1"),
-          ]),
-        ],
-        [html.text("●")],
-      ),
+      // Avatar circle on both collapsed and expanded rails. The
+      // collapsed variant shows just the avatar; the expanded variant
+      // adds the user's display name to the right. We dropped the
+      // separate "you" label + mono-font subtitle pair because the row
+      // sits in the user's own column at the bottom of the screen —
+      // the avatar + name combination already reads as "you".
+      user_avatar(p, your_name),
       case collapsed {
         True -> element.fragment([])
         False ->
@@ -814,30 +812,79 @@ fn you_row(
             [
               ui.css([
                 #("flex", "1"),
-                #("display", "flex"),
-                #("align-items", "baseline"),
-                #("gap", "6px"),
                 #("min-width", "0"),
+                #("font-weight", "500"),
+                #("color", p.text),
+                #("white-space", "nowrap"),
+                #("overflow", "hidden"),
+                #("text-overflow", "ellipsis"),
               ]),
             ],
-            [
-              html.span(
-                [ui.css([#("font-weight", "500"), #("color", p.text)])],
-                [html.text("you")],
-              ),
-              html.span(
-                [
-                  ui.css([
-                    #("font-family", theme.font_mono),
-                    #("font-size", "13.125px"),
-                    #("color", p.text_faint),
-                  ]),
-                ],
-                [html.text(your_name)],
-              ),
-            ],
+            [html.text(your_name)],
           )
       },
+    ],
+  )
+}
+
+/// Round avatar tile used in the rooms-rail bottom "you" row. The
+/// generic-user SVG keeps the chrome readable when the display name
+/// is empty / placeholder; once the user picks a name, the initial
+/// could be swapped in here, but the silhouette is the unambiguous
+/// "this is your account" affordance.
+fn user_avatar(p: Palette, _name: String) -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+        #("width", "28px"),
+        #("height", "28px"),
+        #("border-radius", "999px"),
+        #("background", p.surface_alt),
+        #("color", p.text_muted),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [user_icon()],
+  )
+}
+
+fn user_icon() -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "16"),
+      attribute.attribute("height", "16"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "circle",
+        [
+          attribute.attribute("cx", "8"),
+          attribute.attribute("cy", "6"),
+          attribute.attribute("r", "2.6"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute("d", "M2.5 13.5a5.5 5.5 0 0111 0"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
     ],
   )
 }

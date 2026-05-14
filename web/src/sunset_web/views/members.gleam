@@ -1,20 +1,29 @@
-//// Members rail (column 4) — online + offline groupings, status dots,
-//// no avatars. Routing-detail-on-hover is deferred.
+//// Members rail (column 4) — online + offline member groupings, plus
+//// the relays section (which used to live in the channels rail but
+//// is conceptually about who/what we're connected to, not what
+//// channels exist; same column as the member roster reads more
+//// naturally).
 
 import gleam/int
 import gleam/list
+import gleam/option.{type Option}
 import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
-import sunset_web/domain.{type Member, Away, MutedP, OfflineP, Online, Speaking}
+import sunset_web/domain.{
+  type Member, type Relay, Away, MutedP, OfflineP, Online, Speaking,
+}
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
+import sunset_web/views/relays as relays_view
 
 pub fn view(
   palette p: Palette,
   members ms: List(Member),
+  relays relays: List(Relay),
   on_open_status on_open: fn(domain.MemberId) -> msg,
+  on_open_relay on_open_relay: fn(Float, Option(Float)) -> msg,
 ) -> Element(msg) {
   let in_call_others = ms |> list.filter(fn(m) { m.in_call && !m.you })
   let online_not_in_call =
@@ -79,7 +88,49 @@ pub fn view(
             list.map(offline_members, fn(m) { member_row(p, m, on_open, True) }),
           ])
       },
+      // Relays show after the member groupings. Same column rather than
+      // a separate panel because the user reads "who am I connected to"
+      // top-to-bottom: members in the room, then the upstream relays
+      // those members route through.
+      case relays {
+        [] -> []
+        _ -> [relay_section(p, relays, on_open_relay)]
+      },
     ]),
+  )
+}
+
+/// "Relays" section header + rows, rendered into the members rail.
+/// The wrapping div carries `data-testid="relays-section"` so e2e
+/// tests can assert presence of the relay UI regardless of which rail
+/// it lives in (the testid contract predates this move).
+fn relay_section(
+  p: Palette,
+  relays: List(Relay),
+  on_open_relay: fn(Float, Option(Float)) -> msg,
+) -> Element(msg) {
+  html.div(
+    [
+      attribute.attribute("data-testid", "relays-section"),
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+      ]),
+    ],
+    [
+      html.div([ui.css([#("height", "12px")])], []),
+      section_title(p, "Relays — " <> int.to_string(list.length(relays))),
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "1px"),
+          ]),
+        ],
+        list.map(relays, fn(r) { relays_view.row(p, r, on_open_relay) }),
+      ),
+    ],
   )
 }
 
@@ -105,9 +156,16 @@ fn member_row(
   on_open: fn(domain.MemberId) -> msg,
   dim: Bool,
 ) -> Element(msg) {
+  // Universal presence semantics:
+  //   * Speaking / Online → green (palette ok = palette live)
+  //   * Away → amber (warn)
+  //   * Muted / Offline → muted gray
+  // No accent / sunset color in the presence dot — sunset is reserved
+  // for branding / CTAs, and using it for status was making "online"
+  // hard to recognize at a glance.
   let dot_color = case m.status {
-    Speaking -> p.live
-    Online -> p.live
+    Speaking -> p.ok
+    Online -> p.ok
     Away -> p.warn
     MutedP -> p.text_faint
     OfflineP -> p.text_faint
@@ -120,9 +178,17 @@ fn member_row(
     Speaking -> "600"
     _ -> "400"
   }
-  let color = case m.status {
-    Speaking -> p.text
-    _ -> p.text_muted
+  // Member name color matches the chat author color so a glance at
+  // the right rail tells you what color each speaker's messages will
+  // be down in the chat:
+  //   * YOU → palette accent (same as own-message author name)
+  //   * offline → muted gray (the section reads as inactive)
+  //   * everyone else → stable per-author hue keyed off the display
+  //     name (must match `main_panel.author_color`'s lookup key)
+  let color = case m.you, m.status {
+    True, _ -> p.accent
+    False, OfflineP -> p.text_faint
+    False, _ -> theme.hue_for_identity(p, m.name)
   }
 
   // Click anywhere on the row opens the per-peer status popover.
@@ -152,15 +218,29 @@ fn member_row(
     ),
     list.flatten([
       [
+        // Offline members render a hollow ring rather than a filled
+        // dot — same shape, but visually reads as "this is off" without
+        // the user having to remember which gray means what.
         html.span(
           [
-            ui.css([
-              #("width", "7px"),
-              #("height", "7px"),
-              #("border-radius", "999px"),
-              #("background", dot_color),
-              #("flex-shrink", "0"),
-            ]),
+            ui.css(case m.status {
+              OfflineP -> [
+                #("width", "7px"),
+                #("height", "7px"),
+                #("border-radius", "999px"),
+                #("background", "transparent"),
+                #("border", "1.5px solid " <> dot_color),
+                #("box-sizing", "border-box"),
+                #("flex-shrink", "0"),
+              ]
+              _ -> [
+                #("width", "7px"),
+                #("height", "7px"),
+                #("border-radius", "999px"),
+                #("background", dot_color),
+                #("flex-shrink", "0"),
+              ]
+            }),
           ],
           [],
         ),

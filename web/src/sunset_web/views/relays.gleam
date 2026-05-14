@@ -4,6 +4,8 @@
 //// view functions land in subsequent changes.
 
 import gleam/dict.{type Dict}
+import gleam/dynamic/decode
+import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option}
@@ -152,68 +154,57 @@ pub fn relays_for_view(intents: Dict(Float, IntentSnapshot)) -> List(Relay) {
   |> list.map(from_intent)
 }
 
-pub fn rail_section(
+/// Public single-row renderer. Used by the members rail's "Relays"
+/// section, which composes its own surrounding `section_title` chrome
+/// rather than wrapping the whole `rail_section` (whose title styling
+/// belongs to the channels rail's visual rhythm).
+///
+/// `on_open` receives the click's `clientY` (or `None` for synthetic /
+/// keyboard activations) so the popover can anchor near the row.
+pub fn row(
   palette p: Palette,
-  relays rs: List(Relay),
-  on_open on_open: fn(Float) -> msg,
+  relay r: Relay,
+  on_open on_open: fn(Float, Option(Float)) -> msg,
 ) -> Element(msg) {
-  case rs {
-    [] -> element.fragment([])
-    _ ->
-      html.div(
-        [
-          attribute.attribute("data-testid", "relays-section"),
-          ui.css([
-            #("display", "flex"),
-            #("flex-direction", "column"),
-            #("gap", "4px"),
-          ]),
-        ],
-        [
-          html.div(
-            [
-              ui.css([
-                #("padding", "0 12px 4px 12px"),
-                #("font-size", "13.125px"),
-                #("color", p.text_faint),
-                #("text-transform", "uppercase"),
-                #("letter-spacing", "0.04em"),
-              ]),
-            ],
-            [html.text("Relays")],
-          ),
-          html.div(
-            [
-              ui.css([
-                #("display", "flex"),
-                #("flex-direction", "column"),
-                #("gap", "1px"),
-              ]),
-            ],
-            list.map(rs, fn(r) { rail_row(p, r, on_open) }),
-          ),
-        ],
-      )
-  }
+  rail_row(p, r, on_open)
 }
 
-fn rail_row(p: Palette, r: Relay, on_open: fn(Float) -> msg) -> Element(msg) {
+fn rail_row(
+  p: Palette,
+  r: Relay,
+  on_open: fn(Float, Option(Float)) -> msg,
+) -> Element(msg) {
   html.button(
     [
       attribute.attribute("data-testid", "relay-row"),
       attribute.attribute("data-relay-host", r.host),
       attribute.attribute("data-relay-state", state_attr(r.state)),
-      event.on_click(on_open(r.id)),
+      // Capture clientY off the MouseEvent so the popover can anchor
+      // vertically next to the row instead of pinning itself to the
+      // viewport bottom (the previous fixed-bottom layout was visually
+      // disconnected from a click anywhere but the bottommost row).
+      event.on("click", {
+        use cy <- decode.subfield(["clientY"], decode.float)
+        decode.success(on_open(r.id, option.Some(cy)))
+      }),
+      // Padding matches `members.member_row` (5px 10px) so the leading
+      // status dot lines up vertically across the Online / Offline /
+      // Relays sections in the right rail.
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),
         #("gap", "8px"),
-        #("padding", "6px 12px"),
+        #("padding", "5px 10px"),
         #("border", "none"),
         #("background", "transparent"),
         #("color", p.text_muted),
         #("font-family", "inherit"),
         #("font-size", "16.25px"),
+        // Buttons inherit the page font, but not its weight — some UAs
+        // bake a bold weight into their button stylesheet. Spell normal
+        // out so the relay host renders at the same weight as a
+        // sibling channel row.
+        #("font-weight", "400"),
         #("text-align", "left"),
         #("cursor", "pointer"),
         #("border-radius", "6px"),
@@ -237,20 +228,48 @@ fn rail_row(p: Palette, r: Relay, on_open: fn(Float) -> msg) -> Element(msg) {
   )
 }
 
+/// Relay rail per-row indicator. The relay-list IS a transport
+/// diagnostic, so unlike most rows in the UI we always show some glyph
+/// here — but with universal status semantics: filled green for
+/// connected, filled amber for actively retrying, hollow gray for
+/// cancelled (so the eye reads it as "off" without looking up the
+/// color). Connecting and Backoff share the amber fill; the popover
+/// breaks them out with a text label.
 fn conn_dot(p: Palette, s: RelayConnState) -> Element(msg) {
-  let c = case s {
-    RelayConnected -> p.live
-    RelayConnecting -> p.warn
-    RelayBackoff -> p.warn
-    RelayCancelled -> p.text_faint
+  case s {
+    RelayConnected -> filled_dot(p.ok)
+    RelayConnecting -> filled_dot(p.warn)
+    RelayBackoff -> filled_dot(p.warn)
+    RelayCancelled -> hollow_dot(p.text_faint)
   }
+}
+
+fn filled_dot(color: String) -> Element(msg) {
   html.span(
     [
       ui.css([
         #("width", "7px"),
         #("height", "7px"),
         #("border-radius", "999px"),
-        #("background", c),
+        #("background", color),
+        #("display", "inline-block"),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [],
+  )
+}
+
+fn hollow_dot(color: String) -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("width", "7px"),
+        #("height", "7px"),
+        #("border-radius", "999px"),
+        #("background", "transparent"),
+        #("border", "1.5px solid " <> color),
+        #("box-sizing", "border-box"),
         #("display", "inline-block"),
         #("flex-shrink", "0"),
       ]),
@@ -269,13 +288,20 @@ fn state_attr(s: RelayConnState) -> String {
 }
 
 pub type Placement {
-  /// Desktop floating popover. `anchor_left_px` is where the popover's
-  /// left edge sits — set by the caller to the channels-rail right
-  /// edge + small gap so the popover docks next to the relays section
-  /// instead of the chat shell's right column. Threaded as a number
-  /// rather than baked in here because the channels rail's left
-  /// position depends on whether the rooms rail is collapsed.
-  Floating(anchor_left_px: Int)
+  /// Desktop floating popover.
+  ///
+  /// `anchor_right_px` is the distance from the right edge of the
+  /// viewport to the popover's right edge — set by the caller to the
+  /// right-rail width + small gap so the popover docks next to the
+  /// relays section in the members rail.
+  ///
+  /// `anchor_y` is the click's `clientY` (pixels from the viewport
+  /// top) when the user clicked a row, or `None` when the popover is
+  /// being opened without mouse coordinates (synthetic event,
+  /// keyboard activation). When provided, the popover anchors next
+  /// to the row that opened it; otherwise it falls back to a
+  /// bottom-anchored placement.
+  Floating(anchor_right_px: Int, anchor_y: Option(Float))
   InSheet
 }
 
@@ -314,27 +340,24 @@ pub fn popover(
     )
 
   case placement {
-    Floating(anchor_left_px) ->
+    Floating(anchor_right_px, anchor_y) ->
       html.div(
         [
           attribute.attribute("data-testid", "relay-popover"),
-          ui.css([
-            #("position", "fixed"),
-            // Bottom-anchored: the relays section is the last block in
-            // the channels rail, so a bottom-aligned popover reads as
-            // tied to that section even though we don't measure the row
-            // exactly. The 14px gap matches the page's other floating
-            // overlays.
-            #("bottom", "14px"),
-            #("left", int.to_string(anchor_left_px) <> "px"),
-            #("width", "300px"),
-            #("background", p.surface),
-            #("color", p.text),
-            #("border", "1px solid " <> p.border),
-            #("border-radius", "10px"),
-            #("box-shadow", p.shadow_lg),
-            #("z-index", "20"),
-          ]),
+          ui.css(list.append(
+            [
+              #("position", "fixed"),
+              #("right", int.to_string(anchor_right_px) <> "px"),
+              #("width", "300px"),
+              #("background", p.surface),
+              #("color", p.text),
+              #("border", "1px solid " <> p.border),
+              #("border-radius", "10px"),
+              #("box-shadow", p.shadow_lg),
+              #("z-index", "20"),
+            ],
+            anchor_styles(anchor_y),
+          )),
         ],
         [body],
       )
@@ -351,6 +374,30 @@ pub fn popover(
         ],
         [body],
       )
+  }
+}
+
+/// Vertical placement for the floating popover.
+///
+/// When the click carried a `clientY`, anchor the popover near the
+/// row that opened it: align the popover's top with the click,
+/// clamped via `clamp()` so the popover never escapes the viewport.
+/// Without a click Y (synthetic event), fall back to bottom-anchored
+/// placement at the same 14px gap the page's other floating overlays
+/// use.
+///
+/// Popover height is roughly 200px depending on contents; the clamp
+/// uses 220px of bottom padding so a near-bottom click still leaves
+/// room for the body to render fully.
+fn anchor_styles(anchor_y: Option(Float)) -> List(#(String, String)) {
+  case anchor_y {
+    option.None -> [#("bottom", "14px")]
+    option.Some(y) -> [
+      #(
+        "top",
+        "clamp(8px, " <> float.to_string(y) <> "px, calc(100dvh - 220px))",
+      ),
+    ]
   }
 }
 
@@ -398,11 +445,11 @@ fn header(p: Palette, host: String, on_close: msg) -> Element(msg) {
 }
 
 fn status_pill(p: Palette, state: RelayConnState, label: String) -> Element(msg) {
-  let bg = case state {
-    RelayConnected -> p.live
-    RelayConnecting -> p.warn
-    RelayBackoff -> p.warn
-    RelayCancelled -> p.text_faint
+  let #(bg, fg) = case state {
+    RelayConnected -> #(p.ok_soft, p.ok)
+    RelayConnecting -> #(p.warn_soft, p.warn)
+    RelayBackoff -> #(p.warn_soft, p.warn)
+    RelayCancelled -> #(p.surface_alt, p.text_faint)
   }
   html.span(
     [
@@ -412,7 +459,7 @@ fn status_pill(p: Palette, state: RelayConnState, label: String) -> Element(msg)
         #("padding", "2px 8px"),
         #("border-radius", "999px"),
         #("background", bg),
-        #("color", p.accent_ink),
+        #("color", fg),
         #("font-size", "13px"),
         #("font-weight", "600"),
       ]),

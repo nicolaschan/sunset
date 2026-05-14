@@ -314,11 +314,15 @@ fn reset_section(p: Palette, on_reset: msg) -> Element(msg) {
           attribute.attribute("data-testid", "settings-reset"),
           attribute.title("Wipe all local data and reload"),
           event.on_click(on_reset),
+          // Destructive action → danger palette, not warn. Warn is for
+          // "this might want attention" (e.g. a peer routing via relay);
+          // wiping all local state is unambiguously a destructive
+          // operation, and red is the universal signal for that.
           ui.css([
             #("padding", "8px 12px"),
-            #("border", "1px solid " <> p.warn),
-            #("background", p.warn_soft),
-            #("color", p.warn),
+            #("border", "1px solid " <> p.danger),
+            #("background", p.danger_soft),
+            #("color", p.danger),
             #("border-radius", "6px"),
             #("cursor", "pointer"),
             #("font-family", "inherit"),

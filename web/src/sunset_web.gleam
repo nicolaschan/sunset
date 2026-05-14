@@ -153,8 +153,13 @@ fn initial_channels() -> List(domain.Channel) {
       unread: 0,
     ),
     domain.Channel(
+      // Default voice channel is named "general" in parallel to the
+      // default text channel — same room-wide affordance for "the
+      // unstructured place where everyone hangs out", just one for
+      // typing and one for talking. The kind in the channels rail is
+      // what distinguishes them, not the name.
       id: ChannelId("voice"),
-      name: "Voice Channel",
+      name: "general",
       kind: domain.Voice,
       in_call: 0,
       unread: 0,
@@ -235,9 +240,13 @@ pub type Model {
     /// `voice_start`. Read from the store at model init so the radio
     /// in the self-row popover renders the right initial selection.
     voice_quality: String,
-    /// IntentId of the relay whose popover is currently open. Client-wide
-    /// (not per-room) because relays are a client-level concept.
-    relays_popover: option.Option(Float),
+    /// IntentId of the relay whose popover is currently open + the
+    /// click's `clientY` (so the desktop popover can anchor near the
+    /// row that opened it instead of being pinned to the viewport
+    /// bottom). `None` for clicks that don't carry a Y (synthetic
+    /// events, keyboard activation). Client-wide (not per-room)
+    /// because relays are a client-level concept.
+    relays_popover: option.Option(#(Float, option.Option(Float))),
     /// Peer display-name map, keyed by full hex pubkey. Rebuilt from each
     /// room's member list on MembersUpdated. Used by display_name() to
     /// resolve a peer's chosen name with short_pubkey fallback.
@@ -299,7 +308,10 @@ pub type Msg {
   CloseVoicePopover
   OpenPeerStatusPopover(domain.MemberId)
   ClosePeerStatusPopover
-  OpenRelayPopover(Float)
+  /// Open the relay popover anchored at the click's `clientY` on
+  /// desktop. `None` for the anchor when the trigger doesn't carry a
+  /// mouse Y (mobile sheet placement ignores the anchor).
+  OpenRelayPopover(id: Float, anchor_y: option.Option(Float))
   CloseRelayPopover
   Tick(Int)
   SetMemberVolume(String, Int)
@@ -1668,8 +1680,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       with_active_room(model, fn(state) {
         #(RoomState(..state, peer_status_popover: None), effect.none())
       })
-    OpenRelayPopover(id) -> #(
-      Model(..model, relays_popover: option.Some(id)),
+    OpenRelayPopover(id, anchor_y) -> #(
+      Model(..model, relays_popover: option.Some(#(id, anchor_y))),
       effect.none(),
     )
     CloseRelayPopover -> #(
@@ -2453,7 +2465,7 @@ fn room_view_with_state(
   }
 
   let relay_sheet_el = case model.viewport, model.relays_popover {
-    domain.Phone, Some(id) -> {
+    domain.Phone, Some(#(id, _anchor_y)) -> {
       let rs = relays_view.relays_for_view(model.intents)
       case list.find(rs, fn(r) { r.id == id }) {
         Ok(r) ->
@@ -2506,7 +2518,7 @@ fn room_view_with_state(
   let active_voice_channel_name =
     list.find(channels_for_view, fn(c) { c.kind == domain.Voice })
     |> result.map(fn(c) { c.name })
-    |> result.unwrap("Voice Channel")
+    |> result.unwrap("general")
 
   // Self peer hex for the minibar's "open my own popover" affordance.
   // Falls back to "self" when there's no client (pre-bootstrap, never
@@ -2592,8 +2604,6 @@ fn room_view_with_state(
       on_join_voice: JoinVoice(active_room.id),
       on_leave_voice: LeaveVoice,
       self_in_call: option.is_some(model.voice.self_in_call),
-      relays: relays_view.relays_for_view(model.intents),
-      on_open_relay: OpenRelayPopover,
     ),
     main_panel.view(
       palette: palette,
@@ -2644,7 +2654,9 @@ fn room_view_with_state(
         members.view(
           palette: palette,
           members: state.members,
+          relays: relays_view.relays_for_view(model.intents),
           on_open_status: OpenPeerStatusPopover,
+          on_open_relay: OpenRelayPopover,
         )
     },
     element.fragment([
@@ -2742,7 +2754,7 @@ fn peer_status_popover_overlay(
 
 fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
   case model.viewport, model.relays_popover {
-    domain.Desktop, Some(id) -> {
+    domain.Desktop, Some(#(id, anchor_y)) -> {
       let rs = relays_view.relays_for_view(model.intents)
       case list.find(rs, fn(r) { r.id == id }) {
         Ok(r) ->
@@ -2751,9 +2763,13 @@ fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
             relay: r,
             now_ms: model.now_ms,
             placement: relays_view.Floating(
-              anchor_left_px: rooms_rail_width_px(model.rooms_collapsed)
-              + channels_rail_width_px
-              + 8,
+              // Sit just to the LEFT of the right rail (where the
+              // relays section lives), anchored vertically next to the
+              // row that opened it. `anchor_y` is the click's
+              // `clientY`; the popover code clamps it to keep the
+              // popover fully on-screen.
+              anchor_right_px: members_rail_width_px + 8,
+              anchor_y: anchor_y,
             ),
             on_close: CloseRelayPopover,
           )
@@ -2764,20 +2780,11 @@ fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
   }
 }
 
-/// Mirrors `shell.desktop_view`'s grid-template-columns rooms slot.
-/// Kept here (and not threaded as a constant from `shell`) because the
-/// only desktop overlay that needs the channels-rail right edge is the
-/// relay popover, and Lustre doesn't measure layout from the inside —
-/// the popover's `left` has to come from the layout's source of truth.
-fn rooms_rail_width_px(collapsed: Bool) -> Int {
-  case collapsed {
-    True -> 54
-    False -> 260
-  }
-}
-
-/// Mirrors `shell.desktop_view`'s grid-template-columns channels slot.
-const channels_rail_width_px: Int = 230
+/// Mirrors `shell.desktop_view`'s grid-template-columns right slot when
+/// the per-message details panel is closed (i.e. when the members rail —
+/// and therefore the relays section — is what we're rendering on the
+/// right). Used by the relay popover to anchor next to the rail.
+const members_rail_width_px: Int = 220
 
 fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
   let needle = string.lowercase(string.trim(search))
