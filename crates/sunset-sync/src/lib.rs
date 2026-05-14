@@ -3,6 +3,7 @@
 //!
 //! See `docs/superpowers/specs/2026-04-25-sunset-store-and-sync-design.md` for design.
 
+pub mod chunked;
 mod connectable;
 pub mod digest;
 pub mod dual_inbound_transport;
@@ -28,6 +29,7 @@ pub mod test_transport;
 #[cfg(test)]
 mod test_fixtures;
 
+pub use chunked::ChunkedConnection;
 pub use connectable::{Connectable, ResolveErr};
 pub use dual_inbound_transport::{DualConnection, DualInboundTransport};
 pub use engine::{EngineEvent, SyncEngine};
