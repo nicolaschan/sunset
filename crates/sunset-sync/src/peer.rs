@@ -24,6 +24,20 @@ pub(crate) enum InboundEvent {
         conn_id: crate::engine::ConnectionId,
         kind: crate::transport::TransportKind,
         out_tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>,
+        /// Engine-owned shutdown signal: when the engine drops this
+        /// Sender (because `peer_outbound` got replaced by a newer
+        /// conn's PeerHello, or `remove_peer` deleted the entry), each
+        /// per-peer task observes `Receiver::changed().await` returning
+        /// `Err` and exits cleanly. Without this signal the OLD
+        /// per-peer task lingers indefinitely — `out_tx_clone` in
+        /// `run_peer`'s outer scope keeps the outbound channel open, so
+        /// `send_task` can't exit via channel-close; and as long as the
+        /// peer keeps responding to Pings, liveness never times out
+        /// either. Many reconnect cycles for the same peer
+        /// (browser tab close + reopen, mobile network blip) would
+        /// otherwise leak one zombie run_peer task + one zombie TCP
+        /// socket per cycle.
+        shutdown: tokio::sync::watch::Sender<()>,
         /// One-shot fired by the engine after `peer_outbound` is
         /// populated, to wake the `add_peer().await` caller. Threading
         /// the signal through the inbound event (rather than firing it
@@ -136,7 +150,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     }
 
     // Receive the peer's Hello.
-    let peer_id = match recv_reliable_message(&*conn).await {
+    let (peer_id, shutdown_rx) = match recv_reliable_message(&*conn).await {
         Ok(SyncMessage::Hello {
             protocol_version,
             peer_id,
@@ -160,14 +174,25 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             // fires it after `peer_outbound` is populated, so the
             // `add_peer().await` caller can rely on the peer being
             // routable when the call returns.
+            //
+            // Build the engine-owned shutdown signal here. The Sender
+            // ships out in PeerHello; the Receiver stays in this
+            // run_peer and is cloned into each task's select arm. When
+            // the engine later drops `peer_outbound[peer_id]` (replace
+            // on reconnect or `remove_peer`), the Sender drops and each
+            // task's `changed().await` returns `Err` — the structural
+            // teardown signal that doesn't otherwise exist (see the
+            // `shutdown` field doc on InboundEvent::PeerHello).
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
             let _ = inbound_tx.send(InboundEvent::PeerHello {
                 peer_id: peer_id.clone(),
                 conn_id,
                 kind: local_kind,
                 out_tx,
+                shutdown: shutdown_tx,
                 registered: hello_done,
             });
-            peer_id
+            (peer_id, shutdown_rx)
         }
         Ok(other) => {
             let err_str = format!("expected Hello, got {:?}", other);
@@ -215,46 +240,59 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let peer_id = peer_id.clone();
         let out_tx_for_pong = out_tx_clone.clone();
         let pong_tx = pong_tx.clone();
+        let mut shutdown = shutdown_rx.clone();
         async move {
             loop {
-                match recv_reliable_message(&*conn).await {
-                    Ok(SyncMessage::Goodbye {}) => {
-                        let _ = inbound_tx.send(InboundEvent::Disconnected {
-                            peer_id: peer_id.clone(),
-                            conn_id,
-                            reason: "peer goodbye".into(),
-                        });
-                        break;
-                    }
-                    Ok(SyncMessage::Ping { nonce }) => {
-                        // Respond via the outbound channel; never call
-                        // conn.send_reliable directly to avoid concurrent
-                        // writes (NoiseTransport tracks nonces per send).
-                        let _ = out_tx_for_pong.send(SyncMessage::Pong { nonce });
-                    }
-                    Ok(SyncMessage::Pong { nonce }) => {
-                        // Notify liveness_task with the echoed nonce.
-                        let _ = pong_tx.send(nonce);
-                    }
-                    Ok(message) => {
-                        if inbound_tx
-                            .send(InboundEvent::Message {
-                                from: peer_id.clone(),
-                                message,
-                            })
-                            .is_err()
-                        {
-                            break;
+                tokio::select! {
+                    msg = recv_reliable_message(&*conn) => {
+                        match msg {
+                            Ok(SyncMessage::Goodbye {}) => {
+                                let _ = inbound_tx.send(InboundEvent::Disconnected {
+                                    peer_id: peer_id.clone(),
+                                    conn_id,
+                                    reason: "peer goodbye".into(),
+                                });
+                                break;
+                            }
+                            Ok(SyncMessage::Ping { nonce }) => {
+                                // Respond via the outbound channel; never call
+                                // conn.send_reliable directly to avoid concurrent
+                                // writes (NoiseTransport tracks nonces per send).
+                                let _ = out_tx_for_pong.send(SyncMessage::Pong { nonce });
+                            }
+                            Ok(SyncMessage::Pong { nonce }) => {
+                                // Notify liveness_task with the echoed nonce.
+                                let _ = pong_tx.send(nonce);
+                            }
+                            Ok(message) => {
+                                if inbound_tx
+                                    .send(InboundEvent::Message {
+                                        from: peer_id.clone(),
+                                        message,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = inbound_tx.send(InboundEvent::Disconnected {
+                                    peer_id: peer_id.clone(),
+                                    conn_id,
+                                    reason: format!("recv reliable: {e}"),
+                                });
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        let _ = inbound_tx.send(InboundEvent::Disconnected {
-                            peer_id: peer_id.clone(),
-                            conn_id,
-                            reason: format!("recv reliable: {e}"),
-                        });
-                        break;
-                    }
+                    // Engine dropped PeerOutbound (peer replaced by new
+                    // conn, or remove_peer). Exit cleanly so the conn's
+                    // Rc count can fall and the underlying socket
+                    // releases — without this arm the OLD recv loop
+                    // would block on the next `recv_reliable_message`
+                    // until either Goodbye arrived or the transport
+                    // failed (potentially hours for a TCP half-open).
+                    _ = shutdown.changed() => break,
                 }
             }
         }
@@ -264,6 +302,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let conn = conn.clone();
         let inbound_tx = inbound_tx.clone();
         let peer_id = peer_id.clone();
+        let mut shutdown = shutdown_rx.clone();
         async move {
             // Unreliable recv error: stop the unreliable loop only.
             // Disconnection is reported by the reliable recv task —
@@ -271,15 +310,24 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             // the peer. In practice the underlying channel is paired
             // with reliable, so a real disconnect will surface there
             // too.
-            while let Ok(message) = recv_unreliable_message(&*conn).await {
-                if inbound_tx
-                    .send(InboundEvent::Message {
-                        from: peer_id.clone(),
-                        message,
-                    })
-                    .is_err()
-                {
-                    break;
+            loop {
+                tokio::select! {
+                    res = recv_unreliable_message(&*conn) => match res {
+                        Ok(message) => {
+                            if inbound_tx
+                                .send(InboundEvent::Message {
+                                    from: peer_id.clone(),
+                                    message,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    // Engine dropped PeerOutbound — see recv_reliable_task.
+                    _ = shutdown.changed() => break,
                 }
             }
         }
@@ -289,8 +337,21 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let conn = conn.clone();
         let inbound_tx = inbound_tx.clone();
         let peer_id = peer_id.clone();
+        let mut shutdown = shutdown_rx.clone();
         async move {
-            while let Some(msg) = outbound_rx.recv().await {
+            loop {
+                // Only the channel-recv await is cancellable here. Mid-
+                // send cancellation would corrupt the NoiseTransport
+                // nonce counter (the encrypt happens synchronously and
+                // advances the nonce before the wire write), so once
+                // we're past the select we run the send to completion.
+                let msg = tokio::select! {
+                    m = outbound_rx.recv() => match m {
+                        Some(m) => m,
+                        None => break,
+                    },
+                    _ = shutdown.changed() => break,
+                };
                 match outbound_kind(&msg) {
                     ChannelKind::Reliable => {
                         // Reliable failures indicate a real disconnect; emit
@@ -325,6 +386,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let inbound_tx = inbound_tx.clone();
         let peer_id = peer_id.clone();
         let out_tx_for_ping = out_tx_clone.clone();
+        let mut shutdown = shutdown_rx.clone();
         async move {
             let mut next_nonce: u64 = 1;
 
@@ -395,6 +457,9 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                             observed_at_unix_ms,
                         });
                     }
+                    // Engine dropped PeerOutbound — see the equivalent
+                    // arm in recv_reliable_task for the rationale.
+                    _ = shutdown.changed() => return,
                     else => return,
                 }
             }
@@ -570,19 +635,29 @@ mod tests {
                     None,
                 ));
 
-                // Each side observes the other's Hello.
-                match a_in_rx.recv().await.unwrap() {
-                    InboundEvent::PeerHello { peer_id, .. } => {
+                // Each side observes the other's Hello. Capture the
+                // PeerHello's `shutdown` watch::Sender into a holder
+                // var so dropping the matched event doesn't terminate
+                // the per-peer task — mimics the engine moving it into
+                // `PeerOutbound::_shutdown`.
+                let _a_shutdown_hold = match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello {
+                        peer_id, shutdown, ..
+                    } => {
                         assert_eq!(peer_id, PeerId(vk(b"bob")));
+                        shutdown
                     }
                     other => panic!("expected Hello, got {other:?}"),
-                }
-                match b_in_rx.recv().await.unwrap() {
-                    InboundEvent::PeerHello { peer_id, .. } => {
+                };
+                let _b_shutdown_hold = match b_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello {
+                        peer_id, shutdown, ..
+                    } => {
                         assert_eq!(peer_id, PeerId(vk(b"alice")));
+                        shutdown
                     }
                     other => panic!("expected Hello, got {other:?}"),
-                }
+                };
 
                 // Drop outbound senders → channels close → send_tasks exit →
                 // both peers send Goodbye and the connections shut down.
@@ -650,19 +725,28 @@ mod tests {
                 ));
 
                 // Drain the Hello on each side so the rest of the test
-                // sees only the messages it pushes.
-                match a_in_rx.recv().await.unwrap() {
-                    InboundEvent::PeerHello { peer_id, .. } => {
+                // sees only the messages it pushes. Hold the
+                // `shutdown` Sender from each PeerHello to keep the
+                // per-peer task alive — mirrors the engine storing it
+                // in PeerOutbound.
+                let _a_shutdown_hold = match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello {
+                        peer_id, shutdown, ..
+                    } => {
                         assert_eq!(peer_id, PeerId(vk(b"bob")));
+                        shutdown
                     }
                     other => panic!("expected Hello, got {other:?}"),
-                }
-                match b_in_rx.recv().await.unwrap() {
-                    InboundEvent::PeerHello { peer_id, .. } => {
+                };
+                let _b_shutdown_hold = match b_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello {
+                        peer_id, shutdown, ..
+                    } => {
                         assert_eq!(peer_id, PeerId(vk(b"alice")));
+                        shutdown
                     }
                     other => panic!("expected Hello, got {other:?}"),
-                }
+                };
 
                 // Push an EphemeralDelivery from alice → bob. Routing sends
                 // it on alice's unreliable channel, where send_unreliable
@@ -763,9 +847,17 @@ mod tests {
                     None,
                 ));
 
-                // Drain Hellos.
-                let _ = a_in_rx.recv().await.unwrap();
-                let _ = b_in_rx.recv().await.unwrap();
+                // Drain Hellos. Hold each side's shutdown Sender to
+                // keep the per-peer tasks alive (mirrors the engine
+                // storing them in PeerOutbound).
+                let _a_shutdown_hold = match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected PeerHello, got {other:?}"),
+                };
+                let _b_shutdown_hold = match b_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected PeerHello, got {other:?}"),
+                };
 
                 // Advance time across 5 ping intervals, one interval at a
                 // time, yielding between each so the Ping/Pong round-trip
@@ -881,9 +973,17 @@ mod tests {
                     None,
                 ));
 
-                // Drain Hellos.
-                let _ = a_in_rx.recv().await.unwrap();
-                let _ = b_in_rx.recv().await.unwrap();
+                // Drain Hellos. Hold each side's shutdown Sender so
+                // the per-peer tasks stay alive until heartbeat
+                // timeout actually fires (the path under test).
+                let _a_shutdown_hold = match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected PeerHello, got {other:?}"),
+                };
+                let _b_shutdown_hold = match b_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected PeerHello, got {other:?}"),
+                };
 
                 // Advance well past heartbeat_timeout.
                 tokio::time::advance(cfg.heartbeat_timeout * 2).await;
@@ -1004,14 +1104,17 @@ mod tests {
                 .unwrap();
                 // 3) Drain alice's PeerHello inbound event (so subsequent
                 // recv() can land on PongObserved without confusion).
-                match tokio::time::timeout(Duration::from_millis(200), a_in_rx.recv())
-                    .await
-                    .expect("no PeerHello")
-                    .expect("inbound channel closed")
-                {
-                    InboundEvent::PeerHello { .. } => {}
-                    other => panic!("expected PeerHello, got {other:?}"),
-                }
+                // Hold the shutdown Sender so alice's per-peer task
+                // keeps running (mirrors the engine).
+                let _a_shutdown_hold =
+                    match tokio::time::timeout(Duration::from_millis(200), a_in_rx.recv())
+                        .await
+                        .expect("no PeerHello")
+                        .expect("inbound channel closed")
+                    {
+                        InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                        other => panic!("expected PeerHello, got {other:?}"),
+                    };
                 // 4) Wait for alice's first Ping.
                 let ping_nonce = loop {
                     let msg = super::recv_reliable_message(&bob_conn).await.unwrap();
@@ -1105,8 +1208,13 @@ mod tests {
                     None,
                 ));
 
-                // Drain Hello.
-                let _ = a_in_rx.recv().await.unwrap();
+                // Drain Hello; hold the shutdown Sender to keep alice's
+                // per-peer task alive until the send-side failure path
+                // under test fires.
+                let _a_shutdown_hold = match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected PeerHello, got {other:?}"),
+                };
 
                 // Poison alice's send_reliable: next reliable send fails.
                 *poisoned.borrow_mut() = true;
@@ -1147,6 +1255,141 @@ mod tests {
                 );
 
                 drop(a_out_tx);
+                drop(b_out_tx);
+            })
+            .await;
+    }
+
+    /// Regression: when the engine drops `PeerOutbound` (because the
+    /// peer was replaced by a fresher conn or `remove_peer` deleted the
+    /// entry), the OLD per-peer task must wind down. Without the
+    /// `shutdown` watch::Sender threaded through `PeerHello` →
+    /// `PeerOutbound::_shutdown`, the task would run forever as long as
+    /// the underlying transport stayed responsive — every reconnect of
+    /// the same `PeerId` to a relay would leak one zombie task plus one
+    /// TCP socket, and after many cycles the relay would exhaust its
+    /// file-descriptor budget and refuse new WebSocket upgrades.
+    ///
+    /// Shape: drive Hello to completion, then drop the engine-side
+    /// shutdown handle (mirroring the `state.peer_outbound.insert(...)`
+    /// replacement path that drops the old `PeerOutbound`). The bob
+    /// side stays healthy and responsive throughout, which is the
+    /// scenario the bug needed: with bob alive, liveness never times
+    /// out and send_task never sees a failing send, so the task can
+    /// *only* exit via the engine-driven shutdown signal under test
+    /// here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_peer_terminates_when_engine_drops_peer_outbound() {
+        use std::time::Duration;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = net.transport(PeerId(vk(b"alice")), peer_addr("alice"));
+                let bob = net.transport(PeerId(vk(b"bob")), peer_addr("bob"));
+                let bob_accept =
+                    crate::spawn::spawn_local(async move { bob.accept().await.unwrap() });
+                let alice_conn = alice.connect(peer_addr("bob")).await.unwrap();
+                let bob_conn = bob_accept.await.unwrap();
+
+                // Short heartbeat so the test wouldn't accidentally pass
+                // by virtue of a slow real-time heartbeat timeout firing.
+                // We're proving the engine-shutdown path, not the
+                // heartbeat-timeout path, so the heartbeat must NOT fire
+                // during the test's bounded wait.
+                let cfg = crate::types::SyncConfig {
+                    heartbeat_interval: Duration::from_secs(60),
+                    heartbeat_timeout: Duration::from_secs(180),
+                    ..crate::types::SyncConfig::default()
+                };
+
+                let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+                let (b_in_tx, mut b_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+
+                let alice_task = crate::spawn::spawn_local(run_peer(
+                    Rc::new(alice_conn),
+                    peer_env_for(b"alice", &cfg),
+                    crate::engine::ConnectionId::for_test(1),
+                    a_out_tx.clone(),
+                    a_out_rx,
+                    a_in_tx,
+                    None,
+                ));
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(bob_conn),
+                    peer_env_for(b"bob", &cfg),
+                    crate::engine::ConnectionId::for_test(2),
+                    b_out_tx.clone(),
+                    b_out_rx,
+                    b_in_tx,
+                    None,
+                ));
+
+                // Extract the engine-shutdown handle alice's run_peer
+                // ships in its PeerHello event. Dropping it later is the
+                // signal under test — exactly the drop that fires when
+                // the engine does
+                // `state.peer_outbound.insert(peer_id, NEW_PeerOutbound)`
+                // and discards the OLD entry.
+                let alice_shutdown = match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello {
+                        shutdown, out_tx, ..
+                    } => {
+                        // Drop the engine-side outbound channel as well,
+                        // matching what `state.peer_outbound.insert`
+                        // does to the previous entry's `tx`. Keep the
+                        // shutdown Sender alive for now.
+                        drop(out_tx);
+                        shutdown
+                    }
+                    other => panic!("expected PeerHello, got {other:?}"),
+                };
+                match b_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { .. } => {}
+                    other => panic!("expected PeerHello, got {other:?}"),
+                }
+
+                // Also drop our own `a_out_tx` clone — mirrors the
+                // engine no longer holding any clone of the outbound
+                // sender. The test's `out_tx_clone` *inside* run_peer
+                // (the engine doesn't own this one) still exists; only
+                // the engine-shutdown signal can tell run_peer to wind
+                // down.
+                drop(a_out_tx);
+
+                // Sanity: alice's run_peer is still alive — proves the
+                // task isn't exiting via any other path. We can't await
+                // the JoinHandle here because that'd block.
+                tokio::task::yield_now().await;
+                assert!(
+                    !alice_task.is_finished(),
+                    "alice's run_peer exited before the engine-shutdown signal — test premise broken"
+                );
+
+                // The signal. Engine "removed" alice's PeerOutbound.
+                drop(alice_shutdown);
+
+                // run_peer must wind down promptly. Generous bound so a
+                // slow CI doesn't false-positive: this test is
+                // structural (the watch::changed() arm fires
+                // immediately on Sender drop), so a few hundred ms is
+                // plenty.
+                let exit = tokio::time::timeout(Duration::from_secs(5), alice_task).await;
+                match exit {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => panic!("alice's run_peer task panicked: {e}"),
+                    Err(_) => panic!(
+                        "alice's run_peer did not terminate within 5 s of the engine dropping \
+                         PeerOutbound — the per-peer task is leaking. Without the shutdown \
+                         signal wired through PeerHello, the outbound channel stays open via \
+                         the run_peer-scope `out_tx_clone`, send_task can't exit via channel-\
+                         close, and bob is still responsive on the wire so neither \
+                         send-reliable failure nor heartbeat timeout can fire either."
+                    ),
+                }
+
                 drop(b_out_tx);
             })
             .await;
