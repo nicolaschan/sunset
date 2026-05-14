@@ -19,14 +19,13 @@ image = { version = "0.25", default-features = false, features = [
   "gif",
 ] }
 
-# Pure-Rust HEIC/HEIF decoder. `no_std + alloc`, compiles for
-# wasm32-unknown-unknown, no C/FFI deps. We only use the decoder.
-# `av1` enables decoding AV1-in-HEIF (still images); the AV1 still-image
-# format is what Apple uses for some newer captures and Android cameras
-# emit. `unci` enables uncompressed HEIF; tiny and harmless to include.
-heic = { version = "0.1", default-features = false, features = ["av1", "unci"] }
+# NOTE: HEIC decode is intentionally not wired up yet. The only
+# pure-Rust + wasm-compatible HEIC decoder we found (imazen/heic) is
+# AGPL-3.0 / commercial; adopting it would relicense the workspace.
+# The sniffer rejects HEIC with a distinct error variant so callers
+# can surface a clean message until a license decision is made. See
+# the design spec's "HEIC licensing" section for the open decision.
 
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]

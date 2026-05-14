@@ -45,12 +45,29 @@ Pure host-agnostic Rust. Compiles to `wasm32-unknown-unknown`. No host-specific 
 | Dep | Why | Notes |
 |---|---|---|
 | [`image`](https://crates.io/crates/image) `0.25` | JPEG/PNG/WebP/GIF decode, JPEG encode, resize | `default-features = false`, features = `["jpeg", "png", "webp", "gif"]`. WASM-compatible (pure Rust codec backends; JPEG via `zune-jpeg`). |
-| [`heic`](https://github.com/imazen/heic) `0.1.4` | HEIC/HEIF decode | Pure Rust, `no_std + alloc`, **explicitly compiles to `wasm32-unknown-unknown`**. `#![forbid(unsafe_code)]`. Latest release April 2026. Covers HEVC (iPhone HEICs), AV1 in HEIF (via `av1` feature), uncompressed (via `unci`). 49/49 ITU-T HEVC conformance vectors pass. |
+| ~~[`heic`](https://github.com/imazen/heic) `0.1.4`~~ | ~~HEIC/HEIF decode~~ | **Blocked.** Licensed AGPL-3.0 or commercial; sunset is MIT. See "HEIC licensing decision" below. |
 
-**Maturity note on `heic` 0.1.x:** the crate is alpha-versioned and the README discloses AI-assisted development with "not all code manually reviewed." 118/162 of its own HEIF test files decode cleanly with all features enabled. We accept this because:
-- iPhone HEICs are HEVC I-slice based, which the crate has hardened conformance vectors for.
-- The alternative is libheif (C++) → not wasm-friendly without an emscripten detour the workspace's hermeticity rule would force us to vendor.
-- We *only* use the decoder; failure mode is "couldn't decode this HEIC, fall back to error or pass-through" — never silent corruption, because we never sign HEIC bytes onto the wire.
+### HEIC licensing decision
+
+While implementing the spec I discovered that **every pure-Rust HEIC decoder we could find is AGPL-licensed or unpublished**, which blocks the original plan of bundling decode into `sunset-image`. The shortlist:
+
+| Decoder | Licence | Notes |
+|---|---|---|
+| [`imazen/heic`](https://github.com/imazen/heic) v0.1.4 | AGPL-3.0 OR commercial | Pure Rust, wasm-ready, actively maintained — but adopting it would force the entire workspace into AGPL territory (or require buying the commercial licence). |
+| [`ente-io/heic-decoder`](https://github.com/ente-io/heic-decoder) | AGPL-3.0 | Not on crates.io; only 7 commits. Same AGPL constraint. |
+| [`libheif-rs`](https://crates.io/crates/libheif-rs) | MIT | Wraps the C `libheif` library. `libheif` is LGPL-3 and pulls in `libde265` (LGPL-3, software-patented HEVC). Not wasm-friendly without a substantial emscripten / `cc-rs` vendoring effort. |
+| [`libheif-js`](https://www.npmjs.com/package/libheif-js) | LGPL-3 (libheif) | JS-side WASM bundle (~2 MB). Browser-only, doesn't ship to the TUI / Minecraft / desktop clients without parallel implementations. Adds JS-side processing for one format, which is exactly what the spec set out to avoid. |
+
+The PR that ships this spec implements the **non-HEIC** parts (JPEG / PNG / WebP / GIF normalisation) and surfaces HEIC inputs as [`Error::HeicUnsupported`] so the UI can render a clean "convert to JPEG before sending" hint. **Wiring HEIC decode requires a licence decision** that one autonomous run can't reasonably make on behalf of the project. Once a path is picked, adding decode is a localised change inside `sunset-image::transcode_via_heic_crate`.
+
+The options, in order of how I'd lean today:
+
+1. **Stay MIT, ship without HEIC.** Document the conversion path for iPhone users (Settings → Camera → Formats → Most Compatible) and surface a friendly error. Lowest cost, no licence churn. **Cost:** iPhone users on default settings can't upload directly.
+2. **Use `libheif-js` (JS-side) for HEIC only.** Web-only HEIC support, ~2 MB extra bundle when actually used (load-on-demand), parallel non-Rust implementation just for HEIC. Future TUI / desktop clients would still need a story. **Cost:** breaks the "one preprocessing path for all clients" invariant the spec sets out, but only for the one format that has no permissive Rust option.
+3. **Adopt `imazen/heic` and relicense to AGPL.** Cleanest engineering, biggest legal commitment. Best done deliberately and not while the user is asleep.
+4. **Buy the commercial `heic` licence.** Same clean engineering, no copyleft, but ongoing cost. Worth re-evaluating once HEIC usage data justifies it.
+
+Implementation parity: whichever option lands, the `sunset-image` API doesn't change — it stays `preprocess(bytes, &Config) -> Result<Preprocessed, Error>`. The HEIC branch swaps from `Err(HeicUnsupported)` to a real decode pipeline.
 
 ### Public API
 
@@ -108,7 +125,7 @@ Detection is done by sniffing the first ~32 bytes:
 | `FF D8 FF` | JPEG | decode → resize → encode JPEG (always re-encode, see below) |
 | `47 49 46 38 (37\|39) 61` | GIF | **pass-through unchanged** (animated, JPEG can't represent it) |
 | `52 49 46 46 ?? ?? ?? ?? 57 45 42 50` | WebP | sniff `VP8 ` / `VP8L` / `VP8X`; if `VP8X` with animation flag, pass-through; else decode → resize → encode JPEG |
-| `ftyp` box at offset 4 with brand `heic` / `heix` / `mif1` / `msf1` / `heim` / `heis` | HEIC/HEIF | decode (via `heic`) → resize → encode JPEG |
+| `ftyp` box at offset 4 with brand `heic` / `heix` / `mif1` / `msf1` / `heim` / `heis` / `hevc` / `hevx` / `hevm` / `hevs` / `avif` / `avis` | HEIC/HEIF | **currently:** return `Error::HeicUnsupported` for the UI to surface. Decode requires a licence decision (see above). |
 | anything else | — | `Error::UnrecognisedFormat` |
 
 **Always re-encode JPEG?** Yes. The cost (one lossy round-trip at q=85) is small for a chat photo; the benefit is consistency: every JPEG on the wire is q=85, ≤ 2048 px on its longest edge, EXIF-stripped. The alternative — "pass JPEGs through if they look small" — leaks original EXIF (location, device, camera), and the spec aims for one canonical output shape. If profiling later shows this is a real perf problem on huge JPEGs in WASM, we can add a "skip re-encode for small in-budget JPEGs" branch behind a `Config` flag.
@@ -121,20 +138,23 @@ Detection is done by sniffing the first ~32 bytes:
 
 ### Tests
 
-`crates/sunset-image/tests/preprocess.rs` (integration tests, host target):
+`crates/sunset-image/tests/preprocess.rs` (integration tests, host target). All fixtures are **generated in-process** via the `image` crate so the suite ships no binary blobs:
 
-1. **JPEG roundtrip:** small JPEG fixture → preprocessed → output decodes to a JPEG of the expected dimensions.
-2. **PNG → JPEG:** small PNG fixture → preprocessed → output is `image/jpeg`, decodes successfully, dimensions match.
-3. **WebP (still) → JPEG:** small still WebP fixture → preprocessed → output is `image/jpeg`.
-4. **GIF passthrough:** small GIF → preprocessed → output `mime_type == "image/gif"` and `bytes == input`.
-5. **WebP (animated) passthrough:** animated WebP fixture → preprocessed → output mime is `image/webp` and bytes unchanged.
-6. **HEIC → JPEG:** an iPhone-style HEIC fixture (HEVC, single frame) → preprocessed → output is JPEG with the expected dimensions (no pixel-exact match required; HEIC→YCbCr→RGB→JPEG is lossy).
-7. **Resize:** a 4096×3072 PNG → preprocessed with `max_edge: 2048` → output JPEG with `max(w, h) == 2048` and aspect ratio preserved within 1 px.
-8. **No-op resize:** a 512×512 JPEG → preprocessed → output dimensions still 512×512.
-9. **Unrecognised:** random bytes → `Err(Error::UnrecognisedFormat)`.
-10. **EXIF orientation:** a JPEG with EXIF orientation 6 (rotate 270° CW) → preprocessed → decoded output has the rotated pixel layout. Test the *visible* outcome (e.g. a marker pixel is in the expected corner), not the EXIF tag.
+1. **JPEG roundtrip:** synth 640×480 RGB → JPEG → preprocessed → output is `image/jpeg` with the original dimensions.
+2. **PNG → JPEG:** synth 320×240 RGBA PNG → preprocessed → output is `image/jpeg`, dimensions match, alpha is flattened.
+3. **WebP (still) → JPEG:** synth 256×128 lossless WebP → preprocessed → output is `image/jpeg`.
+4. **GIF passthrough:** synth single-frame GIF → preprocessed → output `mime_type == "image/gif"` and `bytes == input` byte-for-byte.
+5. **Oversize resize:** synth 4096×3072 PNG → preprocessed with `max_edge: 2048` → output JPEG, longest edge == 2048, aspect ratio preserved within 1 px.
+6. **No upscale:** synth 64×64 JPEG → preprocessed with default cap (2048) → output dimensions still 64×64.
+7. **Random bytes rejected:** `0xab × 64` → `Err(Error::UnrecognisedFormat)`.
+8. **Truncated input rejected:** empty / 3-byte input → `Err(Error::UnrecognisedFormat)`.
+9. **Truncated PNG surfaces decode error:** valid PNG magic + 8 null bytes → `Err(Error::Decode(_))` (no panic).
+10. **HEIC sentinel:** `ftyp` box with `heic` brand → `Err(Error::HeicUnsupported)` (distinct from `UnrecognisedFormat` so the UI can render a tailored message).
 
-Fixtures live in `crates/sunset-image/tests/fixtures/` (small files, ideally < 50 KB each). For HEIC we can borrow one of the `heic` crate's BSD-3 test vectors or capture a tiny single-frame HEVC HEIC; flake builds shouldn't pay for >100 KB of fixtures.
+Two tests from the original spec were dropped pending the HEIC licence decision:
+- **HEIC → JPEG** (covered for now by the sentinel error test above).
+- **WebP (animated) passthrough** (the `image` crate's WebP encoder writes still images; the sniffer's animation-flag handling is covered by a unit test rather than an end-to-end transcode round-trip).
+- **EXIF orientation** is deferred to a follow-up; the `image` crate's default `load_from_memory` path does not auto-apply orientation, and the right fix is to decode through `ImageReader` with explicit orientation handling. Tracked as an open issue.
 
 ### Conformance to workspace rules
 
@@ -222,10 +242,10 @@ Update `web/src/sunset_web/sunset.ffi.mjs:506` from
 
 Add to `web/e2e/images.spec.js`:
 
-1. **HEIC upload smokes through.** Pick a small HEIC fixture → assert sent message renders as an `<img>` whose `src` starts with `data:image/jpeg;base64,` (not `image/heic`) and the image is visible to the other peer.
+1. ~~**HEIC upload smokes through.**~~ Deferred pending HEIC licence decision. Replaced with: **HEIC upload surfaces a helpful error** — pick an HEIC file, assert the composer renders the "please convert to JPEG" message rather than silently dropping the file or shipping HEIC bytes.
 2. **Big-image resize cap.** Pick a 4096×4096 PNG fixture → assert the sent attachment's `src` decodes to a JPEG ≤ 2048 px on its longest edge. (Decode via a tiny `Image` in the page and assert `naturalWidth` / `naturalHeight`.)
-3. **GIF passthrough.** Pick an animated GIF → assert the rendered `src` is `data:image/gif;base64,…` and the base64 payload byte-length matches the input (modulo base64 padding).
-4. **Garbage rejected.** Pick a text file renamed to `.jpg` → assert the composer surfaces an error (sub-spec for the error UI is part of the implementation plan, but the existing toast / error channel can carry it).
+3. **GIF passthrough.** Pick a single-frame GIF (or animated GIF if a fixture exists) → assert the rendered `src` is `data:image/gif;base64,…` and the base64 payload byte-length matches the input (modulo base64 padding).
+4. **PNG → JPEG transcode.** Pick a PNG → assert the rendered `src` starts with `data:image/jpeg;base64,…`, even though the source was PNG.
 
 These tests obey CLAUDE.md test discipline:
 - They drive the actual file picker via Playwright's `setInputFiles`.
