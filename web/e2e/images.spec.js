@@ -12,6 +12,7 @@ import { spawn } from "child_process";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { deflateSync } from "node:zlib";
 
 import { expect, test } from "@playwright/test";
 
@@ -130,6 +131,89 @@ function fileFrom(name, mimeType, base64) {
     mimeType,
     buffer: Buffer.from(base64, "base64"),
   };
+}
+
+// Build a synthetic ~300 KB PNG by filling a 320×320 RGB image with
+// deterministic pseudo-random per-pixel colour. High entropy defeats
+// deflate so the encoded PNG is close to the raw RGB size (~300 KB),
+// which is well past the 65 KB Noise per-message ceiling — exactly
+// the case the in-chain `ChunkedConnection` inside `NoiseConnection`
+// has to fire across multiple times each direction.
+//
+// Kept programmatic so the spec has zero on-disk binary assets; the
+// size knob is `widthHeight` here, not a file to regenerate.
+function makeLargePng(widthHeight = 320) {
+  const w = widthHeight;
+  const h = widthHeight;
+  // PNG signature.
+  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+
+  // IHDR data: width, height, bit depth 8, color type 2 (RGB),
+  // compression 0, filter 0, interlace 0.
+  const ihdrData = Buffer.alloc(13);
+  ihdrData.writeUInt32BE(w, 0);
+  ihdrData.writeUInt32BE(h, 4);
+  ihdrData[8] = 8;
+  ihdrData[9] = 2;
+
+  // Raw scanlines: filter byte + RGB triples per pixel. Pixel
+  // colour comes from a tiny LCG seeded with the pixel index so the
+  // resulting bytes look uncorrelated to deflate. Reproducible
+  // across runs and across browsers (no Math.random).
+  const raw = Buffer.alloc((1 + w * 3) * h);
+  let seed = 0x9e3779b9 >>> 0; // arbitrary non-zero starting state
+  for (let y = 0; y < h; y++) {
+    const rowStart = y * (1 + w * 3);
+    raw[rowStart] = 0; // filter byte
+    for (let x = 0; x < w; x++) {
+      // LCG (Numerical Recipes constants); take 3 bytes per pixel.
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      const r = (seed >>> 16) & 0xff;
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      const g = (seed >>> 16) & 0xff;
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      const b = (seed >>> 16) & 0xff;
+      const off = rowStart + 1 + x * 3;
+      raw[off] = r;
+      raw[off + 1] = g;
+      raw[off + 2] = b;
+    }
+  }
+  // level 0 = no compression — for high-entropy data this is faster
+  // and yields a PNG very close to the raw RGB size.
+  const idatPayload = deflateSync(raw, { level: 0 });
+
+  return Buffer.concat([
+    sig,
+    pngChunk("IHDR", ihdrData),
+    pngChunk("IDAT", idatPayload),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, "ascii");
+  const crc = pngCrc(Buffer.concat([typeBuf, data]));
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
+
+// Streaming CRC32 over `buf` with the PNG-standard polynomial
+// (0xedb88320). Inlined so the spec doesn't pull in a new dev-dep
+// just for one helper.
+function pngCrc(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = (crc ^ buf[i]) >>> 0;
+    for (let k = 0; k < 8; k++) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+  }
+  crc = (crc ^ 0xffffffff) >>> 0;
+  const out = Buffer.alloc(4);
+  out.writeUInt32BE(crc, 0);
+  return out;
 }
 
 test("two browsers exchange a text+image message via relay", async ({
@@ -345,6 +429,62 @@ test("multiple images on a single message all render", async ({ browser }) => {
   await expect(pageB.getByTestId("message-image")).toHaveCount(2, {
     timeout: 15_000,
   });
+
+  await ctxA.close();
+  await ctxB.close();
+});
+
+test("large image (~300 KB) survives noise chunking end-to-end", async ({
+  browser,
+}) => {
+  const { ctx: ctxA, page: pageA, composer: inputA } = await openPage(
+    browser,
+    "large",
+  );
+  const { ctx: ctxB, page: pageB } = await openPage(browser, "large");
+
+  // 600×600 pure-red PNG. The deflate of 600 identical scanlines
+  // compresses well, but base64 inflation + envelope overhead
+  // pushes the on-wire payload past the 65 KB Noise ceiling
+  // multiple times — exactly the case the chunker has to handle.
+  const bigPng = makeLargePng(600);
+  expect(bigPng.length).toBeGreaterThan(150_000);
+
+  await stageImages(pageA, [
+    { name: "big-red.png", mimeType: "image/png", buffer: bigPng },
+  ]);
+  await expect(pageA.getByTestId("composer-attachment")).toHaveCount(1, {
+    timeout: 15_000,
+  });
+
+  const text = `large-image — ${Date.now()}`;
+  await inputA.fill(text);
+  await inputA.press("Enter");
+
+  // Sender's composer clears.
+  await expect(pageA.getByTestId("composer-attachment")).toHaveCount(0, {
+    timeout: 15_000,
+  });
+
+  // Both sides render the image. Use a longer timeout: the chunker
+  // does ~5 noise round-trips for a ~300 KB payload and there's
+  // also store-insert + relay-forward latency.
+  await expect(pageB.getByText(text)).toBeVisible({ timeout: 30_000 });
+  await expect(pageB.getByTestId("message-image")).toHaveCount(1, {
+    timeout: 30_000,
+  });
+  await expect(pageA.getByTestId("message-image")).toHaveCount(1, {
+    timeout: 30_000,
+  });
+
+  // Byte-for-byte check on the receiver: the base64 in the `<img src>`
+  // must equal the base64 of what the sender staged.
+  const expectedBase64 = bigPng.toString("base64");
+  const src = await pageB
+    .getByTestId("message-image")
+    .first()
+    .getAttribute("src");
+  expect(src).toBe(`data:image/png;base64,${expectedBase64}`);
 
   await ctxA.close();
   await ctxB.close();
