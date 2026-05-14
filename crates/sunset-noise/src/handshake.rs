@@ -419,6 +419,55 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn noise_send_recv_handles_4mb_payload() {
+        // Pre-chunking, this errored at snow.write_message because 4
+        // MiB is well past MAXMSGLEN = 65535. With the chunker
+        // composed inside NoiseConnection, a single send_reliable /
+        // recv_reliable pair transparently splits + reassembles ~65
+        // noise messages worth of ciphertext.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let alice = Arc::new(StaticIdentity { seed: [1u8; 32] });
+                let bob = Arc::new(StaticIdentity { seed: [2u8; 32] });
+
+                let (a_pipe, b_pipe) = make_pipe_pair();
+
+                let bob_x25519_secret = ed25519_seed_to_x25519_secret(&bob.seed);
+                use curve25519_dalek::{MontgomeryPoint, scalar::Scalar};
+                let bob_x25519_pub: [u8; 32] = {
+                    let scalar = Scalar::from_bytes_mod_order(*bob_x25519_secret);
+                    MontgomeryPoint::mul_base(&scalar).to_bytes()
+                };
+
+                let alice_handle = tokio::task::spawn_local({
+                    let alice_id = alice.clone();
+                    async move { do_handshake_initiator(a_pipe, alice_id, bob_x25519_pub).await }
+                });
+                let bob_handle = tokio::task::spawn_local({
+                    let bob_id = bob.clone();
+                    async move { do_handshake_responder(b_pipe, bob_id).await }
+                });
+
+                let alice_conn = alice_handle.await.unwrap().expect("alice handshake");
+                let bob_conn = bob_handle.await.unwrap().expect("bob handshake");
+
+                // 4 MiB of deterministic content (every byte distinct
+                // mod 256 from its neighbours so a reordering would
+                // show up immediately).
+                let n: usize = 4 * 1024 * 1024;
+                let payload: Vec<u8> = (0..n).map(|i| i.wrapping_mul(31) as u8).collect();
+                let payload = Bytes::from(payload);
+
+                alice_conn.send_reliable(payload.clone()).await.unwrap();
+                let received = bob_conn.recv_reliable().await.unwrap();
+                assert_eq!(received.len(), payload.len(), "length mismatch");
+                assert_eq!(received, payload, "content mismatch");
+            })
+            .await;
+    }
+
     #[test]
     fn parse_addr_extracts_x25519_fragment() {
         let bytes = b"wss://relay.example.com:443#x25519=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
