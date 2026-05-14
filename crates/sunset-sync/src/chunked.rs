@@ -318,4 +318,74 @@ mod tests {
             })
             .await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recv_rejects_oversized_message() {
+        // Sender uses a chunker with a generous reassembly cap so it
+        // will happily send a 3 KB payload. Receiver uses a chunker
+        // with a tight 1 KB cap. The receive must error part-way
+        // through with "oversized message".
+        let (a_pipe, b_pipe) = pipe_pair();
+        let sender = ChunkedConnection::new(a_pipe, TEST_MAX_CHUNK, TEST_MAX_REASSEMBLED);
+        let receiver = ChunkedConnection::new(b_pipe, TEST_MAX_CHUNK, 1024);
+
+        let payload = Bytes::from(vec![0u8; 3000]);
+        sender.send_reliable(payload).await.unwrap();
+
+        let err = receiver
+            .recv_reliable()
+            .await
+            .expect_err("receive should reject oversized message");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("oversized message"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recv_rejects_empty_inner_frame() {
+        // An inner frame with zero bytes has no continuation flag at
+        // all. Inject one directly into the inner pipe to bypass our
+        // own sender's framing.
+        let (a_pipe, b_pipe) = pipe_pair();
+        let receiver = ChunkedConnection::new(b_pipe, TEST_MAX_CHUNK, TEST_MAX_REASSEMBLED);
+        a_pipe.send_reliable(Bytes::new()).await.unwrap();
+
+        let err = receiver
+            .recv_reliable()
+            .await
+            .expect_err("receive should reject empty frame");
+        assert!(format!("{err}").contains("empty inner frame"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recv_rejects_unknown_continuation_flag() {
+        let (a_pipe, b_pipe) = pipe_pair();
+        let receiver = ChunkedConnection::new(b_pipe, TEST_MAX_CHUNK, TEST_MAX_REASSEMBLED);
+        // 0xff is neither FLAG_LAST (0x00) nor FLAG_MORE (0x01).
+        a_pipe
+            .send_reliable(Bytes::from_static(&[0xff, b'x']))
+            .await
+            .unwrap();
+
+        let err = receiver
+            .recv_reliable()
+            .await
+            .expect_err("receive should reject bad flag");
+        assert!(format!("{err}").contains("bad continuation flag"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreliable_passes_through_verbatim() {
+        // send_unreliable must NOT add a continuation flag — the
+        // unreliable channel carries small datagrams (opus frames,
+        // ephemeral deliveries) that don't need chunking and
+        // shouldn't gain framing overhead.
+        let (a, b) = make_chunked();
+        let payload = Bytes::from_static(b"hello unreliable");
+        a.send_unreliable(payload.clone()).await.unwrap();
+        let recv = b.recv_unreliable().await.unwrap();
+        assert_eq!(recv, payload, "unreliable channel must pass through unchanged");
+    }
 }
