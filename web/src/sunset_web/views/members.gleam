@@ -125,7 +125,6 @@ fn relay_section(
             #("display", "flex"),
             #("flex-direction", "column"),
             #("gap", "1px"),
-            #("padding", "0 2px"),
           ]),
         ],
         list.map(relays, fn(r) { relays_view.row(p, r, on_open_relay) }),
@@ -178,9 +177,13 @@ fn member_row(
     Speaking -> "600"
     _ -> "400"
   }
+  // Member name color matches the per-author hue used in the chat
+  // scrollback, so a glance at the right rail tells you what color
+  // each speaker's messages will be down in the chat. Offline members
+  // stay muted gray so the eye reads the section as inactive.
   let color = case m.status {
-    Speaking -> p.text
-    _ -> p.text_muted
+    OfflineP -> p.text_faint
+    _ -> theme.hue_for_identity(p, m.name)
   }
 
   // Click anywhere on the row opens the per-peer status popover.

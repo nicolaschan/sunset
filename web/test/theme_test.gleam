@@ -62,10 +62,14 @@ pub fn accent_does_not_collide_with_status_colors_test() {
   p.accent |> should.not_equal(p.danger)
 }
 
-pub fn fonts_use_geist_family_test() {
+pub fn fonts_use_inter_and_jetbrains_mono_test() {
+  // Inter for the body sans + JetBrains Mono for code/IDs. Both load
+  // via the Google Fonts stylesheet pinned in `web/gleam.toml`; keep
+  // these constants in sync with that link or the second-tier system
+  // fallback will paint instead of the intended typeface.
   theme.font_sans
-  |> should.equal("Geist, system-ui, sans-serif")
+  |> should.equal("Inter, system-ui, sans-serif")
 
   theme.font_mono
-  |> should.equal("Geist Mono, ui-monospace, monospace")
+  |> should.equal("JetBrains Mono, ui-monospace, monospace")
 }

@@ -217,11 +217,14 @@ fn rail_row(p: Palette, r: Relay, on_open: fn(Float) -> msg) -> Element(msg) {
       attribute.attribute("data-relay-host", r.host),
       attribute.attribute("data-relay-state", state_attr(r.state)),
       event.on_click(on_open(r.id)),
+      // Padding matches `members.member_row` (5px 10px) so the leading
+      // status dot lines up vertically across the Online / Offline /
+      // Relays sections in the right rail.
       ui.css([
         #("display", "flex"),
         #("align-items", "center"),
         #("gap", "8px"),
-        #("padding", "6px 12px"),
+        #("padding", "5px 10px"),
         #("border", "none"),
         #("background", "transparent"),
         #("color", p.text_muted),

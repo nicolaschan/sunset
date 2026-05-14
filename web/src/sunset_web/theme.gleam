@@ -9,6 +9,10 @@
 //// neutral grays for offline/idle. Surfaces still carry a subtle warm
 //// undertone so the brand stays present without dominating the chrome.
 
+import gleam/list
+import gleam/result
+import gleam/string
+
 pub type Mode {
   Light
   Dark
@@ -93,9 +97,40 @@ pub type Palette {
   )
 }
 
-pub const font_sans = "Geist, system-ui, sans-serif"
+pub const font_sans = "Inter, system-ui, sans-serif"
 
-pub const font_mono = "Geist Mono, ui-monospace, monospace"
+pub const font_mono = "JetBrains Mono, ui-monospace, monospace"
+
+/// Pick a stable hue from `palette.author_hues` for the given identity
+/// string. Same string → same color across renders, so each
+/// participant in a chat keeps a consistent color in the chat
+/// scrollback AND in the members rail. Falls back to `palette.text`
+/// when the palette ships an empty hue list (defensive — current
+/// themes always populate it).
+pub fn hue_for_identity(palette: Palette, identity: String) -> String {
+  case list.length(palette.author_hues) {
+    0 -> palette.text
+    n -> {
+      let i = identity_hash(identity) % n
+      list.drop(palette.author_hues, i)
+      |> list.first
+      |> result.unwrap(palette.text)
+    }
+  }
+}
+
+/// djb2-style stable hash of an identity string. Multiplier 33,
+/// modulo a prime to keep the running accumulator bounded on the
+/// JS target (where Number is double-precision float — large enough
+/// for this not to matter, but the modulo costs nothing and makes
+/// the hash stable across runtimes too).
+fn identity_hash(s: String) -> Int {
+  s
+  |> string.to_utf_codepoints
+  |> list.fold(5381, fn(acc, cp) {
+    { acc * 33 + string.utf_codepoint_to_int(cp) } % 1_000_003
+  })
+}
 
 pub fn palette_for(mode: Mode) -> Palette {
   case mode {

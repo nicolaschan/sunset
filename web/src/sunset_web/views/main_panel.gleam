@@ -14,7 +14,6 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
-import gleam/result
 import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
@@ -718,8 +717,12 @@ fn message_header(
           [
             attribute.attribute("data-testid", "message-author"),
             attribute.attribute("data-author", m.author),
+            // Author names render at the same weight as body text. The
+            // per-author hue + the YOU tag (for self) is enough visual
+            // distinction; bold here was making the chat scrollback
+            // feel shouty.
             ui.css([
-              #("font-weight", "600"),
+              #("font-weight", "500"),
               #("font-size", "16.25px"),
               #("color", author_color),
               #("cursor", "default"),
@@ -790,6 +793,11 @@ fn reaction_pill(
   r: Reaction,
   on_toggle_reaction: fn(String, String) -> msg,
 ) -> Element(msg) {
+  // Reaction pills sit on a soft neutral surface — `surface_alt` is
+  // a hair above the page background so the pill outline is visible
+  // without forcing a dark grey block under every emoji. Pills you've
+  // reacted to use the soft accent fill so your own reactions stand
+  // out, but no border in either case (the fill alone delimits them).
   let bg = case r.by_you {
     True -> p.accent_soft
     False -> p.surface_alt
@@ -797,10 +805,6 @@ fn reaction_pill(
   let color = case r.by_you {
     True -> p.accent_deep
     False -> p.text_muted
-  }
-  let border = case r.by_you {
-    True -> p.accent
-    False -> p.border_soft
   }
   let title = case r.by_you {
     True -> "Remove your " <> r.emoji <> " reaction"
@@ -824,11 +828,11 @@ fn reaction_pill(
         #("display", "inline-flex"),
         #("align-items", "center"),
         #("gap", "4px"),
-        #("padding", "1px 8px"),
+        #("padding", "2px 8px"),
         #("border-radius", "999px"),
         #("background", bg),
         #("color", color),
-        #("border", "1px solid " <> border),
+        #("border", "none"),
         #("font-size", "13.75px"),
         #("font-family", "inherit"),
         #("cursor", "pointer"),
@@ -1185,43 +1189,14 @@ fn author_color(p: Palette, m: MessageView, members: List(Member)) -> String {
     True -> p.accent
     False ->
       case list.find(members, fn(mem) { mem.name == m.author }) {
-        Error(_) -> hue_for_author(p, m.author)
+        Error(_) -> theme.hue_for_identity(p, m.author)
         Ok(mem) ->
           case mem.status {
             OfflineP -> p.text_faint
-            _ -> hue_for_author(p, m.author)
+            _ -> theme.hue_for_identity(p, m.author)
           }
       }
   }
-}
-
-/// Pick a stable hue from `palette.author_hues` for the given author
-/// identity. Same identity → same color across renders. Falls back to
-/// `palette.text` when the palette ships an empty hue list (defensive
-/// — the current themes always populate it, but the type is open).
-fn hue_for_author(p: Palette, author: String) -> String {
-  case list.length(p.author_hues) {
-    0 -> p.text
-    n -> {
-      let i = name_hash(author) % n
-      list.drop(p.author_hues, i)
-      |> list.first
-      |> result.unwrap(p.text)
-    }
-  }
-}
-
-/// djb2-style stable hash of the author identity. Multiplier 33,
-/// modulo a prime to keep the running accumulator bounded on the
-/// JS target (where Number is double-precision float — large enough
-/// for this not to matter, but the modulo costs nothing and makes
-/// the hash stable across runtimes too).
-fn name_hash(s: String) -> Int {
-  s
-  |> string.to_utf_codepoints
-  |> list.fold(5381, fn(acc, cp) {
-    { acc * 33 + string.utf_codepoint_to_int(cp) } % 1_000_003
-  })
 }
 
 /// Horizontal strip of image thumbnails staged in the composer. Each
