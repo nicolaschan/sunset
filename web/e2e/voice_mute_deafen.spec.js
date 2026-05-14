@@ -121,6 +121,99 @@ async function countFrames(receiverPage, senderBytes) {
 }
 
 
+// Read the rendered button state the way a sighted user perceives it: the
+// background colour, whether the icon includes the diagonal slash that marks
+// the "active" variant, and the ARIA pressed flag that assistive tech reads.
+// Returning all three from one round-trip keeps the test's assertions tight
+// against what the UI is actually showing (not what state we hope it's in).
+//
+// `getByTitle` defaults to a substring match — "Mute mic" matches both
+// "Mute mic" and "Unmute mic" — so this helper (and every call site below)
+// uses { exact: true }. Without that the visibility waits silently pick up
+// the old button before the title actually flips.
+async function readButtonState(page, title) {
+  const btn = page.getByTitle(title, { exact: true });
+  return await btn.evaluate((el) => {
+    const styles = window.getComputedStyle(el);
+    return {
+      ariaPressed: el.getAttribute("aria-pressed"),
+      backgroundColor: styles.backgroundColor,
+      color: styles.color,
+      hasSlash: !!el.querySelector('[data-testid="voice-button-slash"]'),
+    };
+  });
+}
+
+test("mute and deafen buttons visually indicate their active state", async ({
+  browser,
+}) => {
+  // Sighted users can't read aria-pressed — the button has to *look* different
+  // when active. This is the contract the user actually depends on: open the
+  // call, toggle each control, prove the background colour AND the icon shape
+  // AND the ARIA flag all flip. We check all three so a regression in any
+  // single channel (colour theme drift, icon refactor, attribute removal) is
+  // caught the same day it happens.
+  const alice = await openPeer(browser, relay.addr);
+  await joinVoice(alice.page);
+
+  // --- Mute button ----------------------------------------------------------
+  const muteInactive = await readButtonState(alice.page, "Mute mic");
+  expect(muteInactive.ariaPressed).toBe("false");
+  expect(muteInactive.hasSlash).toBe(false);
+
+  await alice.page.getByTitle("Mute mic", { exact: true }).click();
+  await expect(
+    alice.page.getByTitle("Unmute mic", { exact: true }),
+  ).toBeVisible({ timeout: 1_000 });
+
+  const muteActive = await readButtonState(alice.page, "Unmute mic");
+  expect(muteActive.ariaPressed).toBe("true");
+  // Slashed mic variant rendered: data-testid="voice-button-slash" element
+  // sits inside the SVG and is the same signal a sighted user reads.
+  expect(muteActive.hasSlash).toBe(true);
+  // Background and icon colour MUST differ from the inactive state — that's
+  // the at-a-glance signal we promised the user.
+  expect(muteActive.backgroundColor).not.toBe(muteInactive.backgroundColor);
+  expect(muteActive.color).not.toBe(muteInactive.color);
+
+  // Toggle off and confirm the visual state reverts (no sticky styling).
+  await alice.page.getByTitle("Unmute mic", { exact: true }).click();
+  await expect(alice.page.getByTitle("Mute mic", { exact: true })).toBeVisible(
+    { timeout: 1_000 },
+  );
+  const muteReverted = await readButtonState(alice.page, "Mute mic");
+  expect(muteReverted.ariaPressed).toBe("false");
+  expect(muteReverted.hasSlash).toBe(false);
+  expect(muteReverted.backgroundColor).toBe(muteInactive.backgroundColor);
+
+  // --- Deafen button --------------------------------------------------------
+  const deafenInactive = await readButtonState(alice.page, "Deafen");
+  expect(deafenInactive.ariaPressed).toBe("false");
+  expect(deafenInactive.hasSlash).toBe(false);
+
+  await alice.page.getByTitle("Deafen", { exact: true }).click();
+  await expect(alice.page.getByTitle("Undeafen", { exact: true })).toBeVisible(
+    { timeout: 1_000 },
+  );
+
+  const deafenActive = await readButtonState(alice.page, "Undeafen");
+  expect(deafenActive.ariaPressed).toBe("true");
+  expect(deafenActive.hasSlash).toBe(true);
+  expect(deafenActive.backgroundColor).not.toBe(deafenInactive.backgroundColor);
+  expect(deafenActive.color).not.toBe(deafenInactive.color);
+
+  await alice.page.getByTitle("Undeafen", { exact: true }).click();
+  await expect(alice.page.getByTitle("Deafen", { exact: true })).toBeVisible({
+    timeout: 1_000,
+  });
+  const deafenReverted = await readButtonState(alice.page, "Deafen");
+  expect(deafenReverted.ariaPressed).toBe("false");
+  expect(deafenReverted.hasSlash).toBe(false);
+  expect(deafenReverted.backgroundColor).toBe(deafenInactive.backgroundColor);
+
+  await alice.ctx.close();
+});
+
 test("self-mute stops frames at bob; unmute resumes", async ({ browser }) => {
   const alice = await openPeer(browser, relay.addr);
   const bob = await openPeer(browser, relay.addr);
