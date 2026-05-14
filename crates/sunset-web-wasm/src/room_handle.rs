@@ -103,6 +103,62 @@ impl RoomHandle {
         });
     }
 
+    /// Sorted snapshot of every Text message in this room, ordered by
+    /// sender-claimed `sent_at_ms` ascending (tie-broken on value-hash
+    /// for stability). Receipts and Reactions are not included — they
+    /// don't render as messages. Returns an `Array<IncomingMessage>`
+    /// that the JS bridge can iterate directly.
+    pub fn ordered_messages(&self) -> js_sys::Array {
+        let arr = js_sys::Array::new();
+        let identity_pub = self.inner.local_identity_key();
+        for decoded in self.inner.ordered_messages() {
+            if let sunset_core::MessageBody::Text { text, images } = &decoded.body {
+                let is_self = identity_pub.as_ref() == Some(&decoded.author_key);
+                let im = crate::messages::from_decoded_text(
+                    &decoded,
+                    text.clone(),
+                    images,
+                    decoded.value_hash.to_hex(),
+                    is_self,
+                );
+                arr.push(&JsValue::from(im));
+            }
+        }
+        arr
+    }
+
+    /// Register a JS callback fired (immediately with the current
+    /// sorted snapshot, then again on every change) with an
+    /// `Array<IncomingMessage>` of all Text messages in this room,
+    /// ordered by sender-claimed `sent_at_ms`. The bridge handles all
+    /// ordering so JS / Gleam clients can render the array as-is.
+    pub fn on_messages_changed(&self, callback: js_sys::Function) {
+        let inner = self.inner.clone();
+        self.inner.on_messages_changed(move |msgs| {
+            // Resolve `is_self` from the *current* identity each fire.
+            // The Peer's identity doesn't change at runtime, but
+            // taking the value here (instead of capturing at register
+            // time) keeps the wiring resilient if a future refactor
+            // ever does swap it.
+            let identity_pub = inner.local_identity_key();
+            let arr = js_sys::Array::new();
+            for decoded in msgs {
+                if let sunset_core::MessageBody::Text { text, images } = &decoded.body {
+                    let is_self = identity_pub.as_ref() == Some(&decoded.author_key);
+                    let im = crate::messages::from_decoded_text(
+                        decoded,
+                        text.clone(),
+                        images,
+                        decoded.value_hash.to_hex(),
+                        is_self,
+                    );
+                    arr.push(&JsValue::from(im));
+                }
+            }
+            let _ = callback.call1(&JsValue::NULL, &arr);
+        });
+    }
+
     pub fn on_receipt(&self, callback: js_sys::Function) {
         self.inner
             .on_receipt(move |for_hash, from_pubkey, channel, sent_at_ms| {

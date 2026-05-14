@@ -403,6 +403,48 @@ export function onChannelsChanged(room, callback) {
   room.on_channels_changed((arr) => callback(toList(Array.from(arr))));
 }
 
+// Sorted snapshot of every Text message in the room, ordered by the
+// sender-claimed `sent_at_ms` ascending (tie-broken on value-hash for
+// stability). The wasm side hands back an `Array<IncomingMessage>`;
+// `incomingToPlain` copies the fields out and frees each wasm wrapper
+// so we don't hold cross-boundary pointers. Returned as a Gleam
+// List(IncomingMessage).
+export function orderedMessages(room) {
+  const arr = Array.from(room.ordered_messages());
+  return toList(arr.map(incomingToPlain));
+}
+
+// Register a callback fired (immediately with the current snapshot,
+// then on every change) with a Gleam List(IncomingMessage) sorted by
+// sender-claimed `sent_at_ms`. The bridge owns the sort so all client
+// surfaces — Gleam UI, future TUI, etc. — render identical order.
+export function onMessagesChanged(room, callback) {
+  room.on_messages_changed((arr) => {
+    const items = Array.from(arr).map(incomingToPlain);
+    callback(toList(items));
+  });
+}
+
+/// Shared helper: copy fields off a wasm-bindgen `IncomingMessage`
+/// into a plain JS object and free the wrapper. Used by both
+/// `onMessage` (single-message fire) and `onMessagesChanged` /
+/// `orderedMessages` (snapshot fires) so the conversion stays in one
+/// place.
+function incomingToPlain(incoming) {
+  const plain = {
+    author_pubkey: incoming.author_pubkey,
+    epoch_id: incoming.epoch_id,
+    sent_at_ms: incoming.sent_at_ms,
+    channel: incoming.channel,
+    body: incoming.body,
+    value_hash_hex: incoming.value_hash_hex,
+    is_self: incoming.is_self,
+    images: incoming.images,
+  };
+  incoming.free();
+  return plain;
+}
+
 /// Schedule a recurring callback every `ms` milliseconds. Returns
 /// nothing — there is no cancel handle in v1; the ticker runs for the
 /// page lifetime. Use only for cheap, idempotent dispatches.

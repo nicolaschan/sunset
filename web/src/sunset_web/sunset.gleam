@@ -271,6 +271,25 @@ pub fn on_channels_changed(
   callback: fn(List(String)) -> Nil,
 ) -> Nil
 
+/// Sorted snapshot of every Text message in this room, ordered by
+/// sender-claimed `sent_at_ms` ascending (tie-broken on value-hash so
+/// renders don't flip-flop). Receipts and Reactions are excluded —
+/// they don't render as messages. The wasm side does the sort, so all
+/// clients render identical order without local ordering logic.
+@external(javascript, "./sunset.ffi.mjs", "orderedMessages")
+pub fn ordered_messages(room: RoomHandle) -> List(IncomingMessage)
+
+/// Register a callback fired (immediately with the current sorted
+/// snapshot, then again on every change) with the full Text-message
+/// timeline of this room, sorted by sender-claimed `sent_at_ms`. Use
+/// instead of `on_message` when the host wants to render the full
+/// timeline in claimed-time order without its own sort.
+@external(javascript, "./sunset.ffi.mjs", "onMessagesChanged")
+pub fn on_messages_changed(
+  room: RoomHandle,
+  callback: fn(List(IncomingMessage)) -> Nil,
+) -> Nil
+
 /// Snapshot payload delivered to `on_reactions_changed`. Opaque on the
 /// Gleam side; accessors below extract the concrete fields.
 pub type IncomingReactionsSnapshot
