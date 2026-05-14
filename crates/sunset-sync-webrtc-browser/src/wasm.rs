@@ -54,8 +54,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit,
-    RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit, RtcIceServer, RtcPeerConnection,
-    RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
+    RtcDataChannelState, RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit, RtcIceServer,
+    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
 };
 
 use sunset_store::VerifyingKey;
@@ -555,6 +555,17 @@ async fn run_accept_one(task: AcceptTask) -> Result<WebRtcRawConnection> {
                 dc.set_onclose(Some(on_close.as_ref().unchecked_ref()));
                 on_close.forget();
 
+                // If the channel was already `open` by the time we
+                // attached `onopen`, the `open` event does not fire
+                // retroactively — signal opened ourselves so the accept
+                // loop can break. Otherwise on_open fires later and
+                // takes the sender; either path resolves `open_rx` once.
+                if dc.ready_state() == RtcDataChannelState::Open {
+                    if let Some(tx) = open_tx_cell.borrow_mut().take() {
+                        let _ = tx.send(());
+                    }
+                }
+
                 if let Some(tx) = dc_tx_cell.borrow_mut().take() {
                     let _ = tx.send(dc);
                 }
@@ -571,6 +582,12 @@ async fn run_accept_one(task: AcceptTask) -> Result<WebRtcRawConnection> {
                 let on_close = make_close_closure(msg_tx_for_dc_unrel.clone());
                 dc.set_onclose(Some(on_close.as_ref().unchecked_ref()));
                 on_close.forget();
+
+                if dc.ready_state() == RtcDataChannelState::Open {
+                    if let Some(tx) = open_tx_unrel_cell.borrow_mut().take() {
+                        let _ = tx.send(());
+                    }
+                }
 
                 if let Some(tx) = dc_tx_unrel_cell.borrow_mut().take() {
                     let _ = tx.send(dc);
@@ -737,6 +754,7 @@ pub struct WebRtcRawConnection {
 #[async_trait(?Send)]
 impl RawConnection for WebRtcRawConnection {
     async fn send_reliable(&self, bytes: Bytes) -> Result<()> {
+        wait_for_dc_open(&self.dc, "dc").await?;
         self.dc
             .send_with_u8_array(&bytes)
             .map_err(|e| Error::Transport(format!("dc.send: {e:?}")))
@@ -755,6 +773,7 @@ impl RawConnection for WebRtcRawConnection {
     }
 
     async fn send_unreliable(&self, bytes: Bytes) -> Result<()> {
+        wait_for_dc_open(&self.dc_unrel, "dc_unrel").await?;
         self.dc_unrel
             .send_with_u8_array(&bytes)
             .map_err(|e| Error::Transport(format!("dc_unrel.send: {e:?}")))
@@ -931,6 +950,51 @@ fn spawn_ice_forwarder(
 async fn try_add_remote_ice(pc: &RtcPeerConnection, cand_json: &str) {
     if let Err(e) = add_remote_ice(pc, cand_json).await {
         tracing::warn!(error = %e, "ignoring bad/stale remote ICE candidate");
+    }
+}
+
+/// Wait until `dc.readyState` is `Open`, or return a transport error if
+/// the channel is already `Closing` / `Closed`.
+///
+/// Chromium's `RTCDataChannel.open` event can fire ahead of the SCTP
+/// outbound stream being fully usable for sends: the receive direction
+/// works (`onmessage` delivers buffered incoming user data) but
+/// `send_with_u8_array` rejects with `InvalidStateError: readyState is
+/// not 'open'`. Under CI's CPU contention this manifests as a
+/// post-`open` window where `readyState` momentarily reads `Connecting`
+/// for the side that received the inbound channel via `ondatachannel`.
+///
+/// The accept loop in `run_accept_one` already double-signals
+/// `open_rx` if the channel is already `Open` when we attach the
+/// listener, so the loop's exit is correct. This guard catches the
+/// remaining window: it polls the actual `readyState` on each send and
+/// briefly waits if the state hasn't settled yet. The wait window
+/// (200 ms, ~2× a worst-case SCTP-ACK round trip on localhost) is
+/// well under the noise-handshake timeout (60 s) and small enough
+/// that a real "closed before send" failure still surfaces promptly.
+async fn wait_for_dc_open(dc: &RtcDataChannel, label: &str) -> Result<()> {
+    const POLL_INTERVAL_MS: u64 = 5;
+    const MAX_WAIT_MS: u64 = 200;
+    let mut elapsed_ms: u64 = 0;
+    loop {
+        match dc.ready_state() {
+            RtcDataChannelState::Open => return Ok(()),
+            RtcDataChannelState::Connecting => {
+                if elapsed_ms >= MAX_WAIT_MS {
+                    return Err(Error::Transport(format!(
+                        "{label}: readyState stuck at 'connecting' after {MAX_WAIT_MS} ms"
+                    )));
+                }
+                wasmtimer::tokio::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+                elapsed_ms += POLL_INTERVAL_MS;
+            }
+            RtcDataChannelState::Closing | RtcDataChannelState::Closed => {
+                return Err(Error::Transport(format!("{label}: channel closed")));
+            }
+            // RtcDataChannelState is non-exhaustive in web-sys; treat
+            // unknown variants as a permanent error rather than a poll.
+            _ => return Err(Error::Transport(format!("{label}: unknown readyState"))),
+        }
     }
 }
 
