@@ -17,14 +17,14 @@ use js_sys::{Float32Array, Function};
 use wasm_bindgen::prelude::*;
 
 use sunset_core::bus::BusImpl;
-use sunset_store_memory::MemoryStore;
+use sunset_store_indexeddb::IndexedDbStore;
 use sunset_sync::MultiTransport;
 use sunset_voice::runtime::{DynBus, FrameSink, VoiceRuntime};
 
 use crate::client::{RtcT, WsT};
 use crate::room_handle::RoomHandle;
 
-pub(crate) type BusT = BusImpl<MemoryStore, MultiTransport<WsT, RtcT>>;
+pub(crate) type BusT = BusImpl<IndexedDbStore, MultiTransport<WsT, RtcT>>;
 pub(crate) type BusArc = Rc<BusT>;
 
 pub(crate) struct ActiveVoice {

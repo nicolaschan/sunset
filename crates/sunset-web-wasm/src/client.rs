@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use sunset_core::{Ed25519Verifier, Identity};
 use sunset_noise::{NoiseIdentity, NoiseTransport, do_handshake_responder};
-use sunset_store_memory::MemoryStore;
+use sunset_store_indexeddb::{DEFAULT_DATABASE_NAME, IndexedDbStore};
 use sunset_sync::{
     FallbackTransport, MultiTransport, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine,
 };
@@ -87,7 +87,7 @@ pub struct Client {
     /// per-room registry). Per-room ops route through `RoomHandle`;
     /// supervisor-level ops (`add_relay`, `on_intent_changed`,
     /// `intents`) route through `Peer`'s thin delegators.
-    inner: Rc<sunset_core::Peer<MemoryStore, MultiTransport<WsT, RtcT>>>,
+    inner: Rc<sunset_core::Peer<IndexedDbStore, MultiTransport<WsT, RtcT>>>,
     /// Kept on the Client because the voice subsystem needs identity
     /// to start a per-room voice session. Could move into a `Peer`
     /// accessor later; for now the duplication is small and explicit.
@@ -103,17 +103,24 @@ pub struct Client {
 
 #[wasm_bindgen]
 impl Client {
-    #[wasm_bindgen(constructor)]
-    pub fn new(seed: &[u8], heartbeat_interval_ms: u32) -> Result<Client, JsError> {
+    /// Open or create the local IndexedDB store and construct a `Client`
+    /// wired into it. Async because IndexedDB is opened asynchronously;
+    /// the JS-side caller (`createClient` in `sunset.ffi.mjs`) awaits
+    /// this before exposing the client to the rest of the app.
+    pub async fn open(seed: Vec<u8>, heartbeat_interval_ms: u32) -> Result<Client, JsError> {
         // Route Rust panics through `console.error` once, on the first
         // Client construction. Without this a panic in any background
         // task surfaces only as `RuntimeError: unreachable` in the
         // browser, which is unhelpful when debugging FFI shims.
-        // `set_once` makes repeated `Client::new` calls idempotent.
+        // `set_once` makes repeated `Client::open` calls idempotent.
         console_error_panic_hook::set_once();
 
-        let identity = identity_from_seed(seed).map_err(|e| JsError::new(&e))?;
-        let store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
+        let identity = identity_from_seed(&seed).map_err(|e| JsError::new(&e))?;
+        let store = Arc::new(
+            IndexedDbStore::open(DEFAULT_DATABASE_NAME, Arc::new(Ed25519Verifier))
+                .await
+                .map_err(|e| JsError::new(&format!("open IndexedDB store: {e}")))?,
+        );
 
         let ws_raw = WebSocketRawTransport::dial_only();
         let ws_noise =
