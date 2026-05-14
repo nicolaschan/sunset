@@ -20,10 +20,11 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ChannelId, type Member, type MessageView, type Reaction, Away, ChannelId,
-  Direct, OfflineP, OneHop, Online, SelfRelay, Speaking,
+  type Attachment, type ChannelId, type Member, type MessageView, type Reaction,
+  Away, ChannelId, Direct, OfflineP, OneHop, Online, SelfRelay, Speaking,
 }
 import sunset_web/markdown
+import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 
@@ -35,8 +36,11 @@ pub fn view(
   current_channel cur: ChannelId,
   messages ms: List(MessageView),
   draft draft: String,
+  pending_attachments pending_attachments: List(Attachment),
   on_draft on_draft: fn(String) -> msg,
   on_submit on_submit: msg,
+  on_pick_images on_pick_images: msg,
+  on_remove_attachment on_remove_attachment: fn(Int) -> msg,
   noop noop: msg,
   on_shortcut on_shortcut: fn(String, String, String, Bool) -> msg,
   reacting_to reacting_to: Option(String),
@@ -106,8 +110,11 @@ pub fn view(
         viewport,
         channel_name,
         draft,
+        pending_attachments,
         on_draft,
         on_submit,
+        on_pick_images,
+        on_remove_attachment,
         noop,
         on_shortcut,
       ),
@@ -352,17 +359,30 @@ fn message_view(
           ],
           [
             header,
-            html.div(
-              [
-                ui.css([
-                  #("font-size", "16.875px"),
-                  #("color", p.text),
-                  #("white-space", "pre-wrap"),
-                  #("word-break", "break-word"),
-                ]),
-              ],
-              [markdown.render(m.body, m.id, is_revealed, on_toggle_spoiler, p)],
-            ),
+            case m.body {
+              "" -> element.fragment([])
+              _ ->
+                html.div(
+                  [
+                    ui.css([
+                      #("font-size", "16.875px"),
+                      #("color", p.text),
+                      #("white-space", "pre-wrap"),
+                      #("word-break", "break-word"),
+                    ]),
+                  ],
+                  [
+                    markdown.render(
+                      m.body,
+                      m.id,
+                      is_revealed,
+                      on_toggle_spoiler,
+                      p,
+                    ),
+                  ],
+                )
+            },
+            message_attachments(p, m.attachments),
             case m.reactions {
               [] -> element.fragment([])
               rs -> reactions_row(p, m.id, rs, on_add_reaction)
@@ -872,8 +892,11 @@ fn composer(
   viewport: domain.Viewport,
   channel_name: String,
   draft: String,
+  pending_attachments: List(Attachment),
   on_draft: fn(String) -> msg,
   on_submit: msg,
+  on_pick_images: msg,
+  on_remove_attachment: fn(Int) -> msg,
   noop: msg,
   on_shortcut: fn(String, String, String, Bool) -> msg,
 ) -> Element(msg) {
@@ -918,10 +941,14 @@ fn composer(
     [
       html.div(
         [
+          attribute.attribute("data-testid", "composer-shell"),
           ui.css([
             #("display", "flex"),
-            #("align-items", "center"),
-            #("gap", "8px"),
+            #("flex-direction", "column"),
+            #("gap", case pending_attachments {
+              [] -> "0"
+              _ -> "8px"
+            }),
             #("padding", "8px 10px"),
             #("flex", "1"),
             #("background", p.surface_alt),
@@ -930,99 +957,111 @@ fn composer(
           ]),
         ],
         [
-          attach_button(p),
-          html.textarea(
-            [
-              attribute.id("composer-textarea"),
-              attribute.autofocus(True),
-              attribute.placeholder("Message #" <> channel_name),
-              attribute.attribute("rows", "1"),
-              event.on_input(on_draft),
-              event.advanced("keydown", {
-                use key <- decode.subfield(["key"], decode.string)
-                use shift <- decode.subfield(["shiftKey"], decode.bool)
-                use meta <- decode.subfield(["metaKey"], decode.bool)
-                use ctrl <- decode.subfield(["ctrlKey"], decode.bool)
-                let mod = meta || ctrl
-                // For Enter (no shift): prevent default so the browser does not
-                // insert a newline into the textarea before Lustre clears it.
-                // For all other keys let the browser's default action proceed.
-                decode.success(case key, shift, mod {
-                  "Enter", False, _ ->
-                    event.handler(
-                      on_submit,
-                      prevent_default: True,
-                      stop_propagation: False,
-                    )
-                  "b", _, True ->
-                    event.handler(
-                      on_shortcut("**", "", "**", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "B", _, True ->
-                    event.handler(
-                      on_shortcut("**", "", "**", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "i", _, True ->
-                    event.handler(
-                      on_shortcut("*", "", "*", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "I", _, True ->
-                    event.handler(
-                      on_shortcut("*", "", "*", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "k", _, True ->
-                    event.handler(
-                      on_shortcut("[", "", "](url)", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  "K", _, True ->
-                    event.handler(
-                      on_shortcut("[", "", "](url)", True),
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                  _, _, _ ->
-                    event.handler(
-                      noop,
-                      prevent_default: False,
-                      stop_propagation: False,
-                    )
-                })
-              }),
-              ui.css([
-                #("flex", "1"),
-                #("border", "none"),
-                #("background", "transparent"),
-                #("font-family", "inherit"),
-                #("font-size", "16.25px"),
-                #("color", p.text),
-                #("outline", "none"),
-                #("resize", "none"),
-                #("overflow", "hidden"),
-                #("padding", "0"),
-                #("line-height", "1.4"),
-              ]),
-            ],
-            draft,
-          ),
-          html.span(
+          attachment_strip(p, pending_attachments, on_remove_attachment),
+          html.div(
             [
               ui.css([
-                #("font-family", theme.font_mono),
-                #("font-size", "13.125px"),
-                #("color", p.text_faint),
+                #("display", "flex"),
+                #("align-items", "center"),
+                #("gap", "8px"),
               ]),
             ],
-            [html.text("↵ send")],
+            [
+              attach_button(p, on_pick_images),
+              html.textarea(
+                [
+                  attribute.id("composer-textarea"),
+                  attribute.autofocus(True),
+                  attribute.placeholder("Message #" <> channel_name),
+                  attribute.attribute("rows", "1"),
+                  event.on_input(on_draft),
+                  event.advanced("keydown", {
+                    use key <- decode.subfield(["key"], decode.string)
+                    use shift <- decode.subfield(["shiftKey"], decode.bool)
+                    use meta <- decode.subfield(["metaKey"], decode.bool)
+                    use ctrl <- decode.subfield(["ctrlKey"], decode.bool)
+                    let mod = meta || ctrl
+                    // For Enter (no shift): prevent default so the browser does not
+                    // insert a newline into the textarea before Lustre clears it.
+                    // For all other keys let the browser's default action proceed.
+                    decode.success(case key, shift, mod {
+                      "Enter", False, _ ->
+                        event.handler(
+                          on_submit,
+                          prevent_default: True,
+                          stop_propagation: False,
+                        )
+                      "b", _, True ->
+                        event.handler(
+                          on_shortcut("**", "", "**", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "B", _, True ->
+                        event.handler(
+                          on_shortcut("**", "", "**", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "i", _, True ->
+                        event.handler(
+                          on_shortcut("*", "", "*", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "I", _, True ->
+                        event.handler(
+                          on_shortcut("*", "", "*", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "k", _, True ->
+                        event.handler(
+                          on_shortcut("[", "", "](url)", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      "K", _, True ->
+                        event.handler(
+                          on_shortcut("[", "", "](url)", True),
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                      _, _, _ ->
+                        event.handler(
+                          noop,
+                          prevent_default: False,
+                          stop_propagation: False,
+                        )
+                    })
+                  }),
+                  ui.css([
+                    #("flex", "1"),
+                    #("border", "none"),
+                    #("background", "transparent"),
+                    #("font-family", "inherit"),
+                    #("font-size", "16.25px"),
+                    #("color", p.text),
+                    #("outline", "none"),
+                    #("resize", "none"),
+                    #("overflow", "hidden"),
+                    #("padding", "0"),
+                    #("line-height", "1.4"),
+                  ]),
+                ],
+                draft,
+              ),
+              html.span(
+                [
+                  ui.css([
+                    #("font-family", theme.font_mono),
+                    #("font-size", "13.125px"),
+                    #("color", p.text_faint),
+                  ]),
+                ],
+                [html.text("↵ send")],
+              ),
+            ],
           ),
         ],
       ),
@@ -1030,10 +1069,13 @@ fn composer(
   )
 }
 
-fn attach_button(p: Palette) -> Element(msg) {
+fn attach_button(p: Palette, on_click: msg) -> Element(msg) {
   html.button(
     [
       attribute.title("Attach image"),
+      attribute.attribute("aria-label", "Attach image"),
+      attribute.attribute("data-testid", "composer-attach"),
+      event.on_click(on_click),
       ui.css([
         #("display", "inline-flex"),
         #("align-items", "center"),
@@ -1153,6 +1195,138 @@ fn color_for_member(p: Palette, mem: Member) -> String {
     Online, SelfRelay -> p.text
     _, _ -> p.text
   }
+}
+
+/// Horizontal strip of image thumbnails staged in the composer. Each
+/// thumbnail carries a small remove (×) button overlay. Renders as
+/// nothing (`element.fragment([])`) when the staging list is empty so
+/// the composer collapses back to its single-line height.
+fn attachment_strip(
+  p: Palette,
+  pending: List(Attachment),
+  on_remove: fn(Int) -> msg,
+) -> Element(msg) {
+  case pending {
+    [] -> element.fragment([])
+    _ ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "composer-attachments"),
+          ui.css([
+            #("display", "flex"),
+            #("flex-wrap", "wrap"),
+            #("gap", "8px"),
+          ]),
+        ],
+        list.index_map(pending, fn(att, i) {
+          attachment_thumb(p, att, i, on_remove)
+        }),
+      )
+  }
+}
+
+fn attachment_thumb(
+  p: Palette,
+  att: Attachment,
+  index: Int,
+  on_remove: fn(Int) -> msg,
+) -> Element(msg) {
+  html.div(
+    [
+      attribute.attribute("data-testid", "composer-attachment"),
+      ui.css([
+        #("position", "relative"),
+        #("width", "64px"),
+        #("height", "64px"),
+        #("border-radius", "6px"),
+        #("overflow", "hidden"),
+        #("border", "1px solid " <> p.border),
+        #("background", p.surface),
+        #("flex", "0 0 auto"),
+      ]),
+    ],
+    [
+      html.img([
+        attribute.src(sunset.image_data_url(att.mime_type, att.data_base64)),
+        attribute.alt("attachment preview"),
+        ui.css([
+          #("width", "100%"),
+          #("height", "100%"),
+          #("object-fit", "cover"),
+          #("display", "block"),
+        ]),
+      ]),
+      html.button(
+        [
+          attribute.title("Remove attachment"),
+          attribute.attribute("aria-label", "Remove attachment"),
+          attribute.attribute("data-testid", "composer-attachment-remove"),
+          event.on_click(on_remove(index)),
+          ui.css([
+            #("position", "absolute"),
+            #("top", "2px"),
+            #("right", "2px"),
+            #("width", "18px"),
+            #("height", "18px"),
+            #("border", "none"),
+            #("border-radius", "999px"),
+            #("background", "rgba(0,0,0,0.55)"),
+            #("color", "#fff"),
+            #("font-family", "inherit"),
+            #("font-size", "12px"),
+            #("line-height", "1"),
+            #("cursor", "pointer"),
+            #("display", "inline-flex"),
+            #("align-items", "center"),
+            #("justify-content", "center"),
+            #("padding", "0"),
+          ]),
+        ],
+        [html.text("×")],
+      ),
+    ],
+  )
+}
+
+/// Inline image gallery rendered below a message's text body. Empty
+/// list returns `element.fragment([])` so text-only messages render
+/// exactly as they did before image support landed.
+fn message_attachments(p: Palette, atts: List(Attachment)) -> Element(msg) {
+  case atts {
+    [] -> element.fragment([])
+    _ ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "message-attachments"),
+          ui.css([
+            #("display", "flex"),
+            #("flex-wrap", "wrap"),
+            #("gap", "6px"),
+            #("margin-top", "4px"),
+          ]),
+        ],
+        list.map(atts, fn(a) { message_image(p, a) }),
+      )
+  }
+}
+
+fn message_image(p: Palette, att: Attachment) -> Element(msg) {
+  // Cap thumbnail rendering to a sensible width so a huge phone photo
+  // doesn't push the message column wider than the chat area. Users
+  // can right-click + "view image" to open the raw bytes.
+  html.img([
+    attribute.src(sunset.image_data_url(att.mime_type, att.data_base64)),
+    attribute.attribute("data-testid", "message-image"),
+    attribute.alt("attached image"),
+    ui.css([
+      #("max-width", "min(360px, 100%)"),
+      #("max-height", "320px"),
+      #("border-radius", "6px"),
+      #("display", "block"),
+      #("border", "1px solid " <> p.border_soft),
+      #("background", p.surface),
+    ]),
+  ])
 }
 
 /// Index of the last own message that's been seen by anyone — that's

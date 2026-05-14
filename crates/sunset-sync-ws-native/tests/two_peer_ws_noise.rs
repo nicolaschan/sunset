@@ -157,7 +157,7 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
                 0,
                 sent_at,
                 sunset_core::ChannelLabel::default_general(),
-                MessageBody::Text(body.to_owned()),
+                MessageBody::text(body),
                 &mut OsRng,
             )
             .unwrap();
@@ -209,7 +209,7 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
                 .unwrap();
             let decoded = decode_message(&bob_room, &bob_entry, &bob_block).unwrap();
             assert_eq!(decoded.author_key, alice.public());
-            assert_eq!(decoded.body, MessageBody::Text(body.to_owned()));
+            assert_eq!(decoded.body, MessageBody::text(body));
 
             alice_run.abort();
             bob_run.abort();

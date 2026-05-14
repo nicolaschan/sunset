@@ -100,6 +100,11 @@ pub type RoomState {
     /// any voice channels at the end.
     channels: List(domain.Channel),
     draft: String,
+    /// Images the user has staged in the composer but not yet sent.
+    /// Cleared after a successful submit; mutated by AttachImages /
+    /// RemoveAttachment messages. An image-only post is fine — submit
+    /// with empty draft + non-empty pending_attachments.
+    pending_attachments: List(domain.Attachment),
     selected_msg_id: Option(String),
     reacting_to: Option(String),
     sheet: Option(domain.Sheet),
@@ -122,6 +127,7 @@ fn empty_room_state() -> RoomState {
     current_channel: domain.default_channel_id(),
     channels: initial_channels(),
     draft: "",
+    pending_attachments: [],
     selected_msg_id: None,
     reacting_to: None,
     sheet: None,
@@ -266,6 +272,15 @@ pub type Msg {
   SelectChannel(ChannelId)
   ToggleRoomsRail
   UpdateDraft(String)
+  /// User clicked the composer's attach button; open the OS image picker.
+  PickImages
+  /// Picker resolved (possibly with an empty list if the user cancelled
+  /// or selected nothing valid). Appends to the active room's
+  /// `pending_attachments`.
+  ImagesPicked(List(domain.Attachment))
+  /// Remove the attachment at `index` (0-based) from the active room's
+  /// `pending_attachments`. Out-of-bounds indices are silently ignored.
+  RemoveAttachment(index: Int)
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
   AddReaction(String, String)
@@ -703,6 +718,7 @@ pub fn resolve_messages(
       pending: m.pending,
       reactions: m.reactions,
       details: m.details,
+      attachments: m.attachments,
     )
   })
 }
@@ -1134,6 +1150,47 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           effect.from(fn(_dispatch) { composer.auto_grow("composer-textarea") }),
         )
       })
+    PickImages -> {
+      // Fire the picker via FFI; on resolve, dispatch ImagesPicked.
+      // The picker is shared across rooms; results land in whichever
+      // room is active when the callback fires (the picker dialog is
+      // blocking from the user's perspective, so room switches mid-
+      // pick are not a real concern).
+      let eff =
+        effect.from(fn(dispatch) {
+          sunset.pick_images(fn(pairs) {
+            let atts =
+              list.map(pairs, fn(p) {
+                let #(mime, data) = p
+                domain.Attachment(mime_type: mime, data_base64: data)
+              })
+            dispatch(ImagesPicked(atts))
+          })
+        })
+      #(model, eff)
+    }
+    ImagesPicked(atts) ->
+      with_active_room(model, fn(state) {
+        case atts {
+          [] -> #(state, effect.none())
+          _ -> #(
+            RoomState(
+              ..state,
+              pending_attachments: list.append(state.pending_attachments, atts),
+            ),
+            effect.none(),
+          )
+        }
+      })
+    RemoveAttachment(idx) ->
+      with_active_room(model, fn(state) {
+        let kept =
+          state.pending_attachments
+          |> list.index_map(fn(a, i) { #(i, a) })
+          |> list.filter(fn(p) { p.0 != idx })
+          |> list.map(fn(p) { p.1 })
+        #(RoomState(..state, pending_attachments: kept), effect.none())
+      })
     IdentityReady(seed) -> {
       let create_client_eff =
         effect.from(fn(dispatch) {
@@ -1299,6 +1356,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
+          let attachments =
+            list.map(sunset.inc_images(im), fn(p) {
+              let #(mime, data) = p
+              domain.Attachment(mime_type: mime, data_base64: data)
+            })
           let new_msg =
             domain.Message(
               id: sunset.inc_value_hash_hex(im),
@@ -1312,6 +1374,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               pending: False,
               reactions: [],
               details: domain.NoDetails,
+              attachments: attachments,
             )
           // Append; dedupe by id to handle Replay::All re-emits.
           let updated = case
@@ -1343,16 +1406,28 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             None -> #(model, effect.none())
             Some(handle) -> {
               let body = sanitize(state.draft)
-              case body {
-                "" -> #(model, effect.none())
-                _ -> {
+              let has_images = case state.pending_attachments {
+                [] -> False
+                _ -> True
+              }
+              // Empty body is only sendable when at least one image is
+              // attached (image-only post). Otherwise SubmitDraft is a
+              // no-op, mirroring how Slack/Teams/Signal handle this.
+              case body, has_images {
+                "", False -> #(model, effect.none())
+                _, _ -> {
                   let ChannelId(channel_str) = state.current_channel
+                  let images_payload =
+                    list.map(state.pending_attachments, fn(a) {
+                      #(a.mime_type, a.data_base64)
+                    })
                   let send_eff =
                     effect.from(fn(dispatch) {
                       sunset.send_message(
                         handle,
                         channel_str,
                         body,
+                        images_payload,
                         current_time_ms(),
                         fn(r) { dispatch(MessageSent(r)) },
                       )
@@ -1367,7 +1442,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                     effect.from(fn(_dispatch) {
                       composer.reset_textarea("composer-textarea")
                     })
-                  let cleared = RoomState(..state, draft: "")
+                  let cleared =
+                    RoomState(..state, draft: "", pending_attachments: [])
                   #(
                     Model(
                       ..model,
@@ -2525,8 +2601,11 @@ fn room_view_with_state(
       current_channel: state.current_channel,
       messages: filtered_resolved_messages,
       draft: state.draft,
+      pending_attachments: state.pending_attachments,
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
+      on_pick_images: PickImages,
+      on_remove_attachment: RemoveAttachment,
       noop: NoOp,
       on_shortcut: fn(b, m, a, caret) { ApplyComposerShortcut(b, m, a, caret) },
       reacting_to: state.reacting_to,

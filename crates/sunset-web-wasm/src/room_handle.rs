@@ -4,11 +4,37 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 
-use sunset_core::OpenRoom;
+use sunset_core::{ImageAttachment, OpenRoom};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::MultiTransport;
 
 use crate::client::{RtcT, WsT};
+
+/// Decode a JS `Array<{ mime_type, data_base64 }>` into a `Vec<ImageAttachment>`.
+/// Each entry must be a plain JS object exposing those two string fields
+/// — the JS bridge owns the contract; the wasm core only validates the
+/// shape and rejects anything else with a JsError so a typo in the
+/// bridge fails loud instead of silently dropping attachments.
+fn images_from_js(arr: &js_sys::Array) -> Result<Vec<ImageAttachment>, JsError> {
+    let len = arr.length() as usize;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..arr.length() {
+        let item = arr.get(i);
+        let mime = js_sys::Reflect::get(&item, &JsValue::from_str("mime_type"))
+            .map_err(|_| JsError::new(&format!("images[{i}]: missing mime_type")))?
+            .as_string()
+            .ok_or_else(|| JsError::new(&format!("images[{i}].mime_type must be a string")))?;
+        let data = js_sys::Reflect::get(&item, &JsValue::from_str("data_base64"))
+            .map_err(|_| JsError::new(&format!("images[{i}]: missing data_base64")))?
+            .as_string()
+            .ok_or_else(|| JsError::new(&format!("images[{i}].data_base64 must be a string")))?;
+        out.push(ImageAttachment {
+            mime_type: mime,
+            data_base64: data,
+        });
+    }
+    Ok(out)
+}
 
 pub(crate) type OpenRoomT = OpenRoom<MemoryStore, MultiTransport<WsT, RtcT>>;
 
@@ -39,28 +65,36 @@ impl RoomHandle {
 
 #[wasm_bindgen]
 impl RoomHandle {
+    /// Send a chat post under `channel`. `images` is a JS `Array` of
+    /// `{ mime_type, data_base64 }` plain objects; pass an empty array
+    /// for a text-only message. An empty `body` is allowed when
+    /// `images` is non-empty (image-only post). Returns the composed
+    /// entry's value-hash hex.
     pub async fn send_message(
         &self,
         channel: String,
         body: String,
+        images: js_sys::Array,
         sent_at_ms: f64,
     ) -> Result<String, JsError> {
         let channel = sunset_core::ChannelLabel::try_new(channel)
             .map_err(|e| JsError::new(&format!("send_message channel: {e}")))?;
+        let images = images_from_js(&images)?;
         let value_hash = self
             .inner
-            .send_text_in_channel(channel, body, sent_at_ms as u64)
+            .send_post_in_channel(channel, body, images, sent_at_ms as u64)
             .await
-            .map_err(|e| JsError::new(&format!("send_text: {e}")))?;
+            .map_err(|e| JsError::new(&format!("send_post: {e}")))?;
         Ok(value_hash.to_hex())
     }
 
     pub fn on_message(&self, callback: js_sys::Function) {
         self.inner.on_message(move |decoded, is_self| {
-            if let sunset_core::MessageBody::Text(text) = &decoded.body {
+            if let sunset_core::MessageBody::Text { text, images } = &decoded.body {
                 let im = crate::messages::from_decoded_text(
                     decoded,
                     text.clone(),
+                    images,
                     decoded.value_hash.to_hex(),
                     is_self,
                 );

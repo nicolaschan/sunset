@@ -208,13 +208,38 @@ pub enum ReactionAction {
     Remove,
 }
 
+/// An image attached to a `MessageBody::Text` payload. Lives inside the
+/// AEAD plaintext just like the text body. The image bytes are carried
+/// base64-encoded so the same string can flow unchanged from the JS
+/// FileReader, through the wasm boundary, into the encrypted envelope,
+/// and back out as a `<img src="data:...">` attribute on the receiver.
+///
+/// `mime_type` is the IANA media type the sender claims (e.g.
+/// `"image/png"`, `"image/jpeg"`, `"image/webp"`, `"image/gif"`).
+/// The core neither validates the claimed type against the bytes nor
+/// enforces a per-image size cap — those are surface-level concerns
+/// the UI applies before composing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
 /// Discriminator for the inner plaintext of a chat-room entry. All
 /// variants ride the same `<room_fp>/msg/<value_hash>` namespace and
 /// share the AEAD envelope; only the plaintext shape differs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageBody {
-    /// A user-authored chat message.
-    Text(String),
+    /// A user-authored chat post. Carries free-form text (may be empty
+    /// when the post is image-only) and a possibly-empty list of
+    /// inline image attachments. The on-wire encoding is `tag(0) +
+    /// text + images` — a plain text-only post still encodes the
+    /// trailing empty-Vec varint, so this is a wire-format break from
+    /// any pre-images stored `Text` entries.
+    Text {
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
     /// An acknowledgement that the author of this entry decoded the
     /// referenced `Text` message. The author of the receipt is the
     /// receiver of the original message.
@@ -231,6 +256,16 @@ pub enum MessageBody {
     },
 }
 
+impl MessageBody {
+    /// Build a text-only `MessageBody::Text` (empty attachments).
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text {
+            text: s.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,7 +276,7 @@ mod tests {
             inner_signature: Signature([9u8; 64]),
             sent_at_ms: 1_700_000_000_000,
             channel: ChannelLabel::default_general(),
-            body: MessageBody::Text("hello".to_owned()),
+            body: MessageBody::text("hello"),
         };
         let bytes = postcard::to_stdvec(&m).unwrap();
         let back: SignedMessage = postcard::from_bytes(&bytes).unwrap();
@@ -264,16 +299,16 @@ mod tests {
     fn inner_sig_payload_changes_with_each_field() {
         let fp = RoomFingerprint([1u8; 32]);
         let g = ChannelLabel::default_general();
-        let a = inner_sig_payload_bytes(&fp, 0, 100, &g, &MessageBody::Text("hi".to_owned()));
-        let b = inner_sig_payload_bytes(&fp, 1, 100, &g, &MessageBody::Text("hi".to_owned())); // epoch differs
-        let c = inner_sig_payload_bytes(&fp, 0, 101, &g, &MessageBody::Text("hi".to_owned())); // sent_at differs
-        let d = inner_sig_payload_bytes(&fp, 0, 100, &g, &MessageBody::Text("hello".to_owned())); // body differs
+        let a = inner_sig_payload_bytes(&fp, 0, 100, &g, &MessageBody::text("hi"));
+        let b = inner_sig_payload_bytes(&fp, 1, 100, &g, &MessageBody::text("hi")); // epoch differs
+        let c = inner_sig_payload_bytes(&fp, 0, 101, &g, &MessageBody::text("hi")); // sent_at differs
+        let d = inner_sig_payload_bytes(&fp, 0, 100, &g, &MessageBody::text("hello")); // body differs
         let e = inner_sig_payload_bytes(
             &RoomFingerprint([2u8; 32]),
             0,
             100,
             &g,
-            &MessageBody::Text("hi".to_owned()),
+            &MessageBody::text("hi"),
         ); // room differs
         assert_ne!(a, b);
         assert_ne!(a, c);
@@ -283,7 +318,41 @@ mod tests {
 
     #[test]
     fn message_body_text_roundtrips_via_postcard() {
-        let body = MessageBody::Text("hello".to_owned());
+        let body = MessageBody::text("hello");
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn message_body_text_with_images_roundtrips_via_postcard() {
+        let body = MessageBody::Text {
+            text: "look at this".to_owned(),
+            images: vec![
+                ImageAttachment {
+                    mime_type: "image/png".to_owned(),
+                    data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl".to_owned(),
+                },
+                ImageAttachment {
+                    mime_type: "image/jpeg".to_owned(),
+                    data_base64: "/9j/4AAQSkZJRgABAQEASABIAAD".to_owned(),
+                },
+            ],
+        };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn message_body_image_only_roundtrips_via_postcard() {
+        let body = MessageBody::Text {
+            text: String::new(),
+            images: vec![ImageAttachment {
+                mime_type: "image/gif".to_owned(),
+                data_base64: "R0lGODlhAQABAAAAACw=".to_owned(),
+            }],
+        };
         let bytes = postcard::to_stdvec(&body).unwrap();
         let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, body);
@@ -301,12 +370,41 @@ mod tests {
     #[test]
     fn message_body_text_postcard_hex_pin() {
         // Pin the postcard encoding so accidental drift breaks the build.
-        // postcard encodes: enum-tag (varint 0) + len-prefixed UTF-8 string.
-        let body = MessageBody::Text("hi".to_owned());
+        // postcard encodes a struct variant as: enum-tag, then each field
+        // in declaration order. `Text { text, images }` is: tag(0) +
+        // len-prefixed UTF-8 string + len-prefixed image-vec.
+        let body = MessageBody::text("hi");
         let bytes = postcard::to_stdvec(&body).unwrap();
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        // 00 = Text variant tag; 02 = string length (varint); 6869 = "hi".
-        assert_eq!(hex, "00026869", "MessageBody::Text wire encoding drifted");
+        // 00 = Text variant tag; 02 = string length (varint); 6869 = "hi";
+        // 00 = empty-images Vec length (varint).
+        assert_eq!(hex, "0002686900", "MessageBody::Text wire encoding drifted");
+    }
+
+    #[test]
+    fn message_body_text_with_one_image_postcard_hex_pin() {
+        // Encoding shape: tag(0) | text(len + utf8) | images Vec
+        // (len + repeated ImageAttachment). ImageAttachment is a struct,
+        // so its fields encode in declaration order: mime_type then
+        // data_base64, each as len-prefixed UTF-8.
+        let body = MessageBody::Text {
+            text: "hi".to_owned(),
+            images: vec![ImageAttachment {
+                mime_type: "image/png".to_owned(),
+                data_base64: "abc".to_owned(),
+            }],
+        };
+        let bytes = postcard::to_stdvec(&body).unwrap();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        // 00            = Text tag
+        // 02 68 69      = text "hi"
+        // 01            = images.len() = 1
+        // 09 696d6167652f706e67 = mime_type "image/png" (9 bytes)
+        // 03 616263     = data_base64 "abc" (3 bytes)
+        assert_eq!(
+            hex, "000268690109696d6167652f706e6703616263",
+            "MessageBody::Text(with image) wire encoding drifted"
+        );
     }
 
     #[test]
@@ -386,12 +484,14 @@ mod tests {
 
     #[test]
     fn message_body_text_postcard_hex_pin_unchanged() {
-        // Confirms that adding the Reaction variant did not reorder existing
-        // tag values: Text must still encode to 00026869.
-        let body = MessageBody::Text("hi".to_owned());
+        // Sentinel: the Text tag must remain 0 even as new fields are
+        // added inside the Text variant, and as new variants are tacked
+        // onto the enum. If this hex prefix drifts, every persisted
+        // entry from a prior on-disk version becomes undecodable.
+        let body = MessageBody::text("hi");
         let bytes = postcard::to_stdvec(&body).unwrap();
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "00026869");
+        assert_eq!(hex, "0002686900");
     }
 
     #[test]
@@ -493,7 +593,7 @@ mod tests {
             inner_signature: Signature([0u8; 64]),
             sent_at_ms: 1,
             channel: ChannelLabel::default_general(),
-            body: MessageBody::Text("hi".to_owned()),
+            body: MessageBody::text("hi"),
         };
         let bytes = postcard::to_stdvec(&m).unwrap();
         // [0]: 0x40 = signature length varint (64 bytes).
@@ -505,8 +605,9 @@ mod tests {
         // [66]: 0x07 = channel length varint, "general" = 7 bytes.
         assert_eq!(bytes[66], 0x07);
         assert_eq!(&bytes[67..74], b"general");
-        // [74..]: MessageBody::Text("hi") tail = 00 02 68 69.
-        assert_eq!(&bytes[74..], &[0x00, 0x02, 0x68, 0x69]);
+        // [74..]: MessageBody::text("hi") tail =
+        //   00 (Text tag) 02 6869 (text "hi") 00 (empty images Vec).
+        assert_eq!(&bytes[74..], &[0x00, 0x02, 0x68, 0x69, 0x00]);
     }
 
     #[test]
@@ -515,7 +616,7 @@ mod tests {
             inner_signature: Signature([7u8; 64]),
             sent_at_ms: 42,
             channel: ChannelLabel::try_new("links").unwrap(),
-            body: MessageBody::Text("hello".to_owned()),
+            body: MessageBody::text("hello"),
         };
         let bytes = postcard::to_stdvec(&m).unwrap();
         let back: SignedMessage = postcard::from_bytes(&bytes).unwrap();
@@ -526,7 +627,7 @@ mod tests {
     #[test]
     fn inner_sig_payload_changes_with_channel() {
         let fp = RoomFingerprint([1u8; 32]);
-        let body = MessageBody::Text("hi".to_owned());
+        let body = MessageBody::text("hi");
         let general = ChannelLabel::default_general();
         let links = ChannelLabel::try_new("links").unwrap();
         let a = inner_sig_payload_bytes(&fp, 0, 100, &general, &body);
