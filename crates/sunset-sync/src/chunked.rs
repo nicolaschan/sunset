@@ -337,10 +337,7 @@ mod tests {
             .await
             .expect_err("receive should reject oversized message");
         let msg = format!("{err}");
-        assert!(
-            msg.contains("oversized message"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("oversized message"), "unexpected error: {msg}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -386,6 +383,9 @@ mod tests {
         let payload = Bytes::from_static(b"hello unreliable");
         a.send_unreliable(payload.clone()).await.unwrap();
         let recv = b.recv_unreliable().await.unwrap();
-        assert_eq!(recv, payload, "unreliable channel must pass through unchanged");
+        assert_eq!(
+            recv, payload,
+            "unreliable channel must pass through unchanged"
+        );
     }
 }
