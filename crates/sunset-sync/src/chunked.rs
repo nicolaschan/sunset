@@ -276,4 +276,46 @@ mod tests {
             roundtrip(&a, &b, Bytes::from(payload)).await;
         }
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_sends_do_not_interleave() {
+        // Two concurrent multi-chunk sends from the same side must
+        // each arrive intact on the receiver, not interleaved at the
+        // inner frame level. Without `send_lock` the chunker would
+        // race and the receiver would deframe one corrupted blob.
+        let (a, b) = make_chunked();
+        let a = std::rc::Rc::new(a);
+        let p = TEST_MAX_CHUNK - CONTINUATION_FLAG_BYTE;
+
+        let payload_x: Vec<u8> = vec![0xaa; 5 * p]; // 5 chunks
+        let payload_y: Vec<u8> = vec![0xbb; 4 * p]; // 4 chunks
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let a1 = a.clone();
+                let a2 = a.clone();
+                let p_x = payload_x.clone();
+                let p_y = payload_y.clone();
+                let h1 = tokio::task::spawn_local(async move {
+                    a1.send_reliable(Bytes::from(p_x)).await.unwrap();
+                });
+                let h2 = tokio::task::spawn_local(async move {
+                    a2.send_reliable(Bytes::from(p_y)).await.unwrap();
+                });
+                h1.await.unwrap();
+                h2.await.unwrap();
+
+                // Two complete logical messages arrive, in some order.
+                let r1 = b.recv_reliable().await.unwrap();
+                let r2 = b.recv_reliable().await.unwrap();
+                let mut got = [r1, r2];
+                // Sort by length so the asserts below don't depend on
+                // scheduling order.
+                got.sort_by_key(|b| b.len());
+                assert_eq!(got[0].as_ref(), payload_y.as_slice());
+                assert_eq!(got[1].as_ref(), payload_x.as_slice());
+            })
+            .await;
+    }
 }
