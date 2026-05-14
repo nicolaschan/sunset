@@ -196,9 +196,22 @@ We don't carry the candidates in the addr — they come over the signaler. The a
 Mirrors `WebRtcRawTransport` (already reviewed and merged). One shared task drains `signaler.recv()` and routes each `Candidates` by `from`:
 
 - If `per_peer[from]` exists (a `connect()` is mid-flight for that peer), forward the Candidates to its inbound queue.
-- Otherwise this is a fresh inbound — spawn a per-peer accept task before any await, drain any early-buffered Candidates for that peer (small TTL-bound buffer, same 30 s as WebRTC), and register `per_peer[from]` so subsequent messages route correctly.
+- Otherwise this is a fresh inbound — spawn a per-peer acceptor task and register `per_peer[from]` so subsequent messages route correctly.
 
-The accept task runs the holepunch + QUIC handshake and pushes the resulting `QuicRawConnection` (or `Err`) into `completed_tx`; `accept()` reads `completed_rx`.
+The acceptor task runs the holepunch + QUIC handshake and delivers its result to one of two destinations:
+
+- **No racing `connect()`** — pushes to `completed_tx`; `accept()` reads `completed_rx`.
+- **`connect(from)` racing this acceptor** — `connect()` "claims" the in-flight handshake by writing a `oneshot::Sender` into `per_peer[from].role_owner = RoleOwner::Acceptor(Some(_))`. The acceptor reads this on completion and delivers there. This is what makes `connect()` semantically correct for callers who try to dial a peer that's already mid-inbound: instead of erroring, they join the in-flight attempt.
+
+### Accept router (multi-peer demux)
+
+`run_accept_router` drains `endpoint.accept()` and routes each `Incoming` to the correct pre-registered responder using best-match against the responder's advertised `candidate_addrs`:
+
+1. **Exact `(ip, port)` match** — the QUIC initial source matches one of the peer's advertised candidates. The common case.
+2. **IP-only match** — the holepunch probe path and the QUIC initial path diverged across multi-homed paths, so the port differs but the IP belongs to a known candidate set. (NAT remapping or kernel route choice.)
+3. **Oldest live waiter (FIFO fallback)** — single-peer or fully unrouteable edge cases.
+
+Dead waiters (responders that errored before awaiting) are swept on every selection so the routing table self-trims under normal traffic.
 
 ## Failure modes
 
@@ -223,7 +236,9 @@ The accept task runs the holepunch + QUIC handshake and pushes the resulting `Qu
 ### Integration
 
 1. **`tests/holepunch_loopback.rs`** — two `QuicRawTransport` instances on `127.0.0.1`, sharing a `MemoryStore`-backed `RelaySignaler`. Side A calls `connect(quic://<B>)`, side B's `accept()` returns the matching connection. Both roundtrip a reliable message and a datagram. This is the *honest* end-to-end test: no probe-loop bypass, no stub signaler — the real holepunch protocol runs over loopback.
-2. **`tests/stun_skipped.rs`** — STUN servers set to `[]`, both peers on loopback. Holepunch still completes; the test asserts the working candidate is a loopback addr (via `QuicRawConnection::remote_addr`).
+2. **`tests/multi_peer.rs`** — Bob accepts two concurrent inbound peers (Alice + Charlie). Each pair must route correctly: Alice→Bob and Charlie→Bob must each receive the right bytes end-to-end, and the reverse direction round-trips identically. Exercises the source-addr–keyed accept router; the FIFO-only variant would deterministically mis-route here.
+3. **`tests/stun_skipped.rs`** — STUN servers set to `[]`, both peers on loopback. Holepunch still completes; the test asserts the working candidate is a loopback addr (via `QuicRawConnection::remote_addr`).
+4. **`tests/peer_disconnect.rs`** — confirms a peer-side `close()` surfaces as `Err` from the other side's pending `recv_reliable` (the contract the per-peer supervisor in `sunset-sync` watches).
 
 ### Non-tests
 

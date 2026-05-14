@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::spawn_local;
 
 use sunset_store::VerifyingKey;
@@ -56,18 +56,54 @@ type ProbeRouteKey = ([u8; 16], [u8; 32]);
 type ProbeBytes = (SocketAddr, Bytes);
 type ProbeRouteTable = HashMap<ProbeRouteKey, mpsc::UnboundedSender<ProbeBytes>>;
 
+/// One per-peer handshake-in-flight slot, keyed by `PeerId` in
+/// [`Inner::per_peer`]. The slot lives for the duration of one
+/// `run_handshake` invocation (either as initiator or acceptor) and is
+/// removed when that invocation returns.
+struct PeerHandshake {
+    /// Inbound Candidates queue for this peer (driven by the signaler
+    /// dispatcher). The handshake's owner drains this in step 2 of
+    /// `run_handshake`.
+    candidates_tx: mpsc::UnboundedSender<Candidates>,
+    /// Who's running the handshake.
+    role_owner: RoleOwner,
+}
+
+/// Identifies who is running the in-flight handshake for a peer and
+/// where its result should be delivered.
+enum RoleOwner {
+    /// A `connect()` call from local code is running the handshake.
+    /// A second `connect()` to the same peer can't usefully claim this
+    /// in-flight attempt — the result connection moves only once.
+    Connector,
+    /// The dispatcher spawned an acceptor task in response to an
+    /// inbound `Candidates`. The `Option<oneshot>` lets a *later*
+    /// `connect()` call claim the acceptor's result: when set, the
+    /// acceptor sends its `Ok(connection)`/`Err(_)` here instead of to
+    /// `completed_tx`. This is how true simultaneous-open works:
+    /// peer A's inbound Candidates triggers our acceptor, then our own
+    /// `connect(A)` arrives and "claims" the in-flight handshake.
+    Acceptor(Option<oneshot::Sender<SyncResult<QuicRawConnection>>>),
+}
+
+/// One QUIC accept-side waiter. Pre-registered by a responder task at
+/// step 3a of `run_handshake` so an early-arriving QUIC initial isn't
+/// refused by the accept router.
+struct AcceptWaiter {
+    tx: mpsc::UnboundedSender<quinn::Incoming>,
+    /// The remote peer's advertised candidate addresses, used to
+    /// route inbound `Incoming`s to the correct responder when several
+    /// peers are connecting concurrently.
+    candidate_addrs: Vec<SocketAddr>,
+}
+
 struct Inner {
-    per_peer: HashMap<PeerId, mpsc::UnboundedSender<Candidates>>,
+    per_peer: HashMap<PeerId, PeerHandshake>,
     probe_routes: ProbeRouteTable,
-    /// FIFO queue of acceptor tasks awaiting the next QUIC `Incoming`.
-    /// Source-address routing is unreliable on multi-homed hosts: the
-    /// holepunch probe and the QUIC initial can take different paths,
-    /// giving the responder a `confirmed.addr` that doesn't match the
-    /// `Incoming.remote_address()`. The v1 contract is "at most one
-    /// concurrent acceptor per transport"; multi-peer concurrent
-    /// inbound is a known limitation (NoiseTransport on top catches
-    /// any cross-routing via its identity binding).
-    accept_waiters: std::collections::VecDeque<mpsc::UnboundedSender<quinn::Incoming>>,
+    /// Pre-registered acceptors keyed by the remote peer's advertised
+    /// candidate addresses. Routed by `run_accept_router` using
+    /// best-match: exact `(ip, port)` → IP-only → oldest live waiter.
+    accept_waiters: Vec<AcceptWaiter>,
     completed_tx: mpsc::UnboundedSender<SyncResult<QuicRawConnection>>,
     probe_rx: Option<mpsc::UnboundedReceiver<ProbeBytes>>,
     dispatcher_started: bool,
@@ -135,7 +171,7 @@ impl QuicRawTransport {
             inner: Rc::new(RefCell::new(Inner {
                 per_peer: HashMap::new(),
                 probe_routes: HashMap::new(),
-                accept_waiters: std::collections::VecDeque::new(),
+                accept_waiters: Vec::new(),
                 completed_tx,
                 probe_rx: Some(probe_rx),
                 dispatcher_started: false,
@@ -201,16 +237,28 @@ impl QuicRawTransport {
     }
 
     fn route_inbound_candidates(&self, from: &PeerId, candidates: Candidates) {
-        let existing = self.inner.borrow().per_peer.get(from).cloned();
+        // If a handshake is already in flight for this peer (either
+        // we're running connect() to them, or a prior acceptor task
+        // is mid-flight), forward the Candidates to that handshake's
+        // queue. Don't spawn a second acceptor.
+        let existing = self
+            .inner
+            .borrow()
+            .per_peer
+            .get(from)
+            .map(|s| s.candidates_tx.clone());
         if let Some(tx) = existing {
             let _ = tx.send(candidates);
             return;
         }
         let (peer_tx, peer_rx) = mpsc::unbounded_channel();
-        self.inner
-            .borrow_mut()
-            .per_peer
-            .insert(from.clone(), peer_tx);
+        self.inner.borrow_mut().per_peer.insert(
+            from.clone(),
+            PeerHandshake {
+                candidates_tx: peer_tx,
+                role_owner: RoleOwner::Acceptor(None),
+            },
+        );
         let me = self.clone();
         let from = from.clone();
         spawn_local(async move {
@@ -223,9 +271,27 @@ impl QuicRawTransport {
                     },
                 )
                 .await;
-            let completed_tx = me.inner.borrow().completed_tx.clone();
-            let _ = completed_tx.send(result);
-            me.inner.borrow_mut().per_peer.remove(&from);
+            // Take the slot out atomically so we can read its (possibly
+            // updated) role_owner. A racing `connect(from)` may have
+            // claimed the result by writing into `Acceptor(Some(_))`.
+            let claim = me
+                .inner
+                .borrow_mut()
+                .per_peer
+                .remove(&from)
+                .and_then(|slot| match slot.role_owner {
+                    RoleOwner::Acceptor(claim) => claim,
+                    RoleOwner::Connector => None,
+                });
+            match claim {
+                Some(tx) => {
+                    let _ = tx.send(result);
+                }
+                None => {
+                    let completed_tx = me.inner.borrow().completed_tx.clone();
+                    let _ = completed_tx.send(result);
+                }
+            }
         });
     }
 
@@ -245,26 +311,52 @@ impl QuicRawTransport {
 
     async fn run_accept_router(self) {
         while let Some(incoming) = self.endpoint.accept().await {
-            // Walk the FIFO, popping dead waiters (responders that
-            // pre-registered but errored before awaiting their rx)
-            // until we find a live one or run out. If we run out, the
-            // Incoming is refused (no one's listening).
             let mut incoming = Some(incoming);
             loop {
-                let tx = match self.inner.borrow_mut().accept_waiters.pop_front() {
-                    Some(t) => t,
-                    None => break,
+                let target_idx = {
+                    let mut inner = self.inner.borrow_mut();
+                    // Sweep waiters whose receiver has been dropped
+                    // (responders that errored before awaiting). This
+                    // both bounds the Vec and skips them in selection.
+                    inner.accept_waiters.retain(|w| !w.tx.is_closed());
+                    let inc_addr = incoming
+                        .as_ref()
+                        .expect("incoming present at start of loop")
+                        .remote_address();
+                    // Best-match routing for multi-peer demux:
+                    // 1) exact (ip, port) — peer's QUIC initial source
+                    //    matches one of their advertised candidates;
+                    // 2) IP-only — same NAT, different port (path
+                    //    drift between holepunch and QUIC initial);
+                    // 3) oldest live waiter — single-peer fallback so
+                    //    a probe/initial source mismatch still works.
+                    let exact = inner
+                        .accept_waiters
+                        .iter()
+                        .position(|w| w.candidate_addrs.contains(&inc_addr));
+                    let by_ip = exact.or_else(|| {
+                        let ip = inc_addr.ip();
+                        inner
+                            .accept_waiters
+                            .iter()
+                            .position(|w| w.candidate_addrs.iter().any(|c| c.ip() == ip))
+                    });
+                    by_ip.or_else(|| {
+                        if inner.accept_waiters.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        }
+                    })
                 };
-                if tx.is_closed() {
-                    continue;
-                }
-                let i = incoming.take().expect("incoming present in loop");
-                match tx.send(i) {
+                let Some(idx) = target_idx else { break };
+                let waiter = self.inner.borrow_mut().accept_waiters.remove(idx);
+                let i = incoming.take().expect("incoming present at send");
+                match waiter.tx.send(i) {
                     Ok(()) => break,
                     Err(e) => {
-                        // Receiver was dropped between is_closed() and
-                        // send(). Recover the Incoming and try the next
-                        // waiter.
+                        // Receiver was dropped between sweep and send.
+                        // Recover the Incoming and try the next waiter.
                         incoming = Some(e.0);
                     }
                 }
@@ -340,7 +432,10 @@ impl QuicRawTransport {
             None
         } else {
             let (accept_tx, accept_rx) = mpsc::unbounded_channel();
-            self.inner.borrow_mut().accept_waiters.push_back(accept_tx);
+            self.inner.borrow_mut().accept_waiters.push(AcceptWaiter {
+                tx: accept_tx,
+                candidate_addrs: remote_candidates.addresses.clone(),
+            });
             Some(accept_rx)
         };
 
@@ -448,17 +543,57 @@ impl RawTransport for QuicRawTransport {
     async fn connect(&self, addr: PeerAddr) -> SyncResult<Self::Connection> {
         self.ensure_dispatcher();
         let remote = parse_addr(&addr)?;
-        let (peer_tx, peer_rx) = mpsc::unbounded_channel::<Candidates>();
-        {
+
+        // First try to *claim* an in-flight acceptor for this peer.
+        // The dispatcher may have spawned an acceptor task on inbound
+        // Candidates from `remote` before our local `connect()` was
+        // called; rather than start a competing handshake, we hand the
+        // acceptor a oneshot to deliver its result and wait for it.
+        // Another concurrent `connect()` (or a prior claim) loses —
+        // returns `Err`, caller may retry once the in-flight finishes.
+        let claim_rx = {
             let mut inner = self.inner.borrow_mut();
-            if inner.per_peer.contains_key(&remote) {
-                return Err(SyncError::Transport(format!(
-                    "quic connect: handshake already in flight for {:?}",
-                    remote.verifying_key().as_bytes()
-                )));
+            match inner.per_peer.get_mut(&remote) {
+                Some(slot) => match &mut slot.role_owner {
+                    RoleOwner::Connector => {
+                        return Err(SyncError::Transport(format!(
+                            "quic connect: another connect() in flight for {:?}",
+                            remote.verifying_key().as_bytes()
+                        )));
+                    }
+                    RoleOwner::Acceptor(claim) => {
+                        if claim.is_some() {
+                            return Err(SyncError::Transport(format!(
+                                "quic connect: acceptor already claimed for {:?}",
+                                remote.verifying_key().as_bytes()
+                            )));
+                        }
+                        let (tx, rx) = oneshot::channel();
+                        *claim = Some(tx);
+                        Some(rx)
+                    }
+                },
+                None => None,
             }
-            inner.per_peer.insert(remote.clone(), peer_tx);
+        };
+        if let Some(rx) = claim_rx {
+            return rx.await.unwrap_or_else(|_| {
+                Err(SyncError::Transport(
+                    "quic connect: in-flight acceptor was dropped".into(),
+                ))
+            });
         }
+
+        // No in-flight handshake — install ourselves as Connector and
+        // drive the handshake directly.
+        let (peer_tx, peer_rx) = mpsc::unbounded_channel::<Candidates>();
+        self.inner.borrow_mut().per_peer.insert(
+            remote.clone(),
+            PeerHandshake {
+                candidates_tx: peer_tx,
+                role_owner: RoleOwner::Connector,
+            },
+        );
         let result = self
             .run_handshake(remote.clone(), peer_rx, ConnectRole::Initiator)
             .await;
