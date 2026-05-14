@@ -21,7 +21,7 @@ import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
   type Attachment, type ChannelId, type Member, type MessageView, type Reaction,
-  Away, ChannelId, Direct, OfflineP, OneHop, Online, SelfRelay, Speaking,
+  ChannelId, OfflineP,
 }
 import sunset_web/markdown
 import sunset_web/sunset
@@ -717,8 +717,12 @@ fn message_header(
           [
             attribute.attribute("data-testid", "message-author"),
             attribute.attribute("data-author", m.author),
+            // Author names render at the same weight as body text. The
+            // per-author hue + the YOU tag (for self) is enough visual
+            // distinction; bold here was making the chat scrollback
+            // feel shouty.
             ui.css([
-              #("font-weight", "600"),
+              #("font-weight", "500"),
               #("font-size", "16.25px"),
               #("color", author_color),
               #("cursor", "default"),
@@ -789,6 +793,11 @@ fn reaction_pill(
   r: Reaction,
   on_toggle_reaction: fn(String, String) -> msg,
 ) -> Element(msg) {
+  // Reaction pills sit on a soft neutral surface — `surface_alt` is
+  // a hair above the page background so the pill outline is visible
+  // without forcing a dark grey block under every emoji. Pills you've
+  // reacted to use the soft accent fill so your own reactions stand
+  // out, but no border in either case (the fill alone delimits them).
   let bg = case r.by_you {
     True -> p.accent_soft
     False -> p.surface_alt
@@ -796,10 +805,6 @@ fn reaction_pill(
   let color = case r.by_you {
     True -> p.accent_deep
     False -> p.text_muted
-  }
-  let border = case r.by_you {
-    True -> p.accent
-    False -> p.border_soft
   }
   let title = case r.by_you {
     True -> "Remove your " <> r.emoji <> " reaction"
@@ -823,11 +828,11 @@ fn reaction_pill(
         #("display", "inline-flex"),
         #("align-items", "center"),
         #("gap", "4px"),
-        #("padding", "1px 8px"),
+        #("padding", "2px 8px"),
         #("border-radius", "999px"),
         #("background", bg),
         #("color", color),
-        #("border", "1px solid " <> border),
+        #("border", "none"),
         #("font-size", "13.75px"),
         #("font-family", "inherit"),
         #("cursor", "pointer"),
@@ -1161,39 +1166,36 @@ fn you_tag(p: Palette) -> Element(msg) {
   )
 }
 
-/// Pick the color for a message author's name based on the matching
-/// member's connection state. Lookup is by `m.author == member.name`
-/// (both hold the resolved display name, or the short-pubkey fallback
-/// when no name has been set).
+/// Pick the color for a message author's name.
 ///
-/// Mapping:
-///   * own messages → palette accent (so "you" stands out)
-///   * online + direct WebRTC → palette ok (green; healthy mesh)
-///   * online + via-relay → palette warn (amber; not direct)
-///   * speaking → palette live (matches the voice-rail dot)
-///   * away → palette warn
-///   * offline → palette text_faint
-///   * fallback (no member match yet) → palette text
+///   * own messages → palette accent (so the user can spot their own
+///     messages in the scrollback at a glance — own-name is identity,
+///     not status, so the brand accent is appropriate here)
+///   * offline author → text_faint (de-emphasised: the author isn't
+///     here right now)
+///   * everyone else → a stable per-author hue from `palette.author_hues`,
+///     picked by hashing the author identity. Each participant gets a
+///     consistent color across renders, the bold author name is always
+///     visually distinct from the body text, and the palette stays
+///     disjoint from the status colors.
+///
+/// The previous implementation encoded transport state (Direct vs OneHop)
+/// as the author color, which was confusing — readers couldn't tell from
+/// the chat scrollback whether a name was amber because the peer was
+/// "away" or "via-relay". Transport state is now discoverable from the
+/// members rail glyphs and the per-message details panel only.
 fn author_color(p: Palette, m: MessageView, members: List(Member)) -> String {
   case m.you {
     True -> p.accent
     False ->
       case list.find(members, fn(mem) { mem.name == m.author }) {
-        Error(_) -> p.text
-        Ok(mem) -> color_for_member(p, mem)
+        Error(_) -> theme.hue_for_identity(p, m.author)
+        Ok(mem) ->
+          case mem.status {
+            OfflineP -> p.text_faint
+            _ -> theme.hue_for_identity(p, m.author)
+          }
       }
-  }
-}
-
-fn color_for_member(p: Palette, mem: Member) -> String {
-  case mem.status, mem.relay {
-    OfflineP, _ -> p.text_faint
-    Away, _ -> p.warn
-    Speaking, _ -> p.live
-    Online, Direct -> p.ok
-    Online, OneHop -> p.warn
-    Online, SelfRelay -> p.text
-    _, _ -> p.text
   }
 }
 

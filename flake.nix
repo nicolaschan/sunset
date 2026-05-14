@@ -586,13 +586,33 @@
           web-node-modules = webNodeModules;
         };
 
-        apps = pkgs.lib.optionalAttrs (webHexDeps != null) {
+        apps = pkgs.lib.optionalAttrs (webHexDeps != null && webNpmDeps != null) {
           web-dev = {
             type = "app";
+            # Stage the same prerequisites webDist's buildPhase does, so a
+            # fresh worktree (no `web/build/dev/javascript/` populated, no
+            # `web/node_modules` linked) can start the dev server without
+            # any manual setup steps. Both `node_modules` (for esbuild's
+            # bare-specifier resolution) and the `sunset-web-wasm` JS+wasm
+            # bundle (which Lustre's dev server serves at `/sunset_web_wasm.js`
+            # from `build/dev/javascript/`, and which the FFI module imports
+            # at runtime via `import("../../sunset_web_wasm.js")`) are
+            # required for the dev server to work end-to-end.
             program = "${pkgs.writeShellScriptBin "sunset-web-dev" ''
+              set -euo pipefail
               export PATH="${pkgs.lib.makeBinPath [ pkgs.gleam pkgs.erlang pkgs.rebar3 pkgs.nodejs pkgs.bun ]}:$PATH"
               cd "$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || echo .)/web"
               ${gleamLib.devShellHook { gleamHexDeps = webHexDeps; }}
+              ln -sfn ${webNodeModules}/node_modules ./node_modules
+              # `gleam build` creates build/dev/javascript/; the wasm bundle
+              # then drops in beside it so esbuild can resolve the
+              # ../../sunset_web_wasm.js import from the FFI module at
+              # bundle time AND the dev server can serve the .js / .wasm
+              # files at runtime when the browser dynamically imports them.
+              ${pkgs.gleam}/bin/gleam build
+              mkdir -p build/dev/javascript
+              cp -f ${sunsetWebWasmPkg}/sunset_web_wasm.js build/dev/javascript/
+              cp -f ${sunsetWebWasmPkg}/sunset_web_wasm_bg.wasm build/dev/javascript/
               exec ${pkgs.gleam}/bin/gleam run -m lustre/dev start
             ''}/bin/sunset-web-dev";
             meta.description = "Run the sunset.chat dev server with hot reload";

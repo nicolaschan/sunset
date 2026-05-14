@@ -20,14 +20,12 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Channel, type ChannelId, type ConnStatus, type Member, type Relay,
-  type Room, type Viewport, type VoicePeerStateUI, Connected, Desktop, MutedP,
-  Offline, Phone, Reconnecting, TextChannel, Voice,
+  type Channel, type ChannelId, type Member, type Room, type Viewport,
+  type VoicePeerStateUI, Desktop, MutedP, Phone, TextChannel, Voice,
 }
 import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
-import sunset_web/views/relays as relays_view
 import sunset_web/views/voice_meter
 
 pub fn view(
@@ -49,8 +47,6 @@ pub fn view(
   on_join_voice on_join_voice: msg,
   on_leave_voice on_leave_voice: msg,
   self_in_call self_in_call: Bool,
-  relays relays: List(Relay),
-  on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
@@ -119,11 +115,6 @@ pub fn view(
               }),
             ]),
           ),
-          relays_view.rail_section(
-            palette: p,
-            relays: relays,
-            on_open: on_open_relay,
-          ),
         ],
       ),
     ],
@@ -165,7 +156,7 @@ fn room_header(
             #("cursor", "pointer"),
           ]),
         ],
-        [title_text(r), conn_icon(p, r.status), chevron_right(p)],
+        [title_text(r), chevron_right(p)],
       )
     Desktop ->
       html.span(
@@ -200,7 +191,11 @@ fn room_header(
     ],
     case viewport {
       Phone -> [title_el]
-      Desktop -> [title_el, conn_icon(p, r.status)]
+      // Desktop: room title only — connection state is surfaced via a
+      // text label in the rooms-rail meta_line ("reconnecting" /
+      // "offline") and via the phone header on mobile, so a duplicate
+      // dot here would only add visual noise.
+      Desktop -> [title_el]
     },
   )
 }
@@ -292,6 +287,8 @@ fn text_channel_row(
 
   html.button(
     [
+      attribute.attribute("data-testid", "text-channel-row"),
+      attribute.attribute("data-channel-name", c.name),
       event.on_click(sel(c.id)),
       ui.css([
         #("display", "flex"),
@@ -449,7 +446,20 @@ fn idle_voice_row(p: Palette, c: Channel, on_join: msg) -> Element(msg) {
       ]),
     ],
     [
-      html.span([ui.css([#("color", p.text_faint)])], [html.text("◐")]),
+      // Same mic glyph as the live voice block, in muted color so the
+      // idle state reads as "voice channel, no one in it yet" rather
+      // than introducing a different shape (the old ◐ half-circle didn't
+      // map to anything meaningful and was easy to misread as a status).
+      html.span(
+        [
+          ui.css([
+            #("color", p.text_faint),
+            #("display", "inline-flex"),
+            #("align-items", "center"),
+          ]),
+        ],
+        [voice_icon()],
+      ),
       html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
       case c.in_call {
         0 -> element.fragment([])
@@ -520,19 +530,10 @@ fn live_voice_block(
           ]),
         ],
         [
-          html.span(
-            [
-              ui.css([
-                #("width", "8px"),
-                #("height", "8px"),
-                #("border-radius", "999px"),
-                #("background", p.live),
-                #("display", "inline-block"),
-                #("flex-shrink", "0"),
-              ]),
-            ],
-            [],
-          ),
+          // Voice icon — clearer than a colored dot at conveying
+          // "this is a voice channel". Inherits color from the parent
+          // button (accent_deep).
+          voice_icon(),
           html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
         ],
       ),
@@ -635,11 +636,20 @@ fn voice_member_row(
     _, _ -> 0.0
   }
   let speaking = connected && level >. voice_meter.speaking_threshold()
-  let dot_color = case connected, muted, speaking {
-    False, _, _ -> p.text_faint
-    True, True, _ -> p.text_faint
-    True, False, True -> p.live
-    True, False, False -> p.accent
+  // Voice member dot semantics:
+  //   * Speaking → green, the only "active" signal in the row
+  //   * In-call but quiet → no dot at all (the trailing waveform meter
+  //     already conveys "audio path live, no level"; the dot was
+  //     redundant)
+  //   * Not connected (still in voice channel) → hollow gray ring,
+  //     matching the same convention used in the members rail
+  //   * Muted → small mic-muted glyph, conveys *why* there's no audio
+  //     better than a colored dot did
+  let leading_glyph = case connected, muted, speaking {
+    False, _, _ -> hollow_dot(p.text_faint)
+    True, True, _ -> mic_muted_glyph(p)
+    True, False, True -> filled_dot(p.live)
+    True, False, False -> empty_slot()
   }
   let active = case popover_open {
     Some(open_id) -> open_id == peer_key
@@ -691,18 +701,7 @@ fn voice_member_row(
       ]),
     ],
     [
-      html.span(
-        [
-          ui.css([
-            #("width", "6px"),
-            #("height", "6px"),
-            #("border-radius", "999px"),
-            #("background", dot_color),
-            #("flex-shrink", "0"),
-          ]),
-        ],
-        [],
-      ),
+      leading_glyph,
       html.span(
         [
           ui.css([
@@ -846,24 +845,163 @@ fn you_tag(p: Palette) -> Element(msg) {
   )
 }
 
-fn conn_icon(p: Palette, status: ConnStatus) -> Element(msg) {
-  let c = case status {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
-  }
+/// 7px filled dot used for the "speaking" indicator on a voice
+/// member row. Wider context lives at the call site.
+fn filled_dot(color: String) -> Element(msg) {
   html.span(
     [
       ui.css([
         #("width", "7px"),
         #("height", "7px"),
         #("border-radius", "999px"),
-        #("background", c),
-        #("display", "inline-block"),
+        #("background", color),
         #("flex-shrink", "0"),
       ]),
     ],
     [],
+  )
+}
+
+/// Hollow ring — same footprint as `filled_dot`, but reads as "off" /
+/// "not connected" without relying on the user remembering which gray
+/// means what.
+fn hollow_dot(color: String) -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("width", "7px"),
+        #("height", "7px"),
+        #("border-radius", "999px"),
+        #("background", "transparent"),
+        #("border", "1.5px solid " <> color),
+        #("box-sizing", "border-box"),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [],
+  )
+}
+
+/// Empty 7×7 placeholder so the column of leading glyphs in the voice
+/// member rows aligns whether the row has a dot, a ring, or nothing
+/// (in-call but not currently speaking).
+fn empty_slot() -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("width", "7px"),
+        #("height", "7px"),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [],
+  )
+}
+
+/// Mic-with-slash glyph for a peer who is muted. Sits where the
+/// speaking-state dot would otherwise go so the eye reads "no audio,
+/// because mic off" rather than "no audio, unknown why".
+fn mic_muted_glyph(p: Palette) -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "10"),
+      attribute.attribute("height", "10"),
+      attribute.attribute("viewBox", "0 0 12 12"),
+      attribute.attribute("fill", "none"),
+      ui.css([
+        #("color", p.text_faint),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "rect",
+        [
+          attribute.attribute("x", "4.5"),
+          attribute.attribute("y", "1.5"),
+          attribute.attribute("width", "3"),
+          attribute.attribute("height", "5"),
+          attribute.attribute("rx", "1.5"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.2"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute("d", "M2.5 6a3.5 3.5 0 007 0M6 9.5v1.5"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.2"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute("d", "M1.5 1l9 10"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.2"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
+    ],
+  )
+}
+
+/// Microphone glyph — leading icon on the live voice channel header.
+/// "Voice channel = use your mic" is the universal convention (Discord,
+/// Slack, etc.), and a mic icon doesn't get visually confused with the
+/// member-row speaking dots the way a speaker-with-waves design did.
+fn voice_icon() -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "14"),
+      attribute.attribute("height", "14"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      // Mic capsule.
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "rect",
+        [
+          attribute.attribute("x", "6"),
+          attribute.attribute("y", "2"),
+          attribute.attribute("width", "4"),
+          attribute.attribute("height", "8"),
+          attribute.attribute("rx", "2"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+        ],
+        [],
+      ),
+      // Stand — yoke arc + vertical post + base bar.
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute(
+            "d",
+            "M3.5 8a4.5 4.5 0 009 0M8 12.5V14.5M5.5 14.5h5",
+          ),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
+    ],
   )
 }
 

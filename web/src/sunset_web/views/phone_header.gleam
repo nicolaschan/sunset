@@ -84,7 +84,7 @@ fn title(p: Palette, r: Room) -> Element(msg) {
         ],
         [html.text(r.name)],
       ),
-      conn_dot(p, r.status),
+      conn_indicator(p, r.status),
     ],
   )
 }
@@ -122,23 +122,126 @@ fn icon_button(
   )
 }
 
-fn conn_dot(p: Palette, status: ConnStatus) -> Element(msg) {
-  let c = case status {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
+/// Compact "this room is in a non-default sync state" indicator.
+/// Connected (the default and most common state) renders nothing —
+/// only Reconnecting / Offline get a glyph, on the principle that
+/// status indicators should be conspicuous *deviations*, not constant
+/// chrome the user has to learn to ignore.
+fn conn_indicator(p: Palette, status: ConnStatus) -> Element(msg) {
+  case status {
+    Connected -> element.fragment([])
+    Reconnecting -> reconnecting_glyph(p)
+    Offline -> offline_glyph(p)
   }
+}
+
+fn reconnecting_glyph(p: Palette) -> Element(msg) {
   html.span(
     [
+      attribute.title("Reconnecting"),
       ui.css([
-        #("width", "8px"),
-        #("height", "8px"),
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("gap", "4px"),
+        #("padding", "2px 6px"),
         #("border-radius", "999px"),
-        #("background", c),
-        #("flex-shrink", "0"),
+        #("background", p.warn_soft),
+        #("color", p.warn),
+        #("font-size", "11.5px"),
+        #("font-weight", "600"),
+        #("text-transform", "uppercase"),
+        #("letter-spacing", "0.04em"),
       ]),
     ],
-    [],
+    [
+      sync_icon(),
+      html.text("Reconnecting"),
+    ],
+  )
+}
+
+fn offline_glyph(p: Palette) -> Element(msg) {
+  html.span(
+    [
+      attribute.title("Offline"),
+      ui.css([
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("gap", "4px"),
+        #("padding", "2px 6px"),
+        #("border-radius", "999px"),
+        #("background", p.surface_alt),
+        #("color", p.text_faint),
+        #("font-size", "11.5px"),
+        #("font-weight", "600"),
+        #("text-transform", "uppercase"),
+        #("letter-spacing", "0.04em"),
+      ]),
+    ],
+    [
+      offline_icon(),
+      html.text("Offline"),
+    ],
+  )
+}
+
+fn sync_icon() -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "11"),
+      attribute.attribute("height", "11"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute(
+            "d",
+            "M3 8a5 5 0 018.7-3.3L13 6M13 8a5 5 0 01-8.7 3.3L3 10M13 3v3h-3M3 13v-3h3",
+          ),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.5"),
+          attribute.attribute("stroke-linecap", "round"),
+          attribute.attribute("stroke-linejoin", "round"),
+        ],
+        [],
+      ),
+    ],
+  )
+}
+
+fn offline_icon() -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "11"),
+      attribute.attribute("height", "11"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute(
+            "d",
+            "M2 4l12 8M3.5 6.5a8 8 0 019 0M5.5 9a5 5 0 015 0M7.5 11.5a2 2 0 012 0",
+          ),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.5"),
+          attribute.attribute("stroke-linecap", "round"),
+          attribute.attribute("stroke-linejoin", "round"),
+        ],
+        [],
+      ),
+    ],
   )
 }
 

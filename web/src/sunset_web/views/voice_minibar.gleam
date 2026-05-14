@@ -27,6 +27,9 @@ pub fn view(
   self_muted self_muted: Bool,
   self_deafened self_deafened: Bool,
 ) -> Element(msg) {
+  // Soft accent fill + a 3px solid accent ribbon on the left so the
+  // minibar still reads as "you are in a call" without flooding the
+  // chrome with the brand color.
   html.div(
     [
       attribute.attribute("data-testid", "voice-minibar"),
@@ -37,9 +40,10 @@ pub fn view(
         #("box-sizing", "border-box"),
         #("width", "100%"),
         #("padding", "8px 12px"),
-        #("background", p.accent),
-        #("color", p.accent_ink),
+        #("background", p.accent_soft),
+        #("color", p.accent_deep),
         #("border-bottom", "1px solid " <> p.border),
+        #("border-left", "3px solid " <> p.accent),
         #("font-size", "14px"),
         #("font-weight", "600"),
         #("flex-shrink", "0"),
@@ -67,7 +71,7 @@ pub fn view(
         p,
         self_deafened,
       ),
-      leave_button(on_leave),
+      leave_button(p, on_leave),
     ],
   )
 }
@@ -98,24 +102,11 @@ fn label_button(_p: Palette, channel_name: String, on_open: msg) -> Element(msg)
       ]),
     ],
     [
-      live_dot(),
+      // The minibar's accent-colored bar IS the "you are in a call"
+      // indicator — a redundant white dot beside the channel name was
+      // adding noise without information.
       html.span([], [html.text(channel_name)]),
     ],
-  )
-}
-
-fn live_dot() -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("width", "8px"),
-        #("height", "8px"),
-        #("border-radius", "999px"),
-        #("background", "#ffffff"),
-        #("flex-shrink", "0"),
-      ]),
-    ],
-    [],
   )
 }
 
@@ -126,9 +117,12 @@ fn icon_button(
   _p: Palette,
   active: Bool,
 ) -> Element(msg) {
+  // Subtle ink-on-cream tints so the buttons stay readable on the soft
+  // accent surface (the old white overlays were tuned for the solid
+  // accent fill we used to have).
   let bg = case active {
-    True -> "rgba(255, 255, 255, 0.35)"
-    False -> "rgba(255, 255, 255, 0.18)"
+    True -> "rgba(0, 0, 0, 0.10)"
+    False -> "rgba(0, 0, 0, 0.05)"
   }
   html.button(
     [
@@ -158,7 +152,7 @@ fn icon_button(
   )
 }
 
-fn leave_button(on_click: msg) -> Element(msg) {
+fn leave_button(p: Palette, on_click: msg) -> Element(msg) {
   html.button(
     [
       attribute.title("Leave call"),
@@ -173,7 +167,7 @@ fn leave_button(on_click: msg) -> Element(msg) {
         #("padding", "0"),
         #("border", "none"),
         #("border-radius", "6px"),
-        #("background", "#a8242c"),
+        #("background", p.danger),
         #("color", "#ffffff"),
         #("flex-shrink", "0"),
         #("cursor", "pointer"),

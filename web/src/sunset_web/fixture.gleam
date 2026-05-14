@@ -109,7 +109,7 @@ pub fn channels() -> List(Channel) {
     ),
     Channel(
       id: ChannelId("voice"),
-      name: "Voice Channel",
+      name: "general",
       kind: Voice,
       in_call: 0,
       unread: 0,
