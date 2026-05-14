@@ -9,10 +9,11 @@
 //      full-hex peer dict, so non-self peers were silently filtered out
 //      and only the local user ever showed.
 //
-//   2. The channel header reads "Voice Channel" (not "Lounge"). The
-//      fixture-driven name is what end users see in the rail; renaming
-//      it without an e2e check would let it regress on the next
-//      fixture refresh.
+//   2. The voice channel row reads "general" — the same default name
+//      as the text channel, since the channels rail's kind separator
+//      already distinguishes them. The label is what end users see in
+//      the rail; renaming it without an e2e check would let it regress
+//      on the next fixture refresh.
 //
 //   3. The waveform next to a peer's name reflects real audio energy.
 //      Each row exposes its smoothed level via `data-voice-level`
@@ -85,17 +86,18 @@ test("voice channel roster: both peers visible, waveform tracks real audio", asy
   const alice = await openPeer(browser, relay.addr);
   const bob = await openPeer(browser, relay.addr);
 
-  // Channel header reads "Voice Channel" — the rename is part of the
-  // user-visible deliverable. Scope to the voice-channel-row testid
-  // because the voice minibar at the top of the chat panel also
-  // renders the channel name once self_in_call flips true (so a bare
-  // `getByText` would match twice after joining).
+  // Voice channel row reads "general" — same default as the text
+  // channel; the rail's kind separator already distinguishes them.
+  // Scope to the voice-channel-row testid because the voice minibar
+  // at the top of the chat panel also renders the channel name once
+  // self_in_call flips true (so a bare `getByText` would match twice
+  // after joining).
   await expect(
     alice.page.locator('[data-testid="voice-channel-row"]'),
-  ).toContainText("Voice Channel");
+  ).toContainText("general");
   await expect(
     bob.page.locator('[data-testid="voice-channel-row"]'),
-  ).toContainText("Voice Channel");
+  ).toContainText("general");
 
   // Both peers join voice. On Desktop the voice-leave button appears
   // when voice_start() resolves Ok — same gating signal the rest of
