@@ -2575,6 +2575,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
+ "wasmtimer",
  "web-sys",
  "web-time",
 ]
