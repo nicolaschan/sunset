@@ -453,7 +453,20 @@ fn idle_voice_row(p: Palette, c: Channel, on_join: msg) -> Element(msg) {
       ]),
     ],
     [
-      html.span([ui.css([#("color", p.text_faint)])], [html.text("◐")]),
+      // Same mic glyph as the live voice block, in muted color so the
+      // idle state reads as "voice channel, no one in it yet" rather
+      // than introducing a different shape (the old ◐ half-circle didn't
+      // map to anything meaningful and was easy to misread as a status).
+      html.span(
+        [
+          ui.css([
+            #("color", p.text_faint),
+            #("display", "inline-flex"),
+            #("align-items", "center"),
+          ]),
+        ],
+        [voice_icon()],
+      ),
       html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
       case c.in_call {
         0 -> element.fragment([])
@@ -950,9 +963,10 @@ fn mic_muted_glyph(p: Palette) -> Element(msg) {
   )
 }
 
-/// Speaker / voice icon — used as the leading glyph on the live voice
-/// channel header (replacing what used to be a colored "live" dot, which
-/// was easy to confuse with a connection-state indicator).
+/// Microphone glyph — leading icon on the live voice channel header.
+/// "Voice channel = use your mic" is the universal convention (Discord,
+/// Slack, etc.), and a mic icon doesn't get visually confused with the
+/// member-row speaking dots the way a speaker-with-waves design did.
 fn voice_icon() -> Element(msg) {
   element.namespaced(
     "http://www.w3.org/2000/svg",
@@ -964,22 +978,29 @@ fn voice_icon() -> Element(msg) {
       attribute.attribute("fill", "none"),
     ],
     [
+      // Mic capsule.
       element.namespaced(
         "http://www.w3.org/2000/svg",
-        "path",
+        "rect",
         [
-          attribute.attribute("d", "M3.5 6h2L8.5 3.5v9L5.5 10h-2z"),
-          attribute.attribute("fill", "currentColor"),
+          attribute.attribute("x", "6"),
+          attribute.attribute("y", "2"),
+          attribute.attribute("width", "4"),
+          attribute.attribute("height", "8"),
+          attribute.attribute("rx", "2"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
         ],
         [],
       ),
+      // Stand — yoke arc + vertical post + base bar.
       element.namespaced(
         "http://www.w3.org/2000/svg",
         "path",
         [
           attribute.attribute(
             "d",
-            "M11 5.5a3.5 3.5 0 010 5M12.5 3.5a6 6 0 010 9",
+            "M3.5 8a4.5 4.5 0 009 0M8 12.5V14.5M5.5 14.5h5",
           ),
           attribute.attribute("stroke", "currentColor"),
           attribute.attribute("stroke-width", "1.4"),

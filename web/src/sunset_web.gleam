@@ -153,8 +153,13 @@ fn initial_channels() -> List(domain.Channel) {
       unread: 0,
     ),
     domain.Channel(
+      // Default voice channel is named "general" in parallel to the
+      // default text channel — same room-wide affordance for "the
+      // unstructured place where everyone hangs out", just one for
+      // typing and one for talking. The kind in the channels rail is
+      // what distinguishes them, not the name.
       id: ChannelId("voice"),
-      name: "Voice Channel",
+      name: "general",
       kind: domain.Voice,
       in_call: 0,
       unread: 0,
@@ -2506,7 +2511,7 @@ fn room_view_with_state(
   let active_voice_channel_name =
     list.find(channels_for_view, fn(c) { c.kind == domain.Voice })
     |> result.map(fn(c) { c.name })
-    |> result.unwrap("Voice Channel")
+    |> result.unwrap("general")
 
   // Self peer hex for the minibar's "open my own popover" affordance.
   // Falls back to "self" when there's no client (pre-bootstrap, never

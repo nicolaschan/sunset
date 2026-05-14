@@ -214,6 +214,11 @@ fn rail_row(p: Palette, r: Relay, on_open: fn(Float) -> msg) -> Element(msg) {
         #("color", p.text_muted),
         #("font-family", "inherit"),
         #("font-size", "16.25px"),
+        // Buttons inherit the page font, but not its weight — some UAs
+        // bake a bold weight into their button stylesheet. Spell normal
+        // out so the relay host renders at the same weight as a
+        // sibling channel row.
+        #("font-weight", "400"),
         #("text-align", "left"),
         #("cursor", "pointer"),
         #("border-radius", "6px"),
