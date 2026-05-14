@@ -52,23 +52,23 @@ pub fn view(
     [
       label_button(p, channel_name, on_open),
       icon_button(
+        p,
         case self_muted {
           True -> "Unmute mic"
           False -> "Mute mic"
         },
         mic_icon(self_muted),
         on_mute,
-        p,
-        False,
+        self_muted,
       ),
       icon_button(
+        p,
         case self_deafened {
           True -> "Undeafen"
           False -> "Deafen"
         },
-        headphones_icon(),
+        headphones_icon(self_deafened),
         on_deafen,
-        p,
         self_deafened,
       ),
       leave_button(p, on_leave),
@@ -111,18 +111,24 @@ fn label_button(_p: Palette, channel_name: String, on_open: msg) -> Element(msg)
 }
 
 fn icon_button(
+  p: Palette,
   title: String,
   icon: Element(msg),
   on_click: msg,
-  _p: Palette,
   active: Bool,
 ) -> Element(msg) {
-  // Subtle ink-on-cream tints so the buttons stay readable on the soft
-  // accent surface (the old white overlays were tuned for the solid
-  // accent fill we used to have).
+  // Active state surfaces a danger tint + danger-colored icon so being
+  // muted or deafened in a call reads at a glance — matches the universal
+  // convention (Discord/Slack/Zoom/Teams). The slashed icon variant the
+  // caller passes carries the same signal in shape, so colorblind users
+  // still distinguish active from inactive without relying on hue.
   let bg = case active {
-    True -> "rgba(0, 0, 0, 0.10)"
+    True -> p.danger_soft
     False -> "rgba(0, 0, 0, 0.05)"
+  }
+  let fg = case active {
+    True -> p.danger
+    False -> "currentColor"
   }
   html.button(
     [
@@ -142,7 +148,7 @@ fn icon_button(
         #("border", "none"),
         #("border-radius", "6px"),
         #("background", bg),
-        #("color", "currentColor"),
+        #("color", fg),
         #("flex-shrink", "0"),
         #("cursor", "pointer"),
         #("font-family", "inherit"),
@@ -178,7 +184,38 @@ fn leave_button(p: Palette, on_click: msg) -> Element(msg) {
   )
 }
 
-fn mic_icon(_muted: Bool) -> Element(msg) {
+fn mic_icon(muted: Bool) -> Element(msg) {
+  let base = [
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "rect",
+      [
+        attribute.attribute("x", "6"),
+        attribute.attribute("y", "2.5"),
+        attribute.attribute("width", "4"),
+        attribute.attribute("height", "8"),
+        attribute.attribute("rx", "2"),
+        attribute.attribute("stroke", "currentColor"),
+        attribute.attribute("stroke-width", "1.4"),
+      ],
+      [],
+    ),
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "path",
+      [
+        attribute.attribute("d", "M3.5 8a4.5 4.5 0 009 0M8 12.5V14"),
+        attribute.attribute("stroke", "currentColor"),
+        attribute.attribute("stroke-width", "1.4"),
+        attribute.attribute("stroke-linecap", "round"),
+      ],
+      [],
+    ),
+  ]
+  let children = case muted {
+    True -> [slash_line(), ..base]
+    False -> base
+  }
   element.namespaced(
     "http://www.w3.org/2000/svg",
     "svg",
@@ -188,37 +225,75 @@ fn mic_icon(_muted: Bool) -> Element(msg) {
       attribute.attribute("viewBox", "0 0 16 16"),
       attribute.attribute("fill", "none"),
     ],
-    [
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "rect",
-        [
-          attribute.attribute("x", "6"),
-          attribute.attribute("y", "2.5"),
-          attribute.attribute("width", "4"),
-          attribute.attribute("height", "8"),
-          attribute.attribute("rx", "2"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.4"),
-        ],
-        [],
-      ),
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "path",
-        [
-          attribute.attribute("d", "M3.5 8a4.5 4.5 0 009 0M8 12.5V14"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.4"),
-          attribute.attribute("stroke-linecap", "round"),
-        ],
-        [],
-      ),
-    ],
+    children,
   )
 }
 
-fn headphones_icon() -> Element(msg) {
+// A 45° line corner-to-corner, used by the muted / deafened icon
+// variants. Rendered first so the rest of the glyph sits over it.
+fn slash_line() -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "line",
+    [
+      attribute.attribute("x1", "2"),
+      attribute.attribute("y1", "14"),
+      attribute.attribute("x2", "14"),
+      attribute.attribute("y2", "2"),
+      attribute.attribute("stroke", "currentColor"),
+      attribute.attribute("stroke-width", "1.6"),
+      attribute.attribute("stroke-linecap", "round"),
+    ],
+    [],
+  )
+}
+
+fn headphones_icon(deafened: Bool) -> Element(msg) {
+  let base = [
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "path",
+      [
+        attribute.attribute("d", "M3 9V7a5 5 0 0110 0v2"),
+        attribute.attribute("stroke", "currentColor"),
+        attribute.attribute("stroke-width", "1.4"),
+        attribute.attribute("stroke-linecap", "round"),
+      ],
+      [],
+    ),
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "rect",
+      [
+        attribute.attribute("x", "2.5"),
+        attribute.attribute("y", "9"),
+        attribute.attribute("width", "3"),
+        attribute.attribute("height", "4"),
+        attribute.attribute("rx", "1"),
+        attribute.attribute("stroke", "currentColor"),
+        attribute.attribute("stroke-width", "1.3"),
+      ],
+      [],
+    ),
+    element.namespaced(
+      "http://www.w3.org/2000/svg",
+      "rect",
+      [
+        attribute.attribute("x", "10.5"),
+        attribute.attribute("y", "9"),
+        attribute.attribute("width", "3"),
+        attribute.attribute("height", "4"),
+        attribute.attribute("rx", "1"),
+        attribute.attribute("stroke", "currentColor"),
+        attribute.attribute("stroke-width", "1.3"),
+      ],
+      [],
+    ),
+  ]
+  let children = case deafened {
+    True -> [slash_line(), ..base]
+    False -> base
+  }
   element.namespaced(
     "http://www.w3.org/2000/svg",
     "svg",
@@ -228,47 +303,7 @@ fn headphones_icon() -> Element(msg) {
       attribute.attribute("viewBox", "0 0 16 16"),
       attribute.attribute("fill", "none"),
     ],
-    [
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "path",
-        [
-          attribute.attribute("d", "M3 9V7a5 5 0 0110 0v2"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.4"),
-          attribute.attribute("stroke-linecap", "round"),
-        ],
-        [],
-      ),
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "rect",
-        [
-          attribute.attribute("x", "2.5"),
-          attribute.attribute("y", "9"),
-          attribute.attribute("width", "3"),
-          attribute.attribute("height", "4"),
-          attribute.attribute("rx", "1"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.3"),
-        ],
-        [],
-      ),
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "rect",
-        [
-          attribute.attribute("x", "10.5"),
-          attribute.attribute("y", "9"),
-          attribute.attribute("width", "3"),
-          attribute.attribute("height", "4"),
-          attribute.attribute("rx", "1"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.3"),
-        ],
-        [],
-      ),
-    ],
+    children,
   )
 }
 
