@@ -135,12 +135,11 @@ async function readButtonState(page, title) {
   const btn = page.getByTitle(title, { exact: true });
   return await btn.evaluate((el) => {
     const styles = window.getComputedStyle(el);
-    const svgLines = el.querySelectorAll("svg line");
     return {
       ariaPressed: el.getAttribute("aria-pressed"),
       backgroundColor: styles.backgroundColor,
       color: styles.color,
-      slashCount: svgLines.length,
+      hasSlash: !!el.querySelector('[data-testid="voice-button-slash"]'),
     };
   });
 }
@@ -160,7 +159,7 @@ test("mute and deafen buttons visually indicate their active state", async ({
   // --- Mute button ----------------------------------------------------------
   const muteInactive = await readButtonState(alice.page, "Mute mic");
   expect(muteInactive.ariaPressed).toBe("false");
-  expect(muteInactive.slashCount).toBe(0);
+  expect(muteInactive.hasSlash).toBe(false);
 
   await alice.page.getByTitle("Mute mic", { exact: true }).click();
   await expect(
@@ -169,8 +168,9 @@ test("mute and deafen buttons visually indicate their active state", async ({
 
   const muteActive = await readButtonState(alice.page, "Unmute mic");
   expect(muteActive.ariaPressed).toBe("true");
-  // Slashed mic variant rendered: one extra <line> overlaying the glyph.
-  expect(muteActive.slashCount).toBe(1);
+  // Slashed mic variant rendered: data-testid="voice-button-slash" element
+  // sits inside the SVG and is the same signal a sighted user reads.
+  expect(muteActive.hasSlash).toBe(true);
   // Background and icon colour MUST differ from the inactive state — that's
   // the at-a-glance signal we promised the user.
   expect(muteActive.backgroundColor).not.toBe(muteInactive.backgroundColor);
@@ -183,13 +183,13 @@ test("mute and deafen buttons visually indicate their active state", async ({
   );
   const muteReverted = await readButtonState(alice.page, "Mute mic");
   expect(muteReverted.ariaPressed).toBe("false");
-  expect(muteReverted.slashCount).toBe(0);
+  expect(muteReverted.hasSlash).toBe(false);
   expect(muteReverted.backgroundColor).toBe(muteInactive.backgroundColor);
 
   // --- Deafen button --------------------------------------------------------
   const deafenInactive = await readButtonState(alice.page, "Deafen");
   expect(deafenInactive.ariaPressed).toBe("false");
-  expect(deafenInactive.slashCount).toBe(0);
+  expect(deafenInactive.hasSlash).toBe(false);
 
   await alice.page.getByTitle("Deafen", { exact: true }).click();
   await expect(alice.page.getByTitle("Undeafen", { exact: true })).toBeVisible(
@@ -198,7 +198,7 @@ test("mute and deafen buttons visually indicate their active state", async ({
 
   const deafenActive = await readButtonState(alice.page, "Undeafen");
   expect(deafenActive.ariaPressed).toBe("true");
-  expect(deafenActive.slashCount).toBe(1);
+  expect(deafenActive.hasSlash).toBe(true);
   expect(deafenActive.backgroundColor).not.toBe(deafenInactive.backgroundColor);
   expect(deafenActive.color).not.toBe(deafenInactive.color);
 
@@ -208,7 +208,7 @@ test("mute and deafen buttons visually indicate their active state", async ({
   });
   const deafenReverted = await readButtonState(alice.page, "Deafen");
   expect(deafenReverted.ariaPressed).toBe("false");
-  expect(deafenReverted.slashCount).toBe(0);
+  expect(deafenReverted.hasSlash).toBe(false);
   expect(deafenReverted.backgroundColor).toBe(deafenInactive.backgroundColor);
 
   await alice.ctx.close();

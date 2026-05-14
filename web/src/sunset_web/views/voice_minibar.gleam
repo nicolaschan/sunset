@@ -231,11 +231,16 @@ fn mic_icon(muted: Bool) -> Element(msg) {
 
 // A 45° line corner-to-corner, used by the muted / deafened icon
 // variants. Rendered first so the rest of the glyph sits over it.
+// The data-testid lets the visual-state e2e test detect "active"
+// without depending on counting raw `<line>` tags inside the SVG
+// — future icon work can add unrelated `<line>` decorations without
+// silently breaking the assertion.
 fn slash_line() -> Element(msg) {
   element.namespaced(
     "http://www.w3.org/2000/svg",
     "line",
     [
+      attribute.attribute("data-testid", "voice-button-slash"),
       attribute.attribute("x1", "2"),
       attribute.attribute("y1", "14"),
       attribute.attribute("x2", "14"),
