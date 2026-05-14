@@ -798,57 +798,93 @@ fn you_row(
       ]),
     ],
     [
-      // Collapsed rail centers a small avatar tile; expanded shows
-      // "you" + your_name. The rail's "you are signed in" affordance is
-      // the row itself + the surrounding chrome — no status dot needed.
+      // Avatar circle on both collapsed and expanded rails. The
+      // collapsed variant shows just the avatar; the expanded variant
+      // adds the user's display name to the right. We dropped the
+      // separate "you" label + mono-font subtitle pair because the row
+      // sits in the user's own column at the bottom of the screen —
+      // the avatar + name combination already reads as "you".
+      user_avatar(p, your_name),
       case collapsed {
-        True ->
-          html.span(
-            [
-              ui.css([
-                #("display", "inline-flex"),
-                #("align-items", "center"),
-                #("justify-content", "center"),
-                #("width", "28px"),
-                #("height", "28px"),
-                #("border-radius", "999px"),
-                #("background", p.surface_alt),
-                #("color", p.text_muted),
-                #("font-size", "13px"),
-                #("font-weight", "600"),
-              ]),
-            ],
-            [html.text(string.uppercase(string.slice(your_name, 0, 1)))],
-          )
+        True -> element.fragment([])
         False ->
           html.span(
             [
               ui.css([
                 #("flex", "1"),
-                #("display", "flex"),
-                #("align-items", "baseline"),
-                #("gap", "6px"),
                 #("min-width", "0"),
+                #("font-weight", "500"),
+                #("color", p.text),
+                #("white-space", "nowrap"),
+                #("overflow", "hidden"),
+                #("text-overflow", "ellipsis"),
               ]),
             ],
-            [
-              html.span(
-                [ui.css([#("font-weight", "500"), #("color", p.text)])],
-                [html.text("you")],
-              ),
-              html.span(
-                [
-                  ui.css([
-                    #("font-family", theme.font_mono),
-                    #("font-size", "13.125px"),
-                    #("color", p.text_faint),
-                  ]),
-                ],
-                [html.text(your_name)],
-              ),
-            ],
+            [html.text(your_name)],
           )
       },
+    ],
+  )
+}
+
+/// Round avatar tile used in the rooms-rail bottom "you" row. The
+/// generic-user SVG keeps the chrome readable when the display name
+/// is empty / placeholder; once the user picks a name, the initial
+/// could be swapped in here, but the silhouette is the unambiguous
+/// "this is your account" affordance.
+fn user_avatar(p: Palette, _name: String) -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+        #("width", "28px"),
+        #("height", "28px"),
+        #("border-radius", "999px"),
+        #("background", p.surface_alt),
+        #("color", p.text_muted),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [user_icon()],
+  )
+}
+
+fn user_icon() -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "16"),
+      attribute.attribute("height", "16"),
+      attribute.attribute("viewBox", "0 0 16 16"),
+      attribute.attribute("fill", "none"),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "circle",
+        [
+          attribute.attribute("cx", "8"),
+          attribute.attribute("cy", "6"),
+          attribute.attribute("r", "2.6"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute("d", "M2.5 13.5a5.5 5.5 0 0111 0"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
     ],
   )
 }

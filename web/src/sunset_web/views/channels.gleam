@@ -20,14 +20,12 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Channel, type ChannelId, type Member, type Relay, type Room,
-  type Viewport, type VoicePeerStateUI, Desktop, MutedP, Phone, TextChannel,
-  Voice,
+  type Channel, type ChannelId, type Member, type Room, type Viewport,
+  type VoicePeerStateUI, Desktop, MutedP, Phone, TextChannel, Voice,
 }
 import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
-import sunset_web/views/relays as relays_view
 import sunset_web/views/voice_meter
 
 pub fn view(
@@ -49,8 +47,6 @@ pub fn view(
   on_join_voice on_join_voice: msg,
   on_leave_voice on_leave_voice: msg,
   self_in_call self_in_call: Bool,
-  relays relays: List(Relay),
-  on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
@@ -118,11 +114,6 @@ pub fn view(
                 )
               }),
             ]),
-          ),
-          relays_view.rail_section(
-            palette: p,
-            relays: relays,
-            on_open: on_open_relay,
           ),
         ],
       ),
@@ -296,6 +287,8 @@ fn text_channel_row(
 
   html.button(
     [
+      attribute.attribute("data-testid", "text-channel-row"),
+      attribute.attribute("data-channel-name", c.name),
       event.on_click(sel(c.id)),
       ui.css([
         #("display", "flex"),

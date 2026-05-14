@@ -13,7 +13,7 @@ import { spawn } from "child_process";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { openChannelsDrawer } from "./helpers/viewport.js";
+import { openMembersDrawer } from "./helpers/viewport.js";
 
 let relayProcess = null;
 let relayAddress = null;
@@ -97,9 +97,9 @@ test("relay row appears, popover opens, live metrics update", async ({ page }, t
 
   await page.goto(buildUrl());
 
-  // On phone the channels rail lives behind a drawer; open it before
-  // asserting on the relays section. No-op on desktop.
-  await openChannelsDrawer(page, testInfo);
+  // On phone the members rail (where the relays section now lives)
+  // is behind a drawer; open it before asserting. No-op on desktop.
+  await openMembersDrawer(page, testInfo);
 
   // The Relays section is hidden when empty; wait for it to materialise.
   await expect(page.locator('[data-testid="relays-section"]')).toBeVisible({
@@ -147,7 +147,7 @@ test("relay row appears, popover opens, live metrics update", async ({ page }, t
   await expect(popover).toBeHidden();
 });
 
-test("desktop relay popover docks next to the channels rail, not the right column", async ({
+test("desktop relay popover docks next to the relays section in the members rail", async ({
   page,
 }, testInfo) => {
   test.skip(
@@ -172,13 +172,12 @@ test("desktop relay popover docks next to the channels rail, not the right colum
   const popover = page.locator('[data-testid="relay-popover"]');
   await expect(popover).toBeVisible();
 
-  // The popover's left edge should be just to the right of the
-  // relays listing (which lives at the bottom of the channels rail).
-  // Pre-fix the popover was anchored to `right: 260px`, putting it
-  // past the main chat column on the far right of the viewport —
-  // visually disconnected from the row that triggered it. We assert:
-  // the popover sits to the right of the relays section but in the
-  // left half of the viewport, and doesn't run off-screen.
+  // The relays section now lives at the bottom of the members rail
+  // (the right column). The popover anchors to the left of that rail
+  // so it sits visually adjacent to the row that triggered it. We
+  // assert: the popover sits to the LEFT of the relays section, in
+  // the right half of the viewport, and doesn't run off-screen on
+  // either side.
   const rects = await page.evaluate(() => {
     const popoverEl = document.querySelector('[data-testid="relay-popover"]');
     const sectionEl = document.querySelector('[data-testid="relays-section"]');
@@ -188,7 +187,7 @@ test("desktop relay popover docks next to the channels rail, not the right colum
       vw: window.innerWidth,
     };
   });
-  expect(rects.popover.left).toBeGreaterThanOrEqual(rects.section.right);
-  expect(rects.popover.left).toBeLessThan(rects.vw / 2);
-  expect(rects.popover.right).toBeLessThan(rects.vw);
+  expect(rects.popover.right).toBeLessThanOrEqual(rects.section.left);
+  expect(rects.popover.right).toBeGreaterThan(rects.vw / 2);
+  expect(rects.popover.left).toBeGreaterThan(0);
 });

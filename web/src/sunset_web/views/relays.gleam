@@ -198,6 +198,18 @@ pub fn rail_section(
   }
 }
 
+/// Public single-row renderer. Used by the members rail's "Relays"
+/// section, which composes its own surrounding `section_title` chrome
+/// rather than wrapping the whole `rail_section` (whose title styling
+/// belongs to the channels rail's visual rhythm).
+pub fn row(
+  palette p: Palette,
+  relay r: Relay,
+  on_open on_open: fn(Float) -> msg,
+) -> Element(msg) {
+  rail_row(p, r, on_open)
+}
+
 fn rail_row(p: Palette, r: Relay, on_open: fn(Float) -> msg) -> Element(msg) {
   html.button(
     [
@@ -303,13 +315,14 @@ fn state_attr(s: RelayConnState) -> String {
 }
 
 pub type Placement {
-  /// Desktop floating popover. `anchor_left_px` is where the popover's
-  /// left edge sits — set by the caller to the channels-rail right
-  /// edge + small gap so the popover docks next to the relays section
-  /// instead of the chat shell's right column. Threaded as a number
-  /// rather than baked in here because the channels rail's left
-  /// position depends on whether the rooms rail is collapsed.
-  Floating(anchor_left_px: Int)
+  /// Desktop floating popover. `anchor_right_px` is the distance from
+  /// the right edge of the viewport to the popover's right edge — set
+  /// by the caller to the right-rail width + small gap so the popover
+  /// docks next to the relays section in the members rail instead of
+  /// floating in the middle of the chat. Threaded as a number rather
+  /// than baked in because the right column's width depends on whether
+  /// the per-message details panel is open.
+  Floating(anchor_right_px: Int)
   InSheet
 }
 
@@ -348,19 +361,19 @@ pub fn popover(
     )
 
   case placement {
-    Floating(anchor_left_px) ->
+    Floating(anchor_right_px) ->
       html.div(
         [
           attribute.attribute("data-testid", "relay-popover"),
           ui.css([
             #("position", "fixed"),
             // Bottom-anchored: the relays section is the last block in
-            // the channels rail, so a bottom-aligned popover reads as
+            // the members rail, so a bottom-aligned popover reads as
             // tied to that section even though we don't measure the row
             // exactly. The 14px gap matches the page's other floating
             // overlays.
             #("bottom", "14px"),
-            #("left", int.to_string(anchor_left_px) <> "px"),
+            #("right", int.to_string(anchor_right_px) <> "px"),
             #("width", "300px"),
             #("background", p.surface),
             #("color", p.text),

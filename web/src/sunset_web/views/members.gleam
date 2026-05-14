@@ -1,5 +1,8 @@
-//// Members rail (column 4) — online + offline groupings, status dots,
-//// no avatars. Routing-detail-on-hover is deferred.
+//// Members rail (column 4) — online + offline member groupings, plus
+//// the relays section (which used to live in the channels rail but
+//// is conceptually about who/what we're connected to, not what
+//// channels exist; same column as the member roster reads more
+//// naturally).
 
 import gleam/int
 import gleam/list
@@ -7,14 +10,19 @@ import lustre/attribute
 import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
-import sunset_web/domain.{type Member, Away, MutedP, OfflineP, Online, Speaking}
+import sunset_web/domain.{
+  type Member, type Relay, Away, MutedP, OfflineP, Online, Speaking,
+}
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
+import sunset_web/views/relays as relays_view
 
 pub fn view(
   palette p: Palette,
   members ms: List(Member),
+  relays relays: List(Relay),
   on_open_status on_open: fn(domain.MemberId) -> msg,
+  on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
   let in_call_others = ms |> list.filter(fn(m) { m.in_call && !m.you })
   let online_not_in_call =
@@ -79,7 +87,50 @@ pub fn view(
             list.map(offline_members, fn(m) { member_row(p, m, on_open, True) }),
           ])
       },
+      // Relays show after the member groupings. Same column rather than
+      // a separate panel because the user reads "who am I connected to"
+      // top-to-bottom: members in the room, then the upstream relays
+      // those members route through.
+      case relays {
+        [] -> []
+        _ -> [relay_section(p, relays, on_open_relay)]
+      },
     ]),
+  )
+}
+
+/// "Relays" section header + rows, rendered into the members rail.
+/// The wrapping div carries `data-testid="relays-section"` so e2e
+/// tests can assert presence of the relay UI regardless of which rail
+/// it lives in (the testid contract predates this move).
+fn relay_section(
+  p: Palette,
+  relays: List(Relay),
+  on_open_relay: fn(Float) -> msg,
+) -> Element(msg) {
+  html.div(
+    [
+      attribute.attribute("data-testid", "relays-section"),
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+      ]),
+    ],
+    [
+      html.div([ui.css([#("height", "12px")])], []),
+      section_title(p, "Relays — " <> int.to_string(list.length(relays))),
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "1px"),
+            #("padding", "0 2px"),
+          ]),
+        ],
+        list.map(relays, fn(r) { relays_view.row(p, r, on_open_relay) }),
+      ),
+    ],
   )
 }
 
