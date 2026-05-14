@@ -14,6 +14,7 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
+import gleam/result
 import gleam/string
 import lustre/attribute
 import lustre/element.{type Element}
@@ -1161,34 +1162,66 @@ fn you_tag(p: Palette) -> Element(msg) {
   )
 }
 
-/// Pick the color for a message author's name. The previous
-/// implementation also encoded transport state (Direct vs OneHop) as
-/// a color, which was confusing — readers couldn't tell from the chat
-/// scrollback whether a name was amber because the peer was "away" or
-/// "via-relay". That dimension is dropped; transport state stays
-/// discoverable from the members rail glyphs and the per-message
-/// details panel.
-///
-/// What remains:
+/// Pick the color for a message author's name.
 ///
 ///   * own messages → palette accent (so the user can spot their own
 ///     messages in the scrollback at a glance — own-name is identity,
 ///     not status, so the brand accent is appropriate here)
-///   * offline author → text_faint
-///   * everyone else → text
+///   * offline author → text_faint (de-emphasised: the author isn't
+///     here right now)
+///   * everyone else → a stable per-author hue from `palette.author_hues`,
+///     picked by hashing the author identity. Each participant gets a
+///     consistent color across renders, the bold author name is always
+///     visually distinct from the body text, and the palette stays
+///     disjoint from the status colors.
+///
+/// The previous implementation encoded transport state (Direct vs OneHop)
+/// as the author color, which was confusing — readers couldn't tell from
+/// the chat scrollback whether a name was amber because the peer was
+/// "away" or "via-relay". Transport state is now discoverable from the
+/// members rail glyphs and the per-message details panel only.
 fn author_color(p: Palette, m: MessageView, members: List(Member)) -> String {
   case m.you {
     True -> p.accent
     False ->
       case list.find(members, fn(mem) { mem.name == m.author }) {
-        Error(_) -> p.text
+        Error(_) -> hue_for_author(p, m.author)
         Ok(mem) ->
           case mem.status {
             OfflineP -> p.text_faint
-            _ -> p.text
+            _ -> hue_for_author(p, m.author)
           }
       }
   }
+}
+
+/// Pick a stable hue from `palette.author_hues` for the given author
+/// identity. Same identity → same color across renders. Falls back to
+/// `palette.text` when the palette ships an empty hue list (defensive
+/// — the current themes always populate it, but the type is open).
+fn hue_for_author(p: Palette, author: String) -> String {
+  case list.length(p.author_hues) {
+    0 -> p.text
+    n -> {
+      let i = name_hash(author) % n
+      list.drop(p.author_hues, i)
+      |> list.first
+      |> result.unwrap(p.text)
+    }
+  }
+}
+
+/// djb2-style stable hash of the author identity. Multiplier 33,
+/// modulo a prime to keep the running accumulator bounded on the
+/// JS target (where Number is double-precision float — large enough
+/// for this not to matter, but the modulo costs nothing and makes
+/// the hash stable across runtimes too).
+fn name_hash(s: String) -> Int {
+  s
+  |> string.to_utf_codepoints
+  |> list.fold(5381, fn(acc, cp) {
+    { acc * 33 + string.utf_codepoint_to_int(cp) } % 1_000_003
+  })
 }
 
 /// Horizontal strip of image thumbnails staged in the composer. Each

@@ -77,6 +77,17 @@ pub type Palette {
     /// is actively talking reads as the same green as a connected peer
     /// (rather than introducing a third status hue).
     live: String,
+    /// Per-author display-name hues. Picked deterministically from
+    /// each author's identity (see `author_color` in `main_panel`)
+    /// so a chat with N participants reads as N distinct colors —
+    /// without falling back to plain `text` (which makes the bold
+    /// author name visually disappear into the body copy).
+    ///
+    /// Carefully disjoint from accent / ok / warn / danger so a
+    /// per-author hue can never be confused for a status color. All
+    /// hues stay sunset-tinted (no icy blues / pure violets) so the
+    /// palette feels coherent.
+    author_hues: List(String),
     shadow: String,
     shadow_lg: String,
   )
@@ -106,9 +117,9 @@ pub fn color_scheme(mode: Mode) -> String {
 
 fn light() -> Palette {
   Palette(
-    // Cool-leaning warm gray — a hint of the sunset undertone is still
-    // there (~3deg toward orange) but the eye reads it as neutral
-    // off-white rather than as cream.
+    // Slightly cool warm-gray — the sunset undertone is now carried by
+    // the magenta accent, so the surfaces read as crisp neutral rather
+    // than as cream.
     bg: "#f6f6f5",
     surface: "#ffffff",
     surface_alt: "#f0efed",
@@ -121,12 +132,13 @@ fn light() -> Palette {
     text: "#1c1c1b",
     text_muted: "#5b5a57",
     text_faint: "#9a9893",
-    // Deep clay — saturated enough to be the primary CTA, restrained
-    // enough to feel professional. Used sparingly: brand mark, primary
-    // buttons, unread badges.
-    accent: "#b04a2a",
-    accent_soft: "#f5e4dc",
-    accent_deep: "#7e2f15",
+    // Deep magenta-rose — the "purple hour" of a sunset, where pink
+    // gives way to violet. Keeps the brand warm without competing with
+    // the green/amber/red status palette. Used sparingly: brand mark,
+    // primary CTAs, unread badges, own-message author name.
+    accent: "#a83565",
+    accent_soft: "#f3dde6",
+    accent_deep: "#7a2046",
     accent_ink: "#ffffff",
     ok: "#2f7d3f",
     ok_soft: "#dfeede",
@@ -135,6 +147,14 @@ fn light() -> Palette {
     danger: "#a82828",
     danger_soft: "#f5dada",
     live: "#2f7d3f",
+    author_hues: [
+      "#3a5680",
+      "#2a6e7e",
+      "#4d4d8e",
+      "#6b3870",
+      "#6b4a35",
+      "#5a4878",
+    ],
     shadow: "0 1px 2px rgba(20,20,20,0.06)",
     shadow_lg: "0 16px 50px rgba(20,20,20,0.10)",
   )
@@ -154,9 +174,12 @@ fn dark() -> Palette {
     text: "#e8e8ea",
     text_muted: "#9a9a9f",
     text_faint: "#5c5c61",
-    accent: "#e0805e",
-    accent_soft: "#3a201a",
-    accent_deep: "#f29c7e",
+    // Lifted toward pink for dark mode so the magenta-rose reads on
+    // near-black without losing chroma. Same role as the light accent:
+    // brand mark, primary CTAs, unread badges.
+    accent: "#e283ad",
+    accent_soft: "#36202a",
+    accent_deep: "#f198bd",
     accent_ink: "#17171a",
     ok: "#56b66a",
     ok_soft: "#1a2b1d",
@@ -165,6 +188,14 @@ fn dark() -> Palette {
     danger: "#e06464",
     danger_soft: "#2e1818",
     live: "#56b66a",
+    author_hues: [
+      "#7e9bca",
+      "#5fa8b5",
+      "#9494d0",
+      "#b075b3",
+      "#c08d6e",
+      "#a08cc4",
+    ],
     shadow: "0 1px 2px rgba(0,0,0,0.5)",
     shadow_lg: "0 20px 60px rgba(0,0,0,0.6)",
   )

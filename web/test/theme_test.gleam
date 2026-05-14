@@ -1,16 +1,19 @@
 import gleeunit/should
 import sunset_web/theme
 
-pub fn light_accent_is_deep_clay_test() {
-  // Sunset accent — deep clay / terracotta, kept saturated enough to be
-  // the primary CTA, restrained enough to feel professional.
+pub fn light_accent_is_deep_magenta_rose_test() {
+  // Sunset accent — the "purple hour" of a sunset, where pink gives way
+  // to violet. Saturated enough to be the primary CTA, warm enough to
+  // still read as sunset rather than as cool grape.
   theme.palette_for(theme.Light).accent
-  |> should.equal("#b04a2a")
+  |> should.equal("#a83565")
 }
 
-pub fn dark_accent_is_warm_peach_test() {
+pub fn dark_accent_is_lifted_pink_test() {
+  // Same magenta-rose role as light, lifted toward pink so the brand
+  // hue keeps its chroma against a near-black surface.
   theme.palette_for(theme.Dark).accent
-  |> should.equal("#e0805e")
+  |> should.equal("#e283ad")
 }
 
 pub fn live_is_aliased_to_ok_test() {

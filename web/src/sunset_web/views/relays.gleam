@@ -175,6 +175,7 @@ pub fn rail_section(
               ui.css([
                 #("padding", "0 12px 4px 12px"),
                 #("font-size", "13.125px"),
+                #("font-weight", "600"),
                 #("color", p.text_faint),
                 #("text-transform", "uppercase"),
                 #("letter-spacing", "0.04em"),
