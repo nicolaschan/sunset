@@ -527,23 +527,34 @@ export function pickImages(callback) {
   // Reset value so picking the same file twice in a row still fires
   // `change`. (Without this, the browser silently dedupes.)
   input.value = "";
-  const onChange = async () => {
+  let done = false;
+  const finish = (pairs) => {
+    if (done) return;
+    done = true;
     input.removeEventListener("change", onChange);
     input.removeEventListener("cancel", onCancel);
+    callback(toList(pairs));
+  };
+  const onChange = async () => {
     const files = Array.from(input.files ?? []);
+    console.info(`pickImages: change fired, files=${files.length}`);
     try {
       const pairs = await Promise.all(files.map(readImage));
       const valid = pairs.filter((p) => p !== null);
-      callback(toList(valid));
+      finish(valid);
     } catch (e) {
       console.warn("pickImages: readImage failed", e);
-      callback(toList([]));
+      finish([]);
     }
   };
   const onCancel = () => {
-    input.removeEventListener("change", onChange);
-    input.removeEventListener("cancel", onCancel);
-    callback(toList([]));
+    // iOS Safari has been observed firing `cancel` even after a
+    // successful Photo Library selection. If files are actually
+    // present, ignore the spurious cancel and let `change` handle it.
+    const count = input.files ? input.files.length : 0;
+    console.info(`pickImages: cancel fired, files=${count}`);
+    if (count > 0) return;
+    finish([]);
   };
   input.addEventListener("change", onChange);
   // `cancel` is the modern event when the user dismisses the picker
@@ -559,9 +570,30 @@ const ALLOWED_IMAGE_TYPES = new Set([
   "image/gif",
 ]);
 
+/// Resolve an allowed MIME type for `file`, falling back to the
+/// filename extension when `file.type` is empty or unrecognized. iOS
+/// WebKit sometimes hands Photo Library picks back with `file.type =
+/// ""` (Live Photos, edited photos, certain iOS versions), so trusting
+/// `file.type` alone silently drops valid images on iPhone.
+function inferImageType(file) {
+  if (ALLOWED_IMAGE_TYPES.has(file.type)) return file.type;
+  const name = (file.name || "").toLowerCase();
+  const dot = name.lastIndexOf(".");
+  if (dot < 0) return null;
+  const ext = name.slice(dot + 1);
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "png") return "image/png";
+  if (ext === "webp") return "image/webp";
+  if (ext === "gif") return "image/gif";
+  return null;
+}
+
 function readImage(file) {
-  if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
-    console.warn(`pickImages: skipping ${file.name} (type=${file.type})`);
+  const type = inferImageType(file);
+  if (type === null) {
+    console.warn(
+      `pickImages: skipping ${file.name} (type=${file.type}, size=${file.size})`,
+    );
     return Promise.resolve(null);
   }
   return new Promise((resolve, reject) => {
@@ -578,7 +610,7 @@ function readImage(file) {
         resolve(null);
         return;
       }
-      resolve([file.type, result.slice(comma + 1)]);
+      resolve([type, result.slice(comma + 1)]);
     };
     fr.onerror = () => reject(fr.error);
     fr.readAsDataURL(file);
