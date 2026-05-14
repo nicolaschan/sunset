@@ -2841,6 +2841,7 @@ name = "sunset-web-wasm"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "console_error_panic_hook",
  "futures",

@@ -141,7 +141,9 @@ test("two browsers exchange a text+image message via relay", async ({
   );
   const { ctx: ctxB, page: pageB } = await openPage(browser, "textimg");
 
-  // Stage one PNG on A.
+  // Stage one PNG on A. `sunset-image` will transcode this to JPEG
+  // during send (PNG is a static format → re-encoded to standardise
+  // the wire form; only GIF and animated WebP pass through unchanged).
   await stageImages(pageA, [
     fileFrom("red.png", "image/png", PNG_1X1_RED_BASE64),
   ]);
@@ -164,9 +166,20 @@ test("two browsers exchange a text+image message via relay", async ({
   await expect(imagesOnB).toHaveCount(1, { timeout: 15_000 });
   const src = await imagesOnB.first().getAttribute("src");
   expect(src).toBeTruthy();
-  expect(src.startsWith("data:image/png;base64,")).toBeTruthy();
-  // The image is what A sent, byte-for-byte (base64 transports unchanged).
-  expect(src.endsWith(PNG_1X1_RED_BASE64)).toBeTruthy();
+  // Static PNG is normalised to JPEG on the wire — this is the
+  // sunset-image contract for any non-animated input.
+  expect(
+    src.startsWith("data:image/jpeg;base64,"),
+    `expected JPEG-encoded src after preprocessing, got: ${src.slice(0, 64)}…`,
+  ).toBeTruthy();
+  // The receiver's <img> tag must actually decode the bytes (i.e.
+  // they're a real, well-formed JPEG, not just a wrapped data URL).
+  const dims = await imagesOnB.first().evaluate(async (el) => {
+    await el.decode();
+    return { w: el.naturalWidth, h: el.naturalHeight };
+  });
+  expect(dims.w).toBe(1);
+  expect(dims.h).toBe(1);
 
   await ctxA.close();
   await ctxB.close();
@@ -222,7 +235,9 @@ test("removing a staged image before send drops it from the post", async ({
     timeout: 15_000,
   });
 
-  // Remove the first staged image. The remaining one is the GIF.
+  // Remove the first staged image. The remaining one is the GIF, which
+  // we deliberately pick here because GIFs round-trip byte-for-byte
+  // (pass-through path in sunset-image, since JPEG can't be animated).
   await pageA.getByTestId("composer-attachment-remove").first().click();
   await expect(pageA.getByTestId("composer-attachment")).toHaveCount(1);
 
@@ -231,11 +246,79 @@ test("removing a staged image before send drops it from the post", async ({
   await inputA.press("Enter");
 
   await expect(pageB.getByText(text)).toBeVisible({ timeout: 15_000 });
-  // Exactly one image — the GIF, not the PNG that was removed.
+  // Exactly one image — the GIF, not the PNG that was removed. GIF
+  // pass-through means the receiver gets back the exact bytes A sent.
   const imagesOnB = pageB.getByTestId("message-image");
   await expect(imagesOnB).toHaveCount(1, { timeout: 15_000 });
   const src = await imagesOnB.first().getAttribute("src");
   expect(src.startsWith("data:image/gif;base64,")).toBeTruthy();
+  expect(src.endsWith(GIF_1X1_BASE64)).toBeTruthy();
+
+  await ctxA.close();
+  await ctxB.close();
+});
+
+test("oversize PNG is resized to the preprocessing cap on the wire", async ({
+  browser,
+}) => {
+  const { ctx: ctxA, page: pageA, composer: inputA } = await openPage(
+    browser,
+    "resize",
+  );
+  const { ctx: ctxB, page: pageB } = await openPage(browser, "resize");
+
+  // Generate a 3000×2000 PNG in the browser so we don't have to ship
+  // a multi-MB fixture in git. Checkerboard so JPEG doesn't compress
+  // away to a single solid block (we want the encoder to actually do
+  // work, mirroring a real photo upload).
+  const bigPngBytes = await pageA.evaluate(async () => {
+    const W = 3000;
+    const H = 2000;
+    const canvas = document.createElement("canvas");
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext("2d");
+    for (let y = 0; y < H; y += 16) {
+      for (let x = 0; x < W; x += 16) {
+        ctx.fillStyle = ((x / 16 + y / 16) | 0) % 2 === 0 ? "#ff0000" : "#0000ff";
+        ctx.fillRect(x, y, 16, 16);
+      }
+    }
+    const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
+    const buf = await blob.arrayBuffer();
+    return Array.from(new Uint8Array(buf));
+  });
+
+  await stageImages(pageA, [{
+    name: "big.png",
+    mimeType: "image/png",
+    buffer: Buffer.from(bigPngBytes),
+  }]);
+  await expect(pageA.getByTestId("composer-attachment")).toHaveCount(1, {
+    timeout: 15_000,
+  });
+
+  const text = `oversize — ${Date.now()}`;
+  await inputA.fill(text);
+  await inputA.press("Enter");
+
+  await expect(pageB.getByText(text)).toBeVisible({ timeout: 30_000 });
+  const imagesOnB = pageB.getByTestId("message-image");
+  await expect(imagesOnB).toHaveCount(1, { timeout: 30_000 });
+  const dims = await imagesOnB.first().evaluate(async (el) => {
+    await el.decode();
+    return { w: el.naturalWidth, h: el.naturalHeight };
+  });
+  // sunset-image's default Config caps the longest edge at 2048 px.
+  // A 3000×2000 source must come out as 2048×~1365 (aspect ratio
+  // preserved within 1 px); the longest edge must be exactly 2048.
+  expect(Math.max(dims.w, dims.h)).toBe(2048);
+  // Aspect ratio preserved within 1 px.
+  const expectedH = Math.round((2048 * 2000) / 3000);
+  expect(Math.abs(dims.h - expectedH)).toBeLessThanOrEqual(1);
+  // And the wire format is JPEG (PNG normalised).
+  const src = await imagesOnB.first().getAttribute("src");
+  expect(src.startsWith("data:image/jpeg;base64,")).toBeTruthy();
 
   await ctxA.close();
   await ctxB.close();
