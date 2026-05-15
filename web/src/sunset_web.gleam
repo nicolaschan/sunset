@@ -1409,10 +1409,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       {
         Some(client), None, True -> {
           let updated =
-            VoiceModel(
-              ..model.voice,
-              observed_room: Some(RoomId(name)),
-            )
+            VoiceModel(..model.voice, observed_room: Some(RoomId(name)))
           let eff =
             effect.from(fn(_dispatch) {
               voice.voice_observe_start(client, handle, fn(_result) {
@@ -1919,8 +1916,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               // yet (race between RoomOpened and the user clicking Join,
               // or no client) we fall back to the legacy one-shot
               // `voice_start` so behaviour stays the same.
-              let observer_matches =
-                model.voice.observed_room == Some(room_id)
+              let observer_matches = model.voice.observed_room == Some(room_id)
               let eff = case observer_matches {
                 True ->
                   effect.from(fn(dispatch) {
