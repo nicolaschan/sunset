@@ -40,13 +40,6 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 return;
             }
         };
-        let mut decoder = match crate::VoiceDecoder::new() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(error = %e, "decoder init failed");
-                return;
-            }
-        };
 
         while let Some(ev) = stream.next().await {
             let Some(inner) = weak.upgrade() else {
@@ -92,7 +85,32 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     if *inner.deafened.borrow() {
                         continue;
                     }
-                    match decoder.decode(&payload) {
+                    // Decode through the per-peer Opus decoder. One
+                    // decoder per peer is mandatory: libopus's
+                    // predictor history, SILK state, and CELT pitch
+                    // tracking all assume a single continuous stream,
+                    // so a shared decoder would corrupt every frame
+                    // whenever the active sender changes. Lazily
+                    // construct on first frame; an init failure for
+                    // this peer drops their packet but keeps the
+                    // subscribe loop alive for everyone else.
+                    let decoded = {
+                        let mut decoders = inner.decoders.borrow_mut();
+                        let decoder = match decoders.entry(peer.clone()) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                match crate::VoiceDecoder::new() {
+                                    Ok(d) => e.insert(d),
+                                    Err(err) => {
+                                        tracing::warn!(error = %err, "decoder init failed");
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        decoder.decode(&payload)
+                    };
+                    match decoded {
                         Ok(mut pcm) => {
                             // Denoise per peer unless the local user
                             // has toggled this peer off in their

@@ -4,6 +4,7 @@
 //! assertions. All `Bus` traffic loops back through a broadcast channel.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -1485,6 +1486,203 @@ async fn observer_mode_emits_in_voice_channel_without_publishing_self() {
             );
 
             drop(runtime);
+        })
+        .await;
+}
+
+/// Two senders publishing frames interleaved through one receiver:
+/// each peer's decoded audio must arrive intact. Opus decoders are
+/// stateful — SILK predictor history, CELT pitch tracking, and mode
+/// switching all assume one continuous stream — so a single shared
+/// decoder corrupts every frame on a stream change. With per-peer
+/// decoders each stream owns its own state and the RMS energy
+/// survives round-trip on both sides simultaneously.
+///
+/// The shape that fails on shared-decoder code:
+///   - alice encodes a 440 Hz sine, carol a 880 Hz sine, both at
+///     amplitude 0.5 → expected decoded RMS ~0.35 per peer.
+///   - Frames are interleaved A0, C0, A1, C1, … forcing the decoder
+///     to alternate sources on every call.
+///   - Per-peer decoders: each peer's average decoded RMS stays
+///     within ~15 % of the ideal 0.353.
+///   - Shared decoder: at least one peer's RMS collapses well below
+///     0.30 because predictor state from the other stream poisons
+///     every frame.
+#[tokio::test(flavor = "current_thread")]
+async fn multi_peer_decoders_do_not_corrupt_each_other() {
+    type PerPeerRms = Rc<RefCell<HashMap<PeerId, (f32, usize)>>>;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(70);
+            let (carol, _) = make_identity_and_room(71);
+            let (bob, _) = make_identity_and_room(72);
+            let alice_pk = alice.store_verifying_key();
+            let carol_pk = carol.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+
+            let per_peer_rms: PerPeerRms = Rc::new(RefCell::new(HashMap::new()));
+            struct PerPeerRmsSink {
+                rms: PerPeerRms,
+            }
+            impl FrameSink for PerPeerRmsSink {
+                fn deliver(&self, peer: &PeerId, _seq: u32, pcm: &[f32]) {
+                    let s: f32 = pcm.iter().map(|s| s * s).sum();
+                    let rms = (s / pcm.len() as f32).sqrt();
+                    let mut map = self.rms.borrow_mut();
+                    let entry = map.entry(peer.clone()).or_insert((0.0, 0));
+                    entry.0 += rms;
+                    entry.1 += 1;
+                }
+                fn drop_peer(&self, _peer: &PeerId) {}
+            }
+
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(PerPeerRmsSink {
+                rms: per_peer_rms.clone(),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            // Receiver-side denoise off per peer: RNNoise is trained
+            // on speech and attenuates pure 440/880 Hz sines as
+            // "non-speech," which would mask whatever the decoder
+            // delivers. Disabling it isolates the decoder contract
+            // this test exists to verify. The denoise plumbing has
+            // its own dedicated test
+            // (`set_peer_denoise_toggle_attenuates_inbound_noise`).
+            let (runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            runtime.set_peer_denoise(PeerId(alice_pk.clone()), false);
+            runtime.set_peer_denoise(PeerId(carol_pk.clone()), false);
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::yield_now().await;
+
+            const FRAMES: u64 = 40;
+            // 0.5 amplitude → expected RMS 0.5/sqrt(2) ≈ 0.353.
+            const AMPLITUDE: f32 = 0.5;
+            const ALICE_HZ: f32 = 440.0;
+            const CAROL_HZ: f32 = 880.0;
+            // Both use VoiceQuality::Voice (mono) — the runtime's
+            // decoder is always 2-channel and upmixes mono packets, so
+            // the per-peer delivered PCM is stereo regardless. Mono
+            // saves a downmix round and isolates the cross-peer
+            // corruption from any stereo decoding concerns.
+            let mut enc_alice =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+            let mut enc_carol =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+
+            fn sine_pcm(start_frame: u64, hz: f32) -> Vec<f32> {
+                let mut pcm = vec![0.0_f32; sunset_voice::FRAME_SAMPLES_PER_CHANNEL];
+                let base = start_frame * sunset_voice::FRAME_SAMPLES_PER_CHANNEL as u64;
+                for (i, s) in pcm.iter_mut().enumerate() {
+                    let n = (base + i as u64) as f32;
+                    let t = n / sunset_voice::SAMPLE_RATE as f32;
+                    *s = AMPLITUDE * (2.0 * std::f32::consts::PI * hz * t).sin();
+                }
+                pcm
+            }
+
+            async fn publish(
+                bus_impl: &TestBus,
+                room: &Rc<Room>,
+                sender: &Identity,
+                sender_pk: &VerifyingKey,
+                seq: u64,
+                bytes: Vec<u8>,
+            ) {
+                let pkt = sunset_voice::packet::VoicePacket::Frame {
+                    codec_id: sunset_voice::CODEC_ID.to_string(),
+                    seq,
+                    sender_time_ms: 1000 + seq * 20,
+                    payload: bytes,
+                };
+                let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seq);
+                let ev = sunset_voice::packet::encrypt(room, 0, &sender.public(), &pkt, &mut rng)
+                    .unwrap();
+                let payload = postcard::to_stdvec(&ev).unwrap();
+                let room_fp = room.fingerprint().to_hex();
+                let name = Bytes::from(format!(
+                    "voice/{room_fp}/{}",
+                    hex::encode(sender_pk.as_bytes())
+                ));
+                bus_impl
+                    .inject(SignedDatagram {
+                        verifying_key: sender_pk.clone(),
+                        name,
+                        payload: Bytes::from(payload),
+                        signature: Bytes::new(),
+                    })
+                    .await;
+            }
+
+            // Interleave: A0, C0, A1, C1, …  This forces every decode
+            // to alternate sources, which is the worst case for the
+            // shared-decoder bug (every call sees mismatched state).
+            for seq in 0..FRAMES {
+                let pcm_a = sine_pcm(seq, ALICE_HZ);
+                let pcm_c = sine_pcm(seq, CAROL_HZ);
+                let bytes_a = enc_alice.encode(&pcm_a).unwrap();
+                let bytes_c = enc_carol.encode(&pcm_c).unwrap();
+                publish(&bob_bus_impl, &room, &alice, &alice_pk, seq, bytes_a).await;
+                publish(&bob_bus_impl, &room, &carol, &carol_pk, seq, bytes_c).await;
+            }
+
+            // Wait until both peers have at least 30 frames delivered.
+            // The subscribe loop is synchronous w.r.t. inject and the
+            // sink, so under nominal load this resolves in ms — the
+            // 2-second budget is CI tolerance.
+            let alice_peer = PeerId(alice_pk.clone());
+            let carol_peer = PeerId(carol_pk.clone());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let counts = {
+                        let map = per_peer_rms.borrow();
+                        (
+                            map.get(&alice_peer).map(|(_, n)| *n).unwrap_or(0),
+                            map.get(&carol_peer).map(|(_, n)| *n).unwrap_or(0),
+                        )
+                    };
+                    if counts.0 >= 30 && counts.1 >= 30 {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("both peers delivered ≥30 frames within 2s");
+
+            let map = per_peer_rms.borrow();
+            let (alice_sum, alice_n) = map[&alice_peer];
+            let (carol_sum, carol_n) = map[&carol_peer];
+            let alice_avg = alice_sum / alice_n as f32;
+            let carol_avg = carol_sum / carol_n as f32;
+            // Ideal: 0.5/sqrt(2) ≈ 0.353. Denoise is off for both
+            // peers (see above), so RMS lands within Opus quantization
+            // distance of the ideal. 0.30 is ~15 % below ideal: easily
+            // passed by intact per-peer decoders; failed by
+            // shared-decoder corruption because predictor state from
+            // the other stream poisons every alternating frame.
+            assert!(
+                alice_avg > 0.30,
+                "alice average RMS collapsed: {alice_avg} (expected ~0.35)"
+            );
+            assert!(
+                carol_avg > 0.30,
+                "carol average RMS collapsed: {carol_avg} (expected ~0.35)"
+            );
         })
         .await;
 }

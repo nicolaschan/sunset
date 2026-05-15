@@ -15,7 +15,7 @@ use sunset_sync::PeerId;
 
 use crate::runtime::dyn_bus::DynBus;
 use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink};
-use crate::{Denoiser, VoiceEncoder};
+use crate::{Denoiser, VoiceDecoder, VoiceEncoder};
 
 pub(crate) struct RuntimeInner {
     pub identity: Identity,
@@ -44,6 +44,16 @@ pub(crate) struct RuntimeInner {
     /// peer; entries are kept for the lifetime of the runtime so peers
     /// that briefly disappear and return don't lose their tuning.
     pub denoisers: RefCell<HashMap<PeerId, Denoiser>>,
+    /// Per-peer Opus decoder state. Lazily inserted on first frame
+    /// from a peer; kept for the runtime's lifetime to match the
+    /// `denoisers` semantics (a peer that briefly disappears and
+    /// returns resumes with the same decoder state rather than
+    /// re-initializing). One decoder *cannot* be shared across peers
+    /// because libopus's predictor history, SILK state, and CELT
+    /// pitch tracking all assume a single continuous stream — feeding
+    /// it interleaved packets from different senders corrupts every
+    /// decoded frame on a stream change.
+    pub decoders: RefCell<HashMap<PeerId, VoiceDecoder>>,
 
     pub frame_liveness: Arc<Liveness>,
     pub membership_liveness: Arc<Liveness>,
