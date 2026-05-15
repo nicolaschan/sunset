@@ -136,16 +136,30 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 }
                 Some(ev) = life_sub.next() => {
                     if ev.state == LivenessState::Stale {
-                        let Some(inner) = weak.upgrade() else { return; };
-                        let mut state = inner.auto_connect_state.borrow_mut();
-                        state.insert(ev.peer.clone(), AutoConnectState::Unknown);
-                        drop(state);
-                        // Drop per-peer playback resources.
-                        inner.frame_sink.borrow().drop_peer(&ev.peer);
-                        // Forget the last seq we delivered so re-entry
-                        // starts fresh (the host-side jitter buffer is
-                        // also reset via `drop_peer`).
-                        inner.last_delivered_seq.borrow_mut().remove(&ev.peer);
+                        let dialer_to_release = {
+                            let Some(inner) = weak.upgrade() else { return; };
+                            let mut state = inner.auto_connect_state.borrow_mut();
+                            state.insert(ev.peer.clone(), AutoConnectState::Unknown);
+                            drop(state);
+                            // Drop per-peer playback resources.
+                            inner.frame_sink.borrow().drop_peer(&ev.peer);
+                            // Forget the last seq we delivered so re-entry
+                            // starts fresh (the host-side jitter buffer is
+                            // also reset via `drop_peer`).
+                            inner.last_delivered_seq.borrow_mut().remove(&ev.peer);
+                            inner.dialer.clone()
+                        };
+                        // Release any session-scoped connection state
+                        // the host registered for this peer (most
+                        // notably the supervisor's direct-WebRTC
+                        // intent — see `Dialer::release` docs). Without
+                        // this, on the *next* presence event for the
+                        // same peer, `ensure_direct` would short-circuit
+                        // against the still-live intent and never
+                        // start a fresh dial — the post-rejoin "stuck
+                        // dialing" failure mode the rejoin spec exists
+                        // to catch.
+                        dialer_to_release.release(ev.peer).await;
                     }
                 }
                 else => return,

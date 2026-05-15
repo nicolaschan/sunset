@@ -31,14 +31,34 @@ pub struct VoicePeerState {
     pub in_voice_channel: bool,
 }
 
-/// Idempotent connection-establishment hook. The runtime calls this
-/// when it sees a peer's heartbeat for the first time (or after the
-/// peer was previously considered Gone). The host should ensure a
-/// direct WebRTC connection exists. Repeat calls for an already-
-/// connected peer must be cheap — the runtime does not deduplicate.
+/// Connection-establishment + teardown hooks for the runtime's
+/// auto-connect FSM.
+///
+/// `ensure_direct` is called when the runtime sees a peer's first
+/// `voice-presence` entry (or after the peer was previously considered
+/// Gone). The host should ensure a direct WebRTC connection exists.
+/// Repeat calls for an already-connected peer must be cheap — the
+/// runtime does not deduplicate.
+///
+/// `release` is called when the runtime decides a peer is gone (its
+/// `membership_liveness` transitioned to `Stale`) and on runtime
+/// shutdown for every peer that was ever dialed. The host should
+/// tear down any session-scoped state it registered for that peer
+/// — most importantly the supervisor's direct-WebRTC intent — so
+/// the *next* `ensure_direct` for the same peer creates a fresh
+/// dial rather than deduplicating against a stale `Connected` /
+/// `Backoff` intent whose underlying connection silently died. The
+/// default is a no-op, matching pre-fix behavior for hosts that
+/// don't need cleanup (e.g. unit-test stubs).
 #[async_trait(?Send)]
 pub trait Dialer {
     async fn ensure_direct(&self, peer: PeerId);
+
+    /// Tear down any session-scoped state for `peer`. Called on
+    /// membership-stale and on runtime shutdown. Default no-op so
+    /// existing stub `Dialer` impls (tests, in-memory hosts) keep
+    /// compiling without change.
+    async fn release(&self, _peer: PeerId) {}
 }
 
 /// Sink for decoded PCM frames the runtime delivers immediately on
