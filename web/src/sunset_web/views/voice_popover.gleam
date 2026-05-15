@@ -485,9 +485,21 @@ fn quality_control(
   on_set: fn(String) -> msg,
 ) -> Element(msg) {
   let presets = [
-    #("voice", "Voice", "24 kbps mono — best for slow networks"),
-    #("high", "High", "96 kbps stereo — balanced"),
-    #("maximum", "Maximum", "510 kbps stereo — transparent"),
+    #(
+      "voice",
+      "Voice",
+      "24 kbps mono · browser echo cancel, noise suppression, AGC. Best for speech on slow networks.",
+    ),
+    #(
+      "high",
+      "High",
+      "96 kbps stereo · raw mic, no browser processing. Balanced fidelity.",
+    ),
+    #(
+      "maximum",
+      "Maximum",
+      "510 kbps stereo · raw mic, no browser processing. Highest fidelity.",
+    ),
   ]
   html.div(
     [
@@ -509,7 +521,7 @@ fn quality_control(
         ],
         [
           html.text(
-            "Opus codec settings for your outgoing audio. Other peers always hear you in stereo.",
+            "Selects both the Opus codec preset and the mic capture pipeline for your outgoing audio. Voice runs your browser's speech processing; High and Maximum send the raw mic so other peers hear full-band stereo.",
           ),
         ],
       ),
