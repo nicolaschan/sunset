@@ -215,6 +215,11 @@ impl RoomHandle {
         let pk: [u8; 32] = peer_pubkey
             .try_into()
             .map_err(|_| JsError::new("peer_pubkey must be 32 bytes"))?;
+        // The inner call now returns an `IntentId` so session-scoped
+        // callers (the voice runtime) can cancel the intent on stop —
+        // see `OpenRoom::connect_direct` rustdoc. JS callers go through
+        // this wrapper which has always been fire-and-forget, so the
+        // id is discarded here to keep the JS signature stable.
         self.inner
             .connect_direct(pk)
             .await

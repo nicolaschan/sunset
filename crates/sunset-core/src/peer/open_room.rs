@@ -502,7 +502,24 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
         }
     }
 
-    pub async fn connect_direct(&self, peer_pubkey: [u8; 32]) -> crate::Result<()> {
+    /// Register a durable supervisor intent for a direct WebRTC
+    /// connection to `peer_pubkey`. Returns the `IntentId` so the caller
+    /// can later [`cancel_direct`](Self::cancel_direct) it.
+    ///
+    /// Intents are deduplicated by `Connectable` (i.e. the resolved
+    /// `webrtc://<pk>#x25519=<x>` address): calling `connect_direct`
+    /// twice for the same peer returns the same `IntentId` without
+    /// kicking a fresh dial. Session-scoped callers (e.g. the voice
+    /// runtime) must pair `connect_direct` with `cancel_direct` so a
+    /// post-stop rejoin doesn't dedupe against a stale intent whose
+    /// underlying WebRTC connection silently died — the supervisor
+    /// would otherwise keep the orphaned intent in `Connected` /
+    /// `Backoff` until heartbeat timeout (45 s default), during which
+    /// a fresh `connect_direct` call would be a no-op.
+    pub async fn connect_direct(
+        &self,
+        peer_pubkey: [u8; 32],
+    ) -> crate::Result<sunset_sync::IntentId> {
         let peer = self
             .inner
             .peer_weak
@@ -516,11 +533,25 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             hex::encode(x_pub)
         );
         let addr = sunset_sync::PeerAddr::new(bytes::Bytes::from(addr_str));
-        peer.supervisor()
+        let id = peer
+            .supervisor()
             .add(sunset_sync::Connectable::Direct(addr))
             .await
             .map_err(|e| crate::Error::Other(format!("connect_direct: {e}")))?;
-        Ok(())
+        Ok(id)
+    }
+
+    /// Cancel a direct-connection intent registered via
+    /// [`connect_direct`](Self::connect_direct). Tears down the
+    /// supervisor's intent (and the underlying engine peer if it was
+    /// connected) so a subsequent `connect_direct` for the same peer
+    /// starts a fresh dial rather than deduplicating against a stale
+    /// `Connected` / `Backoff` state. No-op if the intent has already
+    /// been removed or the parent `Peer` has been dropped.
+    pub async fn cancel_direct(&self, intent_id: sunset_sync::IntentId) {
+        if let Some(peer) = self.inner.peer_weak.upgrade() {
+            peer.supervisor().remove(intent_id).await;
+        }
     }
 
     pub fn peer_connection_mode(&self, peer_pubkey: [u8; 32]) -> &'static str {
