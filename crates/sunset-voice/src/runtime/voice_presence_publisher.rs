@@ -34,15 +34,18 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
             // Skip publishing when the runtime is in observer mode. The user
             // has not joined the call yet (or has just left it); advertising
             // our presence would falsely show us in the rail for everyone
-            // else in the room. The active gate flips back at `set_active`,
-            // and the next iteration will publish on its own cadence.
+            // else in the room. Poll the gate every 100 ms while inactive
+            // rather than sleeping the full refresh interval — otherwise
+            // the click-to-first-publish budget on the JoinVoice path would
+            // include up to 2 s of dead wait, blowing past the
+            // dial-completion window the e2e suite enforces.
             let Some(inner) = weak.upgrade() else {
                 return;
             };
             let active = *inner.is_active.borrow();
             drop(inner);
             if !active {
-                sleep(VOICE_PRESENCE_REFRESH_INTERVAL).await;
+                sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
 
