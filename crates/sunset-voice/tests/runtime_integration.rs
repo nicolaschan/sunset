@@ -929,13 +929,20 @@ async fn auto_connect_releases_dialer_on_membership_stale_and_redials() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Activate before spawning — auto_connect waits for
+            // `is_active=true` before subscribing to the presence
+            // stream, so without this flip the injected presence event
+            // is queued but never consumed.
+            runtime.set_active(true);
             tokio::task::spawn_local(tasks.auto_connect);
-            tokio::task::yield_now().await;
+            // Give the auto_connect task time to clear its poll-for-active
+            // loop (100 ms cadence) and reach subscribe_prefix.
+            tokio::time::sleep(Duration::from_millis(200)).await;
 
             // First presence event from alice: should trigger one dial.
             let entry = make_presence_entry(&alice, &room);
             bus_impl.inject_durable(entry.clone()).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
 
             assert_eq!(
                 dial_calls.borrow().len(),
