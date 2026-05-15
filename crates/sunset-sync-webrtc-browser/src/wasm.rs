@@ -797,6 +797,29 @@ impl RawConnection for WebRtcRawConnection {
     }
 }
 
+impl Drop for WebRtcRawConnection {
+    /// Detach every JS event handler before letting the `Closure`
+    /// fields drop. Without this, a still-queued `close` /
+    /// `message` event from either dataChannel can fire after the
+    /// corresponding `Closure<dyn FnMut(...)>` has been dropped,
+    /// surfacing as a `closure invoked recursively or after being
+    /// dropped` pageerror in the browser console (and possible UAF
+    /// under wasm-bindgen's debug build). The connect side is the
+    /// one that stores closures in `WebRtcRawConnection`; the
+    /// accept side `.forget()`s them inside `ondatachannel` so the
+    /// closures outlive the page and don't need this teardown.
+    /// `set_*(None)` is a cheap JS call that just clears the
+    /// callback slot — safe on already-closed channels.
+    fn drop(&mut self) {
+        self.dc.set_onclose(None);
+        self.dc.set_onmessage(None);
+        self.dc.set_onopen(None);
+        self.dc_unrel.set_onclose(None);
+        self.dc_unrel.set_onmessage(None);
+        self.dc_unrel.set_onopen(None);
+    }
+}
+
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------

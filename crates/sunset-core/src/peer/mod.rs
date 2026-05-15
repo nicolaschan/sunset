@@ -1440,6 +1440,111 @@ mod tests {
             .await;
     }
 
+    /// `connect_direct` should register a supervisor intent (visible
+    /// via `Peer::intents()`) and return its `IntentId` so
+    /// session-scoped callers (e.g. the voice runtime) can later
+    /// `cancel_direct` it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_direct_returns_intent_id_and_registers_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(60)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let other_pk = [42u8; 32];
+                let id = room
+                    .connect_direct(other_pk)
+                    .await
+                    .expect("connect_direct returns IntentId");
+
+                // The supervisor should now have one intent (the direct
+                // one) and its label should be the canonical
+                // `webrtc://<pk>#x25519=<x>` URL.
+                let snaps = peer.intents().await;
+                assert_eq!(snaps.len(), 1);
+                assert_eq!(snaps[0].id, id);
+                assert!(
+                    snaps[0].label.starts_with("webrtc://"),
+                    "expected webrtc:// label, got {}",
+                    snaps[0].label
+                );
+            })
+            .await;
+    }
+
+    /// `cancel_direct` should drop the supervisor intent so a follow-up
+    /// `connect_direct` for the same peer creates a *fresh* intent
+    /// rather than deduping against the cancelled one.
+    ///
+    /// This is the load-bearing invariant for the voice
+    /// leave-and-rejoin path: the WebDialer drops on `voice_stop` and
+    /// runs `cancel_direct` for every intent it accumulated; the next
+    /// `voice_start` then dials cleanly instead of short-circuiting
+    /// against a stale `Connected` / `Backoff` intent whose underlying
+    /// WebRTC connection died silently during the gap.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_direct_dedupes_until_cancelled_then_fresh_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(61)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let other_pk = [42u8; 32];
+                let id_1 = room.connect_direct(other_pk).await.expect("first dial");
+
+                // Repeat call dedupes (supervisor returns existing id).
+                let id_again = room.connect_direct(other_pk).await.expect("dedup dial");
+                assert_eq!(
+                    id_again, id_1,
+                    "supervisor.add should dedupe by Connectable identity"
+                );
+                assert_eq!(peer.intents().await.len(), 1);
+
+                // Cancel: the intent disappears from snapshots.
+                room.cancel_direct(id_1).await;
+                assert!(
+                    peer.intents().await.iter().all(|s| s.id != id_1),
+                    "cancelled intent should be removed from snapshot"
+                );
+
+                // Fresh dial after cancel: a NEW IntentId is allocated.
+                let id_2 = room
+                    .connect_direct(other_pk)
+                    .await
+                    .expect("fresh dial after cancel");
+                assert_ne!(
+                    id_2, id_1,
+                    "after cancel_direct the dedup slate is clear so a fresh \
+                     connect_direct must allocate a new IntentId"
+                );
+            })
+            .await;
+    }
+
+    /// `cancel_direct` is a no-op for an `IntentId` that doesn't exist
+    /// (already-cancelled, or never registered). This is the
+    /// safety net for the WebDialer's `Drop`-side cleanup: if voice
+    /// drops before the supervisor processes the original Add (rare),
+    /// the cleanup must not panic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_direct_is_noop_for_unknown_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(62)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                // Cancel an IntentId we never registered — must complete
+                // cleanly without panic, without error, without state
+                // leaking onto the supervisor.
+                room.cancel_direct(99_999).await;
+                assert!(peer.intents().await.is_empty());
+            })
+            .await;
+    }
+
     /// Read the current `PresenceBody` for an exact store key.
     /// Returns `None` if no entry is present yet.
     async fn read_presence_body(

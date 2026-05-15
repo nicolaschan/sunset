@@ -70,6 +70,7 @@ pub(crate) fn voice_start(
     });
     let dialer: Rc<dyn sunset_voice::Dialer> = Rc::new(dialer::WebDialer {
         open_room: room_handle.open_room_rc(),
+        intent_ids: RefCell::new(Default::default()),
     });
     let peer_state_sink: Rc<dyn sunset_voice::PeerStateSink> =
         Rc::new(peer_state_sink::WebPeerStateSink {

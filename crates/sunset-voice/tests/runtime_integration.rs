@@ -164,6 +164,24 @@ impl Dialer for CountingDialer {
     }
 }
 
+/// Dialer test stub that records BOTH `ensure_direct` and `release`
+/// calls so tests can assert the auto-connect FSM's cleanup path
+/// (membership-stale → release → fresh dial on the next presence
+/// event) without depending on the production WebDialer.
+struct ReleaseTrackingDialer {
+    dial_calls: DroppedSink,
+    release_calls: DroppedSink,
+}
+#[async_trait::async_trait(?Send)]
+impl Dialer for ReleaseTrackingDialer {
+    async fn ensure_direct(&self, peer: PeerId) {
+        self.dial_calls.borrow_mut().push(peer);
+    }
+    async fn release(&self, peer: PeerId) {
+        self.release_calls.borrow_mut().push(peer);
+    }
+}
+
 struct RecordingFrameSink {
     delivered: DeliveredSink,
     dropped: DroppedSink,
@@ -846,6 +864,119 @@ async fn auto_connect_dials_on_voice_presence_only_once() {
                 calls.borrow().len(),
                 1,
                 "ensure_direct must be called exactly once"
+            );
+        })
+        .await;
+}
+
+/// Regression for the leave-then-rejoin failure mode: when
+/// `membership_liveness` decides a peer is `Stale`, the auto-connect
+/// FSM must call `Dialer::release(peer)` so the host can tear down
+/// any session-scoped state (in production: the supervisor's
+/// direct-WebRTC intent). Without this, the next voice-presence
+/// event for the same peer triggers `ensure_direct` whose
+/// `connect_direct` is deduplicated by the supervisor against a
+/// stale `Connected` / `Backoff` intent — the user-visible
+/// symptom is "rejoined but no audio until the engine's 45 s
+/// heartbeat timeout."
+///
+/// We assert two things in sequence:
+///   1. `release(peer)` is called when membership goes Stale, AND
+///   2. The auto_connect_state for `peer` is reset to `Unknown`, so
+///      that a follow-up presence event triggers a fresh
+///      `ensure_direct` call (rather than being skipped by the
+///      Dialing-state dedup inside auto_connect itself).
+#[tokio::test(flavor = "current_thread")]
+async fn auto_connect_releases_dialer_on_membership_stale_and_redials() {
+    use sunset_core::liveness::Liveness;
+    use sunset_store::VerifyingKey;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // bob is the runtime owner; alice is the remote peer.
+            // Force `bob < alice` so the dialing arm of glare avoidance
+            // fires (otherwise bob is the acceptor and never dials).
+            let (bob, alice, room) = make_pair_self_smaller(9, 8);
+            let (bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bus: Rc<dyn DynBus> = bus_impl.clone();
+
+            let dial_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
+            let release_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
+            let dialer: Rc<dyn Dialer> = Rc::new(ReleaseTrackingDialer {
+                dial_calls: dial_calls.clone(),
+                release_calls: release_calls.clone(),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (runtime, tasks) = VoiceRuntime::new(
+                bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.auto_connect);
+            tokio::task::yield_now().await;
+
+            // First presence event from alice: should trigger one dial.
+            let entry = make_presence_entry(&alice, &room);
+            bus_impl.inject_durable(entry.clone()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert_eq!(
+                dial_calls.borrow().len(),
+                1,
+                "first voice-presence must trigger exactly one ensure_direct"
+            );
+            assert!(
+                release_calls.borrow().is_empty(),
+                "no release before membership goes stale"
+            );
+
+            // Force membership_liveness to fire Stale for alice. The
+            // existing dropping_runtime_terminates_all_tasks test uses
+            // the same observe + run_sweep pattern.
+            let (_, membership_liveness): (std::sync::Arc<Liveness>, std::sync::Arc<Liveness>) =
+                runtime.test_liveness();
+            let alice_peer = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                alice.store_verifying_key().as_bytes(),
+            )));
+            membership_liveness
+                .observe(alice_peer.clone(), std::time::SystemTime::UNIX_EPOCH)
+                .await;
+            membership_liveness.run_sweep().await;
+
+            // Yield enough for the auto_connect select! arm to consume
+            // the Stale event and call dialer.release.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let releases = release_calls.borrow().clone();
+            assert_eq!(
+                releases.len(),
+                1,
+                "release should fire exactly once on the Stale event"
+            );
+            assert_eq!(releases[0], alice_peer);
+
+            // Re-inject the presence entry (simulating the peer rejoining
+            // and republishing). Since auto_connect_state was reset to
+            // Unknown by the Stale handler, a second dial must fire —
+            // proving the rejoin path doesn't sit forever in the
+            // pre-fix "stuck dialing" state.
+            bus_impl.inject_durable(entry.clone()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert_eq!(
+                dial_calls.borrow().len(),
+                2,
+                "after Stale → release, the next presence event must trigger a fresh dial"
             );
         })
         .await;
