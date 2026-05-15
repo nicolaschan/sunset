@@ -26,6 +26,7 @@ use rand_core::SeedableRng;
 
 use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
+use sunset_sync::PeerId;
 
 use crate::VoiceEncoder;
 
@@ -102,7 +103,7 @@ impl VoiceRuntime {
             rng: RefCell::new(ChaCha20Rng::seed_from_u64(now_nanos)),
             muted: RefCell::new(false),
             deafened: RefCell::new(false),
-            denoise: RefCell::new(true),
+            denoise_disabled: RefCell::new(Default::default()),
             denoisers: RefCell::new(Default::default()),
             frame_liveness,
             membership_liveness,
@@ -237,12 +238,18 @@ impl VoiceRuntime {
         *self.inner.deafened.borrow_mut() = deafened;
     }
 
-    /// Toggle receiver-side RNNoise denoising. Defaults to `true` (on)
-    /// at runtime construction. Off bypasses the denoiser entirely;
-    /// previously-built per-peer state is kept so re-enabling resumes
-    /// where it left off rather than starting from scratch.
-    pub fn set_denoise(&self, denoise: bool) {
-        *self.inner.denoise.borrow_mut() = denoise;
+    /// Toggle receiver-side RNNoise denoising for a single peer.
+    /// Defaults to enabled for every peer (absence from the disabled
+    /// set = on). When disabled, the corresponding peer's `Denoiser`
+    /// is left intact so flipping back on resumes where it left off
+    /// rather than restarting from scratch.
+    pub fn set_peer_denoise(&self, peer: PeerId, enabled: bool) {
+        let mut disabled = self.inner.denoise_disabled.borrow_mut();
+        if enabled {
+            disabled.remove(&peer);
+        } else {
+            disabled.insert(peer);
+        }
     }
 
     /// Switch the active send-side quality preset. Rebuilds the
@@ -274,11 +281,12 @@ impl VoiceRuntime {
         *self.inner.muted.borrow()
     }
 
-    /// Read denoise toggle state. Gated behind `test-hooks`; production
-    /// code reads `inner.denoise` directly.
+    /// Read denoise toggle state for one peer. Gated behind
+    /// `test-hooks`; production code reads `inner.denoise_disabled`
+    /// directly.
     #[cfg(feature = "test-hooks")]
-    pub fn is_denoise_enabled(&self) -> bool {
-        *self.inner.denoise.borrow()
+    pub fn is_peer_denoise_enabled(&self, peer: &PeerId) -> bool {
+        !self.inner.denoise_disabled.borrow().contains(peer)
     }
 
     /// Test-only: swap the `FrameSink` with a new implementation (e.g.

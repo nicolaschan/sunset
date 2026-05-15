@@ -501,12 +501,28 @@ export function wasmVoiceSetDeafened(client, d) {
   }
 }
 
-export function wasmVoiceSetDenoise(client, on) {
-  try {
-    client.voice_set_denoise(!!on);
-  } catch (e) {
-    console.warn("voice_set_denoise failed", e);
+export function wasmVoiceSetPeerDenoise(client, peerHex, on) {
+  const bytes = hexToUint8(peerHex);
+  if (!bytes) {
+    console.warn("voice_set_peer_denoise: bad peer hex", peerHex);
+    return;
   }
+  try {
+    client.voice_set_peer_denoise(bytes, !!on);
+  } catch (e) {
+    console.warn("voice_set_peer_denoise failed", e);
+  }
+}
+
+function hexToUint8(hex) {
+  if (typeof hex !== "string" || hex.length % 2 !== 0) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(byte)) return null;
+    out[i] = byte;
+  }
+  return out;
 }
 
 // Persists the new quality preset to localStorage and pushes it

@@ -1183,15 +1183,16 @@ async fn dropping_runtime_terminates_all_tasks() {
         .await;
 }
 
-/// `set_denoise(false)` plumbs through to the receiver path: with denoise
-/// off the inbound PCM is delivered raw (modulo Opus quantization), with
-/// denoise on the same packets are attenuated by RNNoise. The test feeds
-/// pseudo-random noise through a real encrypt → bus → decrypt → decode →
-/// sink loop and compares RMS energy at the sink. The runtime has no
-/// internal buffer between decode and sink — frames arrive synchronously
-/// with the subscribe loop's `inject` calls.
+/// `set_peer_denoise(alice, false)` plumbs through to the receiver
+/// path for that one peer: with denoise off the inbound PCM is
+/// delivered raw (modulo Opus quantization), with denoise on the same
+/// packets are attenuated by RNNoise. The test feeds pseudo-random
+/// noise through a real encrypt → bus → decrypt → decode → sink loop
+/// and compares RMS energy at the sink. The runtime has no internal
+/// buffer between decode and sink — frames arrive synchronously with
+/// the subscribe loop's `inject` calls.
 #[tokio::test(flavor = "current_thread")]
-async fn set_denoise_toggle_attenuates_inbound_noise() {
+async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
     async fn run(denoise_on: bool) -> f32 {
         let delivered_rms_sum = Rc::new(RefCell::new(0.0_f32));
         let delivered_rms_count = Rc::new(RefCell::new(0_usize));
@@ -1242,8 +1243,9 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                         frame_sink,
                         peer_state_sink,
                     );
-                    runtime.set_denoise(denoise_on);
-                    assert_eq!(runtime.is_denoise_enabled(), denoise_on);
+                    let alice_peer = PeerId(alice_pk.clone());
+                    runtime.set_peer_denoise(alice_peer.clone(), denoise_on);
+                    assert_eq!(runtime.is_peer_denoise_enabled(&alice_peer), denoise_on);
 
                     tokio::task::spawn_local(tasks.subscribe);
                     tokio::task::yield_now().await;

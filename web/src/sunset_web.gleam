@@ -378,7 +378,6 @@ pub type Msg {
   LeaveVoice
   ToggleSelfMute
   ToggleSelfDeafen
-  ToggleSelfDenoise
   VoicePeerStateChanged(
     peer_hex: String,
     in_call: Bool,
@@ -464,7 +463,6 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         self_in_call: None,
         self_muted: False,
         self_deafened: False,
-        denoise: True,
         peers: dict.new(),
         peer_levels: dict.new(),
         self_level: 0.0,
@@ -1754,13 +1752,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     ToggleMemberDenoise(name) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, denoise: !settings.denoise)
-      // Denoise is cosmetic in C2c — no FFI wiring yet.
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) {
+            voice.voice_set_peer_denoise(client, name, next.denoise)
+          })
+        None -> effect.none()
+      }
       #(
         Model(
           ..model,
           voice_settings: dict.insert(model.voice_settings, name, next),
         ),
-        effect.none(),
+        eff,
       )
     }
     ToggleMemberDeafen(name) -> {
@@ -1970,12 +1974,29 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     VoiceStarted(room_id) -> {
       let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
       // Each voice_start spawns a fresh runtime that defaults to
-      // denoise on. Push the model's current value so a user who turned
-      // denoise off in a previous session sees the same state on rejoin.
-      let eff = case model.client, model.voice.denoise {
-        Some(client), False ->
-          effect.from(fn(_) { voice.voice_set_denoise(client, False) })
-        _, _ -> effect.none()
+      // denoise on for every peer. Push any peers the user has
+      // disabled denoising for in `voice_settings` so a previously
+      // toggled-off peer stays off across rejoin.
+      let eff = case model.client {
+        Some(client) -> {
+          let disabled =
+            dict.fold(model.voice_settings, [], fn(acc, hex, settings) {
+              case settings.denoise {
+                True -> acc
+                False -> [hex, ..acc]
+              }
+            })
+          case disabled {
+            [] -> effect.none()
+            _ ->
+              effect.from(fn(_) {
+                list.each(disabled, fn(hex) {
+                  voice.voice_set_peer_denoise(client, hex, False)
+                })
+              })
+          }
+        }
+        None -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
     }
@@ -2043,17 +2064,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let eff = case model.client {
         Some(client) ->
           effect.from(fn(_) { voice.voice_set_deafened(client, new_deafened) })
-        None -> effect.none()
-      }
-      #(Model(..model, voice: new_voice), eff)
-    }
-
-    ToggleSelfDenoise -> {
-      let new_denoise = !model.voice.denoise
-      let new_voice = VoiceModel(..model.voice, denoise: new_denoise)
-      let eff = case model.client {
-        Some(client) ->
-          effect.from(fn(_) { voice.voice_set_denoise(client, new_denoise) })
         None -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)

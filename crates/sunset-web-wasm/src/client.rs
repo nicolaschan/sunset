@@ -375,11 +375,13 @@ impl Client {
         crate::voice::voice_set_deafened(&self.voice, deafened);
     }
 
-    /// Toggle receiver-side RNNoise denoising. Defaults to on at runtime
-    /// startup; pass `false` to bypass the denoiser without tearing down
-    /// per-peer state, so flipping back on resumes from where it left off.
-    pub fn voice_set_denoise(&self, denoise: bool) {
-        crate::voice::voice_set_denoise(&self.voice, denoise);
+    /// Toggle receiver-side RNNoise denoising for one peer. Defaults
+    /// to on for every peer at runtime startup; pass `false` to bypass
+    /// the denoiser for that peer without tearing down its per-peer
+    /// state, so flipping back on resumes from where it left off.
+    /// `peer_id` is the 32-byte verifying key of the remote peer.
+    pub fn voice_set_peer_denoise(&self, peer_id: &[u8], enabled: bool) -> Result<(), JsError> {
+        crate::voice::voice_set_peer_denoise(&self.voice, peer_id, enabled)
     }
 
     /// Switch the active send-side voice quality preset. Accepts

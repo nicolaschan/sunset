@@ -94,13 +94,14 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     }
                     match decoder.decode(&payload) {
                         Ok(mut pcm) => {
-                            // Denoise per peer when enabled. Each peer
-                            // owns a stateful `Denoiser` so RNNoise's
-                            // predictor is never crossed between
-                            // sources. Bypass on toggle-off; on size
+                            // Denoise per peer unless the local user
+                            // has toggled this peer off in their
+                            // popover. Each peer owns a stateful
+                            // `Denoiser` so RNNoise's predictor is
+                            // never crossed between sources. On size
                             // mismatch the bug is in the decoder, so
                             // surface it but still deliver the frame.
-                            if *inner.denoise.borrow() {
+                            if !inner.denoise_disabled.borrow().contains(&peer) {
                                 let mut denoisers = inner.denoisers.borrow_mut();
                                 let d = denoisers
                                     .entry(peer.clone())
