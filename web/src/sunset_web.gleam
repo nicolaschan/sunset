@@ -327,7 +327,12 @@ pub type Msg {
   IntentChanged(snap: sunset.IntentSnapshot)
   /// A room's wasm-side handle is ready; register callbacks + start presence.
   RoomOpened(name: String, handle: RoomHandle)
-  IncomingMsg(room: String, im: IncomingMessage)
+  /// Full sorted-by-claimed-time snapshot of the room's Text timeline.
+  /// Replaces the older per-message append flow so the Rust core owns
+  /// the ordering — all client surfaces inherit the same sort. Fires
+  /// immediately on callback registration with the current snapshot
+  /// (possibly empty) and again on every change.
+  MessagesSnapshot(room: String, ims: List(IncomingMessage))
   /// Live channel set observed for the named room. Fired immediately on
   /// callback registration with the current sorted snapshot, then
   /// again on every change. The reducer merges these into
@@ -710,6 +715,32 @@ pub fn display_name(name_map: Dict(String, String), pk: BitArray) -> String {
 
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortPubkey")
 fn short_pubkey(bits: BitArray) -> String
+
+/// Convert a wasm-side IncomingMessage into the local domain.Message.
+/// Called once per snapshot fire from `on_messages_changed`; the order
+/// of the snapshot is already correct (Rust sorted by claimed time),
+/// so this is a pure field-by-field projection.
+fn incoming_to_message(im: IncomingMessage) -> domain.Message {
+  let attachments =
+    list.map(sunset.inc_images(im), fn(p) {
+      let #(mime, data) = p
+      domain.Attachment(mime_type: mime, data_base64: data)
+    })
+  domain.Message(
+    id: sunset.inc_value_hash_hex(im),
+    author_pubkey: sunset.inc_author_pubkey(im),
+    initials: short_initials(sunset.inc_author_pubkey(im)),
+    time: format_time_ms(sunset.inc_sent_at_ms(im)),
+    body: sunset.inc_body(im),
+    channel: sunset.inc_channel(im),
+    seen_by: 0,
+    you: sunset.inc_is_self(im),
+    pending: False,
+    reactions: [],
+    details: domain.NoDetails,
+    attachments: attachments,
+  )
+}
 
 /// Resolve a list of domain.Message into domain.MessageView, baking in the
 /// author display name (from name_map, falling back to short_pubkey).
@@ -1334,7 +1365,9 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let #(interval, ttl, refresh) = sunset.presence_params_from_url()
       let wire_eff =
         effect.from(fn(dispatch) {
-          sunset.on_message(handle, fn(im) { dispatch(IncomingMsg(name, im)) })
+          sunset.on_messages_changed(handle, fn(ims) {
+            dispatch(MessagesSnapshot(name, ims))
+          })
           sunset.on_channels_changed(handle, fn(chans) {
             dispatch(ChannelsObserved(name, chans))
           })
@@ -1364,38 +1397,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         })
       #(Model(..model, rooms: new_rooms), wire_eff)
     }
-    IncomingMsg(name, im) -> {
+    MessagesSnapshot(name, ims) -> {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
-          let attachments =
-            list.map(sunset.inc_images(im), fn(p) {
-              let #(mime, data) = p
-              domain.Attachment(mime_type: mime, data_base64: data)
-            })
-          let new_msg =
-            domain.Message(
-              id: sunset.inc_value_hash_hex(im),
-              author_pubkey: sunset.inc_author_pubkey(im),
-              initials: short_initials(sunset.inc_author_pubkey(im)),
-              time: format_time_ms(sunset.inc_sent_at_ms(im)),
-              body: sunset.inc_body(im),
-              channel: sunset.inc_channel(im),
-              seen_by: 0,
-              you: sunset.inc_is_self(im),
-              pending: False,
-              reactions: [],
-              details: domain.NoDetails,
-              attachments: attachments,
-            )
-          // Append; dedupe by id to handle Replay::All re-emits.
-          let updated = case
-            list.any(state.messages, fn(m) { m.id == new_msg.id })
-          {
-            True -> state.messages
-            False -> list.append(state.messages, [new_msg])
-          }
-          let new_state = RoomState(..state, messages: updated)
+          // The wasm side already orders by sender-claimed `sent_at_ms`
+          // (tie-broken on value-hash), so we render the list as-is.
+          // No Gleam-side sort, no per-message dedupe — the Rust
+          // BTreeMap is the single source of truth, and the snapshot
+          // is the full Text timeline of the room.
+          let messages = list.map(ims, incoming_to_message)
+          let new_state = RoomState(..state, messages: messages)
           #(
             Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
             effect.none(),

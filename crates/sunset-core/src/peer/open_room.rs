@@ -4,7 +4,7 @@
 //! the data shape so `Peer` can hold its registry of `Weak<RoomState>`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::{Rc, Weak};
 
 use sunset_store::Store;
@@ -19,12 +19,22 @@ pub(crate) type MessageCallback = Box<dyn Fn(&DecodedMessage, bool /* is_self */
 pub(crate) type ReceiptCallback =
     Box<dyn Fn(sunset_store::Hash, &crate::IdentityKey, &ChannelLabel, u64)>;
 pub(crate) type ChannelsCallback = Box<dyn Fn(&[ChannelLabel])>;
+pub(crate) type MessagesCallback = Box<dyn Fn(&[DecodedMessage])>;
+
+/// Total-order key for the sorted Text-message index. Primary sort is
+/// the sender-claimed `sent_at_ms` (so the timeline renders in author
+/// chronology, not arrival order). Tie-break on `value_hash` because
+/// it's content-addressed and unique — gives a deterministic order
+/// even when two messages claim the same millisecond, so renders don't
+/// flip-flop between sessions.
+type MessageKey = (u64, sunset_store::Hash);
 
 #[derive(Default)]
 pub(crate) struct RoomCallbacks {
     pub(crate) on_message: Option<MessageCallback>,
     pub(crate) on_receipt: Option<ReceiptCallback>,
     pub(crate) on_channels: Option<ChannelsCallback>,
+    pub(crate) on_messages: Option<MessagesCallback>,
 }
 
 impl RoomCallbacks {
@@ -33,7 +43,10 @@ impl RoomCallbacks {
     /// registration should kick off the per-room decode loop. Adding a
     /// new callback slot only needs one update here.
     fn is_empty(&self) -> bool {
-        self.on_message.is_none() && self.on_receipt.is_none() && self.on_channels.is_none()
+        self.on_message.is_none()
+            && self.on_receipt.is_none()
+            && self.on_channels.is_none()
+            && self.on_messages.is_none()
     }
 }
 
@@ -51,6 +64,12 @@ pub(crate) struct RoomState<St: Store + 'static, T: Transport + 'static> {
     /// open). Mutations fire `on_channels` with the full sorted
     /// snapshot.
     pub(crate) observed_channels: Rc<RefCell<BTreeSet<ChannelLabel>>>,
+    /// Sorted index of decoded Text messages by `(sent_at_ms,
+    /// value_hash)`. Built up by `spawn_decode_loop` so all clients
+    /// share one source of "messages in claimed-time order" without
+    /// each having to sort. Only `Text` bodies land here; Receipts
+    /// and Reactions are side data and stay out of the timeline.
+    pub(crate) decoded_text_messages: Rc<RefCell<BTreeMap<MessageKey, DecodedMessage>>>,
 }
 
 pub struct OpenRoom<St: Store + 'static, T: Transport + 'static> {
@@ -65,6 +84,18 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
     /// Return a reference-counted handle to the `Room` key material.
     pub fn room(&self) -> Rc<Room> {
         self.inner.room.clone()
+    }
+
+    /// Local identity's public key, if the parent `Peer` is still alive.
+    /// Hosts use this to compute `is_self` for messages in
+    /// `ordered_messages` without needing to thread the identity through
+    /// their own state separately. `None` when the parent `Peer` has
+    /// been dropped (the `Weak` upgrade failed).
+    pub fn local_identity_key(&self) -> Option<crate::IdentityKey> {
+        self.inner
+            .peer_weak
+            .upgrade()
+            .map(|p| p.identity().public())
     }
 
     /// Convenience wrapper: sends a text message under the default
@@ -203,6 +234,46 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             .collect()
     }
 
+    /// Snapshot of every decoded Text message in this room, sorted by
+    /// sender-claimed `sent_at_ms` ascending, tie-broken on
+    /// `value_hash`. Receipts and Reactions are not included — the
+    /// timeline only renders Text bodies. Built up by the decode loop;
+    /// callers that register `on_message`, `on_receipt`,
+    /// `on_channels_changed`, or `on_messages_changed` start the loop
+    /// and the index fills up as entries land in the store.
+    pub fn ordered_messages(&self) -> Vec<DecodedMessage> {
+        self.inner
+            .decoded_text_messages
+            .borrow()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Register a callback fired with the current sorted-by-claimed-time
+    /// Text snapshot (immediately on register, then again after every
+    /// change). Lets thin clients drop their own ordering logic and
+    /// just render what arrives. Mirrors `on_channels_changed`'s
+    /// register-late-get-current-state shape, including the
+    /// re-entrancy guarantee (the immediate fire happens before any
+    /// borrow on `callbacks` is held, so a callback that synchronously
+    /// re-registers any `on_*` handler doesn't panic with
+    /// `BorrowMutError`).
+    pub fn on_messages_changed<F: Fn(&[DecodedMessage]) + 'static>(&self, cb: F) {
+        let boxed: MessagesCallback = Box::new(cb);
+        let snap = self.ordered_messages();
+        boxed(&snap);
+
+        let mut cbs = self.inner.callbacks.borrow_mut();
+        let was_unregistered = cbs.is_empty();
+        cbs.on_messages = Some(boxed);
+        drop(cbs);
+
+        if was_unregistered {
+            self.spawn_decode_loop();
+        }
+    }
+
     fn spawn_decode_loop(&self) {
         let inner = self.inner.clone();
         let peer = match inner.peer_weak.upgrade() {
@@ -269,6 +340,27 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                 };
 
                 let is_self = decoded.author_key == identity_pub;
+                // For Text messages: insert into the sorted index
+                // *before* firing callbacks so a synchronous handler
+                // that reads `ordered_messages()` sees the new entry.
+                // Detect novelty here too — Replay::All re-emits an
+                // entry whose key is already in the index, and we
+                // want to skip re-firing `on_messages_changed` for
+                // duplicates so subscribers don't see a stream of
+                // identical snapshots.
+                let messages_changed = if let crate::MessageBody::Text { .. } = &decoded.body {
+                    let key = (decoded.sent_at_ms, decoded.value_hash);
+                    let mut map = inner.decoded_text_messages.borrow_mut();
+                    if let std::collections::btree_map::Entry::Vacant(e) = map.entry(key) {
+                        e.insert(decoded.clone());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
                 {
                     let cbs = callbacks.borrow();
                     match &decoded.body {
@@ -291,6 +383,24 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
                         // (spawned separately, see sunset-core::reactions).
                         // The per-room decode loop has nothing to do here.
                         crate::MessageBody::Reaction { .. } => {}
+                    }
+                }
+
+                // Fire on_messages_changed with the current sorted
+                // snapshot iff this iteration actually grew the index.
+                // Borrowing the BTreeMap to collect the snapshot is
+                // done before the callback is invoked so a handler
+                // that calls `ordered_messages()` doesn't deadlock on
+                // `RefCell`.
+                if messages_changed {
+                    let snap: Vec<DecodedMessage> = inner
+                        .decoded_text_messages
+                        .borrow()
+                        .values()
+                        .cloned()
+                        .collect();
+                    if let Some(cb) = callbacks.borrow().on_messages.as_ref() {
+                        cb(&snap);
                     }
                 }
 
