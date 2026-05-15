@@ -1056,21 +1056,62 @@ fn composer(
                 ],
                 draft,
               ),
-              html.span(
-                [
-                  ui.css([
-                    #("font-family", theme.font_mono),
-                    #("font-size", "13.125px"),
-                    #("color", p.text_faint),
-                  ]),
-                ],
-                [html.text("↵ send")],
-              ),
+              send_button(p, draft, pending_attachments, on_submit),
             ],
           ),
         ],
       ),
     ],
+  )
+}
+
+/// Send affordance — a real `<button>` so taps and clicks both
+/// dispatch SubmitDraft, identical to pressing Enter. Disabled when
+/// there's nothing to send (empty draft AND no pending attachments);
+/// `SubmitDraft` already no-ops on empty content, but disabling the
+/// button gives the user a clear "ready / not ready" signal and stops
+/// stray clicks from racing the textarea's value-prop sync.
+fn send_button(
+  p: Palette,
+  draft: String,
+  pending_attachments: List(Attachment),
+  on_click: msg,
+) -> Element(msg) {
+  let disabled =
+    string.trim(draft) == "" && list.is_empty(pending_attachments)
+  let color = case disabled {
+    True -> p.text_faint
+    False -> p.accent_deep
+  }
+  let cursor = case disabled {
+    True -> "not-allowed"
+    False -> "pointer"
+  }
+  html.button(
+    [
+      attribute.attribute("data-testid", "composer-send"),
+      attribute.title("Send"),
+      attribute.attribute("aria-label", "Send"),
+      attribute.disabled(disabled),
+      event.on_click(on_click),
+      ui.css([
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("justify-content", "center"),
+        #("gap", "4px"),
+        #("min-width", "24px"),
+        #("height", "24px"),
+        #("padding", "0 4px"),
+        #("border", "none"),
+        #("background", "transparent"),
+        #("color", color),
+        #("cursor", cursor),
+        #("border-radius", "4px"),
+        #("font-family", theme.font_mono),
+        #("font-size", "13.125px"),
+      ]),
+    ],
+    [html.text("↵ send")],
   )
 }
 

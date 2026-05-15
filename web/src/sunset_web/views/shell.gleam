@@ -253,6 +253,13 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
      }
      #app { height: 100%; background: " <> palette.bg <> "; }
      *, *::before, *::after { box-sizing: border-box; }
+     /* Suppress the OS default tap-highlight (translucent gray on iOS,
+        translucent cyan on Android Chrome) so a tap on any of our
+        buttons / channel rows / etc. doesn't briefly flash a non-brand
+        colour that fights with the magenta accent. Press feedback that
+        we want — the active-channel highlight, the action-toolbar
+        :hover, the row :hover backdrop — is driven by our own styles. */
+     * { -webkit-tap-highlight-color: transparent; }
      /* Hover highlight on every message row, full-bleed (no rounded
         corners) so the user can see exactly where one message ends and
         the next begins — matters for multi-line messages. The row
