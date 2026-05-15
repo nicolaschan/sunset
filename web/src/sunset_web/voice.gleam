@@ -36,11 +36,17 @@ pub fn voice_set_muted(client: ClientHandle, muted: Bool) -> Nil
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceSetDeafened")
 pub fn voice_set_deafened(client: ClientHandle, deafened: Bool) -> Nil
 
-/// Toggle receiver-side RNNoise denoising. Defaults to on when the
-/// runtime starts; pass `False` to bypass the denoiser without losing
-/// per-peer state, so flipping back on resumes from where it left off.
-@external(javascript, "./voice.ffi.mjs", "wasmVoiceSetDenoise")
-pub fn voice_set_denoise(client: ClientHandle, denoise: Bool) -> Nil
+/// Toggle receiver-side RNNoise denoising for a single peer. The
+/// runtime defaults to on for every peer; pass `False` here to bypass
+/// the denoiser for `peer_hex` without losing its per-peer state, so
+/// flipping back on resumes from where it left off. `peer_hex` is the
+/// peer's full 64-char verifying-key hex.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceSetPeerDenoise")
+pub fn voice_set_peer_denoise(
+  client: ClientHandle,
+  peer_hex: String,
+  enabled: Bool,
+) -> Nil
 
 /// Switch the active send-side voice quality preset. Persists the
 /// label to localStorage and (if voice is running) pushes the change

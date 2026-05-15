@@ -1,20 +1,20 @@
-// voice_denoise.spec.js — RNNoise receiver-side denoise toggle.
+// voice_denoise.spec.js — RNNoise receiver-side per-peer denoise toggle.
 //
 // Asserts two contracts:
-//   1. The toggle UI is present once the user opens their own voice
-//      popover, defaults to enabled (aria-pressed="true" — the popover
-//      switch reads the live state directly, no inversion), and
+//   1. The toggle UI is present on a *remote* peer's voice popover
+//      (denoising your own outgoing audio isn't a thing — denoise
+//      runs locally on the receiving side, so the self row doesn't
+//      offer it), defaults to enabled (aria-pressed="true"), and
 //      round-trips through Lustre + the WASM client without throwing.
 //   2. Toggling off and back on doesn't crash the receive path: noise
-//      frames keep arriving on the peer regardless of denoise state.
+//      frames keep arriving on that peer regardless of denoise state.
 //      (Quality of denoising is covered by the Rust integration tests
 //      in `crates/sunset-voice/tests/runtime_integration.rs`; the e2e
 //      test here is wire-through only.)
 //
-// Pattern lifted from voice_mute_deafen.spec.js: spawn a relay, open
-// two browser contexts, join voice, then open the user's own voice
-// popover (by tapping the channel name in the minibar) and drive the
-// denoise toggle there.
+// Pattern: spawn a relay, open two browser contexts, both join voice,
+// then on bob's page open alice's voice-member row (which renders her
+// peer popover) and drive the denoise toggle there.
 
 import { test, expect, devices } from "@playwright/test";
 import {
@@ -33,9 +33,6 @@ test.afterAll(async () => {
   teardownRelay(relay);
 });
 
-// Desktop viewport: the voice minibar at the top of the chat panel
-// renders identically on phone and desktop, but driving it from a
-// desktop context is faster than booting a phone emulator.
 async function openPeer(browser, relayAddr) {
   const ctx = await browser.newContext({
     ...devices["Desktop Chrome"],
@@ -66,18 +63,21 @@ async function openPeer(browser, relayAddr) {
 
 async function joinVoice(page) {
   await page.locator('[data-testid="voice-channel-row"]').first().click();
-  // voice-leave appears once self_in_call flips true, which only happens
-  // after the WASM voice runtime has started. 2 s is the same budget as
-  // voice_mute_deafen.spec.js — anything slower is a real UX bug.
   await expect(page.locator('[data-testid="voice-leave"]')).toBeVisible({
     timeout: 2_000,
   });
 }
 
-test("denoise toggle defaults on, flips state via aria-pressed, and survives noise traffic", async ({
+function uint8ToHex(arr) {
+  return Array.from(arr)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+test("per-peer denoise toggle defaults on, flips state, and survives noise traffic", async ({
   browser,
 }, testInfo) => {
-  // Phone and desktop now share the same minibar + popover for voice
+  // Phone and desktop share the same minibar + popover for voice
   // controls. Run the wire-through against Desktop to keep startup
   // fast (no mobile emulation overhead).
   test.skip(
@@ -91,26 +91,31 @@ test("denoise toggle defaults on, flips state via aria-pressed, and survives noi
   await joinVoice(alice.page);
   await joinVoice(bob.page);
 
-  // Open bob's own voice popover by tapping the channel name in the
-  // minibar — that's the user path to per-self controls (denoise,
-  // volume, send quality).
-  await bob.page.locator('[data-testid="voice-minibar"]').click();
+  const aliceBytes = await alice.page.evaluate(() =>
+    Array.from(new Uint8Array(window.sunsetClient.public_key)),
+  );
+  const aliceHex = uint8ToHex(aliceBytes);
+
+  // Wait for alice's row to appear in bob's roster, then open her
+  // popover. The denoise toggle lives on remote peers only.
+  const aliceRow = bob.page.locator(
+    `[data-testid="voice-member"][data-peer-hex="${aliceHex}"]`,
+  );
+  await expect(aliceRow).toBeVisible({ timeout: 5_000 });
+  await aliceRow.click();
+
   const denoiseBtn = bob.page.locator(
     '[data-testid="voice-popover-denoise"]',
   );
   await expect(denoiseBtn).toBeVisible({ timeout: 2_000 });
-  // Default: denoise on. The popover switch mirrors the live state,
-  // so aria-pressed reads "true" while denoise is active.
+  // Default: denoise on for every peer. The popover switch mirrors the
+  // per-peer state, so aria-pressed reads "true" until toggled off.
   await expect(denoiseBtn).toHaveAttribute("aria-pressed", "true");
 
   // Receiver-side wire-through: install bob's frame recorder so we
   // can confirm frames keep arriving as denoise is toggled.
   await bob.page.evaluate(() =>
     window.sunsetClient.voice_install_frame_recorder(),
-  );
-
-  const aliceBytes = await alice.page.evaluate(() =>
-    Array.from(new Uint8Array(window.sunsetClient.public_key)),
   );
 
   async function injectNoiseFrames(page, startCounter, count) {
@@ -147,7 +152,7 @@ test("denoise toggle defaults on, flips state via aria-pressed, and survives noi
   await denoiseBtn.click();
   await expect(denoiseBtn).toHaveAttribute("aria-pressed", "false");
 
-  // Frames continue to flow with denoise off.
+  // Frames continue to flow with denoise off for this peer.
   const beforeOff = await bob.page.evaluate(
     ([bytes]) =>
       window.sunsetClient.voice_recorded_frames(new Uint8Array(bytes)).length,
