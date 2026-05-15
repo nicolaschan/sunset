@@ -149,10 +149,20 @@ pub(crate) fn voice_set_deafened(cell: &VoiceCell, deafened: bool) {
     }
 }
 
-pub(crate) fn voice_set_denoise(cell: &VoiceCell, denoise: bool) {
-    if let Some(v) = cell.borrow().as_ref() {
-        v.runtime.set_denoise(denoise);
+pub(crate) fn voice_set_peer_denoise(
+    cell: &VoiceCell,
+    peer_bytes: &[u8],
+    enabled: bool,
+) -> Result<(), JsError> {
+    if peer_bytes.len() != 32 {
+        return Err(JsError::new("peer_id must be 32 bytes"));
     }
+    let pk = sunset_store::VerifyingKey::new(bytes::Bytes::copy_from_slice(peer_bytes));
+    let peer = sunset_sync::PeerId(pk);
+    if let Some(v) = cell.borrow().as_ref() {
+        v.runtime.set_peer_denoise(peer, enabled);
+    }
+    Ok(())
 }
 
 /// Switch the active send-side voice quality preset. Accepts

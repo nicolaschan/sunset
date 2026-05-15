@@ -119,8 +119,9 @@ test("desktop: voice minibar renders at the top of the chat panel when in a call
   ).toBeLessThanOrEqual(1);
 
   // Tapping the channel-name button on the minibar opens the user's
-  // own voice popover — the new home for the denoise toggle / send
-  // quality / per-self volume.
+  // own voice popover — the new home for send-quality / per-self
+  // volume. Denoise is per-peer (applied locally to incoming streams)
+  // so it doesn't appear on the self row.
   await alice.page
     .getByRole("button", { name: /Voice controls for/i })
     .click();
@@ -129,7 +130,7 @@ test("desktop: voice minibar renders at the top of the chat panel when in a call
   ).toBeVisible({ timeout: 1_000 });
   await expect(
     alice.page.locator('[data-testid="voice-popover-denoise"]'),
-  ).toBeVisible();
+  ).toHaveCount(0);
 
   // Leaving the call removes the minibar from the chat panel.
   await alice.page.locator('[data-testid="voice-popover-close"]').click();
