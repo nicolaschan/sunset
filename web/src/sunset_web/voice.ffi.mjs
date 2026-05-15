@@ -88,24 +88,57 @@ export function ensureCtx() {
 const FRAME_SAMPLES_PER_CHANNEL = 960;
 const STEREO_FRAME_TOTAL = FRAME_SAMPLES_PER_CHANNEL * 2;
 
+// The mic profile attached to whichever quality preset is active.
+// Voice mode is speech-optimized and runs the browser's WebRTC
+// pre-processing (echo cancel + noise suppression + AGC), which hard
+// band-limits the input to roughly 8 kHz — appropriate at 24 kbps Opus
+// VOIP and saves us bandwidth, but pointless once the encoder has
+// headroom for full-band stereo. High/Maximum disable all three so
+// the encoder actually sees the mic's full bandwidth.
+function micConstraintsForPreset(preset) {
+  const speechOptimized = preset === "voice";
+  return {
+    echoCancellation: speechOptimized,
+    noiseSuppression: speechOptimized,
+    autoGainControl: speechOptimized,
+    // Always request the highest-fidelity capture the device offers.
+    // The encoder reconfigures per preset; the input pipeline can
+    // safely stay at maximum rate / depth / channels regardless.
+    // `ideal` lets the browser fall back when a constraint can't be
+    // met (e.g. mono mic, 16-bit-only driver).
+    sampleRate: { ideal: 48000 },
+    channelCount: { ideal: 2 },
+    sampleSize: { ideal: 24 },
+    latency: { ideal: 0.02 },
+  };
+}
+
+// Identifier returned by micConstraintsForPreset that distinguishes
+// "Voice (speech-optimized)" from "High/Maximum (raw)". A preset
+// switch only needs to re-acquire the mic when this profile changes.
+function micProfileForPreset(preset) {
+  return preset === "voice" ? "speech" : "raw";
+}
+
+let currentMicProfile = null;
+
 export async function startCapture(client) {
   ensureCtx();
   await ctx.audioWorklet.addModule("/audio/voice-capture-worklet.js");
   await ctx.audioWorklet.addModule("/audio/voice-playback-worklet.js");
   startLevelDecayTimer();
+  const preset = readPersistedQuality();
+  await openCaptureStream(client, preset);
+}
+
+// Acquire (or re-acquire) the mic with constraints matching `preset`,
+// then wire the capture worklet into the audio graph. Caller must
+// have torn down any prior `captureStream` / `captureNode` first.
+async function openCaptureStream(client, preset) {
   captureStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      // Always request stereo capture. If the platform only has a
-      // mono mic the worklet duplicates L into R so we get the same
-      // interleaved 1920-sample frame shape regardless. See
-      // `voice-capture-worklet.js` for the rationale on not
-      // reconfiguring channelCount per quality preset.
-      channelCount: 2,
-    },
+    audio: micConstraintsForPreset(preset),
   });
+  currentMicProfile = micProfileForPreset(preset);
   const src = ctx.createMediaStreamSource(captureStream);
   captureNode = new AudioWorkletNode(ctx, "voice-capture", {
     // The capture worklet reads from a stereo source; tell the audio
@@ -130,6 +163,38 @@ export async function startCapture(client) {
     }
   };
   src.connect(captureNode);
+}
+
+// Tear down only the mic side of the pipeline; per-peer playback
+// chains stay live so a preset switch mid-call doesn't drop the
+// audio the user is currently hearing.
+function tearDownCapture() {
+  if (captureNode) {
+    captureNode.port.onmessage = null;
+    try {
+      captureNode.disconnect();
+    } catch (_e) {
+      // ignore — already disconnected
+    }
+    captureNode = null;
+  }
+  if (captureStream) {
+    for (const t of captureStream.getTracks()) t.stop();
+    captureStream = null;
+  }
+  currentMicProfile = null;
+}
+
+function readPersistedQuality() {
+  try {
+    const stored = window.localStorage?.getItem("sunset/voice-quality");
+    if (stored === "voice" || stored === "high" || stored === "maximum") {
+      return stored;
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return "maximum";
 }
 
 function updateSelfLevel(pcm) {
@@ -369,17 +434,14 @@ export function wasmVoiceStart(client, roomHandle, callback) {
             }
           },
         );
-        // Re-apply the user's preferred quality preset. localStorage
-        // is the canonical persistence; default `"maximum"` matches
-        // the Rust default. Failures are non-fatal — the encoder
-        // already constructed itself with the default.
+        // Re-apply the user's preferred quality preset to the
+        // freshly-built encoder. `startCapture` already opened the mic
+        // with constraints matching this preset (read from the same
+        // localStorage key), so the encoder + capture pipeline agree
+        // on EC/NS/AGC and channel layout. Failures are non-fatal —
+        // the encoder already constructed itself with the Rust default.
         try {
-          const stored = window.localStorage?.getItem("sunset/voice-quality");
-          const label =
-            stored === "voice" || stored === "high" || stored === "maximum"
-              ? stored
-              : "maximum";
-          client.voice_set_quality(label);
+          client.voice_set_quality(readPersistedQuality());
         } catch (qe) {
           console.warn("voice_set_quality on start failed", qe);
         }
@@ -446,7 +508,9 @@ function hexToUint8(hex) {
 // Persists the new quality preset to localStorage and pushes it
 // down to the active encoder if voice is started. The setting is
 // re-applied on every voice_start so a user who changes it before
-// joining a call sees the right preset on rejoin.
+// joining a call sees the right preset on rejoin. If the mic
+// profile differs (Voice's speech-optimized capture vs High/Maximum's
+// raw capture), the mic stream is re-acquired with new constraints.
 export function wasmVoiceSetQuality(client, label) {
   try {
     window.localStorage?.setItem("sunset/voice-quality", label);
@@ -461,20 +525,24 @@ export function wasmVoiceSetQuality(client, label) {
     if (!String(e?.message || e).includes("voice not started")) {
       console.warn("voice_set_quality failed", e);
     }
+    return;
+  }
+  // Re-acquire the mic with new constraints when crossing the
+  // speech ↔ raw boundary. Same-profile transitions (e.g. High ↔
+  // Maximum) only rebuild the encoder; the capture stream is
+  // unaffected.
+  const newProfile = micProfileForPreset(label);
+  if (captureStream && newProfile !== currentMicProfile) {
+    tearDownCapture();
+    openCaptureStream(client, label).catch((err) => {
+      console.warn("re-open mic for quality change failed", err);
+    });
   }
 }
 
 // Read the persisted preset (or the Rust default if nothing saved).
 export function wasmVoiceGetQuality() {
-  try {
-    const stored = window.localStorage?.getItem("sunset/voice-quality");
-    if (stored === "voice" || stored === "high" || stored === "maximum") {
-      return stored;
-    }
-  } catch (_e) {
-    // ignore
-  }
-  return "maximum";
+  return readPersistedQuality();
 }
 
 
