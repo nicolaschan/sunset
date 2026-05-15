@@ -538,6 +538,18 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       composer.attach_shortcut_prevent_default("composer-textarea")
     })
 
+  let install_image_paste_eff =
+    effect.from(fn(dispatch) {
+      composer.install_image_paste_handler("composer-textarea", fn(pairs) {
+        let atts =
+          list.map(pairs, fn(p) {
+            let #(mime, data) = p
+            domain.Attachment(mime_type: mime, data_base64: data)
+          })
+        dispatch(ImagesPicked(atts))
+      })
+    })
+
   let install_voice_handler_eff =
     effect.from(fn(dispatch) {
       voice.install_voice_state_handler(
@@ -582,6 +594,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       subscribe_touch_drag,
       ticker_eff,
       attach_shortcuts_eff,
+      install_image_paste_eff,
       install_voice_handler_eff,
       install_voice_level_handlers_eff,
       initial_compose_reset_eff,

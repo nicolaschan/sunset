@@ -20,3 +20,14 @@ pub fn attach_shortcut_prevent_default(element_id: String) -> Nil
 
 @external(javascript, "./composer.ffi.mjs", "focusTextarea")
 pub fn focus_textarea(element_id: String) -> Nil
+
+/// Install a global paste listener that dispatches `(mime, base64)`
+/// tuples for every image pasted into the textarea with id
+/// `element_id`. The handler is idempotent — calling it again just
+/// rebinds the callback. Non-image pastes fall through to the
+/// browser default so plain-text paste keeps working.
+@external(javascript, "./composer.ffi.mjs", "installImagePasteHandler")
+pub fn install_image_paste_handler(
+  element_id: String,
+  callback: fn(List(#(String, String))) -> Nil,
+) -> Nil
