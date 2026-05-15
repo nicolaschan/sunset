@@ -311,8 +311,47 @@ impl Client {
         )
     }
 
+    /// Start the voice subsystem in *observer* mode for the given room.
+    /// All six runtime tasks spawn; the three active ones (heartbeat,
+    /// presence publisher, auto-connect) short-circuit until
+    /// `voice_activate` is called. The user is told who is in the
+    /// channel without needing mic permission or emitting any voice
+    /// traffic of their own. Pair with `voice_activate`/`voice_deactivate`
+    /// at join/leave, and `voice_stop` at room exit.
+    pub fn voice_observe_start(
+        &self,
+        room_handle: &crate::room_handle::RoomHandle,
+        on_pcm: js_sys::Function,
+        on_drop_peer: js_sys::Function,
+        on_voice_peer_state: js_sys::Function,
+    ) -> Result<(), JsError> {
+        crate::voice::voice_observe_start(
+            &self.voice,
+            &self.identity,
+            room_handle,
+            &self.bus,
+            on_pcm,
+            on_drop_peer,
+            on_voice_peer_state,
+        )
+    }
+
+    /// Transition from observer to active mode. The JS shell is
+    /// responsible for having brought up `startCapture` before this
+    /// call; `voice_activate` only flips the runtime's internal gate.
+    pub fn voice_activate(&self) -> Result<(), JsError> {
+        crate::voice::voice_activate(&self.voice)
+    }
+
+    /// Transition from active back to observer mode. Stops heartbeats
+    /// and presence publishing; the durable-presence subscription
+    /// remains so the roster stays populated.
+    pub fn voice_deactivate(&self) -> Result<(), JsError> {
+        crate::voice::voice_deactivate(&self.voice)
+    }
+
     /// Stop the voice subsystem and release all resources. Dropping
-    /// `VoiceRuntime` cancels all five protocol tasks.
+    /// `VoiceRuntime` cancels all six protocol tasks.
     pub fn voice_stop(&self) -> Result<(), JsError> {
         crate::voice::voice_stop(&self.voice)
     }

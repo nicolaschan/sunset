@@ -73,6 +73,14 @@ pub(crate) struct RuntimeInner {
     pub last_delivered_seq: RefCell<HashMap<PeerId, u64>>,
     pub auto_connect_state: RefCell<HashMap<PeerId, AutoConnectState>>,
     pub last_emitted: RefCell<HashMap<PeerId, EmittedState>>,
+
+    /// `false` ⇒ the runtime is in observer mode: it consumes durable
+    /// `voice-presence/...` events (so the UI can render who is in the
+    /// channel) but does not publish presence, send heartbeats, or
+    /// auto-dial peers. `true` ⇒ the user has joined the call; the
+    /// active tasks resume normal operation. Toggled via
+    /// `VoiceRuntime::set_active`.
+    pub is_active: RefCell<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

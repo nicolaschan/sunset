@@ -54,6 +54,29 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         let membership_arc = inner.membership_liveness.clone();
         drop(inner);
 
+        // Don't subscribe to the durable presence stream until the local
+        // user is in the call. If we subscribed in observer mode and
+        // simply discarded events, we'd swallow whatever presence entries
+        // arrived between observe_start and activate — the next dial
+        // wouldn't fire until each peer's next republish (≤ 2 s away),
+        // tightening the test/UX budget for nothing. By deferring the
+        // subscribe, `subscribe_prefix` runs once active and the bus
+        // immediately replays the current durable state so the FSM can
+        // act on it. Poll-loop because we have no Notify primitive on
+        // RuntimeInner; 100 ms is fast enough that the click-to-dial
+        // latency is dominated by getUserMedia, not by this check.
+        loop {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let active = *inner.is_active.borrow();
+            drop(inner);
+            if active {
+                break;
+            }
+            sleep(std::time::Duration::from_millis(100)).await;
+        }
+
         let mut presence_stream = match bus.subscribe_prefix(prefix.clone()).await {
             Ok(s) => s,
             Err(e) => {
@@ -155,4 +178,13 @@ fn is_valid_presence_name(name: &Bytes, prefix: &Bytes, vk: &VerifyingKey) -> bo
     let suffix = &name[prefix.len()..];
     let expected = hex::encode(vk.as_bytes());
     suffix == expected.as_bytes()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep(d: std::time::Duration) {
+    wasmtimer::tokio::sleep(d).await;
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep(d: std::time::Duration) {
+    tokio::time::sleep(d).await;
 }
