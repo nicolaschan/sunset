@@ -137,6 +137,16 @@ impl VoiceRuntime {
     /// the active preset is mono we downmix here so the encoder gets
     /// the shape it expects.
     pub fn send_pcm(&self, pcm: &[f32]) {
+        // Drop frames when the runtime is in observer mode. Without this
+        // gate, audio captured before `stopCapture` finishes flushing
+        // (worklet `process()` ticks queued on the audio graph) can
+        // still reach the bus after `voice_deactivate`, which refreshes
+        // `frame_alive` on every receiver and keeps them seeing us as
+        // "in call" for the full FRAME_STALE_AFTER + next sweep window
+        // — well past the 6 s "leave detected" spec budget.
+        if !*self.inner.is_active.borrow() {
+            return;
+        }
         if *self.inner.muted.borrow() {
             return;
         }

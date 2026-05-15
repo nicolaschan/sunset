@@ -373,6 +373,10 @@ async fn send_pcm_publishes_frame_when_unmuted() {
                 frame_sink,
                 peer_state_sink,
             );
+            // `send_pcm` drops frames when the runtime is in observer
+            // mode (the default after `new`); activate so the publish
+            // path runs.
+            runtime.set_active(true);
             let mut rx = tx.subscribe();
 
             // Default quality is `Maximum` (stereo): 1920 interleaved
@@ -438,6 +442,7 @@ async fn send_pcm_drops_frames_when_muted() {
                 frame_sink,
                 peer_state_sink,
             );
+            runtime.set_active(true);
             runtime.set_muted(true);
 
             let mut rx = tx.subscribe();
