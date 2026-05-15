@@ -268,6 +268,9 @@ async fn heartbeat_publishes_periodically_with_is_muted_flag() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Runtimes default to observer mode; the heartbeat task only
+            // publishes once the local user has joined the call.
+            runtime.set_active(true);
             tokio::task::spawn_local(tasks.heartbeat);
 
             // Subscribe ahead of the first heartbeat.
@@ -821,7 +824,7 @@ async fn auto_connect_dials_on_voice_presence_only_once() {
             let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
                 events: Rc::new(RefCell::new(vec![])),
             });
-            let (_runtime, tasks) = VoiceRuntime::new(
+            let (runtime, tasks) = VoiceRuntime::new(
                 bus,
                 room.clone(),
                 bob.clone(),
@@ -829,6 +832,9 @@ async fn auto_connect_dials_on_voice_presence_only_once() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Active mode is required for auto_connect to dial; observer
+            // mode drains the presence stream without entering the FSM.
+            runtime.set_active(true);
             tokio::task::spawn_local(tasks.auto_connect);
 
             // Yield to let auto_connect task start up and register its sink.
@@ -876,7 +882,7 @@ async fn auto_connect_skips_dial_when_self_pk_is_larger() {
             let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
                 events: Rc::new(RefCell::new(vec![])),
             });
-            let (_runtime, tasks) = VoiceRuntime::new(
+            let (runtime, tasks) = VoiceRuntime::new(
                 bus,
                 room.clone(),
                 larger.clone(),
@@ -884,6 +890,11 @@ async fn auto_connect_skips_dial_when_self_pk_is_larger() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Activate so the gate doesn't trivially mask the glare-avoidance
+            // path under test (we want auto_connect to *reach* the comparison
+            // and then decline to dial because self_pk > peer_pk, not because
+            // it skipped processing entirely).
+            runtime.set_active(true);
             tokio::task::spawn_local(tasks.auto_connect);
             tokio::task::yield_now().await;
 
@@ -998,7 +1009,7 @@ async fn voice_presence_publisher_emits_periodically() {
             let room_fp = room.fingerprint().to_hex();
             let presence_prefix = Bytes::from(format!("voice-presence/{room_fp}/"));
 
-            let (_runtime, tasks) = VoiceRuntime::new(
+            let (runtime, tasks) = VoiceRuntime::new(
                 bus,
                 room.clone(),
                 alice.clone(),
@@ -1006,6 +1017,9 @@ async fn voice_presence_publisher_emits_periodically() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Activate so the publisher actually publishes. Observer-mode
+            // (the default) intentionally skips publication.
+            runtime.set_active(true);
 
             // Subscribe to durable presence entries before spawning the publisher.
             let mut stream = bus_impl
@@ -1014,6 +1028,9 @@ async fn voice_presence_publisher_emits_periodically() {
                 .expect("subscribe succeeded");
 
             tokio::task::spawn_local(tasks.voice_presence_publisher);
+            // Keep the runtime alive for the duration of the test so the
+            // task's `weak.upgrade()` keeps succeeding.
+            let _runtime = runtime;
 
             use futures::StreamExt as _;
 
@@ -1314,4 +1331,158 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
         on_rms * 2.0 < off_rms,
         "denoise on should attenuate inbound noise vs off: on={on_rms}, off={off_rms}",
     );
+}
+
+/// Observer-mode contract: with `is_active=false`, the runtime emits
+/// `in_voice_channel` for remote peers (so the rail can render the
+/// roster before the local user joins the call) but does *not* publish
+/// our own durable presence. Flipping to `is_active=true` resumes the
+/// publisher; flipping back stops it. This is the load-bearing
+/// guarantee for "show who is in the voice channel even when I haven't
+/// joined yet".
+#[tokio::test(flavor = "current_thread")]
+async fn observer_mode_emits_in_voice_channel_without_publishing_self() {
+    use futures::StreamExt as _;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (bob, alice, room) = make_pair_self_smaller(40, 41);
+            let alice_pk = alice.store_verifying_key();
+            let bob_pk = bob.store_verifying_key();
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob_pk.clone());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let events: EventSink = Rc::new(RefCell::new(vec![]));
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: events.clone(),
+            });
+
+            // Subscribe to our own presence prefix *before* spawning the
+            // publisher so the assertion below can observe "nothing was
+            // ever published while observing".
+            let room_fp = room.fingerprint().to_hex();
+            let presence_prefix = Bytes::from(format!("voice-presence/{room_fp}/"));
+            let mut own_presence_stream = bob_bus_impl
+                .subscribe_prefix(presence_prefix)
+                .await
+                .expect("presence prefix subscribe");
+
+            let (runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            // Runtime defaults to observer mode. Spawn the three
+            // observer-side tasks plus the three gated tasks so we
+            // can verify the gates' behaviour end-to-end.
+            assert!(!runtime.is_active(), "default mode is observer");
+            tokio::task::spawn_local(tasks.combiner);
+            tokio::task::spawn_local(tasks.voice_presence_membership);
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::spawn_local(tasks.auto_connect);
+            tokio::task::spawn_local(tasks.heartbeat);
+            tokio::task::spawn_local(tasks.voice_presence_publisher);
+
+            tokio::task::yield_now().await;
+
+            // Inject a remote durable-presence entry from alice. The
+            // combiner should emit `in_voice_channel=true` even though
+            // we never activated.
+            let entry = make_presence_entry(&alice, &room);
+            bob_bus_impl.inject_durable(entry.clone()).await;
+
+            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snap = events.borrow().last().cloned();
+                    if let Some(ev) = snap {
+                        if ev.in_voice_channel {
+                            return ev;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("combiner emits in_voice_channel within 2s");
+            assert_eq!(observed.peer, PeerId(alice_pk.clone()));
+            assert!(
+                observed.in_voice_channel,
+                "observer must see alice in channel"
+            );
+            assert!(!observed.in_call, "no P2P → in_call must stay false");
+
+            // Helper macro: wait up to `$budget` for the next durable
+            // entry on `own_presence_stream` whose `verifying_key` equals
+            // `bob_pk`. Alice's injected entry from the previous step
+            // also flows through this stream, so filtering by key is
+            // what isolates self-publishes from observer-side traffic.
+            macro_rules! next_self_publish {
+                ($budget:expr) => {{
+                    let bob_pk = bob_pk.clone();
+                    tokio::time::timeout($budget, async {
+                        loop {
+                            match own_presence_stream.next().await {
+                                Some(BusEvent::Durable { entry, .. })
+                                    if entry.verifying_key == bob_pk =>
+                                {
+                                    return Some(entry);
+                                }
+                                Some(_) => continue,
+                                None => return None,
+                            }
+                        }
+                    })
+                    .await
+                }};
+            }
+
+            // The publisher's first publish would land within
+            // VOICE_PRESENCE_REFRESH_INTERVAL (2 s) if it were running.
+            // Give it 1.5 s (well past task startup, well under the
+            // 2 s republish cadence) — observer mode must not publish.
+            let saw_self = next_self_publish!(Duration::from_millis(1500));
+            assert!(
+                saw_self.is_err(),
+                "publisher must stay silent in observer mode (saw {saw_self:?})"
+            );
+
+            // Activate. The publisher's loop wakes from its sleep on its
+            // own cadence (≤2 s) — wait up to 3 s for the first self-publish.
+            runtime.set_active(true);
+            assert!(runtime.is_active());
+            let first_pub = next_self_publish!(Duration::from_secs(3))
+                .expect("first own-presence publish within 3s after activate")
+                .expect("stream open");
+            assert_eq!(
+                first_pub.verifying_key, bob_pk,
+                "self-publish carries bob's key"
+            );
+
+            // Deactivate. The publisher's next iteration must observe
+            // `is_active=false` and skip. There may be one in-flight
+            // republish if we deactivate mid-sleep, so allow up to one
+            // grace publish and then require silence.
+            runtime.set_active(false);
+            // Drain any already-emitted entries within the first refresh
+            // interval, then require no further entries for a full
+            // republish cycle. With the 2 s interval, a 4 s window after
+            // drain leaves >1 republish-worth of margin.
+            let _maybe_grace = next_self_publish!(Duration::from_secs(2));
+            let after_grace = next_self_publish!(Duration::from_secs(4));
+            assert!(
+                after_grace.is_err(),
+                "publisher must stop after set_active(false) (saw {after_grace:?})"
+            );
+
+            drop(runtime);
+        })
+        .await;
 }

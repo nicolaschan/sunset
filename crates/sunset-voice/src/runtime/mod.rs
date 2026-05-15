@@ -110,6 +110,7 @@ impl VoiceRuntime {
             last_delivered_seq: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
             last_emitted: RefCell::new(Default::default()),
+            is_active: RefCell::new(false),
         });
 
         let tasks = VoiceTasks {
@@ -210,6 +211,26 @@ impl VoiceRuntime {
 
     pub fn set_muted(&self, muted: bool) {
         *self.inner.muted.borrow_mut() = muted;
+    }
+
+    /// Toggle the runtime between observer and active modes.
+    ///
+    /// In observer mode (`false`, the default), the durable
+    /// `voice-presence/...` subscription continues to drive the combiner
+    /// so the UI knows who is in the voice channel, but the three
+    /// active tasks (heartbeat, presence publisher, auto-connect) skip
+    /// their work. Calling `set_active(true)` flips the gate so the
+    /// active tasks resume on their next iteration; `set_active(false)`
+    /// returns to observer mode.
+    pub fn set_active(&self, active: bool) {
+        *self.inner.is_active.borrow_mut() = active;
+    }
+
+    /// Read the active flag. Useful for tests; production code consults
+    /// `RuntimeInner::is_active` directly.
+    #[cfg(feature = "test-hooks")]
+    pub fn is_active(&self) -> bool {
+        *self.inner.is_active.borrow()
     }
 
     pub fn set_deafened(&self, deafened: bool) {

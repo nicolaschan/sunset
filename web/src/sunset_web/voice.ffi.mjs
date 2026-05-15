@@ -403,6 +403,88 @@ export function wasmVoiceStop(client) {
   stopCapture();
 }
 
+// Start voice in *observer* mode — no mic permission, no audio
+// context, no outbound voice traffic. Just enough to subscribe to
+// the durable voice-presence stream so the channels rail can
+// render who is in the voice channel before the local user joins.
+// Mirrors `wasmVoiceStart`'s callback shape so the Rust side wires
+// the same three handlers (PCM delivery, peer-drop, peer-state-changed)
+// — none of which can fire until `wasmVoiceActivate` opens the gate.
+export function wasmVoiceObserveStart(client, roomHandle, callback) {
+  try {
+    client.voice_observe_start(
+      roomHandle,
+      (peerId, seq, pcm) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        deliverFrame(hex, seq >>> 0, new Float32Array(pcm));
+      },
+      (peerId) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        dropPeer(hex);
+      },
+      (peerId, inCall, talking, isMuted, inVoiceChannel) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        if (window.__voicePeerStateHandler) {
+          window.__voicePeerStateHandler(
+            hex,
+            inCall,
+            talking,
+            isMuted,
+            inVoiceChannel,
+          );
+        }
+      },
+    );
+    callback(new Ok(null));
+  } catch (e) {
+    callback(new GError(String(e?.message || e)));
+  }
+}
+
+// Bring up mic capture, then flip the runtime out of observer mode
+// so heartbeats / presence publishes / auto-connect resume. Pairs
+// with `wasmVoiceObserveStart`. The user-quality preset is re-applied
+// here (rather than in observe-start) because it's a property of the
+// active encoder, not the observer.
+export function wasmVoiceActivate(client, callback) {
+  startCapture(client)
+    .then(() => {
+      try {
+        client.voice_activate();
+        try {
+          const stored = window.localStorage?.getItem("sunset/voice-quality");
+          const label =
+            stored === "voice" || stored === "high" || stored === "maximum"
+              ? stored
+              : "maximum";
+          client.voice_set_quality(label);
+        } catch (qe) {
+          console.warn("voice_set_quality on activate failed", qe);
+        }
+        callback(new Ok(null));
+      } catch (e) {
+        stopCapture();
+        callback(new GError(String(e?.message || e)));
+      }
+    })
+    .catch((e) => {
+      callback(new GError(String(e?.message || e)));
+    });
+}
+
+// Inverse of `wasmVoiceActivate`. Returns to observer mode so the
+// roster stays populated for the local user; stops mic capture so
+// no audio leaves the device. Does *not* drop the runtime — use
+// `wasmVoiceStop` for that (on room exit).
+export function wasmVoiceDeactivate(client) {
+  try {
+    client.voice_deactivate();
+  } catch (e) {
+    console.warn("voice_deactivate failed", e);
+  }
+  stopCapture();
+}
+
 export function wasmVoiceSetMuted(client, m) {
   try {
     client.voice_set_muted(!!m);

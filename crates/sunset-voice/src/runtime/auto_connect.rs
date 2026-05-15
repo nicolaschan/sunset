@@ -74,6 +74,22 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     if entry.verifying_key == self_pk {
                         continue;
                     }
+                    // Skip dialling in observer mode. We still drain the
+                    // presence stream (so the channel doesn't back up while
+                    // the local user is in the room but not in the call),
+                    // but we don't enter `auto_connect_state` for the peer
+                    // — that way, the first presence republish after the
+                    // user joins is what arms the dial, mirroring the
+                    // freshly-spawned-task behaviour from before the
+                    // observe/activate split.
+                    {
+                        let Some(inner) = weak.upgrade() else { return; };
+                        let active = *inner.is_active.borrow();
+                        drop(inner);
+                        if !active {
+                            continue;
+                        }
+                    }
                     // Glare avoidance: only the side with the
                     // lexicographically smaller public key initiates
                     // the WebRTC dial; the other side accepts via the

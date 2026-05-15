@@ -30,6 +30,34 @@ pub fn voice_start(
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceStop")
 pub fn voice_stop(client: ClientHandle) -> Nil
 
+/// Start voice in *observer* mode: subscribes to the durable
+/// voice-presence stream so the rail can render who is in the channel,
+/// without requesting mic permission or emitting any outbound voice
+/// traffic. Use at room load. Pair with `voice_activate` on join,
+/// `voice_deactivate` on leave, and `voice_stop` on room exit.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceObserveStart")
+pub fn voice_observe_start(
+  client: ClientHandle,
+  room_handle: RoomHandle,
+  callback: fn(Result(Nil, String)) -> Nil,
+) -> Nil
+
+/// Transition from observer to active: brings up `getUserMedia` + the
+/// capture worklet, then flips the runtime's internal `is_active` gate
+/// so heartbeats, presence publishing, and auto-connect resume. On
+/// mic-permission denial `callback` receives `Error(message)`.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceActivate")
+pub fn voice_activate(
+  client: ClientHandle,
+  callback: fn(Result(Nil, String)) -> Nil,
+) -> Nil
+
+/// Inverse of `voice_activate`: returns to observer mode so the local
+/// user keeps seeing who is in the channel, without sending any audio
+/// or presence themselves. Does not drop the runtime.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceDeactivate")
+pub fn voice_deactivate(client: ClientHandle) -> Nil
+
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceSetMuted")
 pub fn voice_set_muted(client: ClientHandle, muted: Bool) -> Nil
 

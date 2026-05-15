@@ -25,6 +25,14 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
             let Some(inner) = weak.upgrade() else {
                 return;
             };
+            // Skip when the runtime is in observer mode (`set_active(false)`).
+            // Continue looping so the task is ready to resume the moment the
+            // local user joins the call, without needing to be re-spawned.
+            if !*inner.is_active.borrow() {
+                drop(inner);
+                sleep(HEARTBEAT_INTERVAL).await;
+                continue;
+            }
             let now_ms = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

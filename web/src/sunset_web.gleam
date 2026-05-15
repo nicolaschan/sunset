@@ -469,6 +469,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         peer_levels: dict.new(),
         self_level: 0.0,
         permission_error: None,
+        observed_room: None,
       ),
       voice_quality: voice.voice_get_quality(),
       relays_popover: None,
@@ -1395,7 +1396,42 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           })
           sunset.start_presence(handle, interval, ttl, refresh)
         })
-      #(Model(..model, rooms: new_rooms), wire_eff)
+      // Start the voice runtime in observer mode for the active room.
+      // We only do this once per session: the observer keeps running
+      // across join/leave and across other-room opens. The runtime
+      // itself is a singleton on the wasm Client, so a second
+      // voice_observe_start would error out — observed_room guards
+      // against that and also lets `JoinVoice` know whether the
+      // observer is already in place for the room being joined.
+      let active_name = active_room_name(model)
+      let #(new_voice, observe_eff) = case
+        model.client,
+        model.voice.observed_room,
+        name == active_name
+      {
+        Some(client), None, True -> {
+          let updated =
+            VoiceModel(
+              ..model.voice,
+              observed_room: Some(RoomId(name)),
+            )
+          let eff =
+            effect.from(fn(_dispatch) {
+              voice.voice_observe_start(client, handle, fn(_result) {
+                // Failure here is non-fatal: the rail will simply
+                // stay in the idle shape for this user, matching the
+                // pre-observer behaviour.
+                Nil
+              })
+            })
+          #(updated, eff)
+        }
+        _, _, _ -> #(model.voice, effect.none())
+      }
+      #(
+        Model(..model, rooms: new_rooms, voice: new_voice),
+        effect.batch([wire_eff, observe_eff]),
+      )
     }
     MessagesSnapshot(name, ims) -> {
       case dict.get(model.rooms, name) {
@@ -1871,16 +1907,43 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               // WASM voice runtime is ready, leading callers (UI clicks,
               // tests) to act on a half-initialised pipeline. On Error we
               // dispatch VoicePermissionDenied which surfaces a toast.
-              let eff =
-                effect.from(fn(dispatch) {
-                  voice.voice_start(client, handle, fn(result) {
-                    case result {
-                      Ok(_) -> dispatch(VoiceStarted(room_id))
-                      Error(msg) -> dispatch(VoicePermissionDenied(msg))
-                    }
+              //
+              // When the observer is already running for this room (typical
+              // case: RoomOpened started it on room load), we only need to
+              // flip the gate — `voice_activate` triggers `getUserMedia`
+              // and toggles `is_active=true`. If the observer isn't running
+              // yet (race between RoomOpened and the user clicking Join,
+              // or no client) we fall back to the legacy one-shot
+              // `voice_start` so behaviour stays the same.
+              let observer_matches =
+                model.voice.observed_room == Some(room_id)
+              let eff = case observer_matches {
+                True ->
+                  effect.from(fn(dispatch) {
+                    voice.voice_activate(client, fn(result) {
+                      case result {
+                        Ok(_) -> dispatch(VoiceStarted(room_id))
+                        Error(msg) -> dispatch(VoicePermissionDenied(msg))
+                      }
+                    })
                   })
-                })
-              #(model, eff)
+                False ->
+                  effect.from(fn(dispatch) {
+                    voice.voice_start(client, handle, fn(result) {
+                      case result {
+                        Ok(_) -> dispatch(VoiceStarted(room_id))
+                        Error(msg) -> dispatch(VoicePermissionDenied(msg))
+                      }
+                    })
+                  })
+              }
+              // Mark this room as observed (the legacy fallback path
+              // implicitly observes too — both `voice_start` and
+              // `voice_activate` leave the durable-presence subscription
+              // up).
+              let new_voice =
+                VoiceModel(..model.voice, observed_room: Some(room_id))
+              #(Model(..model, voice: new_voice), eff)
             }
             None -> {
               let new_voice =
@@ -1918,24 +1981,47 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
 
     LeaveVoice -> {
-      // Clear peer state + levels so a fresh join doesn't reuse stale
-      // bars / talking flags. The FFI's stopCapture flushes its own
-      // EMA state and dispatches one final 0 per peer, but we reset
-      // here too so the UI is clean immediately on click rather than
-      // racing the FFI callback.
+      // After deactivate we no longer have a P2P leg with any peer,
+      // so `in_call` and `talking` are false from our perspective for
+      // every entry in the dict. Flip them eagerly rather than waiting
+      // for `membership_alive` to age out (~5 s) — otherwise the rail
+      // would keep rendering peers as "Connected" with stale waveforms
+      // for several seconds after the user clicks Leave. We keep
+      // `in_voice_channel` as-is so the roster stays visible: those
+      // peers are still in the channel, just no longer connected
+      // to us. The combiner's natural state-debouncing means the
+      // next emission for each peer matches what we set here, so no
+      // churn.
+      let new_peers =
+        dict.map_values(model.voice.peers, fn(_hex, ps) {
+          VoicePeerStateUI(
+            in_call: False,
+            talking: False,
+            is_muted: ps.is_muted,
+            in_voice_channel: ps.in_voice_channel,
+          )
+        })
       let new_voice =
         VoiceModel(
           ..model.voice,
           self_in_call: None,
           self_muted: False,
           self_deafened: False,
-          peers: dict.new(),
+          peers: new_peers,
           peer_levels: dict.new(),
           self_level: 0.0,
         )
-      let eff = case model.client {
-        Some(client) -> effect.from(fn(_) { voice.voice_stop(client) })
-        None -> effect.none()
+      // Prefer `voice_deactivate` when the observer is running for
+      // this room: it stops mic capture + heartbeats + publishing
+      // but leaves the durable-presence subscription up, so the
+      // user keeps seeing who else is in the channel after they
+      // leave. Fall back to `voice_stop` for legacy callers that
+      // started the runtime via `voice_start`.
+      let eff = case model.client, model.voice.observed_room {
+        Some(client), Some(_) ->
+          effect.from(fn(_) { voice.voice_deactivate(client) })
+        Some(client), None -> effect.from(fn(_) { voice.voice_stop(client) })
+        None, _ -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
     }

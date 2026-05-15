@@ -291,6 +291,12 @@ pub type VoiceModel {
     self_level: Float,
     /// Set when mic permission is denied; cleared by `ResetVoiceError`.
     permission_error: option.Option(String),
+    /// Room whose durable voice-presence stream the runtime is
+    /// observing right now. `None` until the first room handle is
+    /// available; tracked separately from `self_in_call` because the
+    /// observer keeps running across join/leave so the local user
+    /// keeps seeing the roster between calls.
+    observed_room: option.Option(RoomId),
   )
 }
 

@@ -298,6 +298,97 @@ test("voice channel roster: peer in channel but not connected renders dimmed wit
   await bob.ctx.close();
 });
 
+test("voice channel roster: peer in channel is visible to a user who hasn't joined yet", async ({
+  browser,
+}) => {
+  // The user-facing UX: when alice joins a voice channel, bob should
+  // see her in the rail *before* he clicks Join. Today's behaviour:
+  // the voice runtime only spins up on JoinVoice, so durable
+  // voice-presence entries never reach bob's combiner until he joins
+  // — meaning the rail stays in the "idle" shape and bob has no way
+  // to tell anyone is in the channel until he commits to joining.
+  //
+  // After the observe/activate split, bob's runtime starts observing
+  // the moment the room handle is available (RoomOpened), so alice's
+  // presence republish (every 2 s) reaches him via the relay-backed
+  // sync layer regardless of whether he joins.
+  //
+  // Coverage: alice joins, bob waits. Within ~5 s alice's row
+  // appears in bob's rail with `data-voice-connected="false"` (no
+  // P2P from bob's side), bob *himself* doesn't appear (he hasn't
+  // joined), and the channel toggle still reads "Join general" so
+  // a click on it does the right thing.
+  const alice = await openPeer(browser, relay.addr);
+  const bob = await openPeer(browser, relay.addr);
+
+  // Alice joins; bob does not.
+  await alice.page
+    .locator('[data-testid="voice-channel-row"]')
+    .first()
+    .click();
+  await expect(alice.page.locator('[data-testid="voice-leave"]')).toBeVisible({
+    timeout: 2_000,
+  });
+
+  const aliceHex = await getPubkeyHex(alice.page);
+  const bobHex = await getPubkeyHex(bob.page);
+
+  // Alice's row must show in bob's rail, even though bob hasn't
+  // joined. Generous timeout: presence republish cadence is 2 s and
+  // the entry has to traverse the relay both ways, so 8 s leaves
+  // room for one missed republish without flaking.
+  const aliceRowOnBob = bob.page.locator(
+    `[data-testid="voice-member"][data-peer-hex="${aliceHex}"]`,
+  );
+  await expect(aliceRowOnBob).toBeVisible({ timeout: 8_000 });
+
+  // From bob's perspective there's no P2P leg to alice (he hasn't
+  // joined the call), so the row must render the "in channel, not
+  // connected" branch — same affordance the existing roster spec
+  // exercises via the synthetic state injection, but here it comes
+  // from the real durable-presence flow end-to-end.
+  await expect(aliceRowOnBob).toHaveAttribute(
+    "data-voice-connected",
+    "false",
+    { timeout: 2_000 },
+  );
+  await expect(
+    aliceRowOnBob.locator('[data-testid="voice-member-not-connected"]'),
+  ).toBeVisible();
+  await expect(
+    aliceRowOnBob.locator('[data-testid="voice-waveform"]'),
+  ).toHaveCount(0);
+
+  // Bob himself must not appear in bob's roster (he hasn't joined).
+  // The runtime's voice-presence-membership task explicitly skips
+  // self-published presence; the UI's `members_for_channels` map
+  // reads self_in_call instead of `voice.peers[self]`, so a self
+  // row would only appear after a real join.
+  await expect(
+    bob.page.locator(
+      `[data-testid="voice-member"][data-peer-hex="${bobHex}"]`,
+    ),
+  ).toHaveCount(0);
+
+  // The toggle must still read "Join general" — bob hasn't joined,
+  // and clicking it should join (not leave). Pre-fix the rail would
+  // have been idle anyway; this guards against a regression where
+  // the roster appearing accidentally flipped the toggle to "Leave".
+  await expect(
+    bob.page.locator('[data-testid="voice-channel-row"]').first(),
+  ).toHaveAttribute("aria-label", "Join general");
+
+  // Alice leaves. Bob's rail must return to the idle shape within
+  // the presence-staleness budget. TTL is 6 s and stale-after is
+  // ~8 s, so by 12 s the entry must have been swept and the live
+  // block collapsed back to idle.
+  await alice.page.locator('[data-testid="voice-leave"]').click();
+  await expect(aliceRowOnBob).toHaveCount(0, { timeout: 12_000 });
+
+  await alice.ctx.close();
+  await bob.ctx.close();
+});
+
 test("voice channel popover: keyed by full pubkey hex, opens for any peer", async ({
   browser,
 }) => {

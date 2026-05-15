@@ -31,6 +31,21 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         drop(inner);
 
         loop {
+            // Skip publishing when the runtime is in observer mode. The user
+            // has not joined the call yet (or has just left it); advertising
+            // our presence would falsely show us in the rail for everyone
+            // else in the room. The active gate flips back at `set_active`,
+            // and the next iteration will publish on its own cadence.
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let active = *inner.is_active.borrow();
+            drop(inner);
+            if !active {
+                sleep(VOICE_PRESENCE_REFRESH_INTERVAL).await;
+                continue;
+            }
+
             let now_ms = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
