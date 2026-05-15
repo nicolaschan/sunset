@@ -105,6 +105,7 @@ impl VoiceRuntime {
             deafened: RefCell::new(false),
             denoise_disabled: RefCell::new(Default::default()),
             denoisers: RefCell::new(Default::default()),
+            decoders: RefCell::new(Default::default()),
             frame_liveness,
             membership_liveness,
             voice_presence_liveness,
