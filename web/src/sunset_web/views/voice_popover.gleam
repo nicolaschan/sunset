@@ -458,6 +458,12 @@ fn body(
     True -> quality_control(p, voice_quality, on_set_voice_quality)
     False -> element.fragment([])
   }
+  // Denoise filters incoming audio per peer — meaningless on the
+  // self row since you don't receive your own frames.
+  let denoise_row = case m.you {
+    True -> element.fragment([])
+    False -> denoise_control(p, settings, on_toggle_denoise)
+  }
   html.div(
     [
       ui.css([
@@ -469,7 +475,7 @@ fn body(
     ],
     [
       volume_control(p, m, settings, max_volume, on_set_volume),
-      denoise_control(p, m, settings, on_toggle_denoise),
+      denoise_row,
       quality_row,
     ],
   )
@@ -693,15 +699,11 @@ fn volume_control(
 
 fn denoise_control(
   p: Palette,
-  m: Member,
   settings: VoiceSettings,
   on_toggle: msg,
 ) -> Element(msg) {
-  let hint = case m.you {
-    True -> "Strip background noise from your outgoing audio."
-    False ->
-      "Filter background noise from their incoming stream — applied locally."
-  }
+  let hint =
+    "Filter background noise from their incoming stream — applied locally."
   html.div(
     [
       ui.css([

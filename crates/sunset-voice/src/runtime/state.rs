@@ -3,7 +3,7 @@
 //! `VoiceRuntime`) lets every task observe the upgrade failure and exit.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -33,11 +33,13 @@ pub(crate) struct RuntimeInner {
 
     pub muted: RefCell<bool>,
     pub deafened: RefCell<bool>,
-    /// Receiver-side RNNoise denoiser toggle. Defaults to true (on).
-    /// Toggle via `VoiceRuntime::set_denoise`. When false, `denoisers`
-    /// is left intact so flipping back on resumes with the existing
-    /// per-peer state instead of starting cold.
-    pub denoise: RefCell<bool>,
+    /// Peers the local user has explicitly disabled denoising for.
+    /// Denoising is on by default for every peer (absence = enabled);
+    /// the popover's per-member toggle inserts/removes entries here
+    /// via `VoiceRuntime::set_peer_denoise`. The corresponding entry
+    /// in `denoisers` is left intact so flipping back on resumes with
+    /// the existing per-peer state instead of starting cold.
+    pub denoise_disabled: RefCell<HashSet<PeerId>>,
     /// Per-peer denoiser state. Lazily inserted on first frame from a
     /// peer; entries are kept for the lifetime of the runtime so peers
     /// that briefly disappear and return don't lose their tuning.
