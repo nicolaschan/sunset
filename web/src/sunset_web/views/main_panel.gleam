@@ -1077,8 +1077,7 @@ fn send_button(
   pending_attachments: List(Attachment),
   on_click: msg,
 ) -> Element(msg) {
-  let disabled =
-    string.trim(draft) == "" && list.is_empty(pending_attachments)
+  let disabled = string.trim(draft) == "" && list.is_empty(pending_attachments)
   let color = case disabled {
     True -> p.text_faint
     False -> p.accent_deep
