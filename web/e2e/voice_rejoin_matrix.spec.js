@@ -91,10 +91,36 @@ async function leaveVoice(page) {
 }
 
 async function refreshPage(page) {
+  // Capture pubkey + raw localStorage seed before the reload so we can
+  // assert below that the same identity comes back. This guards
+  // against a test-fixture bug where `addInitScript` would mask a
+  // localStorage-isn't-actually-persisting situation: if Playwright
+  // ever changed reload semantics and dropped storage, the init
+  // script would silently re-seed and the test would keep passing
+  // — but production (no init script) would NOT preserve identity.
+  // Reading the localStorage value directly catches that.
+  const before = await page.evaluate(() => ({
+    pubkey: Array.from(new Uint8Array(window.sunsetClient.public_key)),
+    seed: window.localStorage.getItem("sunset/identity-seed"),
+  }));
+
   await page.reload();
   await page.waitForFunction(() => !!window.sunsetClient, null, {
     timeout: 15_000,
   });
+
+  const after = await page.evaluate(() => ({
+    pubkey: Array.from(new Uint8Array(window.sunsetClient.public_key)),
+    seed: window.localStorage.getItem("sunset/identity-seed"),
+  }));
+
+  // localStorage must persist across reload natively. If this fails,
+  // the addInitScript is the only thing pinning identity, which means
+  // the test is hiding a real bug in production.
+  expect(after.seed, "localStorage identity seed must survive page.reload()")
+    .toBe(before.seed);
+  expect(after.pubkey, "public key must match across reload (persistent identity)")
+    .toEqual(before.pubkey);
 }
 
 async function getPubkeyBytes(page) {
@@ -355,6 +381,60 @@ async function assertRecoveryAfter(a, b, aBytes, bBytes, transition) {
 // ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
+
+// Sanity check on the test fixture itself: localStorage must survive
+// page.reload() WITHOUT the addInitScript safety net. If this ever
+// fails, the rest of the matrix is testing fresh identities (every
+// reload = a new pubkey), not the persistent-identity rejoin paths
+// the user actually cares about. We use a bare context (no
+// addInitScript seed pinning) and let the app generate its own
+// identity on first load via `crypto.getRandomValues` →
+// `localStorage.setItem`. Reload. Assert pubkey is byte-identical.
+test("[fixture] identity persists across page.reload without init-script pinning", async ({
+  browser,
+}) => {
+  const ctx = await browser.newContext({
+    ...devices["Pixel 7"],
+    permissions: ["microphone"],
+  });
+  await ctx.addInitScript(() => {
+    window.SUNSET_TEST = true;
+  });
+  const page = await ctx.newPage();
+  await page.goto(`/?relay=${encodeURIComponent(relay.addr)}#voice-test-room`);
+  await page.waitForFunction(() => !!window.sunsetClient, null, {
+    timeout: 15_000,
+  });
+
+  const before = await page.evaluate(() => ({
+    pubkey: Array.from(new Uint8Array(window.sunsetClient.public_key)),
+    seed: window.localStorage.getItem("sunset/identity-seed"),
+  }));
+  expect(
+    before.seed,
+    "app must write identity seed to localStorage on first load",
+  ).toMatch(/^[0-9a-fA-F]{64}$/);
+
+  await page.reload();
+  await page.waitForFunction(() => !!window.sunsetClient, null, {
+    timeout: 15_000,
+  });
+
+  const after = await page.evaluate(() => ({
+    pubkey: Array.from(new Uint8Array(window.sunsetClient.public_key)),
+    seed: window.localStorage.getItem("sunset/identity-seed"),
+  }));
+  expect(
+    after.seed,
+    "localStorage identity seed must persist natively across reload",
+  ).toBe(before.seed);
+  expect(
+    after.pubkey,
+    "public key must match across reload (natural identity persistence)",
+  ).toEqual(before.pubkey);
+
+  await ctx.close();
+});
 
 test("A refreshes mid-call: both sides recover bidirectional audio", async ({
   browser,
