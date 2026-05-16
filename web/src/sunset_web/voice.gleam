@@ -88,6 +88,21 @@ pub fn voice_set_quality(client: ClientHandle, label: String) -> Nil
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceGetQuality")
 pub fn voice_get_quality() -> String
 
+/// Toggle send-side echo cancellation. Persists the choice to
+/// localStorage (`"on"` / `"off"`) and, if voice capture is running,
+/// re-acquires the mic with the new `getUserMedia` constraint. The
+/// Opus encoder is unaffected (EC is a browser-side capture concern).
+/// Independent of the quality preset.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceSetEchoCancellation")
+pub fn voice_set_echo_cancellation(client: ClientHandle, enabled: Bool) -> Nil
+
+/// Read the persisted echo-cancellation preference. When nothing has
+/// been saved yet, the value is derived from the active preset (`True`
+/// for `"voice"`, `False` otherwise) so existing users see no
+/// behavior change.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceGetEchoCancellation")
+pub fn voice_get_echo_cancellation() -> Bool
+
 /// Install the global `window.__voicePeerStateHandler` callback so
 /// `wasmVoiceStart`'s `on_voice_peer_state` fires into Lustre dispatch.
 /// Five-arg signature: `(peer_hex, in_call, talking, is_muted,

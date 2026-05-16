@@ -46,6 +46,7 @@ import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
 import sunset_web/views/details_panel
 import sunset_web/views/emoji_picker
+import sunset_web/views/image_theater
 import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
@@ -53,6 +54,7 @@ import sunset_web/views/peer_status_popover
 import sunset_web/views/phone_header
 import sunset_web/views/relays as relays_view
 import sunset_web/views/rooms
+import sunset_web/views/self_settings_row
 import sunset_web/views/settings_popover
 import sunset_web/views/shell
 import sunset_web/views/touch_drag
@@ -178,6 +180,11 @@ pub type Model {
     theme_pref: Pref,
     /// True when the settings popover (theme + reset) is visible.
     settings_open: Bool,
+    /// When `Some`, render the full-screen image theater overlay for
+    /// this attachment. Click on the backdrop or pressing Escape sets
+    /// it back to `None`. Carried on the top-level model (not per-room)
+    /// because the overlay is global UI; only one image is up at a time.
+    image_theater: Option(domain.Attachment),
     view: View,
     joined_rooms: List(String),
     rooms_collapsed: Bool,
@@ -240,6 +247,12 @@ pub type Model {
     /// `voice_start`. Read from the store at model init so the radio
     /// in the self-row popover renders the right initial selection.
     voice_quality: String,
+    /// Send-side browser echo cancellation. Independent of the quality
+    /// preset and persisted under its own `sunset/echo-cancellation`
+    /// localStorage key. Drives the self-row popover toggle and the
+    /// `getUserMedia` `echoCancellation` constraint when the mic is
+    /// (re-)acquired.
+    voice_echo_cancellation: Bool,
     /// IntentId of the relay whose popover is currently open + the
     /// click's `clientY` (so the desktop popover can anchor near the
     /// row that opened it instead of being pinned to the viewport
@@ -265,6 +278,11 @@ pub type Msg {
   ToggleMode
   OpenSettings
   CloseSettings
+  /// Click on an inline message image — show it full-screen in the
+  /// theater overlay.
+  OpenImageTheater(domain.Attachment)
+  /// Backdrop click or Escape key — dismiss the theater overlay.
+  CloseImageTheater
   SetThemePref(Pref)
   ResetLocalState
   HashChanged(String)
@@ -321,6 +339,10 @@ pub type Msg {
   /// Self-row popover radio: change the active send-side Opus
   /// quality preset (`"voice"` / `"high"` / `"maximum"`).
   SetVoiceQuality(String)
+  /// Self-row popover toggle: enable/disable browser-side echo
+  /// cancellation on the outgoing mic capture. Independent of the
+  /// quality preset.
+  SetVoiceEchoCancellation(Bool)
   // sunset-web-wasm bridge wiring:
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
@@ -442,6 +464,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       mode: initial_mode,
       theme_pref: initial_pref,
       settings_open: False,
+      image_theater: None,
       view: initial_view,
       joined_rooms: joined,
       rooms_collapsed: False,
@@ -470,6 +493,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         observed_room: None,
       ),
       voice_quality: voice.voice_get_quality(),
+      voice_echo_cancellation: voice.voice_get_echo_cancellation(),
       relays_popover: None,
       name_map: dict.new(),
       self_name: storage.read_self_name(),
@@ -913,6 +937,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     OpenSettings -> #(Model(..model, settings_open: True), effect.none())
     CloseSettings -> #(Model(..model, settings_open: False), effect.none())
+    OpenImageTheater(att) -> #(
+      Model(..model, image_theater: Some(att)),
+      effect.none(),
+    )
+    CloseImageTheater -> #(Model(..model, image_theater: None), effect.none())
     SetThemePref(pref) -> {
       let next_mode = theme.resolve_mode(pref, storage.prefers_dark())
       let label = case pref {
@@ -1820,6 +1849,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(Model(..model, voice_quality: label), eff)
     }
+    SetVoiceEchoCancellation(enabled) -> {
+      // Persist + apply. The JS bridge writes localStorage and, if the
+      // mic is currently captured, re-acquires it with the new
+      // `echoCancellation` constraint. No-op on the encoder.
+      let eff = case model.client {
+        Some(c) ->
+          effect.from(fn(_) { voice.voice_set_echo_cancellation(c, enabled) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice_echo_cancellation: enabled), eff)
+    }
     ViewportChanged(v) -> {
       // Crossing the boundary in either direction closes any open drawer.
       // Sheets intentionally survive: DetailsSheet and VoiceSheet render
@@ -2408,6 +2448,18 @@ fn room_view_with_state(
     _, _, _ -> element.fragment([])
   }
 
+  let image_theater_el = case model.image_theater {
+    Some(att) ->
+      image_theater.view(
+        palette: palette,
+        mime_type: att.mime_type,
+        data_base64: att.data_base64,
+        on_close: CloseImageTheater,
+        noop: NoOp,
+      )
+    None -> element.fragment([])
+  }
+
   let settings_overlay_el = case model.viewport, model.settings_open {
     domain.Desktop, True ->
       settings_popover.view(
@@ -2543,6 +2595,7 @@ fn room_view_with_state(
               member: m,
               settings: member_voice_settings(model.voice_settings, id_str),
               voice_quality: model.voice_quality,
+              echo_cancellation: model.voice_echo_cancellation,
               level: peer_level_for_member(model.voice, m, id_str),
               on_close: CloseVoicePopover,
               on_set_volume: fn(v) {
@@ -2550,6 +2603,7 @@ fn room_view_with_state(
               },
               on_toggle_denoise: ToggleMemberDenoise(id_str),
               on_set_voice_quality: SetVoiceQuality,
+              on_set_echo_cancellation: SetVoiceEchoCancellation,
               on_toggle_deafen: ToggleMuteForPeer(id_str),
               on_reset: ResetMemberVoice(id_str),
             ),
@@ -2696,8 +2750,6 @@ fn room_view_with_state(
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
       viewport: model.viewport,
-      members: state.members,
-      on_open_settings: OpenSettings,
     ),
     channels.view(
       palette: palette,
@@ -2720,7 +2772,14 @@ fn room_view_with_state(
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
       on_join_voice: JoinVoice(active_room.id),
       on_leave_voice: LeaveVoice,
-      self_in_call: option.is_some(model.voice.self_in_call),
+      // Scope "in call" to this room: a user can only be in one voice
+      // call at a time, so when they're in room A's call but viewing
+      // room B, B's voice block must read as observer (gray), not as
+      // joined (magenta).
+      self_in_call: case model.voice.self_in_call {
+        Some(rid) -> rid == active_room.id
+        None -> False
+      },
     ),
     main_panel.view(
       palette: palette,
@@ -2744,6 +2803,7 @@ fn room_view_with_state(
       on_add_reaction: ToggleReactionEmoji,
       on_open_full_picker: OpenFullEmojiPicker,
       on_open_detail: OpenDetail,
+      on_open_image: OpenImageTheater,
       receipts: state.receipts,
       selected_msg_id: state.selected_msg_id,
       on_toggle_selected: ToggleMessageSelected,
@@ -2756,26 +2816,30 @@ fn room_view_with_state(
       members: state.members,
       voice_minibar: voice_minibar_el,
     ),
-    case model.viewport, detail_msg {
-      domain.Desktop, Some(m) ->
-        details_panel.view(
-          palette: palette,
-          message: m,
-          receipts: receipts_for(state.receipts, m.id),
-          reactions: reactions_for(model.reactions, m.id),
-          members: state.members,
-          name_map: model.name_map,
-          on_close: CloseDetail,
-        )
-      _, _ ->
-        members.view(
-          palette: palette,
-          members: state.members,
-          relays: relays_view.relays_for_view(model.intents),
-          on_open_status: OpenPeerStatusPopover,
-          on_open_relay: OpenRelayPopover,
-        )
-    },
+    right_rail_with_self_row(
+      palette,
+      state.members,
+      case model.viewport, detail_msg {
+        domain.Desktop, Some(m) ->
+          details_panel.view(
+            palette: palette,
+            message: m,
+            receipts: receipts_for(state.receipts, m.id),
+            reactions: reactions_for(model.reactions, m.id),
+            members: state.members,
+            name_map: model.name_map,
+            on_close: CloseDetail,
+          )
+        _, _ ->
+          members.view(
+            palette: palette,
+            members: state.members,
+            relays: relays_view.relays_for_view(model.intents),
+            on_open_status: OpenPeerStatusPopover,
+            on_open_relay: OpenRelayPopover,
+          )
+      },
+    ),
     element.fragment([
       voice_popover_overlay(palette, model, state, members_for_channels),
       peer_status_popover_overlay(palette, model, state),
@@ -2792,6 +2856,7 @@ fn room_view_with_state(
         None -> element.fragment([])
       },
       settings_overlay_el,
+      image_theater_el,
     ]),
     phone_header.view(
       palette: palette,
@@ -2807,6 +2872,44 @@ fn room_view_with_state(
       full_picker_sheet_el,
       settings_sheet_el,
     ]),
+  )
+}
+
+/// Wrap whatever pane is showing in the right rail (members roster or
+/// the per-message details panel) with the pinned self/settings row at
+/// the bottom. The row stays visible regardless of which pane is up so
+/// the settings affordance is always one click away in the right rail.
+///
+/// Sizing: on desktop the column is sized by the grid row (100dvh); on
+/// phone the wrapping drawer is a `display: flex; flex-direction: column;
+/// height: 100dvh` container. We claim that space via `flex: 1 1 auto`
+/// + `min-height: 0` — `height: 100%` doesn't reliably resolve through
+/// the drawer's safe-area padding box, leaving the pinned you-row below
+/// the viewport.
+fn right_rail_with_self_row(
+  palette: theme.Palette,
+  members: List(domain.Member),
+  inner: Element(Msg),
+) -> Element(Msg) {
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("flex", "1 1 auto"),
+        #("min-height", "0"),
+        #("height", "100%"),
+        #("background", palette.surface),
+      ]),
+    ],
+    [
+      inner,
+      self_settings_row.view(
+        palette: palette,
+        members: members,
+        on_open_settings: OpenSettings,
+      ),
+    ],
   )
 }
 
@@ -2829,6 +2932,7 @@ fn voice_popover_overlay(
             member: m,
             settings: member_voice_settings(model.voice_settings, id_str),
             voice_quality: model.voice_quality,
+            echo_cancellation: model.voice_echo_cancellation,
             level: peer_level_for_member(model.voice, m, id_str),
             on_close: CloseVoicePopover,
             on_set_volume: fn(v) {
@@ -2836,6 +2940,7 @@ fn voice_popover_overlay(
             },
             on_toggle_denoise: ToggleMemberDenoise(id_str),
             on_set_voice_quality: SetVoiceQuality,
+            on_set_echo_cancellation: SetVoiceEchoCancellation,
             on_toggle_deafen: ToggleMuteForPeer(id_str),
             on_reset: ResetMemberVoice(id_str),
           )

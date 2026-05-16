@@ -88,17 +88,22 @@ export function ensureCtx() {
 const FRAME_SAMPLES_PER_CHANNEL = 960;
 const STEREO_FRAME_TOTAL = FRAME_SAMPLES_PER_CHANNEL * 2;
 
-// The mic profile attached to whichever quality preset is active.
-// Voice mode is speech-optimized and runs the browser's WebRTC
-// pre-processing (echo cancel + noise suppression + AGC), which hard
-// band-limits the input to roughly 8 kHz — appropriate at 24 kbps Opus
-// VOIP and saves us bandwidth, but pointless once the encoder has
-// headroom for full-band stereo. High/Maximum disable all three so
-// the encoder actually sees the mic's full bandwidth.
-function micConstraintsForPreset(preset) {
+// Mic capture constraints. Two independent axes:
+//
+//   * `preset` — bundles noise suppression + AGC + opus encoder profile.
+//     Voice mode runs the browser's WebRTC speech processing (NS + AGC),
+//     which band-limits the input to roughly 8 kHz — appropriate at the
+//     24 kbps Opus VOIP target. High/Maximum disable NS/AGC so the
+//     encoder sees the mic's full bandwidth.
+//
+//   * `echoCancellation` — independent send-side toggle, persisted
+//     separately. Defaults derived from preset (on for voice, off for
+//     high/maximum) when nothing is persisted, so existing users see no
+//     behavior change; once toggled, it stays independent of preset.
+function micConstraints(preset, echoCancellation) {
   const speechOptimized = preset === "voice";
   return {
-    echoCancellation: speechOptimized,
+    echoCancellation,
     noiseSuppression: speechOptimized,
     autoGainControl: speechOptimized,
     // Always request the highest-fidelity capture the device offers.
@@ -113,11 +118,13 @@ function micConstraintsForPreset(preset) {
   };
 }
 
-// Identifier returned by micConstraintsForPreset that distinguishes
-// "Voice (speech-optimized)" from "High/Maximum (raw)". A preset
-// switch only needs to re-acquire the mic when this profile changes.
-function micProfileForPreset(preset) {
-  return preset === "voice" ? "speech" : "raw";
+// Combined profile identifier covering both the preset's speech-vs-raw
+// dimension and the independent echo-cancellation toggle. A change in
+// either dimension implies the mic stream must be re-acquired with new
+// `getUserMedia` constraints.
+function micProfile(preset, echoCancellation) {
+  const base = preset === "voice" ? "speech" : "raw";
+  return base + ":" + (echoCancellation ? "ec" : "noec");
 }
 
 let currentMicProfile = null;
@@ -128,17 +135,19 @@ export async function startCapture(client) {
   await ctx.audioWorklet.addModule("/audio/voice-playback-worklet.js");
   startLevelDecayTimer();
   const preset = readPersistedQuality();
-  await openCaptureStream(client, preset);
+  const ec = readPersistedEchoCancellation();
+  await openCaptureStream(client, preset, ec);
 }
 
-// Acquire (or re-acquire) the mic with constraints matching `preset`,
-// then wire the capture worklet into the audio graph. Caller must
-// have torn down any prior `captureStream` / `captureNode` first.
-async function openCaptureStream(client, preset) {
+// Acquire (or re-acquire) the mic with constraints matching `preset` and
+// `echoCancellation`, then wire the capture worklet into the audio
+// graph. Caller must have torn down any prior `captureStream` /
+// `captureNode` first.
+async function openCaptureStream(client, preset, echoCancellation) {
   captureStream = await navigator.mediaDevices.getUserMedia({
-    audio: micConstraintsForPreset(preset),
+    audio: micConstraints(preset, echoCancellation),
   });
-  currentMicProfile = micProfileForPreset(preset);
+  currentMicProfile = micProfile(preset, echoCancellation);
   const src = ctx.createMediaStreamSource(captureStream);
   captureNode = new AudioWorkletNode(ctx, "voice-capture", {
     // The capture worklet reads from a stereo source; tell the audio
@@ -195,6 +204,23 @@ function readPersistedQuality() {
     // ignore
   }
   return "maximum";
+}
+
+// Independent echo-cancellation preference. Stored as `"on"` / `"off"`.
+// When nothing is persisted, derive from the active preset to preserve
+// pre-toggle behavior: the legacy "voice" preset implied echoCancellation
+// on; "high" / "maximum" implied it off. Once the user flips the toggle,
+// `wasmVoiceSetEchoCancellation` writes the explicit value and the
+// derivation no longer applies.
+function readPersistedEchoCancellation() {
+  try {
+    const stored = window.localStorage?.getItem("sunset/echo-cancellation");
+    if (stored === "on") return true;
+    if (stored === "off") return false;
+  } catch (_e) {
+    // ignore
+  }
+  return readPersistedQuality() === "voice";
 }
 
 function updateSelfLevel(pcm) {
@@ -609,14 +635,15 @@ export function wasmVoiceSetQuality(client, label) {
     }
     return;
   }
-  // Re-acquire the mic with new constraints when crossing the
-  // speech ↔ raw boundary. Same-profile transitions (e.g. High ↔
-  // Maximum) only rebuild the encoder; the capture stream is
-  // unaffected.
-  const newProfile = micProfileForPreset(label);
+  // Re-acquire the mic with new constraints when the combined mic
+  // profile changes. Same-profile transitions (e.g. High ↔ Maximum
+  // with EC unchanged) only rebuild the encoder; the capture stream
+  // is unaffected.
+  const ec = readPersistedEchoCancellation();
+  const newProfile = micProfile(label, ec);
   if (captureStream && newProfile !== currentMicProfile) {
     tearDownCapture();
-    openCaptureStream(client, label).catch((err) => {
+    openCaptureStream(client, label, ec).catch((err) => {
       console.warn("re-open mic for quality change failed", err);
     });
   }
@@ -625,6 +652,36 @@ export function wasmVoiceSetQuality(client, label) {
 // Read the persisted preset (or the Rust default if nothing saved).
 export function wasmVoiceGetQuality() {
   return readPersistedQuality();
+}
+
+// Persist the new echo-cancellation preference and, if voice is
+// running, re-acquire the mic with updated `getUserMedia` constraints.
+// EC is purely a send-side capture constraint — the Opus encoder is
+// unaffected, so we don't push anything to the WASM client.
+export function wasmVoiceSetEchoCancellation(_client, enabled) {
+  const ec = !!enabled;
+  try {
+    window.localStorage?.setItem(
+      "sunset/echo-cancellation",
+      ec ? "on" : "off",
+    );
+  } catch (_e) {
+    // Private browsing or full quota — non-fatal.
+  }
+  const preset = readPersistedQuality();
+  const newProfile = micProfile(preset, ec);
+  if (captureStream && newProfile !== currentMicProfile) {
+    tearDownCapture();
+    openCaptureStream(_client, preset, ec).catch((err) => {
+      console.warn("re-open mic for echo-cancellation change failed", err);
+    });
+  }
+}
+
+// Read the persisted echo-cancellation preference. Falls back to the
+// preset-derived default when nothing has been persisted yet.
+export function wasmVoiceGetEchoCancellation() {
+  return readPersistedEchoCancellation();
 }
 
 

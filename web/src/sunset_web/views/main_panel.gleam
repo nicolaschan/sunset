@@ -50,6 +50,7 @@ pub fn view(
   on_open_full_picker on_open_full_picker: fn(String, Option(#(Float, Float))) ->
     msg,
   on_open_detail on_open_detail: fn(String) -> msg,
+  on_open_image on_open_image: fn(Attachment) -> msg,
   receipts receipts: Dict(String, Dict(String, Int)),
   selected_msg_id selected_msg_id: Option(String),
   on_toggle_selected on_toggle_selected: fn(String) -> msg,
@@ -98,6 +99,7 @@ pub fn view(
         on_add_reaction,
         on_open_full_picker,
         on_open_detail,
+        on_open_image,
         receipts,
         selected_msg_id,
         on_toggle_selected,
@@ -162,6 +164,7 @@ fn messages_list(
   on_add_reaction: fn(String, String) -> msg,
   on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
   on_open_detail: fn(String) -> msg,
+  on_open_image: fn(Attachment) -> msg,
   receipts: Dict(String, Dict(String, Int)),
   selected_msg_id: Option(String),
   on_toggle_selected: fn(String) -> msg,
@@ -208,6 +211,7 @@ fn messages_list(
         on_add_reaction,
         on_open_full_picker,
         on_open_detail,
+        on_open_image,
         on_toggle_selected,
         receipts,
         is_revealed,
@@ -249,6 +253,7 @@ fn message_view(
   on_add_reaction: fn(String, String) -> msg,
   on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
   on_open_detail: fn(String) -> msg,
+  on_open_image: fn(Attachment) -> msg,
   on_toggle_selected: fn(String) -> msg,
   receipts: Dict(String, Dict(String, Int)),
   is_revealed: fn(markdown.SpoilerKey) -> Bool,
@@ -382,7 +387,7 @@ fn message_view(
                   ],
                 )
             },
-            message_attachments(p, m.attachments),
+            message_attachments(p, m.attachments, on_open_image),
             case m.reactions {
               [] -> element.fragment([])
               rs -> reactions_row(p, m.id, rs, on_add_reaction)
@@ -906,7 +911,7 @@ fn composer(
   on_shortcut: fn(String, String, String, Bool) -> msg,
 ) -> Element(msg) {
   // The composer's outer height drives the column-bottom seam shared
-  // with the rooms-rail you_row and channels-rail self-bar (64px); the
+  // with the channels-rail self-bar and the members-rail you_row (64px); the
   // empty-state container must stay at 64px (±1px) so the bottom seam
   // reads as one horizontal line. Vertical padding is explicit (not
   // derived from `align-items: center` against `min-height`) so a
@@ -1333,7 +1338,11 @@ fn attachment_thumb(
 /// Inline image gallery rendered below a message's text body. Empty
 /// list returns `element.fragment([])` so text-only messages render
 /// exactly as they did before image support landed.
-fn message_attachments(p: Palette, atts: List(Attachment)) -> Element(msg) {
+fn message_attachments(
+  p: Palette,
+  atts: List(Attachment),
+  on_open_image: fn(Attachment) -> msg,
+) -> Element(msg) {
   case atts {
     [] -> element.fragment([])
     _ ->
@@ -1347,19 +1356,32 @@ fn message_attachments(p: Palette, atts: List(Attachment)) -> Element(msg) {
             #("margin-top", "4px"),
           ]),
         ],
-        list.map(atts, fn(a) { message_image(p, a) }),
+        list.map(atts, fn(a) { message_image(p, a, on_open_image) }),
       )
   }
 }
 
-fn message_image(p: Palette, att: Attachment) -> Element(msg) {
+fn message_image(
+  p: Palette,
+  att: Attachment,
+  on_open_image: fn(Attachment) -> msg,
+) -> Element(msg) {
   // Cap thumbnail rendering to a sensible width so a huge phone photo
-  // doesn't push the message column wider than the chat area. Users
-  // can right-click + "view image" to open the raw bytes.
+  // doesn't push the message column wider than the chat area. Click
+  // opens the theater overlay (image_theater.view) for a full-screen
+  // view. `stop_propagation` keeps the message-row click handler from
+  // also toggling the row's selected state.
   html.img([
     attribute.src(sunset.image_data_url(att.mime_type, att.data_base64)),
     attribute.attribute("data-testid", "message-image"),
     attribute.alt("attached image"),
+    event.advanced("click", {
+      decode.success(event.handler(
+        on_open_image(att),
+        prevent_default: False,
+        stop_propagation: True,
+      ))
+    }),
     ui.css([
       #("max-width", "min(360px, 100%)"),
       #("max-height", "320px"),
@@ -1367,6 +1389,7 @@ fn message_image(p: Palette, att: Attachment) -> Element(msg) {
       #("display", "block"),
       #("border", "1px solid " <> p.border_soft),
       #("background", p.surface),
+      #("cursor", "zoom-in"),
     ]),
   ])
 }

@@ -298,7 +298,7 @@ test("voice channel roster: peer in channel but not connected renders dimmed wit
   await bob.ctx.close();
 });
 
-test("voice channel roster: peer in channel is visible to a user who hasn't joined yet", async ({
+test("voice channel roster: peer in channel is visible to a user who hasn't joined yet, in observer (gray) mode", async ({
   browser,
 }) => {
   // The user-facing UX: when alice joins a voice channel, bob should
@@ -313,11 +313,12 @@ test("voice channel roster: peer in channel is visible to a user who hasn't join
   // presence republish (every 2 s) reaches him via the relay-backed
   // sync layer regardless of whether he joins.
   //
-  // Coverage: alice joins, bob waits. Within ~5 s alice's row
-  // appears in bob's rail with `data-voice-connected="false"` (no
-  // P2P from bob's side), bob *himself* doesn't appear (he hasn't
-  // joined), and the channel toggle still reads "Join general" so
-  // a click on it does the right thing.
+  // Observer mode (bob hasn't joined): the block must read as
+  // "this channel is live, you're not in it", NOT as "you are
+  // connected" and NOT as "you are trying to connect". So the
+  // voice-channel-row carries data-voice-self-joined="false", and
+  // the connecting affordance is suppressed for every peer (we
+  // aren't dialing anyone — bob hasn't asked to join).
   const alice = await openPeer(browser, relay.addr);
   const bob = await openPeer(browser, relay.addr);
 
@@ -342,11 +343,23 @@ test("voice channel roster: peer in channel is visible to a user who hasn't join
   );
   await expect(aliceRowOnBob).toBeVisible({ timeout: 8_000 });
 
+  // The channel-row itself must mark observer mode — this is the
+  // signal the styling keys off (neutral palette instead of the
+  // magenta-accent in-call treatment).
+  const channelRowOnBob = bob.page
+    .locator('[data-testid="voice-channel-row"]')
+    .first();
+  await expect(channelRowOnBob).toHaveAttribute(
+    "data-voice-self-joined",
+    "false",
+    { timeout: 2_000 },
+  );
+
   // From bob's perspective there's no P2P leg to alice (he hasn't
-  // joined the call), so the row must render the "in channel, not
-  // connected" branch — same affordance the existing roster spec
-  // exercises via the synthetic state injection, but here it comes
-  // from the real durable-presence flow end-to-end.
+  // joined the call). Crucially the UI must NOT show the
+  // "connecting" affordance — bob isn't trying to connect to
+  // anyone; he's an observer. Showing connecting would lie about
+  // work the runtime isn't doing and add visual noise to the rail.
   await expect(aliceRowOnBob).toHaveAttribute(
     "data-voice-connected",
     "false",
@@ -354,7 +367,10 @@ test("voice channel roster: peer in channel is visible to a user who hasn't join
   );
   await expect(
     aliceRowOnBob.locator('[data-testid="voice-member-not-connected"]'),
-  ).toBeVisible();
+  ).toHaveCount(0);
+  // Waveform meter is also suppressed (no audio path, nothing to
+  // visualise) — this is the same as the connected-but-not-in-call
+  // branch in the in-call test; keeps the assertion symmetric.
   await expect(
     aliceRowOnBob.locator('[data-testid="voice-waveform"]'),
   ).toHaveCount(0);
@@ -374,9 +390,47 @@ test("voice channel roster: peer in channel is visible to a user who hasn't join
   // and clicking it should join (not leave). Pre-fix the rail would
   // have been idle anyway; this guards against a regression where
   // the roster appearing accidentally flipped the toggle to "Leave".
+  await expect(channelRowOnBob).toHaveAttribute("aria-label", "Join general");
+
+  // Tapping a peer row in observer mode must NOT open the per-peer
+  // voice popover. The popover's controls (volume, mute-for-me,
+  // send quality) only have an effect when there's an audio path
+  // with that peer; in observer mode there isn't one, so making the
+  // row appear interactive would lie about what tapping it does.
+  // The row is rendered as a `disabled` button so the browser
+  // suppresses the click at the platform level — assert that signal
+  // first (deterministic, observable from the DOM) and then force-
+  // click to confirm no popover surfaces even when the click is
+  // pushed past Playwright's actionability check.
+  await expect(aliceRowOnBob).toBeDisabled();
+  await aliceRowOnBob.click({ force: true });
   await expect(
-    bob.page.locator('[data-testid="voice-channel-row"]').first(),
-  ).toHaveAttribute("aria-label", "Join general");
+    bob.page.locator('[data-testid="voice-popover"]'),
+  ).toHaveCount(0);
+
+  // Once bob actually joins, the same row must flip to the
+  // joined-mode treatment: the channel-row gains
+  // data-voice-self-joined="true", and the connecting affordance
+  // becomes legal again (it'll show transiently for any peer whose
+  // P2P leg hasn't completed yet — there's no easy way to assert
+  // that here without re-doing the synthetic-state dance the prior
+  // test already covers, so we just check the joined-mode signal).
+  await channelRowOnBob.click();
+  await expect(bob.page.locator('[data-testid="voice-leave"]')).toBeVisible({
+    timeout: 2_000,
+  });
+  await expect(channelRowOnBob).toHaveAttribute(
+    "data-voice-self-joined",
+    "true",
+    { timeout: 2_000 },
+  );
+
+  await bob.page.locator('[data-testid="voice-leave"]').click();
+  await expect(channelRowOnBob).toHaveAttribute(
+    "data-voice-self-joined",
+    "false",
+    { timeout: 2_000 },
+  );
 
   // Alice leaves. Bob's rail must return to the idle shape within
   // the presence-staleness budget. TTL is 6 s and stale-after is

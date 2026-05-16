@@ -45,12 +45,12 @@ pub fn view(
           attribute.attribute("data-testid", "settings-popover"),
           ui.css([
             #("position", "fixed"),
-            // Anchor the popover above the rooms-rail you_row (which
-            // is 64px tall, pinned to the bottom of the rail). Leaving
-            // a small gap above the row keeps the popover visually
-            // tied to the trigger without overlapping it.
+            // Anchor the popover above the members-rail you_row (which
+            // is 64px tall, pinned to the bottom of the right rail).
+            // Leaving a small gap above the row keeps the popover
+            // visually tied to the trigger without overlapping it.
             #("bottom", "76px"),
-            #("left", "12px"),
+            #("right", "12px"),
             #("width", "240px"),
             #("background", p.surface),
             #("color", p.text),
