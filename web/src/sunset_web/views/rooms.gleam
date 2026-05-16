@@ -35,8 +35,6 @@ pub fn view(
   on_drag_end on_drag_end: msg,
   toggle toggle: msg,
   viewport viewport: domain.Viewport,
-  members members: List(domain.Member),
-  on_open_settings on_open_settings: msg,
 ) -> Element(msg) {
   // On phone the rail lives inside a 320px-wide drawer, so it should
   // fill the drawer's width rather than the desktop 260px column.
@@ -45,11 +43,9 @@ pub fn view(
     domain.Desktop, True -> "54px"
     domain.Desktop, False -> "260px"
   }
-  // On phone the rail fills the drawer's safe-area-padded content
-  // box, not the raw viewport — the drawer wrapper already accounts
-  // for the iOS status bar / home indicator insets, and a 100dvh rail
-  // would overflow the drawer's clipping box and hide the bottom
-  // you_row behind the home indicator. On desktop the rail still
+  // On phone the rail fills the drawer's safe-area-padded content box,
+  // not the raw viewport — the drawer wrapper already accounts for the
+  // iOS status bar / home indicator insets. On desktop the rail still
   // anchors to the viewport via dvh so it fills the grid row.
   let height_props = case viewport {
     domain.Phone -> [#("height", "100%"), #("min-height", "0")]
@@ -62,11 +58,6 @@ pub fn view(
     domain.Phone -> "0"
     domain.Desktop -> "1px solid " <> p.border
   }
-  // The current user
-  let you =
-    members
-    |> list.find(fn(m) { m.you })
-    |> option.from_result
   html.aside(
     [
       attribute.attribute("data-testid", "rooms-rail"),
@@ -113,7 +104,6 @@ pub fn view(
         on_drop,
         on_drag_end,
       ),
-      you_row(you, p, col, on_open_settings),
     ],
   )
 }
@@ -748,144 +738,6 @@ fn unread_pill(p: Palette, n: Int) -> Element(msg) {
       ]),
     ],
     [html.text(int_to_string(n))],
-  )
-}
-
-fn you_row(
-  you: Option(domain.Member),
-  p: Palette,
-  collapsed: Bool,
-  on_open_settings: msg,
-) -> Element(msg) {
-  // Pinned at the bottom of the rooms rail. The fixed 64px height +
-  // border-top is shared by the channels-rail self-bar and the main
-  // panel composer so all three column-bottom rows visually align.
-  // The whole row is a button: clicking it opens the settings popover
-  // (theme + reset). Collapsed-rail variant centers a single dot.
-  let padding = case collapsed {
-    True -> "0"
-    False -> "0 14px"
-  }
-  let justify = case collapsed {
-    True -> "center"
-    False -> "flex-start"
-  }
-  let your_name = you |> option.map(fn(a) { a.name }) |> option.unwrap("?")
-  html.button(
-    [
-      attribute.attribute("data-testid", "you-row"),
-      attribute.title("Settings"),
-      attribute.attribute("aria-label", "Open settings"),
-      event.on_click(on_open_settings),
-      ui.css([
-        #("box-sizing", "border-box"),
-        #("height", "64px"),
-        #("flex-shrink", "0"),
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("justify-content", justify),
-        #("gap", "8px"),
-        #("padding", padding),
-        #("border", "none"),
-        #("border-top", "1px solid " <> p.border_soft),
-        #("background", "transparent"),
-        #("color", p.text),
-        #("font-family", "inherit"),
-        #("font-size", "16.25px"),
-        #("text-align", "left"),
-        #("cursor", "pointer"),
-        #("width", "100%"),
-      ]),
-    ],
-    [
-      // Avatar circle on both collapsed and expanded rails. The
-      // collapsed variant shows just the avatar; the expanded variant
-      // adds the user's display name to the right. We dropped the
-      // separate "you" label + mono-font subtitle pair because the row
-      // sits in the user's own column at the bottom of the screen —
-      // the avatar + name combination already reads as "you".
-      user_avatar(p, your_name),
-      case collapsed {
-        True -> element.fragment([])
-        False ->
-          html.span(
-            [
-              ui.css([
-                #("flex", "1"),
-                #("min-width", "0"),
-                #("font-weight", "500"),
-                #("color", p.text),
-                #("white-space", "nowrap"),
-                #("overflow", "hidden"),
-                #("text-overflow", "ellipsis"),
-              ]),
-            ],
-            [html.text(your_name)],
-          )
-      },
-    ],
-  )
-}
-
-/// Round avatar tile used in the rooms-rail bottom "you" row. The
-/// generic-user SVG keeps the chrome readable when the display name
-/// is empty / placeholder; once the user picks a name, the initial
-/// could be swapped in here, but the silhouette is the unambiguous
-/// "this is your account" affordance.
-fn user_avatar(p: Palette, _name: String) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("display", "inline-flex"),
-        #("align-items", "center"),
-        #("justify-content", "center"),
-        #("width", "28px"),
-        #("height", "28px"),
-        #("border-radius", "999px"),
-        #("background", p.surface_alt),
-        #("color", p.text_muted),
-        #("flex-shrink", "0"),
-      ]),
-    ],
-    [user_icon()],
-  )
-}
-
-fn user_icon() -> Element(msg) {
-  element.namespaced(
-    "http://www.w3.org/2000/svg",
-    "svg",
-    [
-      attribute.attribute("width", "16"),
-      attribute.attribute("height", "16"),
-      attribute.attribute("viewBox", "0 0 16 16"),
-      attribute.attribute("fill", "none"),
-    ],
-    [
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "circle",
-        [
-          attribute.attribute("cx", "8"),
-          attribute.attribute("cy", "6"),
-          attribute.attribute("r", "2.6"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.4"),
-        ],
-        [],
-      ),
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "path",
-        [
-          attribute.attribute("d", "M2.5 13.5a5.5 5.5 0 0111 0"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.4"),
-          attribute.attribute("stroke-linecap", "round"),
-        ],
-        [],
-      ),
-    ],
   )
 }
 

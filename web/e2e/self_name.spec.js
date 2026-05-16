@@ -16,7 +16,7 @@ import { spawn } from "child_process";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { openRoomsDrawer } from "./helpers/viewport.js";
+import { openMembersDrawer } from "./helpers/viewport.js";
 
 let relayProcess = null;
 let relayAddress = null;
@@ -102,8 +102,8 @@ test.describe("self-name", () => {
       timeout: 15_000,
     });
 
-    // Open the rooms drawer on mobile; no-op on desktop.
-    await openRoomsDrawer(page, testInfo);
+    // Open the members drawer on mobile; no-op on desktop.
+    await openMembersDrawer(page, testInfo);
 
     // Click the you-row to open the settings popover.
     await page.getByTestId("you-row").click();
@@ -123,7 +123,7 @@ test.describe("self-name", () => {
       timeout: 15_000,
     });
 
-    await openRoomsDrawer(page, testInfo);
+    await openMembersDrawer(page, testInfo);
     await page.getByTestId("you-row").click();
 
     // The name should have been restored from localStorage.
@@ -191,7 +191,7 @@ test.describe("self-name", () => {
     expect(initialAuthor).toBeTruthy();
 
     // Peer 1 opens settings and sets a name.
-    await openRoomsDrawer(page1, testInfo);
+    await openMembersDrawer(page1, testInfo);
     await page1.getByTestId("you-row").click();
     const nameInput1 = page1.getByTestId("settings-name-input");
     await expect(nameInput1).toBeVisible({ timeout: 5_000 });
@@ -208,7 +208,7 @@ test.describe("self-name", () => {
       .isVisible()
       .catch(() => false);
     if (!popoverVisible) {
-      await openRoomsDrawer(page1, testInfo);
+      await openMembersDrawer(page1, testInfo);
       await page1.getByTestId("you-row").click();
       await expect(page1.getByTestId("settings-name-input")).toBeVisible({
         timeout: 5_000,

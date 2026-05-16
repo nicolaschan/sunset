@@ -120,11 +120,10 @@ async function openChat(browser, hash = "ui-tweaks") {
 async function openSettings(page, testInfo) {
   const isMobile = testInfo.project.name === "mobile-chrome";
   if (isMobile) {
-    // The "you" row lives in the rooms rail, which is behind the
-    // rooms drawer on phone. Open channels first, then swap to rooms
-    // via the channels-room-title (same path the drawer helpers use).
-    await page.getByTestId("phone-rooms-toggle").click();
-    await page.getByTestId("channels-room-title").click();
+    // The "you" row sits at the bottom of the right (members) rail.
+    // On phone that rail is behind the members drawer — the same
+    // toggle that shows the member roster.
+    await page.getByTestId("phone-members-toggle").click();
   }
   await page.getByTestId("you-row").click();
 }

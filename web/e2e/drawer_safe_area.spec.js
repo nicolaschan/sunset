@@ -259,22 +259,21 @@ for (const kind of ["channels", "rooms", "members"]) {
   });
 }
 
-test("rooms-rail you-row stays inside the drawer's tappable area", async ({
+test("members-rail you-row stays inside the drawer's tappable area", async ({
   browser,
 }, testInfo) => {
   skipDesktop(testInfo);
-  // The you-row (settings trigger) sits at the bottom of the rooms
-  // rail. Before the safe-area fix, with iOS home-indicator inset the
-  // row was clipped behind the indicator and couldn't be tapped. This
-  // test asserts the row's centre is within the drawer's bounding box
-  // even at zero inset — the contract test above guards the env()
-  // rule, this one guards the layout's robustness against the rule
-  // ever expanding to non-zero values.
+  // The you-row (settings trigger) sits at the bottom of the right
+  // (members) rail. Before the safe-area fix, with iOS home-indicator
+  // inset the row was clipped behind the indicator and couldn't be
+  // tapped. This test asserts the row's centre is within the drawer's
+  // bounding box even at zero inset — the contract test above guards
+  // the env() rule, this one guards the layout's robustness against
+  // the rule ever expanding to non-zero values.
   const { ctx, page } = await openChat(browser, "drawer-you-row");
 
-  await page.getByTestId("phone-rooms-toggle").click();
-  await page.getByTestId("channels-room-title").click();
-  const drawer = page.getByTestId("rooms-drawer");
+  await page.getByTestId("phone-members-toggle").click();
+  const drawer = page.getByTestId("members-drawer");
   await expect(drawer).toHaveAttribute("aria-hidden", "false");
 
   const youRow = page.getByTestId("you-row");
@@ -282,7 +281,7 @@ test("rooms-rail you-row stays inside the drawer's tappable area", async ({
 
   const { youCenter, drawerBottom } = await page.evaluate(() => {
     const y = document.querySelector('[data-testid="you-row"]');
-    const d = document.querySelector('[data-testid="rooms-drawer"]');
+    const d = document.querySelector('[data-testid="members-drawer"]');
     const yr = y.getBoundingClientRect();
     const dr = d.getBoundingClientRect();
     return {

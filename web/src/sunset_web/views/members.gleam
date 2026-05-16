@@ -48,15 +48,16 @@ pub fn view(
     list.length(in_call_others) + list.length(online_not_in_call)
   let offline_count = list.length(offline_members)
 
-  // `height: 100%` resolves correctly for both layouts: the drawer's
-  // safe-area-padded content box on phone, and the desktop grid row
-  // (sized to 100dvh by shell.desktop_view's `grid-template-rows`).
-  // A bare 100dvh would overflow the drawer's clipping box on phone
-  // PWA mode and cover the iOS home indicator.
+  // The members roster lives inside the right-rail flex-column wrapper
+  // (see sunset_web.right_rail_with_self_row), which is what handles
+  // the column-height sizing across viewports. The roster itself just
+  // needs to claim the remaining space above the pinned self-row and
+  // scroll its own overflow.
   html.aside(
     [
+      attribute.attribute("data-testid", "members-rail"),
       ui.css([
-        #("height", "100%"),
+        #("flex", "1 1 auto"),
         #("min-height", "0"),
         #("display", "flex"),
         #("flex-direction", "column"),
