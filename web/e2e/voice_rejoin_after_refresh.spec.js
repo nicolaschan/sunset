@@ -307,10 +307,6 @@ test("refresh + rejoin while peer stays in call: audio resumes both ways", async
   // The injectUntil loop above returns on the first observation of
   // ≥ 15 frames; if it didn't, the count is < 15 and these fail with
   // a clear message naming the broken direction.
-  const aToB = await a.page.evaluate(async () => {
-    /* keep symmetry */ return 0;
-  }); // (no-op, kept for parallel structure)
-  void aToB;
   const aToBFrames = await b.page.evaluate(
     (bytes) =>
       window.sunsetClient.voice_recorded_frames(new Uint8Array(bytes)) || [],
