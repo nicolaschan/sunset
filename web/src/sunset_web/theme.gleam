@@ -97,9 +97,14 @@ pub type Palette {
   )
 }
 
-pub const font_sans = "Inter, system-ui, sans-serif"
+// `Noto Color Emoji` is appended last to both stacks. Browsers fall
+// through font-family entries glyph-by-glyph, so Latin / numeric runs
+// keep hitting Inter / JetBrains Mono — only codepoints those faces
+// don't carry (emoji) reach Noto. The webfont itself is requested by
+// the Google Fonts <link> in `gleam.toml`.
+pub const font_sans = "Inter, system-ui, sans-serif, \"Noto Color Emoji\""
 
-pub const font_mono = "JetBrains Mono, ui-monospace, monospace"
+pub const font_mono = "JetBrains Mono, ui-monospace, monospace, \"Noto Color Emoji\""
 
 /// Pick a stable hue from `palette.author_hues` for the given identity
 /// string. Same string → same color across renders, so each
