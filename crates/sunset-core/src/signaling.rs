@@ -176,34 +176,57 @@ impl<S: Store + 'static> RelaySignaler<S> {
     async fn decrypt_inbound(&self, from: &PeerId, ciphertext: &[u8]) -> SyncResult<Vec<u8>> {
         let mut inner = self.inner.lock().await;
         let slot = inner.peers.entry(from.clone()).or_default();
-        if slot.session.is_none() && slot.initiator.is_none() && slot.responder.is_none() {
-            let remote_x = self.x25519_pub_for(from).await?;
-            let mut resp = KkResponder::new(&self.local_x25519_secret, &remote_x)
-                .map_err(|e| SyncError::Transport(format!("KkResponder::new: {e}")))?;
-            let pt = resp
-                .read_message_1(ciphertext)
-                .map_err(|e| SyncError::Transport(format!("read_message_1: {e}")))?;
-            slot.responder = Some(resp);
-            return Ok(pt);
+
+        // Try the slot's current strategy first. If a peer with the same
+        // static identity restarts (page refresh, process restart) it loses
+        // its in-memory KK state and naturally sends a fresh msg1 — which
+        // looks like a corrupted session message to whichever side held
+        // the live session, and like a corrupted msg2 to whichever side
+        // was mid-handshake. In both cases we want to fall back to
+        // "treat this as a new responder kicking off a fresh handshake"
+        // rather than dropping the message. The KK pattern's static-key
+        // authentication still constrains who can produce a valid msg1
+        // — only the peer's holder of the matching static key — so the
+        // fallback can't be exploited for impersonation. (Replay of an
+        // old valid msg1 *can* force a session reset, but that's a
+        // pre-existing DoS surface: any party who can write to the
+        // relay can already censor signaling.)
+        if let Some(session) = slot.session.as_mut() {
+            match session.decrypt(ciphertext) {
+                Ok(pt) => return Ok(pt),
+                Err(_) => { /* fall through to rehandshake attempt */ }
+            }
         }
         if let Some(init) = slot.initiator.take() {
-            let (pt, session) = init
-                .read_message_2(ciphertext)
-                .map_err(|e| SyncError::Transport(format!("read_message_2: {e}")))?;
-            slot.session = Some(session);
-            for waiter in slot.on_session_ready.drain(..) {
-                let _ = waiter.send(());
+            match init.read_message_2(ciphertext) {
+                Ok((pt, session)) => {
+                    slot.session = Some(session);
+                    for waiter in slot.on_session_ready.drain(..) {
+                        let _ = waiter.send(());
+                    }
+                    return Ok(pt);
+                }
+                Err(_) => { /* fall through to rehandshake attempt */ }
             }
-            return Ok(pt);
         }
-        if let Some(session) = slot.session.as_mut() {
-            return session
-                .decrypt(ciphertext)
-                .map_err(|e| SyncError::Transport(format!("session.decrypt: {e}")));
-        }
-        Err(SyncError::Transport(
-            "inbound before responder sent msg2; dropped".into(),
-        ))
+
+        // Either the slot was fresh, or every higher-priority strategy
+        // failed. Try as a new responder; if read_message_1 also fails,
+        // the bytes really are garbage and we surface the error.
+        let remote_x = self.x25519_pub_for(from).await?;
+        let mut resp = KkResponder::new(&self.local_x25519_secret, &remote_x)
+            .map_err(|e| SyncError::Transport(format!("KkResponder::new: {e}")))?;
+        let pt = resp
+            .read_message_1(ciphertext)
+            .map_err(|e| SyncError::Transport(format!("read_message_1: {e}")))?;
+        // Successful re-handshake: discard whatever stale state we had
+        // (it can't decrypt anything sent against the new key) and pin
+        // the slot to the fresh responder so the next outbound `send`
+        // writes msg2.
+        slot.session = None;
+        slot.initiator = None;
+        slot.responder = Some(resp);
+        Ok(pt)
     }
 
     async fn next_send_seq(&self, to: &PeerId) -> u64 {
@@ -300,6 +323,49 @@ impl<S: Store + 'static> Signaler for RelaySignaler<S> {
         rx.next()
             .await
             .ok_or_else(|| SyncError::Transport("signaler closed".into()))
+    }
+
+    async fn reset_peer(&self, peer: &PeerId) {
+        // Drop the Noise session / handshake state for `peer`. The next
+        // outbound `send` takes the empty-slot arm and writes a fresh KK
+        // msg1; the receiver's `decrypt_inbound` falls back to a new
+        // responder (see the bug doc above on `decrypt_inbound`).
+        //
+        // We also rewind `next_send_seq` to 0 so the new msg1 lands at
+        // `<from>/<to>/0` and *overwrites* the prior session's msg1
+        // (CRDT LWW by priority, and the new entry has a fresh-now
+        // priority that beats any historical entry). Without this, the
+        // new msg1 would be at a *higher* seq while the old msg1
+        // remains at seq=0; a freshly-started receiver replaying
+        // signaling history would then `read_message_1` against the
+        // *old* msg1 first, build a responder bound to the dead
+        // session's ephemeral key, and answer with an msg2 that the
+        // dialer's *new* initiator can't decrypt. The dial then
+        // hangs and the supervisor's intent stays in `Connecting`
+        // until backoff/give-up — exactly the "rejoin → no audio"
+        // failure mode `voice_rejoin_after_refresh.spec.js` catches.
+        //
+        // Leftover ICE candidates at higher seqs from the dead
+        // session remain in the store; the receiver routes them to
+        // the new per-peer queue where `addIceCandidate` fails
+        // non-fatally on the wrong ufrag/pwd (the v2 SDP has
+        // different credentials). That's acceptable noise rather
+        // than a correctness bug.
+        let mut inner = self.inner.lock().await;
+        if let Some(slot) = inner.peers.get_mut(peer) {
+            slot.session = None;
+            slot.initiator = None;
+            slot.responder = None;
+            slot.next_send_seq = 0;
+            // `on_session_ready` waiters are deliberately *not* preserved
+            // here: if a concurrent `send` is parked waiting for a
+            // session, the next `send` after this reset will take the
+            // fresh-initiator arm and that path doesn't go through
+            // `on_session_ready` — the parked waiter would block
+            // indefinitely. Drop them so they wake (with an effective
+            // cancellation) and the corresponding caller can retry.
+            slot.on_session_ready.clear();
+        }
     }
 }
 
@@ -423,6 +489,19 @@ impl Signaler for MultiRoomSignaler {
             }
         }
     }
+
+    async fn reset_peer(&self, peer: &PeerId) {
+        // Reset the slot in *every* per-room signaler. Per-room
+        // signalers hold independent Noise_KK state, so a partial
+        // reset (e.g. only the one we'd use for the next `send`) would
+        // leave stale state in other rooms ready to corrupt a future
+        // dial that picks a different carrier room.
+        let signalers: Vec<Rc<dyn Signaler>> =
+            { self.by_room.borrow().values().cloned().collect() };
+        for s in signalers {
+            s.reset_peer(peer).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +545,136 @@ mod multi_room_tests {
                 dispatcher.unregister(&fp);
                 assert_eq!(dispatcher.len(), 0);
                 assert!(!dispatcher.contains(&fp));
+            })
+            .await;
+    }
+
+    // When one side of a Noise_KK signaling pair restarts (page refresh
+    // is the canonical case — same identity seed, fresh in-memory state),
+    // the restarted side has no session state for its peer and naturally
+    // sends a fresh KK msg1. The peer that *didn't* restart still holds
+    // the old session, so its `decrypt_inbound` finds an active session
+    // and tries `session.decrypt(new_msg1)` — which fails. Pre-fix, the
+    // message was dropped on the floor and the restarted side's WebRTC
+    // dial hung indefinitely.
+    //
+    // Fix: `decrypt_inbound` falls back to a fresh `KkResponder` when
+    // the existing strategies fail, succeeds against a valid msg1
+    // (KK static-key authentication keeps this safe — only the
+    // peer's key can produce a valid msg1), and resets the slot to
+    // the new responder. See `voice_rejoin_after_refresh.spec.js`
+    // for the end-to-end coverage on WebRTC voice rejoin.
+    //
+    // This is a small DoS surface (an attacker who recorded an old
+    // msg1 can replay it to force a session reset), but it's the same
+    // DoS surface the relay already has (any peer in the room can
+    // also just refuse to forward signaling entries). It does not
+    // break confidentiality.
+    //
+    // Scope of this unit test: only the live-side (Bob's) decrypt
+    // path. The post-restart side (Alice v2)'s receipt of Bob's
+    // msg2 is *not* exercised here because in this unit setup Alice
+    // and Bob share one in-memory store, so Alice v2's dispatcher
+    // replays every entry Alice v1 ever wrote — and Alice v2's
+    // initiator would be consumed by an `initiator.read_message_2`
+    // attempt against a stale session ciphertext (Snow consumes the
+    // initiator by value). In production the two peers hold
+    // independent stores synced through the relay, and the
+    // WebRTC dispatcher's "rejoin → cancel + restart accept" arm
+    // (`per_peer` entries are tagged with `PerPeerKind::Accept` and
+    // a monotonic generation) handles the equivalent rejoin race
+    // at a layer above the signaler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn alice_restart_with_same_identity_can_rehandshake_against_live_bob() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let alice_id = ident(1);
+                let bob_id = ident(2);
+                let alice_pk = PeerId(alice_id.store_verifying_key());
+                let bob_pk = PeerId(bob_id.store_verifying_key());
+
+                let st = store();
+                let room =
+                    Room::open_with_params("alpha", &test_fast_params()).expect("Room::open");
+                let fp = room.fingerprint();
+
+                // Phase 1: Alice and Bob establish a session.
+                let alice_v1 = RelaySignaler::new(alice_id.clone(), fp.to_hex(), &st);
+                let bob = RelaySignaler::new(bob_id, fp.to_hex(), &st);
+                let alice_v1_disp = MultiRoomSignaler::new();
+                alice_v1_disp.register(fp, alice_v1);
+                let bob_disp = MultiRoomSignaler::new();
+                bob_disp.register(fp, bob);
+
+                alice_v1_disp
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: bytes::Bytes::from_static(b"hello-from-v1"),
+                    })
+                    .await
+                    .expect("alice v1 → bob (msg1)");
+                let r1 = tokio::time::timeout(std::time::Duration::from_secs(2), bob_disp.recv())
+                    .await
+                    .expect("bob recv #1 timed out")
+                    .expect("bob recv #1 err");
+                assert_eq!(r1.payload.as_ref(), b"hello-from-v1");
+
+                bob_disp
+                    .send(SignalMessage {
+                        from: bob_pk.clone(),
+                        to: alice_pk.clone(),
+                        seq: 0,
+                        payload: bytes::Bytes::from_static(b"ack-from-bob"),
+                    })
+                    .await
+                    .expect("bob → alice v1 (msg2)");
+                let r2 =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), alice_v1_disp.recv())
+                        .await
+                        .expect("alice v1 recv #1 timed out")
+                        .expect("alice v1 recv #1 err");
+                assert_eq!(r2.payload.as_ref(), b"ack-from-bob");
+
+                // Phase 2: simulate Alice's page refresh. Drop the v1
+                // signaler entirely, build a fresh v2 with the same
+                // identity but no in-memory peer state.
+                drop(alice_v1_disp);
+                let alice_v2 = RelaySignaler::new(alice_id, fp.to_hex(), &st);
+                let alice_v2_disp = MultiRoomSignaler::new();
+                alice_v2_disp.register(fp, alice_v2);
+
+                // Alice v2's first send is a fresh KK msg1 — her slot is
+                // empty, so `send` takes the initiator-creation arm.
+                // Bob's slot for Alice still has the v1 session; pre-fix,
+                // Bob's `decrypt_inbound` calls `session.decrypt(new_msg1)`,
+                // gets a Noise auth failure, and silently drops the
+                // message. The recv below times out forever.
+                //
+                // Post-fix, Bob's `decrypt_inbound` falls back to a fresh
+                // `KkResponder::read_message_1` when the session decrypt
+                // fails, succeeds (because the message really is a valid
+                // msg1 from Alice's static key), resets the slot, and
+                // surfaces the plaintext to recv.
+                alice_v2_disp
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: bytes::Bytes::from_static(b"hello-from-v2"),
+                    })
+                    .await
+                    .expect("alice v2 → bob (fresh msg1)");
+                let r3 = tokio::time::timeout(std::time::Duration::from_secs(2), bob_disp.recv())
+                    .await
+                    .expect(
+                        "bob recv #2 timed out — restarted Alice's msg1 never delivered \
+                     (Noise session not reset on bob's side)",
+                    )
+                    .expect("bob recv #2 err");
+                assert_eq!(r3.payload.as_ref(), b"hello-from-v2");
             })
             .await;
     }
