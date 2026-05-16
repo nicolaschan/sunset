@@ -37,11 +37,13 @@ pub fn view(
   member m: Member,
   settings settings: VoiceSettings,
   voice_quality voice_quality: String,
+  echo_cancellation echo_cancellation: Bool,
   level level: Float,
   on_close on_close: msg,
   on_set_volume on_set_volume: fn(Int) -> msg,
   on_toggle_denoise on_toggle_denoise: msg,
   on_set_voice_quality on_set_voice_quality: fn(String) -> msg,
+  on_set_echo_cancellation on_set_echo_cancellation: fn(Bool) -> msg,
   on_toggle_deafen on_toggle_deafen: msg,
   on_reset on_reset: msg,
 ) -> Element(msg) {
@@ -59,10 +61,12 @@ pub fn view(
       m,
       settings,
       voice_quality,
+      echo_cancellation,
       max_volume,
       on_set_volume,
       on_toggle_denoise,
       on_set_voice_quality,
+      on_set_echo_cancellation,
     ),
     case is_self {
       True -> element.fragment([])
@@ -449,13 +453,22 @@ fn body(
   m: Member,
   settings: VoiceSettings,
   voice_quality: String,
+  echo_cancellation: Bool,
   max_volume: Int,
   on_set_volume: fn(Int) -> msg,
   on_toggle_denoise: msg,
   on_set_voice_quality: fn(String) -> msg,
+  on_set_echo_cancellation: fn(Bool) -> msg,
 ) -> Element(msg) {
   let quality_row = case m.you {
     True -> quality_control(p, voice_quality, on_set_voice_quality)
+    False -> element.fragment([])
+  }
+  // Echo cancellation is a send-side mic constraint, so the toggle
+  // only makes sense on the self row.
+  let echo_cancellation_row = case m.you {
+    True ->
+      echo_cancellation_control(p, echo_cancellation, on_set_echo_cancellation)
     False -> element.fragment([])
   }
   // Denoise filters incoming audio per peer — meaningless on the
@@ -477,6 +490,7 @@ fn body(
       volume_control(p, m, settings, max_volume, on_set_volume),
       denoise_row,
       quality_row,
+      echo_cancellation_row,
     ],
   )
 }
@@ -494,17 +508,17 @@ fn quality_control(
     #(
       "voice",
       "Voice",
-      "24 kbps mono · browser echo cancel, noise suppression, AGC. Best for speech on slow networks.",
+      "24 kbps mono · browser noise suppression + AGC. Best for speech on slow networks.",
     ),
     #(
       "high",
       "High",
-      "96 kbps stereo · raw mic, no browser processing. Balanced fidelity.",
+      "96 kbps stereo · raw mic, no noise suppression. Balanced fidelity.",
     ),
     #(
       "maximum",
       "Maximum",
-      "510 kbps stereo · raw mic, no browser processing. Highest fidelity.",
+      "510 kbps stereo · raw mic, no noise suppression. Highest fidelity.",
     ),
   ]
   html.div(
@@ -527,7 +541,7 @@ fn quality_control(
         ],
         [
           html.text(
-            "Selects both the Opus codec preset and the mic capture pipeline for your outgoing audio. Voice runs your browser's speech processing; High and Maximum send the raw mic so other peers hear full-band stereo.",
+            "Selects the Opus codec preset and noise-suppression pipeline for your outgoing audio. Voice runs your browser's speech processing; High and Maximum send the raw mic so other peers hear full-band stereo. Echo cancellation is controlled separately below.",
           ),
         ],
       ),
@@ -725,6 +739,58 @@ fn denoise_control(
         [
           control_label(p, "Denoise"),
           toggle_switch(p, settings.denoise, on_toggle, "voice-popover-denoise"),
+        ],
+      ),
+      html.div(
+        [
+          ui.css([
+            #("font-size", "12.5px"),
+            #("color", p.text_muted),
+          ]),
+        ],
+        [html.text(hint)],
+      ),
+    ],
+  )
+}
+
+/// Self-row only: independent toggle for browser-side echo cancellation
+/// on the outgoing mic stream. Persisted by `voice.ffi.mjs` under
+/// `sunset/echo-cancellation`; flipping it re-acquires the mic with
+/// the new `getUserMedia` constraint if voice is currently captured.
+fn echo_cancellation_control(
+  p: Palette,
+  enabled: Bool,
+  on_set: fn(Bool) -> msg,
+) -> Element(msg) {
+  let hint =
+    "Suppress your speakers' audio from your mic input. Recommended when not wearing headphones; turn off for full-fidelity capture."
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("gap", "6px"),
+      ]),
+    ],
+    [
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("align-items", "center"),
+            #("justify-content", "space-between"),
+            #("gap", "8px"),
+          ]),
+        ],
+        [
+          control_label(p, "Echo cancellation"),
+          toggle_switch(
+            p,
+            enabled,
+            on_set(!enabled),
+            "voice-popover-echo-cancellation",
+          ),
         ],
       ),
       html.div(

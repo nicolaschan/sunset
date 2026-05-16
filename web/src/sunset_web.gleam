@@ -246,6 +246,12 @@ pub type Model {
     /// `voice_start`. Read from the store at model init so the radio
     /// in the self-row popover renders the right initial selection.
     voice_quality: String,
+    /// Send-side browser echo cancellation. Independent of the quality
+    /// preset and persisted under its own `sunset/echo-cancellation`
+    /// localStorage key. Drives the self-row popover toggle and the
+    /// `getUserMedia` `echoCancellation` constraint when the mic is
+    /// (re-)acquired.
+    voice_echo_cancellation: Bool,
     /// IntentId of the relay whose popover is currently open + the
     /// click's `clientY` (so the desktop popover can anchor near the
     /// row that opened it instead of being pinned to the viewport
@@ -332,6 +338,10 @@ pub type Msg {
   /// Self-row popover radio: change the active send-side Opus
   /// quality preset (`"voice"` / `"high"` / `"maximum"`).
   SetVoiceQuality(String)
+  /// Self-row popover toggle: enable/disable browser-side echo
+  /// cancellation on the outgoing mic capture. Independent of the
+  /// quality preset.
+  SetVoiceEchoCancellation(Bool)
   // sunset-web-wasm bridge wiring:
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
@@ -482,6 +492,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         observed_room: None,
       ),
       voice_quality: voice.voice_get_quality(),
+      voice_echo_cancellation: voice.voice_get_echo_cancellation(),
       relays_popover: None,
       name_map: dict.new(),
       self_name: storage.read_self_name(),
@@ -1837,6 +1848,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(Model(..model, voice_quality: label), eff)
     }
+    SetVoiceEchoCancellation(enabled) -> {
+      // Persist + apply. The JS bridge writes localStorage and, if the
+      // mic is currently captured, re-acquires it with the new
+      // `echoCancellation` constraint. No-op on the encoder.
+      let eff = case model.client {
+        Some(c) ->
+          effect.from(fn(_) { voice.voice_set_echo_cancellation(c, enabled) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice_echo_cancellation: enabled), eff)
+    }
     ViewportChanged(v) -> {
       // Crossing the boundary in either direction closes any open drawer.
       // Sheets intentionally survive: DetailsSheet and VoiceSheet render
@@ -2572,6 +2594,7 @@ fn room_view_with_state(
               member: m,
               settings: member_voice_settings(model.voice_settings, id_str),
               voice_quality: model.voice_quality,
+              echo_cancellation: model.voice_echo_cancellation,
               level: peer_level_for_member(model.voice, m, id_str),
               on_close: CloseVoicePopover,
               on_set_volume: fn(v) {
@@ -2579,6 +2602,7 @@ fn room_view_with_state(
               },
               on_toggle_denoise: ToggleMemberDenoise(id_str),
               on_set_voice_quality: SetVoiceQuality,
+              on_set_echo_cancellation: SetVoiceEchoCancellation,
               on_toggle_deafen: ToggleMuteForPeer(id_str),
               on_reset: ResetMemberVoice(id_str),
             ),
@@ -2867,6 +2891,7 @@ fn voice_popover_overlay(
             member: m,
             settings: member_voice_settings(model.voice_settings, id_str),
             voice_quality: model.voice_quality,
+            echo_cancellation: model.voice_echo_cancellation,
             level: peer_level_for_member(model.voice, m, id_str),
             on_close: CloseVoicePopover,
             on_set_volume: fn(v) {
@@ -2874,6 +2899,7 @@ fn voice_popover_overlay(
             },
             on_toggle_denoise: ToggleMemberDenoise(id_str),
             on_set_voice_quality: SetVoiceQuality,
+            on_set_echo_cancellation: SetVoiceEchoCancellation,
             on_toggle_deafen: ToggleMuteForPeer(id_str),
             on_reset: ResetMemberVoice(id_str),
           )
