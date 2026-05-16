@@ -911,7 +911,7 @@ fn composer(
   on_shortcut: fn(String, String, String, Bool) -> msg,
 ) -> Element(msg) {
   // The composer's outer height drives the column-bottom seam shared
-  // with the rooms-rail you_row and channels-rail self-bar (64px); the
+  // with the channels-rail self-bar and the members-rail you_row (64px); the
   // empty-state container must stay at 64px (±1px) so the bottom seam
   // reads as one horizontal line. Vertical padding is explicit (not
   // derived from `align-items: center` against `min-height`) so a

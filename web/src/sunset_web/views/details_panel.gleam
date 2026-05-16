@@ -49,12 +49,16 @@ pub fn view(
       element.fragment([sender_section(p, d), delivery_section(p, d)])
     NoDetails -> element.fragment([])
   }
+  // Sized by the right-rail flex-column wrapper in sunset_web (which
+  // also pins the self/settings row beneath). `flex: 1; min-height: 0`
+  // here lets the panel fill the column above the row while its inner
+  // body scrolls.
   html.aside(
     [
       attribute.attribute("data-testid", "details-panel"),
       ui.css([
-        #("height", "100vh"),
-        #("height", "100dvh"),
+        #("flex", "1 1 auto"),
+        #("min-height", "0"),
         #("display", "flex"),
         #("flex-direction", "column"),
         #("background", p.surface),

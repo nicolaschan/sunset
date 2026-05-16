@@ -347,22 +347,24 @@ test("channels and main column bottom borders line up", async ({ page }, testInf
 
 test("column-bottom rows share a top y-coordinate", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chrome", "desktop-only test");
-  // Rooms rail's pinned 'you' row and main panel's composer both sit
-  // at the bottom of their column at a fixed height — their top borders
-  // must align horizontally so the layout reads as a single bottom seam
-  // across the screen. (The channels rail no longer has a fixed bottom
-  // row: the in-call self-controls moved to the voice minibar at the
-  // top of the chat panel, so the rail ends in a scrollable list.)
+  // Members rail's pinned 'you' / settings row and the main panel's
+  // composer both sit at the bottom of their column at the same fixed
+  // height (64px) — their top borders must align horizontally so the
+  // layout reads as a single bottom seam across the right half of the
+  // screen. (The rooms and channels rails no longer have fixed bottom
+  // rows: the rooms-rail you-row moved to the right rail, and the
+  // channels in-call self-controls moved to the voice minibar at the
+  // top of the chat panel, so both rails end in scrollable lists.)
   const tops = await page.evaluate(() => {
-    const rooms = document.querySelectorAll("aside")[0];
     const main = document.querySelector("main");
+    const youRow = document.querySelector('[data-testid="you-row"]');
     const lastChild = (parent) => parent.children[parent.children.length - 1];
     return {
-      rooms: lastChild(rooms).getBoundingClientRect().top,
-      main: lastChild(main).getBoundingClientRect().top,
+      composer: lastChild(main).getBoundingClientRect().top,
+      youRow: youRow.getBoundingClientRect().top,
     };
   });
-  expect(Math.abs(tops.rooms - tops.main)).toBeLessThanOrEqual(1);
+  expect(Math.abs(tops.composer - tops.youRow)).toBeLessThanOrEqual(1);
 });
 
 test("channels header has no online subtitle", async ({ page }) => {
@@ -573,12 +575,11 @@ test.describe("phone shell smoke", () => {
     page,
   }) => {
     // Theme controls live in the settings sheet, opened from the
-    // rooms-rail "you" row. The standalone phone-theme-toggle row
-    // (under the rooms list) was removed once the settings sheet
-    // landed — it was a redundant second entry point to the same
-    // preference.
-    await page.getByTestId("phone-rooms-toggle").click();
-    await page.getByTestId("channels-room-title").click();
+    // members-rail "you" row pinned at the bottom of the right rail.
+    // The standalone phone-theme-toggle row (under the rooms list)
+    // was removed once the settings sheet landed — it was a redundant
+    // second entry point to the same preference.
+    await page.getByTestId("phone-members-toggle").click();
     await page.getByTestId("you-row").click();
     await expect(page.getByTestId("settings-sheet")).toBeVisible();
     await expect(page.getByTestId("settings-theme-system")).toBeVisible();

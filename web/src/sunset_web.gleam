@@ -54,6 +54,7 @@ import sunset_web/views/peer_status_popover
 import sunset_web/views/phone_header
 import sunset_web/views/relays as relays_view
 import sunset_web/views/rooms
+import sunset_web/views/self_settings_row
 import sunset_web/views/settings_popover
 import sunset_web/views/shell
 import sunset_web/views/touch_drag
@@ -2725,8 +2726,6 @@ fn room_view_with_state(
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
       viewport: model.viewport,
-      members: state.members,
-      on_open_settings: OpenSettings,
     ),
     channels.view(
       palette: palette,
@@ -2793,26 +2792,30 @@ fn room_view_with_state(
       members: state.members,
       voice_minibar: voice_minibar_el,
     ),
-    case model.viewport, detail_msg {
-      domain.Desktop, Some(m) ->
-        details_panel.view(
-          palette: palette,
-          message: m,
-          receipts: receipts_for(state.receipts, m.id),
-          reactions: reactions_for(model.reactions, m.id),
-          members: state.members,
-          name_map: model.name_map,
-          on_close: CloseDetail,
-        )
-      _, _ ->
-        members.view(
-          palette: palette,
-          members: state.members,
-          relays: relays_view.relays_for_view(model.intents),
-          on_open_status: OpenPeerStatusPopover,
-          on_open_relay: OpenRelayPopover,
-        )
-    },
+    right_rail_with_self_row(
+      palette,
+      state.members,
+      case model.viewport, detail_msg {
+        domain.Desktop, Some(m) ->
+          details_panel.view(
+            palette: palette,
+            message: m,
+            receipts: receipts_for(state.receipts, m.id),
+            reactions: reactions_for(model.reactions, m.id),
+            members: state.members,
+            name_map: model.name_map,
+            on_close: CloseDetail,
+          )
+        _, _ ->
+          members.view(
+            palette: palette,
+            members: state.members,
+            relays: relays_view.relays_for_view(model.intents),
+            on_open_status: OpenPeerStatusPopover,
+            on_open_relay: OpenRelayPopover,
+          )
+      },
+    ),
     element.fragment([
       voice_popover_overlay(palette, model, state, members_for_channels),
       peer_status_popover_overlay(palette, model, state),
@@ -2845,6 +2848,44 @@ fn room_view_with_state(
       full_picker_sheet_el,
       settings_sheet_el,
     ]),
+  )
+}
+
+/// Wrap whatever pane is showing in the right rail (members roster or
+/// the per-message details panel) with the pinned self/settings row at
+/// the bottom. The row stays visible regardless of which pane is up so
+/// the settings affordance is always one click away in the right rail.
+///
+/// Sizing: on desktop the column is sized by the grid row (100dvh); on
+/// phone the wrapping drawer is a `display: flex; flex-direction: column;
+/// height: 100dvh` container. We claim that space via `flex: 1 1 auto`
+/// + `min-height: 0` — `height: 100%` doesn't reliably resolve through
+/// the drawer's safe-area padding box, leaving the pinned you-row below
+/// the viewport.
+fn right_rail_with_self_row(
+  palette: theme.Palette,
+  members: List(domain.Member),
+  inner: Element(Msg),
+) -> Element(Msg) {
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("flex", "1 1 auto"),
+        #("min-height", "0"),
+        #("height", "100%"),
+        #("background", palette.surface),
+      ]),
+    ],
+    [
+      inner,
+      self_settings_row.view(
+        palette: palette,
+        members: members,
+        on_open_settings: OpenSettings,
+      ),
+    ],
   )
 }
 
