@@ -392,6 +392,22 @@ test("voice channel roster: peer in channel is visible to a user who hasn't join
   // the roster appearing accidentally flipped the toggle to "Leave".
   await expect(channelRowOnBob).toHaveAttribute("aria-label", "Join general");
 
+  // Tapping a peer row in observer mode must NOT open the per-peer
+  // voice popover. The popover's controls (volume, mute-for-me,
+  // send quality) only have an effect when there's an audio path
+  // with that peer; in observer mode there isn't one, so making the
+  // row appear interactive would lie about what tapping it does.
+  // The row is rendered as a `disabled` button so the browser
+  // suppresses the click at the platform level — assert that signal
+  // first (deterministic, observable from the DOM) and then force-
+  // click to confirm no popover surfaces even when the click is
+  // pushed past Playwright's actionability check.
+  await expect(aliceRowOnBob).toBeDisabled();
+  await aliceRowOnBob.click({ force: true });
+  await expect(
+    bob.page.locator('[data-testid="voice-popover"]'),
+  ).toHaveCount(0);
+
   // Once bob actually joins, the same row must flip to the
   // joined-mode treatment: the channel-row gains
   // data-voice-self-joined="true", and the connecting affordance
