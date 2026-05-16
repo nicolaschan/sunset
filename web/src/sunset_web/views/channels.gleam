@@ -496,10 +496,24 @@ fn live_voice_block(
     True -> on_leave
     False -> on_join
   }
+  // Magenta accent treatment is reserved for the "you are in this
+  // call" state — it's the same brand role the voice minibar uses to
+  // signal active participation. When we're observing peers in a
+  // call we haven't joined, the block uses neutral surface tones so
+  // the user reads the rail as "this channel is live" without
+  // mistaking it for "you're connected".
+  let block_bg = case self_in_call {
+    True -> p.accent_soft
+    False -> p.surface_sunk
+  }
+  let header_color = case self_in_call {
+    True -> p.accent_deep
+    False -> p.text_muted
+  }
   html.div(
     [
       ui.css([
-        #("background", p.accent_soft),
+        #("background", block_bg),
         #("border-radius", "6px"),
         #("padding-bottom", "10px"),
       ]),
@@ -508,6 +522,10 @@ fn live_voice_block(
       html.button(
         [
           attribute.attribute("data-testid", "voice-channel-row"),
+          attribute.attribute("data-voice-self-joined", case self_in_call {
+            True -> "true"
+            False -> "false"
+          }),
           attribute.attribute("aria-label", case self_in_call {
             True -> "Leave " <> c.name
             False -> "Join " <> c.name
@@ -520,7 +538,7 @@ fn live_voice_block(
             #("padding", "6px 12px"),
             #("font-size", "16.25px"),
             #("font-weight", "600"),
-            #("color", p.accent_deep),
+            #("color", header_color),
             #("border", "none"),
             #("background", "transparent"),
             #("font-family", "inherit"),
@@ -531,8 +549,8 @@ fn live_voice_block(
         ],
         [
           // Voice icon — clearer than a colored dot at conveying
-          // "this is a voice channel". Inherits color from the parent
-          // button (accent_deep).
+          // "this is a voice channel". Inherits color from the
+          // parent button.
           voice_icon(),
           html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
         ],
@@ -548,7 +566,7 @@ fn live_voice_block(
           ]),
         ],
         list.flatten([
-          [connector_line(p)],
+          [connector_line(p, self_in_call)],
           list.map(ms, fn(m) {
             voice_member_row(
               p,
@@ -567,10 +585,15 @@ fn live_voice_block(
   )
 }
 
-fn connector_line(p: Palette) -> Element(msg) {
+fn connector_line(p: Palette, self_in_call: Bool) -> Element(msg) {
   // Bound to the inset of the members container's padding so the line
   // only spans the rows themselves, not the surrounding whitespace at
-  // the top and bottom of the light-blue block.
+  // the top and bottom of the block. Color tracks the block's tone:
+  // accent when self is in the call, neutral when observing.
+  let #(color, opacity) = case self_in_call {
+    True -> #(p.accent, "0.35")
+    False -> #(p.text_faint, "0.55")
+  }
   html.span(
     [
       ui.css([
@@ -579,8 +602,8 @@ fn connector_line(p: Palette) -> Element(msg) {
         #("top", "4px"),
         #("bottom", "10px"),
         #("width", "2px"),
-        #("background", p.accent),
-        #("opacity", "0.35"),
+        #("background", color),
+        #("opacity", opacity),
         #("border-radius", "1px"),
       ]),
     ],
@@ -661,10 +684,15 @@ fn voice_member_row(
   }
   // Disconnected rows render at reduced opacity so the eye reads them
   // as "in the channel but not currently audible" without removing
-  // them from the roster.
-  let row_opacity = case connected {
-    True -> "1"
-    False -> "0.55"
+  // them from the roster. In observer mode (self not in this call) we
+  // skip the dimming — every row is "not connected to me" trivially,
+  // and the block's neutral palette already signals "not in it"; an
+  // additional 0.55 opacity on every row would just make the names
+  // hard to read.
+  let row_opacity = case connected, self_in_call {
+    True, _ -> "1"
+    False, False -> "1"
+    False, True -> "0.55"
   }
   html.button(
     [
@@ -724,9 +752,21 @@ fn voice_member_row(
         ]),
       ),
       html.span([ui.css([#("flex", "1")])], []),
-      case connected, muted {
-        False, _ -> not_connected_label(p)
-        True, True ->
+      // Trailing slot. Three states drive what shows here:
+      //   * Self is in the call AND we have audio flow with this peer
+      //     → live waveform meter (or "muted" pill if the peer is
+      //     muted): same affordance the previous design had.
+      //   * Self is in the call but we don't have a P2P link yet (or
+      //     anymore) → animated 'connecting' dots — we're actively
+      //     trying to reach this peer.
+      //   * Self is NOT in the call → render nothing. We aren't
+      //     dialing anyone; the rail is in observer mode and showing
+      //     a connecting affordance for every peer would lie about
+      //     work we aren't doing.
+      case self_in_call, connected, muted {
+        False, _, _ -> element.fragment([])
+        True, False, _ -> not_connected_label(p)
+        True, True, True ->
           html.span(
             [
               ui.css([
@@ -737,27 +777,46 @@ fn voice_member_row(
             ],
             [html.text("muted")],
           )
-        True, False -> waveform_meter(p, level)
+        True, True, False -> waveform_meter(p, level)
       },
     ],
   )
 }
 
 /// Affordance for a peer who is in the voice channel but we don't
-/// have a P2P connection to yet (or anymore). Replaces the waveform
-/// meter so the row reads as "joined, audio not flowing" instead of
-/// "joined, silent" (which `waveform_meter(_, 0.0)` would imply).
+/// have a P2P connection to yet (or anymore). Three pulsing dots
+/// instead of a wide "connecting…" label so the icon stays the same
+/// width as the row's normal trailing slot (the waveform meter) and
+/// doesn't push the member name around as state flips. Animation
+/// keyframes live in shell.global_reset; reduced-motion users get a
+/// static dimmed dot.
 fn not_connected_label(p: Palette) -> Element(msg) {
+  let dot =
+    html.span(
+      [
+        attribute.class("voice-connecting-dot"),
+        ui.css([
+          #("display", "inline-block"),
+          #("width", "4px"),
+          #("height", "4px"),
+          #("border-radius", "50%"),
+          #("background", p.text_faint),
+        ]),
+      ],
+      [],
+    )
   html.span(
     [
       attribute.attribute("data-testid", "voice-member-not-connected"),
+      attribute.attribute("aria-label", "connecting"),
+      attribute.title("connecting"),
       ui.css([
-        #("font-size", "13.125px"),
-        #("color", p.text_faint),
-        #("font-style", "italic"),
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("gap", "3px"),
       ]),
     ],
-    [html.text("connecting…")],
+    [dot, dot, dot],
   )
 }
 
