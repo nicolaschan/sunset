@@ -63,13 +63,18 @@ pub fn accent_does_not_collide_with_status_colors_test() {
 }
 
 pub fn fonts_use_inter_and_jetbrains_mono_test() {
-  // Inter for the body sans + JetBrains Mono for code/IDs. Both load
-  // via the Google Fonts stylesheet pinned in `web/gleam.toml`; keep
-  // these constants in sync with that link or the second-tier system
-  // fallback will paint instead of the intended typeface.
+  // Inter for the body sans + JetBrains Mono for code/IDs. Noto Color
+  // Emoji terminates both stacks so emoji codepoints render the same
+  // on every host rather than falling back to OS-installed emoji
+  // fonts (Apple Color Emoji / Segoe UI Emoji / mono-glyph stubs).
+  // All three faces ship via the Google Fonts stylesheet pinned in
+  // `web/gleam.toml`; keep these constants in sync with that link or
+  // the second-tier system fallback will paint instead.
   theme.font_sans
-  |> should.equal("Inter, system-ui, sans-serif")
+  |> should.equal("Inter, system-ui, sans-serif, \"Noto Color Emoji\"")
 
   theme.font_mono
-  |> should.equal("JetBrains Mono, ui-monospace, monospace")
+  |> should.equal(
+    "JetBrains Mono, ui-monospace, monospace, \"Noto Color Emoji\"",
+  )
 }
