@@ -2720,7 +2720,14 @@ fn room_view_with_state(
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
       on_join_voice: JoinVoice(active_room.id),
       on_leave_voice: LeaveVoice,
-      self_in_call: option.is_some(model.voice.self_in_call),
+      // Scope "in call" to this room: a user can only be in one voice
+      // call at a time, so when they're in room A's call but viewing
+      // room B, B's voice block must read as observer (gray), not as
+      // joined (magenta).
+      self_in_call: case model.voice.self_in_call {
+        Some(rid) -> rid == active_room.id
+        None -> False
+      },
     ),
     main_panel.view(
       palette: palette,
