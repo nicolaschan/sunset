@@ -461,20 +461,6 @@ fn idle_voice_row(p: Palette, c: Channel, on_join: msg) -> Element(msg) {
         [voice_icon()],
       ),
       html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
-      case c.in_call {
-        0 -> element.fragment([])
-        n ->
-          html.span(
-            [
-              ui.css([
-                #("font-size", "13.75px"),
-                #("color", p.accent),
-                #("font-weight", "600"),
-              ]),
-            ],
-            [html.text(int.to_string(n) <> " live")],
-          )
-      },
     ],
   )
 }
@@ -694,6 +680,12 @@ fn voice_member_row(
     False, False -> "1"
     False, True -> "0.55"
   }
+  // Observer mode (self not in this call) makes the row purely
+  // informational: there's no audio path to this peer, so the
+  // per-peer popover (volume / mute-for-me / send quality) has
+  // nothing to act on. Disabling the button suppresses clicks at
+  // the browser level and we override `cursor` to `default` so the
+  // row doesn't read as a tappable target.
   html.button(
     [
       attribute.attribute("data-testid", "voice-member"),
@@ -711,6 +703,7 @@ fn voice_member_row(
         True -> "true"
         False -> "false"
       }),
+      attribute.disabled(!self_in_call),
       event.on_click(on_open_voice_popover(peer_key)),
       ui.css([
         #("display", "flex"),
@@ -724,7 +717,10 @@ fn voice_member_row(
         #("text-align", "left"),
         #("font-family", "inherit"),
         #("font-size", "15.625px"),
-        #("cursor", "pointer"),
+        #("cursor", case self_in_call {
+          True -> "pointer"
+          False -> "default"
+        }),
         #("opacity", row_opacity),
       ]),
     ],
