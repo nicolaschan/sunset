@@ -46,6 +46,7 @@ import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
 import sunset_web/views/details_panel
 import sunset_web/views/emoji_picker
+import sunset_web/views/image_theater
 import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
@@ -178,6 +179,11 @@ pub type Model {
     theme_pref: Pref,
     /// True when the settings popover (theme + reset) is visible.
     settings_open: Bool,
+    /// When `Some`, render the full-screen image theater overlay for
+    /// this attachment. Click on the backdrop or pressing Escape sets
+    /// it back to `None`. Carried on the top-level model (not per-room)
+    /// because the overlay is global UI; only one image is up at a time.
+    image_theater: Option(domain.Attachment),
     view: View,
     joined_rooms: List(String),
     rooms_collapsed: Bool,
@@ -265,6 +271,11 @@ pub type Msg {
   ToggleMode
   OpenSettings
   CloseSettings
+  /// Click on an inline message image — show it full-screen in the
+  /// theater overlay.
+  OpenImageTheater(domain.Attachment)
+  /// Backdrop click or Escape key — dismiss the theater overlay.
+  CloseImageTheater
   SetThemePref(Pref)
   ResetLocalState
   HashChanged(String)
@@ -442,6 +453,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       mode: initial_mode,
       theme_pref: initial_pref,
       settings_open: False,
+      image_theater: None,
       view: initial_view,
       joined_rooms: joined,
       rooms_collapsed: False,
@@ -913,6 +925,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     OpenSettings -> #(Model(..model, settings_open: True), effect.none())
     CloseSettings -> #(Model(..model, settings_open: False), effect.none())
+    OpenImageTheater(att) -> #(
+      Model(..model, image_theater: Some(att)),
+      effect.none(),
+    )
+    CloseImageTheater -> #(Model(..model, image_theater: None), effect.none())
     SetThemePref(pref) -> {
       let next_mode = theme.resolve_mode(pref, storage.prefers_dark())
       let label = case pref {
@@ -2408,6 +2425,18 @@ fn room_view_with_state(
     _, _, _ -> element.fragment([])
   }
 
+  let image_theater_el = case model.image_theater {
+    Some(att) ->
+      image_theater.view(
+        palette: palette,
+        mime_type: att.mime_type,
+        data_base64: att.data_base64,
+        on_close: CloseImageTheater,
+        noop: NoOp,
+      )
+    None -> element.fragment([])
+  }
+
   let settings_overlay_el = case model.viewport, model.settings_open {
     domain.Desktop, True ->
       settings_popover.view(
@@ -2744,6 +2773,7 @@ fn room_view_with_state(
       on_add_reaction: ToggleReactionEmoji,
       on_open_full_picker: OpenFullEmojiPicker,
       on_open_detail: OpenDetail,
+      on_open_image: OpenImageTheater,
       receipts: state.receipts,
       selected_msg_id: state.selected_msg_id,
       on_toggle_selected: ToggleMessageSelected,
@@ -2792,6 +2822,7 @@ fn room_view_with_state(
         None -> element.fragment([])
       },
       settings_overlay_el,
+      image_theater_el,
     ]),
     phone_header.view(
       palette: palette,
