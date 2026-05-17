@@ -543,8 +543,11 @@ function getImagePickerInput() {
   el.type = "file";
   el.multiple = true;
   // Browser-renderable raster formats only: jpeg, png, webp, gif.
-  // The user picker filters to these, and the composer side double-
-  // checks before adding to the staging area.
+  // HEIC is intentionally absent — the wasm preprocessor recognises
+  // and rejects HEIC with a tailored error as a defence-in-depth
+  // measure, but until we have a permissively-licensed HEIC decoder
+  // wired in (see docs/superpowers/specs/2026-05-13-image-
+  // preprocessing-design.md) we don't surface it in the picker.
   el.accept = "image/jpeg,image/png,image/webp,image/gif";
   el.setAttribute("data-testid", "composer-image-input");
   el.style.position = "fixed";
