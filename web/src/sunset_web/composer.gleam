@@ -21,6 +21,15 @@ pub fn attach_shortcut_prevent_default(element_id: String) -> Nil
 @external(javascript, "./composer.ffi.mjs", "focusTextarea")
 pub fn focus_textarea(element_id: String) -> Nil
 
+/// Install a global `visibilitychange` listener that re-focuses the
+/// textarea with id `element_id` whenever the page becomes visible
+/// again *and* nothing else is currently focused. Idempotent — calling
+/// it again just rebinds the target id. No-op when the listener fires
+/// with focus already held by an interactive element (button, input,
+/// etc.) so we never steal focus from the user's actual interaction.
+@external(javascript, "./composer.ffi.mjs", "installReturnAutofocus")
+pub fn install_return_autofocus(element_id: String) -> Nil
+
 /// Install a global paste listener that dispatches `(mime, base64)`
 /// tuples for every image pasted into the textarea with id
 /// `element_id`. The handler is idempotent — calling it again just

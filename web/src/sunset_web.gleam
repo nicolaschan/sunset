@@ -563,6 +563,15 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       composer.attach_shortcut_prevent_default("composer-textarea")
     })
 
+  // Restore composer focus on tab-/window-return when the user wasn't
+  // already focused on something else. Mirrors the auto-focus we apply
+  // on initial mount / channel / room switch so the typing path is the
+  // happy path: come back to the tab → start typing.
+  let install_return_autofocus_eff =
+    effect.from(fn(_dispatch) {
+      composer.install_return_autofocus("composer-textarea")
+    })
+
   let install_image_paste_eff =
     effect.from(fn(dispatch) {
       composer.install_image_paste_handler("composer-textarea", fn(pairs) {
@@ -619,6 +628,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       subscribe_touch_drag,
       ticker_eff,
       attach_shortcuts_eff,
+      install_return_autofocus_eff,
       install_image_paste_eff,
       install_voice_handler_eff,
       install_voice_level_handlers_eff,

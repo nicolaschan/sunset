@@ -76,6 +76,42 @@ export function focusTextarea(elementId) {
   });
 }
 
+// Install a global visibilitychange listener that re-focuses the
+// composer textarea when the user returns to the tab. Only re-focuses
+// when nothing else is focused (document.activeElement === <body>) —
+// we never steal focus from an actually-focused element like a button
+// in the rail, the search box, or a modal input. The listener is
+// idempotent: calling this with a new elementId just rebinds the
+// target; multiple calls don't stack listeners.
+let returnAutofocusTargetId = null;
+let returnAutofocusInstalled = false;
+
+export function installReturnAutofocus(elementId) {
+  returnAutofocusTargetId = elementId;
+  if (returnAutofocusInstalled) return;
+  returnAutofocusInstalled = true;
+  document.addEventListener("visibilitychange", onPageBecameVisible);
+}
+
+function onPageBecameVisible() {
+  if (document.visibilityState !== "visible") return;
+  const active = document.activeElement;
+  // "Nothing focused" is observable as activeElement being <body>
+  // (or, defensively, null / the documentElement). Any focusable
+  // element — input, button, contenteditable, link — would be a
+  // non-body activeElement, in which case we leave focus alone.
+  if (active && active !== document.body && active !== document.documentElement) {
+    return;
+  }
+  const el = document.getElementById(returnAutofocusTargetId);
+  if (!el || el.tagName !== "TEXTAREA") return;
+  try {
+    el.focus({ preventScroll: true });
+  } catch {
+    // ignored: focus is best-effort.
+  }
+}
+
 export function attachShortcutPreventDefault(elementId) {
   const el = document.getElementById(elementId);
   if (!el) return;
