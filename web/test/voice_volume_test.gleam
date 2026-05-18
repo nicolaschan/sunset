@@ -66,7 +66,11 @@ pub fn percent_negative_clamps_to_zero_test() {
 }
 
 pub fn percent_above_max_clamps_to_max_gain_test() {
-  assert_close(voice_volume.percent_to_gain(9999), voice_volume.max_gain, 0.0001)
+  assert_close(
+    voice_volume.percent_to_gain(9999),
+    voice_volume.max_gain,
+    0.0001,
+  )
 }
 
 // --- gain → percent ---
@@ -145,9 +149,7 @@ pub fn boundary_is_continuous_at_one_hundred_test() {
   // and tighter on the boundary side than the linear segment would
   // suggest — exponential rises slower than the linear slope at 100.
   let _ =
-    should.be_true({
-      just_below <. at_boundary && at_boundary <. just_above
-    })
+    should.be_true({ just_below <. at_boundary && at_boundary <. just_above })
   // Continuity check: a 5-percent step on either side of the boundary
   // shouldn't differ by more than the linear-segment step (0.05).
   assert_close(at_boundary -. just_below, 0.05, 0.0001)
@@ -155,7 +157,6 @@ pub fn boundary_is_continuous_at_one_hundred_test() {
   // Exponential step is smaller than the linear-segment step at this
   // distance from the boundary — that's the whole point of "finer
   // control above 100%".
-  let _ =
-    should.be_true(above_step <. 0.05)
+  let _ = should.be_true(above_step <. 0.05)
   Nil
 }

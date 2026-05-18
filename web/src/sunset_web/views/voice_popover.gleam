@@ -718,9 +718,7 @@ fn volume_tick_labels(p: Palette, max_volume: Int) -> Element(msg) {
   let positioned = fn(left_pct: String, transform: String, text: String) {
     html.span(
       [
-        ui.css(
-          [#("left", left_pct), #("transform", transform), ..label_style],
-        ),
+        ui.css([#("left", left_pct), #("transform", transform), ..label_style]),
       ],
       [html.text(text)],
     )
