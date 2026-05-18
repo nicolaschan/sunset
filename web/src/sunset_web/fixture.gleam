@@ -13,12 +13,16 @@ import sunset_web/domain.{
 }
 
 pub fn rooms() -> List(Room) {
+  // The `online` field on each fixture room is a placeholder: `resolve_rooms`
+  // overrides it with a live count derived from the corresponding
+  // `RoomState.members`. Keep it at 0 here so an accidental miss in the
+  // override path is obviously broken instead of silently showing a
+  // plausible-looking stale value.
   [
     Room(
       id: RoomId("dusk-collective"),
       name: "dusk-collective",
-      members: 14,
-      online: 6,
+      online: 0,
       in_call: 3,
       status: Connected,
       last_active: "now",
@@ -27,8 +31,7 @@ pub fn rooms() -> List(Room) {
     Room(
       id: RoomId("minecraft-smp"),
       name: "stoneage-smp",
-      members: 23,
-      online: 11,
+      online: 0,
       in_call: 5,
       status: Connected,
       last_active: "2m",
@@ -37,8 +40,7 @@ pub fn rooms() -> List(Room) {
     Room(
       id: RoomId("design-crit"),
       name: "design-crit",
-      members: 8,
-      online: 4,
+      online: 0,
       in_call: 0,
       status: Connected,
       last_active: "12m",
@@ -47,8 +49,7 @@ pub fn rooms() -> List(Room) {
     Room(
       id: RoomId("weekend-radio"),
       name: "weekend-radio",
-      members: 31,
-      online: 19,
+      online: 0,
       in_call: 14,
       status: Connected,
       last_active: "now",
@@ -57,7 +58,6 @@ pub fn rooms() -> List(Room) {
     Room(
       id: RoomId("ghost-team"),
       name: "ghost-team",
-      members: 5,
       online: 0,
       in_call: 0,
       status: Offline,
@@ -67,8 +67,7 @@ pub fn rooms() -> List(Room) {
     Room(
       id: RoomId("field-notes"),
       name: "field-notes",
-      members: 12,
-      online: 2,
+      online: 0,
       in_call: 0,
       status: Reconnecting,
       last_active: "just now",
