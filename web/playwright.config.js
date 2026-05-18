@@ -21,6 +21,17 @@ if (!dist) {
 const port = Number(process.env.SUNSET_WEB_PORT ?? 4173);
 const testHooks = process.env.SUNSET_TEST_HOOKS === "1";
 
+// Per-project `testIgnore` overrides the top-level `testIgnore` (it
+// does not merge). That means any project that wants to add its own
+// ignore patterns must also re-include the top-level ones, or the
+// non-voice runner (SUNSET_TEST_HOOKS=0) will start picking up
+// voice_*.spec.js. We build per-project ignore lists by prepending
+// the top-level pattern.
+function ignoreFor(...extra) {
+  const base = testHooks ? [] : [/voice_.*\.spec\.js$/];
+  return [...base, ...extra];
+}
+
 export default defineConfig({
   testDir: "e2e",
   // Voice runner only runs voice_*.spec.js; chat runner skips voice.
@@ -65,7 +76,7 @@ export default defineConfig({
       // fake-audio device would assert tone purity on a signal that
       // wasn't designed to satisfy it — a spurious failure shape
       // that says nothing about the code under test.
-      testIgnore: [/_real_mic\.spec\.js$/],
+      testIgnore: ignoreFor(/_real_mic\.spec\.js$/),
     },
     {
       name: "mobile-chrome",
@@ -79,7 +90,7 @@ export default defineConfig({
           ],
         },
       },
-      testIgnore: [/_real_mic\.spec\.js$/],
+      testIgnore: ignoreFor(/_real_mic\.spec\.js$/),
     },
     // Chromium project with a fake WAV file piped as the mic input.
     // Used exclusively by voice_real_mic.spec.js (testMatch below).
