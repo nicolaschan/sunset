@@ -70,15 +70,23 @@ export function toPlain(body) {
 // which matches the base codepoint of every emoji grapheme cluster
 // (skin-tone modifiers, ZWJ joiners, variation selectors are extenders
 // that the segmenter folds into a single cluster).
+//
+// The `Intl.Segmenter` is built once at module load and reused — it's
+// stateless and instantiation isn't free at message-list scale.
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+const WHITESPACE_RE = /^\s+$/u;
+const EMOJI_RE = /\p{Extended_Pictographic}/u;
+
 export function emojiOnlyCount(body) {
   if (typeof body !== "string") return 0;
   const trimmed = body.trim();
   if (trimmed.length === 0) return 0;
   let count = 0;
-  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-  for (const { segment } of segmenter.segment(trimmed)) {
-    if (/^\s+$/u.test(segment)) continue;
-    if (!/\p{Extended_Pictographic}/u.test(segment)) return 0;
+  for (const { segment } of GRAPHEME_SEGMENTER.segment(trimmed)) {
+    if (WHITESPACE_RE.test(segment)) continue;
+    if (!EMOJI_RE.test(segment)) return 0;
     count += 1;
     if (count > 3) return 0;
   }

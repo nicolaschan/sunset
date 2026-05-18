@@ -338,8 +338,10 @@ pub type Msg {
   CloseComposerEmojiPicker
   /// User picked an emoji from the composer's picker — splice it into
   /// the active room's draft at the textarea's current caret
-  /// position. Closes the picker so the next pick reopens it
-  /// explicitly (matches the picker-element's one-tap-per-emoji UX).
+  /// position. The picker stays open so the user can drop several
+  /// emoji in a row without re-clicking the toolbar button;
+  /// dismissal happens through `CloseComposerEmojiPicker` (Esc,
+  /// outside click, or pressing the toolbar button again).
   InsertEmojiAtCaret(emoji: String)
   OpenDetail(String)
   CloseDetail
