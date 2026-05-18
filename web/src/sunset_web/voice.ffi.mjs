@@ -326,11 +326,19 @@ function flushSelfLevelToZero() {
 }
 
 export function stopCapture() {
-  if (captureStream) {
-    for (const t of captureStream.getTracks()) t.stop();
-    captureStream = null;
-  }
-  captureNode = null;
+  // Mic side: full teardown. Stopping the MediaStream's tracks is not
+  // enough — the AudioWorkletNode stays alive in the audio graph and
+  // its `process()` keeps firing on whatever its source emits after the
+  // tracks end (silence, per WebAudio spec). If we leave
+  // `port.onmessage` attached, that handler then keeps calling
+  // `client.voice_input` for the lifetime of the AudioContext. On the
+  // next `wasmVoiceActivate` a *second* capture worklet is created on
+  // top of the leaked one, both pumping frames into `voice_input` —
+  // the encoder sees ~2× the frame rate (real audio interleaved with
+  // post-leave silence), the receiver hears 50 Hz amplitude-modulated
+  // distortion. Clearing `port.onmessage` + `.disconnect()` cuts that
+  // path off cleanly at the boundary the JS bridge already owns.
+  tearDownCapture();
   for (const [peerHex, slot] of peers) {
     try {
       slot.worklet.disconnect();
