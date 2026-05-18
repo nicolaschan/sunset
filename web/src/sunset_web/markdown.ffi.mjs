@@ -54,3 +54,33 @@ export function toPlain(body) {
   }
   return body;
 }
+
+// Count grapheme clusters in `body` after trimming, returning the count
+// IFF every non-whitespace grapheme is an emoji and the total is in
+// [1, 3]. Returns 0 in every other case ("not emoji-only" or "too many
+// emoji to enlarge"). Drives the iMessage-style jumbo-emoji rendering:
+// short emoji-only messages render at a larger size than mixed text.
+//
+// Grapheme iteration is required because emoji like 👨‍👩‍👧‍👦 are
+// multi-codepoint ZWJ sequences — naive `[...string]` length would
+// over-count. `Intl.Segmenter` is available in every browser we
+// support (Chromium 87+, WebKit 14.1+, Firefox 125+).
+//
+// "Emoji" is detected via Unicode's `Extended_Pictographic` property,
+// which matches the base codepoint of every emoji grapheme cluster
+// (skin-tone modifiers, ZWJ joiners, variation selectors are extenders
+// that the segmenter folds into a single cluster).
+export function emojiOnlyCount(body) {
+  if (typeof body !== "string") return 0;
+  const trimmed = body.trim();
+  if (trimmed.length === 0) return 0;
+  let count = 0;
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  for (const { segment } of segmenter.segment(trimmed)) {
+    if (/^\s+$/u.test(segment)) continue;
+    if (!/\p{Extended_Pictographic}/u.test(segment)) return 0;
+    count += 1;
+    if (count > 3) return 0;
+  }
+  return count;
+}

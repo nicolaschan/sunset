@@ -201,6 +201,17 @@ pub type Model {
     /// whether there's space to render below or above. Cleared on
     /// `CloseFullEmojiPicker`.
     full_picker_anchor: Option(#(Float, Float)),
+    /// True when the composer's emoji picker overlay is visible. The
+    /// picker is desktop-only (the desktop composer surfaces an emoji
+    /// button next to the attach button); phones rely on the OS
+    /// keyboard's native emoji panel. Opening this closes the
+    /// per-message reaction picker (and vice versa) so at most one
+    /// emoji picker is on screen at a time.
+    composer_picker_open: Bool,
+    /// Click-relative anchor of the composer emoji button — same
+    /// shape as `full_picker_anchor` — so the picker opens directly
+    /// above the button instead of viewport-centered.
+    composer_picker_anchor: Option(#(Float, Float)),
     /// Per-target reaction state from the bridge tracker. TEMPORARILY
     /// global on the merged branch — the reactions tracker in
     /// sunset-core::reactions is currently per-Client (not per-room).
@@ -320,6 +331,16 @@ pub type Msg {
   /// sheet and passes `None`.
   OpenFullEmojiPicker(target: String, anchor: Option(#(Float, Float)))
   CloseFullEmojiPicker
+  /// Open the composer's emoji picker (desktop only). The optional
+  /// anchor is captured by the trigger's click decoder so the overlay
+  /// can position itself near the button.
+  OpenComposerEmojiPicker(anchor: Option(#(Float, Float)))
+  CloseComposerEmojiPicker
+  /// User picked an emoji from the composer's picker — splice it into
+  /// the active room's draft at the textarea's current caret
+  /// position. Closes the picker so the next pick reopens it
+  /// explicitly (matches the picker-element's one-tap-per-emoji UX).
+  InsertEmojiAtCaret(emoji: String)
   OpenDetail(String)
   CloseDetail
   OpenVoicePopover(String)
@@ -472,6 +493,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       sidebar_search: "",
       full_picker_for: None,
       full_picker_anchor: None,
+      composer_picker_open: False,
+      composer_picker_anchor: None,
       reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
@@ -2220,6 +2243,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           rooms: rooms,
           full_picker_for: Some(target),
           full_picker_anchor: anchor,
+          // Reaction picker takes priority over the composer picker —
+          // close the latter so we never paint two overlays at once.
+          composer_picker_open: False,
+          composer_picker_anchor: None,
         ),
         register_eff,
       )
@@ -2228,6 +2255,40 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, full_picker_for: None, full_picker_anchor: None),
       effect.none(),
     )
+    OpenComposerEmojiPicker(anchor) -> {
+      let register_eff =
+        effect.from(fn(_dispatch) { sunset.register_emoji_picker() })
+      #(
+        Model(
+          ..model,
+          composer_picker_open: True,
+          composer_picker_anchor: anchor,
+          // Symmetric with OpenFullEmojiPicker: only one picker open at
+          // a time.
+          full_picker_for: None,
+          full_picker_anchor: None,
+        ),
+        register_eff,
+      )
+    }
+    CloseComposerEmojiPicker -> #(
+      Model(..model, composer_picker_open: False, composer_picker_anchor: None),
+      effect.none(),
+    )
+    InsertEmojiAtCaret(emoji) -> {
+      // Splice the emoji into the textarea at its current caret /
+      // selection (the FFI also returns the textarea's new value so we
+      // can keep `state.draft` in sync without a synthetic input event).
+      let new_value =
+        composer.apply_template("composer-textarea", emoji, "", "", True)
+      let #(m, eff) = with_active_room(model, fn(state) {
+        #(RoomState(..state, draft: new_value), effect.none())
+      })
+      // Keep the picker open so the user can drop several emoji in a
+      // row without re-clicking the toolbar button. Esc / outside-click
+      // / pressing the toolbar button again still closes it.
+      #(m, eff)
+    }
     UpdateSelfName(value) -> {
       let new_token = model.self_name_token + 1
       let updated = Model(..model, self_name: value, self_name_token: new_token)
@@ -2434,6 +2495,81 @@ fn room_view_with_state(
             palette: palette,
             mode: model.mode,
             on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+          ),
+        ],
+      )
+    _, _, _ -> element.fragment([])
+  }
+
+  // Composer emoji picker (desktop only). The composer surfaces an
+  // emoji button so the user can pick an emoji without leaving the
+  // keyboard; phones rely on the OS keyboard's native emoji panel and
+  // never render this. Both the backdrop and the overlay open
+  // together — same close-on-outside-click affordance as the reaction
+  // picker.
+  let composer_picker_backdrop_el = case
+    model.viewport,
+    model.composer_picker_open
+  {
+    domain.Desktop, True ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "composer-emoji-picker-backdrop"),
+          event.on_click(CloseComposerEmojiPicker),
+          ui.css([
+            #("position", "fixed"),
+            #("inset", "0"),
+            #("background", "transparent"),
+            #("z-index", "99"),
+          ]),
+        ],
+        [],
+      )
+    _, _ -> element.fragment([])
+  }
+
+  let composer_picker_overlay_el = case
+    model.viewport,
+    model.composer_picker_open,
+    model.composer_picker_anchor
+  {
+    domain.Desktop, True, Some(#(anchor_y, viewport_h)) ->
+      html.div(
+        [
+          attribute.attribute("data-testid", "composer-emoji-picker-overlay"),
+          ui.css(composer_picker_anchor_styles(palette, anchor_y, viewport_h)),
+        ],
+        [
+          emoji_picker.view(
+            palette: palette,
+            mode: model.mode,
+            on_pick: InsertEmojiAtCaret,
+          ),
+        ],
+      )
+    domain.Desktop, True, None ->
+      // Missing anchor (e.g. picker opened programmatically). Render a
+      // centered fallback so the button never dead-ends.
+      html.div(
+        [
+          attribute.attribute("data-testid", "composer-emoji-picker-overlay"),
+          ui.css([
+            #("position", "fixed"),
+            #("top", "50%"),
+            #("left", "50%"),
+            #("transform", "translate(-50%, -50%)"),
+            #("z-index", "100"),
+            #("background", palette.surface),
+            #("border", "1px solid " <> palette.border),
+            #("border-radius", "8px"),
+            #("box-shadow", palette.shadow_lg),
+          ]),
+        ],
+        [
+          emoji_picker.view(
+            palette: palette,
+            mode: model.mode,
+            on_pick: InsertEmojiAtCaret,
           ),
         ],
       )
@@ -2786,6 +2922,7 @@ fn room_view_with_state(
       on_remove_attachment: RemoveAttachment,
       noop: NoOp,
       on_shortcut: fn(b, m, a, caret) { ApplyComposerShortcut(b, m, a, caret) },
+      on_open_emoji_picker: OpenComposerEmojiPicker,
       reacting_to: state.reacting_to,
       detail_msg_id: case state.sheet {
         Some(domain.DetailsSheet(message_id: id)) -> Some(id)
@@ -2838,6 +2975,8 @@ fn room_view_with_state(
       relay_popover_overlay(palette, model),
       full_picker_backdrop_el,
       full_picker_overlay_el,
+      composer_picker_backdrop_el,
+      composer_picker_overlay_el,
       case model.voice.permission_error {
         Some(msg) ->
           voice_error_toast.view(
@@ -3122,6 +3261,40 @@ fn picker_anchor_styles(
     #("position", "fixed"),
     #("top", top_css),
     #("right", right_css),
+    #("z-index", "100"),
+    #("background", palette.surface),
+    #("border", "1px solid " <> palette.border),
+    #("border-radius", "8px"),
+    #("box-shadow", palette.shadow_lg),
+  ]
+}
+
+/// Place the composer's emoji picker overlay (desktop). The composer
+/// sits at the bottom of the chat column, so the picker is always
+/// flipped *above* the trigger — there is never room below — and
+/// left-anchored because the button itself sits at the column's left
+/// edge.
+fn composer_picker_anchor_styles(
+  palette: theme.Palette,
+  anchor_y: Float,
+  _viewport_h: Float,
+) -> List(#(String, String)) {
+  let picker_h = 410.0
+  let gap = 8.0
+  let top_css =
+    "clamp(8px, "
+    <> float_px(anchor_y -. picker_h -. gap)
+    <> ", calc(100dvh - "
+    <> float_px(picker_h +. 8.0)
+    <> "))"
+  // 16px from the chat column's left edge, with the same `clamp` on
+  // narrow viewports that the reaction picker uses on the right — keeps
+  // the picker wholly visible if the window is dragged narrow.
+  let left_css = "clamp(8px, 16px, calc(100dvw - 372px))"
+  [
+    #("position", "fixed"),
+    #("top", top_css),
+    #("left", left_css),
     #("z-index", "100"),
     #("background", palette.surface),
     #("border", "1px solid " <> palette.border),

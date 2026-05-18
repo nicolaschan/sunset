@@ -247,3 +247,54 @@ pub fn to_plain_returns_something_with_text_test() {
   should.be_true(string.contains(result, "hello"))
   should.be_true(string.contains(result, "bold"))
 }
+
+// `classify` runs entirely in JS (Intl.Segmenter + Unicode property
+// regex) — no WASM is involved — so it's safe to exercise here.
+
+pub fn classify_single_emoji_test() {
+  should.equal(markdown.classify("🌅"), markdown.EmojiOnly(1))
+}
+
+pub fn classify_two_emoji_test() {
+  should.equal(markdown.classify("🌅🌙"), markdown.EmojiOnly(2))
+}
+
+pub fn classify_three_emoji_test() {
+  should.equal(markdown.classify("🌅🌙🔥"), markdown.EmojiOnly(3))
+}
+
+pub fn classify_four_emoji_is_normal_test() {
+  // 4+ emoji exceeds the jumbo threshold — render at normal size so
+  // the bubble doesn't push out of the message column.
+  should.equal(markdown.classify("🌅🌙🔥👀"), markdown.Normal)
+}
+
+pub fn classify_emoji_with_surrounding_whitespace_test() {
+  // Whitespace doesn't disqualify — the user typing "  🌅  " still
+  // gets the jumbo treatment.
+  should.equal(markdown.classify("  🌅  "), markdown.EmojiOnly(1))
+  should.equal(markdown.classify("🌅 🌙"), markdown.EmojiOnly(2))
+}
+
+pub fn classify_mixed_text_and_emoji_is_normal_test() {
+  // The presence of any non-emoji, non-whitespace character demotes
+  // back to normal — "hi 🌅" should look like a regular message.
+  should.equal(markdown.classify("hi 🌅"), markdown.Normal)
+  should.equal(markdown.classify("🌅!"), markdown.Normal)
+}
+
+pub fn classify_plain_text_is_normal_test() {
+  should.equal(markdown.classify("hello"), markdown.Normal)
+}
+
+pub fn classify_empty_is_normal_test() {
+  should.equal(markdown.classify(""), markdown.Normal)
+  should.equal(markdown.classify("   "), markdown.Normal)
+}
+
+pub fn classify_zwj_sequence_counts_as_one_test() {
+  // 👨‍👩‍👧 is a single grapheme cluster composed of three people
+  // codepoints joined by ZWJs — Intl.Segmenter folds it into one
+  // segment, so the body counts as a single jumbo emoji.
+  should.equal(markdown.classify("👨‍👩‍👧"), markdown.EmojiOnly(1))
+}

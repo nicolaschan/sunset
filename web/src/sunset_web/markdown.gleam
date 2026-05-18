@@ -105,6 +105,33 @@ pub fn render_blocks(
 @external(javascript, "./markdown.ffi.mjs", "toPlain")
 pub fn to_plain(body: String) -> String
 
+/// Visual size classification for a rendered message body.
+///
+/// `EmojiOnly(n)` means the trimmed body is exactly `n` emoji
+/// grapheme clusters (1-3) with no other content; callers render
+/// those at a larger size (iMessage / Signal "jumbo" emoji).
+/// `Normal` covers everything else — empty, mixed text+emoji, or
+/// more than 3 emoji.
+pub type BodyKind {
+  Normal
+  EmojiOnly(count: Int)
+}
+
+@external(javascript, "./markdown.ffi.mjs", "emojiOnlyCount")
+fn emoji_only_count_ffi(body: String) -> Int
+
+/// Classify a message body for rendering size. Pure function over the
+/// body string; never goes through the markdown parser. Safe to call
+/// on every render.
+pub fn classify(body: String) -> BodyKind {
+  case emoji_only_count_ffi(body) {
+    1 -> EmojiOnly(1)
+    2 -> EmojiOnly(2)
+    3 -> EmojiOnly(3)
+    _ -> Normal
+  }
+}
+
 // ----- AST types -----
 // Pub so tests can construct AST values directly without going through FFI.
 

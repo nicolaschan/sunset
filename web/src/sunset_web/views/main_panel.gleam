@@ -43,6 +43,11 @@ pub fn view(
   on_remove_attachment on_remove_attachment: fn(Int) -> msg,
   noop noop: msg,
   on_shortcut on_shortcut: fn(String, String, String, Bool) -> msg,
+  // Desktop only: clicking the composer's emoji button dispatches this
+  // with the click's `(client_y, viewport_h)` so the overlay can
+  // position itself relative to the trigger. On phones the button
+  // isn't rendered.
+  on_open_emoji_picker on_open_emoji_picker: fn(Option(#(Float, Float))) -> msg,
   reacting_to reacting_to: Option(String),
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
@@ -119,6 +124,7 @@ pub fn view(
         on_remove_attachment,
         noop,
         on_shortcut,
+        on_open_emoji_picker,
       ),
     ],
   )
@@ -366,26 +372,7 @@ fn message_view(
             header,
             case m.body {
               "" -> element.fragment([])
-              _ ->
-                html.div(
-                  [
-                    ui.css([
-                      #("font-size", "16.875px"),
-                      #("color", p.text),
-                      #("white-space", "pre-wrap"),
-                      #("word-break", "break-word"),
-                    ]),
-                  ],
-                  [
-                    markdown.render(
-                      m.body,
-                      m.id,
-                      is_revealed,
-                      on_toggle_spoiler,
-                      p,
-                    ),
-                  ],
-                )
+              _ -> message_body(m, p, is_revealed, on_toggle_spoiler)
             },
             message_attachments(p, m.attachments, on_open_image),
             case m.reactions {
@@ -414,6 +401,63 @@ fn message_view(
       False -> element.fragment([])
     },
   ])
+}
+
+/// Render a non-empty message body. iMessage-style: when the body is
+/// 1-3 emoji with no other content, render the emoji at a much larger
+/// size and skip markdown parsing entirely (there's nothing to parse).
+/// Anything else flows through the markdown renderer at the normal
+/// body size.
+///
+/// The wrapper uses an inline `style` (via `ui.css`) rather than a
+/// class because every other styled element in this file does the
+/// same — keeping classes reserved for the small handful of selectors
+/// shell.gleam targets globally (`.msg-row`, `.msg-actions`).
+fn message_body(
+  m: MessageView,
+  p: Palette,
+  is_revealed: fn(markdown.SpoilerKey) -> Bool,
+  on_toggle_spoiler: fn(markdown.SpoilerKey) -> msg,
+) -> Element(msg) {
+  case markdown.classify(m.body) {
+    markdown.EmojiOnly(n) -> {
+      let font_size = case n {
+        1 -> "54px"
+        2 -> "44px"
+        _ -> "36px"
+      }
+      html.div(
+        [
+          attribute.attribute("data-testid", "emoji-jumbo"),
+          attribute.attribute("data-emoji-count", int.to_string(n)),
+          ui.css([
+            #("font-size", font_size),
+            #("line-height", "1.15"),
+            #("color", p.text),
+            #("white-space", "pre-wrap"),
+            #("word-break", "break-word"),
+            // Tighter top gutter so the bigger glyph doesn't push the
+            // whole row's vertical rhythm; the bottom gutter is the
+            // shared 4px gap already coming from the column flex.
+            #("margin-top", "2px"),
+          ]),
+        ],
+        [html.text(m.body)],
+      )
+    }
+    markdown.Normal ->
+      html.div(
+        [
+          ui.css([
+            #("font-size", "16.875px"),
+            #("color", p.text),
+            #("white-space", "pre-wrap"),
+            #("word-break", "break-word"),
+          ]),
+        ],
+        [markdown.render(m.body, m.id, is_revealed, on_toggle_spoiler, p)],
+      )
+  }
 }
 
 /// Floating toolbar in the top-right of each message row. Two
@@ -909,6 +953,7 @@ fn composer(
   on_remove_attachment: fn(Int) -> msg,
   noop: msg,
   on_shortcut: fn(String, String, String, Bool) -> msg,
+  on_open_emoji_picker: fn(Option(#(Float, Float))) -> msg,
 ) -> Element(msg) {
   // The composer's outer height drives the column-bottom seam shared
   // with the channels-rail self-bar and the members-rail you_row (64px); the
@@ -978,6 +1023,7 @@ fn composer(
             ],
             [
               attach_button(p, on_pick_images),
+              composer_emoji_button(p, viewport, on_open_emoji_picker),
               html.textarea(
                 [
                   attribute.id("composer-textarea"),
@@ -1191,6 +1237,57 @@ fn attach_button(p: Palette, on_click: msg) -> Element(msg) {
       ),
     ],
   )
+}
+
+/// Desktop-only emoji affordance in the composer toolbar. On phones the
+/// OS keyboard already surfaces an emoji panel, so adding a button
+/// there would duplicate the affordance and steal toolbar space.
+///
+/// Captures the click's `clientY` + viewport height (same pair the
+/// reaction "+" button captures) so the desktop overlay can decide
+/// whether to render above or below and stay clamped on-screen.
+fn composer_emoji_button(
+  p: Palette,
+  viewport: domain.Viewport,
+  on_open: fn(Option(#(Float, Float))) -> msg,
+) -> Element(msg) {
+  case viewport {
+    domain.Phone -> element.fragment([])
+    domain.Desktop ->
+      html.button(
+        [
+          attribute.title("Pick emoji"),
+          attribute.attribute("aria-label", "Pick emoji"),
+          attribute.attribute("data-testid", "composer-emoji"),
+          event.on("click", {
+            use cy <- decode.subfield(["clientY"], decode.float)
+            use vh <- decode.subfield(["view", "innerHeight"], decode.float)
+            decode.success(on_open(option.Some(#(cy, vh))))
+          }),
+          ui.css([
+            #("display", "inline-flex"),
+            #("align-items", "center"),
+            #("justify-content", "center"),
+            #("width", "24px"),
+            #("height", "24px"),
+            #("border", "none"),
+            #("background", "transparent"),
+            #("color", p.text_faint),
+            #("cursor", "pointer"),
+            #("padding", "0"),
+            #("border-radius", "4px"),
+            #("font-size", "18px"),
+            #("line-height", "1"),
+          ]),
+        ],
+        // Use a literal emoji glyph rather than an SVG icon. The
+        // emoji-picker-element already ships a faithful "smileys"
+        // category icon as a unicode emoji, so painting the same
+        // codepoint here keeps the button visually consistent with
+        // the picker it opens.
+        [html.text("🙂")],
+      )
+  }
 }
 
 fn you_tag(p: Palette) -> Element(msg) {
