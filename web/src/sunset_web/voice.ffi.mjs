@@ -419,10 +419,17 @@ export function dropPeer(peerHex) {
   peerLastFrameMs.delete(peerHex);
 }
 
+// Maximum gain the slider can drive. The Gleam UI runs a
+// linear-then-exponential curve (`voice_volume`); the top of the
+// slider (500%) maps to gain 16.0 (= 2 ** ((500 - 100) / 100)).
+// Must agree with `voice_volume.max_gain` — otherwise the model's
+// reported volume and what's actually applied would diverge.
+const PEER_GAIN_MAX = 16.0;
+
 export function setPeerVolume(peerHex, gain) {
   const slot = peers.get(peerHex);
   if (!slot) return;
-  slot.gain.gain.value = Math.max(0, Math.min(2.0, gain));
+  slot.gain.gain.value = Math.max(0, Math.min(PEER_GAIN_MAX, gain));
 }
 
 export function getPeerGain(peerHex) {
