@@ -14,7 +14,6 @@
 
 import gleam/dict.{type Dict}
 import gleam/float
-import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -62,6 +61,7 @@ import sunset_web/views/voice_error_toast
 import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
 import sunset_web/voice
+import sunset_web/voice_volume
 
 /// Relays the client dials at startup when the URL has no
 /// `?relay=…` query parameter. Each entry is fed through
@@ -656,24 +656,14 @@ fn peer_level_for_member(
   }
 }
 
-/// Convert a linear gain float (0.0–2.0) to an integer volume percent (0–200).
+/// Convert a linear gain float to the matching integer slider
+/// percent. Mirrors the linear-then-exponential curve in
+/// `voice_volume.percent_to_gain` so a model that stores raw gain
+/// (e.g. when an FFI caller dispatched `SetPeerVolume` with a
+/// multiplier) can be rendered back into the slider's position.
 fn float_to_volume_int(gain: Float) -> Int {
-  let clamped = case gain <. 0.0 {
-    True -> 0.0
-    False ->
-      case gain >. 2.0 {
-        True -> 2.0
-        False -> gain
-      }
-  }
-  // Truncate to int by flooring: multiply, convert via string parse as fallback.
-  // Using integer division as the JS target represents floats precisely enough.
-  // `int.to_float(x) == f` isn't available directly; nearest: truncate via cast.
-  float_truncate(clamped *. 100.0)
+  voice_volume.gain_to_percent(gain)
 }
-
-@external(javascript, "./sunset_web/sunset.ffi.mjs", "truncFloat")
-fn float_truncate(f: Float) -> Int
 
 /// Add `name` to `existing` if it isn't already present (prepending
 /// at the head, which is where new rooms appear). If `name` is
@@ -1777,8 +1767,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, volume: value)
-      // Also forward to FFI so real peers (when name == peer_hex) get updated.
-      let gain = int.to_float(value) /. 100.0
+      // Also forward to FFI so real peers (when name == peer_hex) get
+      // updated. The slider is linear below 100% and exponential above
+      // — see `voice_volume` for the curve and rationale.
+      let gain = voice_volume.percent_to_gain(value)
       let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
         Model(
@@ -1813,7 +1805,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // Mute-for-me: set GainNode to 0 or restore prior volume via FFI.
       let gain = case new_deafened {
         True -> 0.0
-        False -> int.to_float(settings.volume) /. 100.0
+        False -> voice_volume.percent_to_gain(settings.volume)
       }
       let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
@@ -2170,7 +2162,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let new_muted_for_me = !settings.deafened
       let gain = case new_muted_for_me {
         True -> 0.0
-        False -> int.to_float(settings.volume) /. 100.0
+        False -> voice_volume.percent_to_gain(settings.volume)
       }
       let new_settings =
         domain.VoiceSettings(..settings, deafened: new_muted_for_me)
@@ -2599,7 +2591,7 @@ fn room_view_with_state(
               level: peer_level_for_member(model.voice, m, id_str),
               on_close: CloseVoicePopover,
               on_set_volume: fn(v) {
-                SetPeerVolume(id_str, int.to_float(v) /. 100.0)
+                SetPeerVolume(id_str, voice_volume.percent_to_gain(v))
               },
               on_toggle_denoise: ToggleMemberDenoise(id_str),
               on_set_voice_quality: SetVoiceQuality,
@@ -2936,7 +2928,7 @@ fn voice_popover_overlay(
             level: peer_level_for_member(model.voice, m, id_str),
             on_close: CloseVoicePopover,
             on_set_volume: fn(v) {
-              SetPeerVolume(id_str, int.to_float(v) /. 100.0)
+              SetPeerVolume(id_str, voice_volume.percent_to_gain(v))
             },
             on_toggle_denoise: ToggleMemberDenoise(id_str),
             on_set_voice_quality: SetVoiceQuality,

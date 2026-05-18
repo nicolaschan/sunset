@@ -3,7 +3,10 @@
 ////
 //// Shows the peer's status, a level-driven waveform reflecting their
 //// live audio, and three per-peer controls:
-////   * Volume slider — 0–100% for the local user, 0–200% for others.
+////   * Volume slider — 0–100% for the local user, 0–500% for others.
+////     The non-self curve is linear up to 100% and exponential above
+////     (each +100% doubles gain). See `voice_volume` for the
+////     mapping.
 ////   * Denoise toggle — strip background noise from this peer's
 ////     incoming stream (or your outgoing stream, on the self row).
 ////   * Mute-for-me / Reset — only on non-self rows.
@@ -25,6 +28,7 @@ import sunset_web/domain.{
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 import sunset_web/views/voice_meter
+import sunset_web/voice_volume
 
 pub type Placement {
   Floating
@@ -49,8 +53,8 @@ pub fn view(
 ) -> Element(msg) {
   let is_self = m.you
   let max_volume = case is_self {
-    True -> 100
-    False -> 200
+    True -> voice_volume.max_percent_self
+    False -> voice_volume.max_percent_other
   }
 
   let body_children = [
@@ -688,26 +692,63 @@ fn volume_control(
           #("accent-color", p.accent),
         ]),
       ]),
-      html.div(
-        [
-          ui.css([
-            #("display", "flex"),
-            #("justify-content", "space-between"),
-            #("font-size", "10.5px"),
-            #("color", p.text_faint),
-            #("font-family", theme.font_mono),
-          ]),
-        ],
-        [
-          html.span([], [html.text("0")]),
-          html.span([], [html.text("100")]),
-          case max_volume {
-            200 -> html.span([], [html.text("200")])
-            _ -> element.fragment([])
-          },
-        ],
-      ),
+      volume_tick_labels(p, max_volume),
     ],
+  )
+}
+
+/// Render the tick labels under the volume slider.
+///
+/// The slider is linear in *percent* (its native value) — so a
+/// label's left offset matches its percent position on the track.
+/// At the self-only max (100), the `100` label collapses into the
+/// right edge so we omit the redundant rightmost tick. For other
+/// peers, the slider extends to `max_volume` (500% currently) and
+/// the `100` label sits at the linear/exponential boundary so the
+/// user can see *where* the curve transitions, not just that it
+/// does.
+fn volume_tick_labels(p: Palette, max_volume: Int) -> Element(msg) {
+  let label_style = [
+    #("position", "absolute"),
+    #("font-size", "10.5px"),
+    #("color", p.text_faint),
+    #("font-family", theme.font_mono),
+    #("top", "0"),
+  ]
+  let positioned = fn(left_pct: String, transform: String, text: String) {
+    html.span(
+      [
+        ui.css(
+          [#("left", left_pct), #("transform", transform), ..label_style],
+        ),
+      ],
+      [html.text(text)],
+    )
+  }
+  let unity_position = case max_volume {
+    n if n <= 100 -> "100%"
+    n -> int.to_string(100 * 100 / n) <> "%"
+  }
+  let children = case max_volume <= 100 {
+    True -> [
+      positioned("0", "translateX(0)", "0"),
+      positioned(unity_position, "translateX(-100%)", "100"),
+    ]
+    False -> [
+      positioned("0", "translateX(0)", "0"),
+      positioned(unity_position, "translateX(-50%)", "100"),
+      positioned("100%", "translateX(-100%)", int.to_string(max_volume)),
+    ]
+  }
+  html.div(
+    [
+      ui.css([
+        #("position", "relative"),
+        #("height", "14px"),
+        #("width", "100%"),
+      ]),
+    ],
+    children,
   )
 }
 
