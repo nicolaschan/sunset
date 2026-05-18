@@ -59,6 +59,13 @@ export default defineConfig({
           ],
         },
       },
+      // *_real_mic.spec.js depends on the deterministic sweep.wav
+      // reference signal that only the chromium-real-mic project
+      // wires up (see below). Running it under the default
+      // fake-audio device would assert tone purity on a signal that
+      // wasn't designed to satisfy it — a spurious failure shape
+      // that says nothing about the code under test.
+      testIgnore: [/_real_mic\.spec\.js$/],
     },
     {
       name: "mobile-chrome",
@@ -72,6 +79,7 @@ export default defineConfig({
           ],
         },
       },
+      testIgnore: [/_real_mic\.spec\.js$/],
     },
     // Chromium project with a fake WAV file piped as the mic input.
     // Used exclusively by voice_real_mic.spec.js (testMatch below).
