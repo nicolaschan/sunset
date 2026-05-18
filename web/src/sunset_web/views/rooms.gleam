@@ -625,14 +625,7 @@ fn meta_line(p: Palette, r: Room) -> List(Element(msg)) {
     Connected -> option.None
   }
 
-  let segs =
-    [online_seg, in_call_seg, status_seg]
-    |> list.filter_map(fn(o) {
-      case o {
-        option.Some(s) -> Ok(s)
-        option.None -> Error(Nil)
-      }
-    })
+  let segs = option.values([online_seg, in_call_seg, status_seg])
 
   list.index_map(segs, fn(seg, i) {
     let #(text, css) = seg

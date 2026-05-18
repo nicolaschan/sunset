@@ -3047,10 +3047,10 @@ fn online_count_for_room(name: String, rooms: Dict(String, RoomState)) -> Int {
 /// — peers we know about but haven't heard a recent heartbeat from —
 /// are excluded.
 pub fn count_online_members(members: List(domain.Member)) -> Int {
-  list.fold(members, 0, fn(acc, m) {
+  list.count(members, fn(m) {
     case m.status {
-      domain.OfflineP -> acc
-      _ -> acc + 1
+      domain.OfflineP -> False
+      _ -> True
     }
   })
 }
