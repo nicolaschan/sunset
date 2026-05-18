@@ -222,6 +222,79 @@ test("composer regains focus after a channel switch", async ({
   await ctx.close();
 });
 
+// Returning to the page after tab-/window-away should restore composer
+// focus *only* when the user wasn't already focused on something else.
+// The user's words: "if i didn't have anything already focused, the
+// message compose box should be autofocused". The listener responds to
+// `visibilitychange` (hidden→visible). We drive it directly rather than
+// relying on bringToFront because Playwright pages don't behave like
+// real browser tabs w.r.t. visibility unless multiple are in flight,
+// and an event-driven test exactly matches the production contract.
+
+async function tabAwayAndBack(page) {
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+}
+
+test("composer is autofocused after tab-away/return when nothing was focused", async ({
+  browser,
+}) => {
+  const { ctx, page, composer } = await openChat(browser, "focus-return");
+  await expect(composer).toBeFocused({ timeout: 5_000 });
+
+  // Move focus to body so nothing is focused — this is the
+  // "I tabbed away with nothing focused" starting state.
+  await page.evaluate(() => {
+    const el = document.activeElement;
+    if (el && typeof el.blur === "function") el.blur();
+  });
+  await expect(composer).not.toBeFocused();
+
+  await tabAwayAndBack(page);
+
+  await expect
+    .poll(async () => composer.evaluate((el) => el === document.activeElement), {
+      timeout: 5_000,
+    })
+    .toBe(true);
+
+  await ctx.close();
+});
+
+test("returning to the page leaves a focused non-composer element alone", async ({
+  browser,
+}) => {
+  const { ctx, page, composer } = await openChat(browser, "focus-return-keep");
+  await expect(composer).toBeFocused({ timeout: 5_000 });
+
+  // Move focus to a non-composer element near the composer that's
+  // always present in both desktop and phone layouts: the attach
+  // button. Focusing it via `.focus()` matches what tabbing to it
+  // would do.
+  const attach = page.getByTestId("composer-attach");
+  await attach.evaluate((el) => el.focus());
+  await expect(attach).toBeFocused();
+
+  await tabAwayAndBack(page);
+
+  // The attach button should retain focus — the composer must not
+  // steal it.
+  await expect(attach).toBeFocused();
+  await expect(composer).not.toBeFocused();
+
+  await ctx.close();
+});
+
 // ─────────────────────────────────────────────────────────────────────
 // 2. Settings popover from the "you" row
 // ─────────────────────────────────────────────────────────────────────
