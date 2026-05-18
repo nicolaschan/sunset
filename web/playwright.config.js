@@ -75,6 +75,14 @@ export default defineConfig({
     },
     // Chromium project with a fake WAV file piped as the mic input.
     // Used exclusively by voice_real_mic.spec.js (testMatch below).
+    //
+    // sweep.wav lives inside the Nix-built dist (`webVoiceUiTestDist`
+    // copies it into `$out/audio/test-fixtures/sweep.wav` via the flake
+    // — see flake.nix). The previous resolve to `web/audio/test-fixtures`
+    // (the source tree) never existed on disk, so Chromium silently
+    // fell back to its built-in fake audio generator and tests that
+    // depended on a known 440 Hz reference signal didn't actually
+    // observe one.
     {
       name: "chromium-real-mic",
       use: {
@@ -84,11 +92,16 @@ export default defineConfig({
           args: [
             "--use-fake-device-for-media-stream",
             "--use-fake-ui-for-media-stream",
-            `--use-file-for-fake-audio-capture=${resolve(__dirname, "audio/test-fixtures/sweep.wav")}`,
+            `--use-file-for-fake-audio-capture=${resolve(dist, "audio/test-fixtures/sweep.wav")}`,
           ],
         },
       },
-      testMatch: /voice_real_mic\.spec\.js/,
+      // The real-mic project pipes a deterministic 440 Hz sine into
+      // getUserMedia, so any spec that needs a clean reference signal
+      // for tone-purity / audio-quality assertions lives here. Match on
+      // the `_real_mic` suffix so new specs slot in without touching
+      // the config.
+      testMatch: /voice_.*_real_mic\.spec\.js|voice_real_mic\.spec\.js/,
     },
   ],
   webServer: {
