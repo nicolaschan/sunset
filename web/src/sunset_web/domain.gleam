@@ -69,7 +69,6 @@ pub type Room {
   Room(
     id: RoomId,
     name: String,
-    members: Int,
     online: Int,
     in_call: Int,
     status: ConnStatus,

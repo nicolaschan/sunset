@@ -584,34 +584,64 @@ fn delete_button(
 fn meta_line(p: Palette, r: Room) -> List(Element(msg)) {
   // Every span in the meta line is regular weight: the room name above
   // is the only bold element in this row.
-  let online_total =
-    html.span([ui.css([#("font-weight", "400")])], [
-      html.text(
-        int_to_string(r.online) <> "/" <> int_to_string(r.members) <> " online",
-      ),
-    ])
-
-  let in_call_part = case r.in_call {
-    0 -> element.fragment([])
+  //
+  // Each segment is a *deviation* indicator — we render only when there
+  // is something to claim. "online" is omitted when we have no presence
+  // data yet (count = 0) rather than inventing a fake "1/1"; "in voice"
+  // is omitted at zero; the status segment shows only for non-Connected
+  // states. "· " separators are inserted between the segments that
+  // actually render, so a meta line starting with "in voice" doesn't
+  // begin with an orphan "· ".
+  let online_seg = case r.online {
+    0 -> option.None
     n ->
-      html.span([ui.css([#("color", p.accent), #("font-weight", "400")])], [
-        html.text("· " <> int_to_string(n) <> " in voice"),
-      ])
+      option.Some(#(int_to_string(n) <> " online", [#("font-weight", "400")]))
   }
-
-  let status_part = case r.status {
+  let in_call_seg = case r.in_call {
+    0 -> option.None
+    n ->
+      option.Some(
+        #(int_to_string(n) <> " in voice", [
+          #("color", p.accent),
+          #("font-weight", "400"),
+        ]),
+      )
+  }
+  let status_seg = case r.status {
     Reconnecting ->
-      html.span([ui.css([#("color", p.warn), #("font-weight", "400")])], [
-        html.text("· reconnecting"),
-      ])
+      option.Some(
+        #("reconnecting", [
+          #("color", p.warn),
+          #("font-weight", "400"),
+        ]),
+      )
     Offline ->
-      html.span([ui.css([#("color", p.text_faint), #("font-weight", "400")])], [
-        html.text("· offline"),
-      ])
-    Connected -> element.fragment([])
+      option.Some(
+        #("offline", [
+          #("color", p.text_faint),
+          #("font-weight", "400"),
+        ]),
+      )
+    Connected -> option.None
   }
 
-  [online_total, in_call_part, status_part]
+  let segs =
+    [online_seg, in_call_seg, status_seg]
+    |> list.filter_map(fn(o) {
+      case o {
+        option.Some(s) -> Ok(s)
+        option.None -> Error(Nil)
+      }
+    })
+
+  list.index_map(segs, fn(seg, i) {
+    let #(text, css) = seg
+    let prefix = case i {
+      0 -> ""
+      _ -> "· "
+    }
+    html.span([ui.css(css)], [html.text(prefix <> text)])
+  })
 }
 
 fn room_mini(

@@ -2293,7 +2293,8 @@ fn room_view_with_state(
   current_name: String,
   state: RoomState,
 ) -> Element(Msg) {
-  let displayed_rooms = resolve_rooms(model.joined_rooms, model.intents)
+  let displayed_rooms =
+    resolve_rooms(model.joined_rooms, model.intents, model.rooms)
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
   let active_room = lookup_room(displayed_rooms, current_name, model.intents)
 
@@ -3014,16 +3015,42 @@ fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
 /// Resolve a list of joined room names to rich Room records. Names
 /// that match a fixture room reuse its mock data; anything else falls
 /// back to a synthetic Room so the rail still renders something useful.
+/// The `online` field on each returned Room is always derived from the
+/// per-room live member list (`rooms` dict) — fixture/synthetic defaults
+/// are placeholders the resolver overwrites.
 fn resolve_rooms(
   names: List(String),
   intents: Dict(Float, sunset.IntentSnapshot),
+  rooms: Dict(String, RoomState),
 ) -> List(Room) {
   let fixture_rooms = fixture.rooms()
   let conn = relay_status_pill(intents)
   list.map(names, fn(name) {
+    let online = online_count_for_room(name, rooms)
     case list.find(fixture_rooms, fn(r) { r.name == name }) {
-      Ok(r) -> Room(..r, status: conn, id: RoomId(name))
-      Error(_) -> synthetic_room(name, intents)
+      Ok(r) -> Room(..r, status: conn, id: RoomId(name), online: online)
+      Error(_) -> synthetic_room(name, intents, online)
+    }
+  })
+}
+
+fn online_count_for_room(name: String, rooms: Dict(String, RoomState)) -> Int {
+  case dict.get(rooms, name) {
+    Ok(state) -> count_online_members(state.members)
+    Error(_) -> 0
+  }
+}
+
+/// Count members whose presence is anything other than `OfflineP`. A
+/// peer counts as online whether they're idle (`Away`), in voice
+/// (`Speaking` / `MutedP`), or plain `Online`. Offline-presence members
+/// — peers we know about but haven't heard a recent heartbeat from —
+/// are excluded.
+pub fn count_online_members(members: List(domain.Member)) -> Int {
+  list.fold(members, 0, fn(acc, m) {
+    case m.status {
+      domain.OfflineP -> acc
+      _ -> acc + 1
     }
   })
 }
@@ -3035,21 +3062,23 @@ fn lookup_room(
 ) -> Room {
   case list.find(rs, fn(r) { r.name == name }) {
     Ok(r) -> r
-    Error(_) -> synthetic_room(name, intents)
+    Error(_) -> synthetic_room(name, intents, 0)
   }
 }
 
 /// Default Room record for a name we have no fixture entry for. Reads
-/// like a freshly-joined room with no observed activity yet.
+/// like a freshly-joined room with no observed activity yet. `online`
+/// is supplied by the caller (derived from live member data); it is
+/// `0` when we have no member snapshot for this room yet.
 fn synthetic_room(
   name: String,
   intents: Dict(Float, sunset.IntentSnapshot),
+  online: Int,
 ) -> Room {
   Room(
     id: RoomId(name),
     name: name,
-    members: 1,
-    online: 1,
+    online: online,
     in_call: 0,
     status: relay_status_pill(intents),
     last_active: "now",
