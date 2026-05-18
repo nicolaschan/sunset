@@ -2281,9 +2281,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // can keep `state.draft` in sync without a synthetic input event).
       let new_value =
         composer.apply_template("composer-textarea", emoji, "", "", True)
-      let #(m, eff) = with_active_room(model, fn(state) {
-        #(RoomState(..state, draft: new_value), effect.none())
-      })
+      let #(m, eff) =
+        with_active_room(model, fn(state) {
+          #(RoomState(..state, draft: new_value), effect.none())
+        })
       // Keep the picker open so the user can drop several emoji in a
       // row without re-clicking the toolbar button. Esc / outside-click
       // / pressing the toolbar button again still closes it.
