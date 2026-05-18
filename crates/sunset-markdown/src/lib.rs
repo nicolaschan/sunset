@@ -56,6 +56,59 @@ pub enum Inline {
 mod blocks;
 mod inline;
 
+/// Count emoji grapheme clusters in `input` (after trimming) IFF every
+/// non-whitespace grapheme is an emoji and the total is in `[1, 3]`.
+/// Returns `0` for any other shape — empty input, mixed text + emoji,
+/// or more than three emoji.
+///
+/// The non-zero return is what callers use to opt into iMessage-style
+/// "jumbo emoji" rendering: short emoji-only messages render at a
+/// larger size than mixed text. The cap at 3 mirrors iMessage / Signal —
+/// beyond that the bubble starts pushing out of the message column.
+///
+/// Grapheme iteration handles ZWJ sequences (👨‍👩‍👧 → 1 cluster),
+/// skin-tone modifiers, regional-indicator flag pairs, and variation
+/// selectors. Detection per grapheme inspects the Unicode `EmojiStatus`
+/// of the base codepoint and rejects the keycap-base set (digits, `#`,
+/// `*`) so plain text like "123" or "**" doesn't get the jumbo
+/// treatment despite those codepoints carrying `Emoji=YES`.
+pub fn emoji_only_count(input: &str) -> u8 {
+    use unicode_properties::UnicodeEmoji;
+    use unicode_properties::emoji::EmojiStatus;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let mut count: u8 = 0;
+    for grapheme in trimmed.graphemes(true) {
+        if grapheme.chars().all(char::is_whitespace) {
+            continue;
+        }
+        let Some(first) = grapheme.chars().next() else {
+            return 0;
+        };
+        let qualifies = matches!(
+            first.emoji_status(),
+            EmojiStatus::EmojiPresentation
+                | EmojiStatus::EmojiPresentationAndModifierBase
+                | EmojiStatus::EmojiPresentationAndEmojiComponent
+                | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+                | EmojiStatus::EmojiModifierBase
+                | EmojiStatus::EmojiOther,
+        );
+        if !qualifies {
+            return 0;
+        }
+        count = count.saturating_add(1);
+        if count > 3 {
+            return 0;
+        }
+    }
+    count
+}
+
 /// Parse a message body into a `Document`. Total: malformed input
 /// degrades to literal text rather than erroring.
 pub fn parse(input: &str) -> Document {
@@ -681,6 +734,90 @@ mod tests {
                 "input: {input:?}"
             );
         }
+    }
+
+    // ----- emoji_only_count -----
+
+    #[test]
+    fn emoji_only_count_single() {
+        assert_eq!(emoji_only_count("🌅"), 1);
+    }
+
+    #[test]
+    fn emoji_only_count_two() {
+        assert_eq!(emoji_only_count("🌅🌙"), 2);
+    }
+
+    #[test]
+    fn emoji_only_count_three() {
+        assert_eq!(emoji_only_count("🌅🌙🔥"), 3);
+    }
+
+    #[test]
+    fn emoji_only_count_four_or_more_is_zero() {
+        // Past three we revert to normal rendering — the message bubble
+        // shouldn't grow without bound.
+        assert_eq!(emoji_only_count("🌅🌙🔥👀"), 0);
+        assert_eq!(emoji_only_count("🌅🌙🔥👀✨"), 0);
+    }
+
+    #[test]
+    fn emoji_only_count_surrounding_whitespace_doesnt_disqualify() {
+        // The user typing "  🌅  " is still emoji-only as far as the
+        // jumbo treatment is concerned.
+        assert_eq!(emoji_only_count("  🌅  "), 1);
+        assert_eq!(emoji_only_count("🌅 🌙"), 2);
+        assert_eq!(emoji_only_count("\n🌅\t"), 1);
+    }
+
+    #[test]
+    fn emoji_only_count_mixed_text_and_emoji_is_zero() {
+        assert_eq!(emoji_only_count("hi 🌅"), 0);
+        assert_eq!(emoji_only_count("🌅!"), 0);
+        assert_eq!(emoji_only_count("🌅."), 0);
+    }
+
+    #[test]
+    fn emoji_only_count_plain_text_is_zero() {
+        assert_eq!(emoji_only_count("hello"), 0);
+        assert_eq!(emoji_only_count("a"), 0);
+    }
+
+    #[test]
+    fn emoji_only_count_empty_is_zero() {
+        assert_eq!(emoji_only_count(""), 0);
+        assert_eq!(emoji_only_count("   "), 0);
+        assert_eq!(emoji_only_count("\n\t"), 0);
+    }
+
+    #[test]
+    fn emoji_only_count_zwj_family_is_one_cluster() {
+        // 👨‍👩‍👧 is a single grapheme composed of three people
+        // codepoints joined by ZWJs (U+200D). `graphemes(true)` folds
+        // it into one segment, and the Extended_Pictographic property
+        // on the base (👨) makes the test pass.
+        assert_eq!(emoji_only_count("👨\u{200D}👩\u{200D}👧"), 1);
+    }
+
+    #[test]
+    fn emoji_only_count_skin_tone_is_one_cluster() {
+        // 👋🏽 = WAVING HAND + MEDIUM SKIN TONE modifier. One grapheme.
+        assert_eq!(emoji_only_count("👋\u{1F3FD}"), 1);
+    }
+
+    #[test]
+    fn emoji_only_count_three_zwj_families_is_three() {
+        // Each ZWJ family is one grapheme; three of them fits the cap.
+        let body = "👨\u{200D}👩\u{200D}👧 👨\u{200D}👩\u{200D}👦 👨\u{200D}👧";
+        assert_eq!(emoji_only_count(body), 3);
+    }
+
+    #[test]
+    fn emoji_only_count_punctuation_only_is_zero() {
+        // No emoji at all — non-zero would mean the function false-
+        // positives on plain ASCII punctuation.
+        assert_eq!(emoji_only_count("!!!"), 0);
+        assert_eq!(emoji_only_count("..."), 0);
     }
 
     #[test]

@@ -55,40 +55,26 @@ export function toPlain(body) {
   return body;
 }
 
-// Count grapheme clusters in `body` after trimming, returning the count
-// IFF every non-whitespace grapheme is an emoji and the total is in
-// [1, 3]. Returns 0 in every other case ("not emoji-only" or "too many
-// emoji to enlarge"). Drives the iMessage-style jumbo-emoji rendering:
-// short emoji-only messages render at a larger size than mixed text.
+// Thin bridge to `sunset_markdown::emoji_only_count` via the WASM
+// bundle. The Rust function owns the policy (grapheme cluster
+// iteration via `unicode-segmentation`, base-codepoint
+// `EmojiStatus` discrimination via `unicode-properties`) so all
+// clients see the same classification — the TUI / native shells will
+// share this same logic when they read messages off the Rust core.
 //
-// Grapheme iteration is required because emoji like 👨‍👩‍👧‍👦 are
-// multi-codepoint ZWJ sequences — naive `[...string]` length would
-// over-count. `Intl.Segmenter` is available in every browser we
-// support (Chromium 87+, WebKit 14.1+, Firefox 125+).
-//
-// "Emoji" is detected via Unicode's `Extended_Pictographic` property,
-// which matches the base codepoint of every emoji grapheme cluster
-// (skin-tone modifiers, ZWJ joiners, variation selectors are extenders
-// that the segmenter folds into a single cluster).
-//
-// The `Intl.Segmenter` is built once at module load and reused — it's
-// stateless and instantiation isn't free at message-list scale.
-const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
-  granularity: "grapheme",
-});
-const WHITESPACE_RE = /^\s+$/u;
-const EMOJI_RE = /\p{Extended_Pictographic}/u;
-
+// When the WASM bundle isn't loaded (Node `gleam test` env), the
+// function returns 0, which means "Normal" rendering — a safe
+// fallback for the unit-test environment where the WASM bundle isn't
+// present. The Playwright e2e suite exercises the real Rust → WASM
+// → Gleam → DOM path.
 export function emojiOnlyCount(body) {
   if (typeof body !== "string") return 0;
-  const trimmed = body.trim();
-  if (trimmed.length === 0) return 0;
-  let count = 0;
-  for (const { segment } of GRAPHEME_SEGMENTER.segment(trimmed)) {
-    if (WHITESPACE_RE.test(segment)) continue;
-    if (!EMOJI_RE.test(segment)) return 0;
-    count += 1;
-    if (count > 3) return 0;
+  if (wasmModule && wasmModule.emoji_only_count) {
+    try {
+      return wasmModule.emoji_only_count(body);
+    } catch (err) {
+      console.error("markdown.emojiOnlyCount WASM call failed:", err);
+    }
   }
-  return count;
+  return 0;
 }
