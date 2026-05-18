@@ -14,7 +14,6 @@
 
 import gleam/dict.{type Dict}
 import gleam/float
-import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -46,6 +45,7 @@ import sunset_web/views/bottom_sheet
 import sunset_web/views/channels
 import sunset_web/views/details_panel
 import sunset_web/views/emoji_picker
+import sunset_web/views/image_theater
 import sunset_web/views/landing
 import sunset_web/views/main_panel
 import sunset_web/views/members
@@ -53,6 +53,7 @@ import sunset_web/views/peer_status_popover
 import sunset_web/views/phone_header
 import sunset_web/views/relays as relays_view
 import sunset_web/views/rooms
+import sunset_web/views/self_settings_row
 import sunset_web/views/settings_popover
 import sunset_web/views/shell
 import sunset_web/views/touch_drag
@@ -60,6 +61,7 @@ import sunset_web/views/voice_error_toast
 import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
 import sunset_web/voice
+import sunset_web/voice_volume
 
 /// Relays the client dials at startup when the URL has no
 /// `?relay=…` query parameter. Each entry is fed through
@@ -100,6 +102,11 @@ pub type RoomState {
     /// any voice channels at the end.
     channels: List(domain.Channel),
     draft: String,
+    /// Images the user has staged in the composer but not yet sent.
+    /// Cleared after a successful submit; mutated by AttachImages /
+    /// RemoveAttachment messages. An image-only post is fine — submit
+    /// with empty draft + non-empty pending_attachments.
+    pending_attachments: List(domain.Attachment),
     selected_msg_id: Option(String),
     reacting_to: Option(String),
     sheet: Option(domain.Sheet),
@@ -122,6 +129,7 @@ fn empty_room_state() -> RoomState {
     current_channel: domain.default_channel_id(),
     channels: initial_channels(),
     draft: "",
+    pending_attachments: [],
     selected_msg_id: None,
     reacting_to: None,
     sheet: None,
@@ -147,8 +155,13 @@ fn initial_channels() -> List(domain.Channel) {
       unread: 0,
     ),
     domain.Channel(
+      // Default voice channel is named "general" in parallel to the
+      // default text channel — same room-wide affordance for "the
+      // unstructured place where everyone hangs out", just one for
+      // typing and one for talking. The kind in the channels rail is
+      // what distinguishes them, not the name.
       id: ChannelId("voice"),
-      name: "Voice Channel",
+      name: "general",
       kind: domain.Voice,
       in_call: 0,
       unread: 0,
@@ -167,6 +180,11 @@ pub type Model {
     theme_pref: Pref,
     /// True when the settings popover (theme + reset) is visible.
     settings_open: Bool,
+    /// When `Some`, render the full-screen image theater overlay for
+    /// this attachment. Click on the backdrop or pressing Escape sets
+    /// it back to `None`. Carried on the top-level model (not per-room)
+    /// because the overlay is global UI; only one image is up at a time.
+    image_theater: Option(domain.Attachment),
     view: View,
     joined_rooms: List(String),
     rooms_collapsed: Bool,
@@ -229,9 +247,19 @@ pub type Model {
     /// `voice_start`. Read from the store at model init so the radio
     /// in the self-row popover renders the right initial selection.
     voice_quality: String,
-    /// IntentId of the relay whose popover is currently open. Client-wide
-    /// (not per-room) because relays are a client-level concept.
-    relays_popover: option.Option(Float),
+    /// Send-side browser echo cancellation. Independent of the quality
+    /// preset and persisted under its own `sunset/echo-cancellation`
+    /// localStorage key. Drives the self-row popover toggle and the
+    /// `getUserMedia` `echoCancellation` constraint when the mic is
+    /// (re-)acquired.
+    voice_echo_cancellation: Bool,
+    /// IntentId of the relay whose popover is currently open + the
+    /// click's `clientY` (so the desktop popover can anchor near the
+    /// row that opened it instead of being pinned to the viewport
+    /// bottom). `None` for clicks that don't carry a Y (synthetic
+    /// events, keyboard activation). Client-wide (not per-room)
+    /// because relays are a client-level concept.
+    relays_popover: option.Option(#(Float, option.Option(Float))),
     /// Peer display-name map, keyed by full hex pubkey. Rebuilt from each
     /// room's member list on MembersUpdated. Used by display_name() to
     /// resolve a peer's chosen name with short_pubkey fallback.
@@ -250,6 +278,11 @@ pub type Msg {
   ToggleMode
   OpenSettings
   CloseSettings
+  /// Click on an inline message image — show it full-screen in the
+  /// theater overlay.
+  OpenImageTheater(domain.Attachment)
+  /// Backdrop click or Escape key — dismiss the theater overlay.
+  CloseImageTheater
   SetThemePref(Pref)
   ResetLocalState
   HashChanged(String)
@@ -266,6 +299,15 @@ pub type Msg {
   SelectChannel(ChannelId)
   ToggleRoomsRail
   UpdateDraft(String)
+  /// User clicked the composer's attach button; open the OS image picker.
+  PickImages
+  /// Picker resolved (possibly with an empty list if the user cancelled
+  /// or selected nothing valid). Appends to the active room's
+  /// `pending_attachments`.
+  ImagesPicked(List(domain.Attachment))
+  /// Remove the attachment at `index` (0-based) from the active room's
+  /// `pending_attachments`. Out-of-bounds indices are silently ignored.
+  RemoveAttachment(index: Int)
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
   AddReaction(String, String)
@@ -284,7 +326,10 @@ pub type Msg {
   CloseVoicePopover
   OpenPeerStatusPopover(domain.MemberId)
   ClosePeerStatusPopover
-  OpenRelayPopover(Float)
+  /// Open the relay popover anchored at the click's `clientY` on
+  /// desktop. `None` for the anchor when the trigger doesn't carry a
+  /// mouse Y (mobile sheet placement ignores the anchor).
+  OpenRelayPopover(id: Float, anchor_y: option.Option(Float))
   CloseRelayPopover
   Tick(Int)
   SetMemberVolume(String, Int)
@@ -294,13 +339,22 @@ pub type Msg {
   /// Self-row popover radio: change the active send-side Opus
   /// quality preset (`"voice"` / `"high"` / `"maximum"`).
   SetVoiceQuality(String)
+  /// Self-row popover toggle: enable/disable browser-side echo
+  /// cancellation on the outgoing mic capture. Independent of the
+  /// quality preset.
+  SetVoiceEchoCancellation(Bool)
   // sunset-web-wasm bridge wiring:
   IdentityReady(BitArray)
   ClientReady(ClientHandle)
   IntentChanged(snap: sunset.IntentSnapshot)
   /// A room's wasm-side handle is ready; register callbacks + start presence.
   RoomOpened(name: String, handle: RoomHandle)
-  IncomingMsg(room: String, im: IncomingMessage)
+  /// Full sorted-by-claimed-time snapshot of the room's Text timeline.
+  /// Replaces the older per-message append flow so the Rust core owns
+  /// the ordering — all client surfaces inherit the same sort. Fires
+  /// immediately on callback registration with the current snapshot
+  /// (possibly empty) and again on every change.
+  MessagesSnapshot(room: String, ims: List(IncomingMessage))
   /// Live channel set observed for the named room. Fired immediately on
   /// callback registration with the current sorted snapshot, then
   /// again on every change. The reducer merges these into
@@ -346,7 +400,6 @@ pub type Msg {
   LeaveVoice
   ToggleSelfMute
   ToggleSelfDeafen
-  ToggleSelfDenoise
   VoicePeerStateChanged(
     peer_hex: String,
     in_call: Bool,
@@ -411,6 +464,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       mode: initial_mode,
       theme_pref: initial_pref,
       settings_open: False,
+      image_theater: None,
       view: initial_view,
       joined_rooms: joined,
       rooms_collapsed: False,
@@ -432,13 +486,14 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
         self_in_call: None,
         self_muted: False,
         self_deafened: False,
-        denoise: True,
         peers: dict.new(),
         peer_levels: dict.new(),
         self_level: 0.0,
         permission_error: None,
+        observed_room: None,
       ),
       voice_quality: voice.voice_get_quality(),
+      voice_echo_cancellation: voice.voice_get_echo_cancellation(),
       relays_popover: None,
       name_map: dict.new(),
       self_name: storage.read_self_name(),
@@ -508,6 +563,18 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       composer.attach_shortcut_prevent_default("composer-textarea")
     })
 
+  let install_image_paste_eff =
+    effect.from(fn(dispatch) {
+      composer.install_image_paste_handler("composer-textarea", fn(pairs) {
+        let atts =
+          list.map(pairs, fn(p) {
+            let #(mime, data) = p
+            domain.Attachment(mime_type: mime, data_base64: data)
+          })
+        dispatch(ImagesPicked(atts))
+      })
+    })
+
   let install_voice_handler_eff =
     effect.from(fn(dispatch) {
       voice.install_voice_state_handler(
@@ -552,6 +619,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       subscribe_touch_drag,
       ticker_eff,
       attach_shortcuts_eff,
+      install_image_paste_eff,
       install_voice_handler_eff,
       install_voice_level_handlers_eff,
       initial_compose_reset_eff,
@@ -588,24 +656,14 @@ fn peer_level_for_member(
   }
 }
 
-/// Convert a linear gain float (0.0–2.0) to an integer volume percent (0–200).
+/// Convert a linear gain float to the matching integer slider
+/// percent. Mirrors the linear-then-exponential curve in
+/// `voice_volume.percent_to_gain` so a model that stores raw gain
+/// (e.g. when an FFI caller dispatched `SetPeerVolume` with a
+/// multiplier) can be rendered back into the slider's position.
 fn float_to_volume_int(gain: Float) -> Int {
-  let clamped = case gain <. 0.0 {
-    True -> 0.0
-    False ->
-      case gain >. 2.0 {
-        True -> 2.0
-        False -> gain
-      }
-  }
-  // Truncate to int by flooring: multiply, convert via string parse as fallback.
-  // Using integer division as the JS target represents floats precisely enough.
-  // `int.to_float(x) == f` isn't available directly; nearest: truncate via cast.
-  float_truncate(clamped *. 100.0)
+  voice_volume.gain_to_percent(gain)
 }
-
-@external(javascript, "./sunset_web/sunset.ffi.mjs", "truncFloat")
-fn float_truncate(f: Float) -> Int
 
 /// Add `name` to `existing` if it isn't already present (prepending
 /// at the head, which is where new rooms appear). If `name` is
@@ -684,6 +742,32 @@ pub fn display_name(name_map: Dict(String, String), pk: BitArray) -> String {
 @external(javascript, "./sunset_web/sunset.ffi.mjs", "shortPubkey")
 fn short_pubkey(bits: BitArray) -> String
 
+/// Convert a wasm-side IncomingMessage into the local domain.Message.
+/// Called once per snapshot fire from `on_messages_changed`; the order
+/// of the snapshot is already correct (Rust sorted by claimed time),
+/// so this is a pure field-by-field projection.
+fn incoming_to_message(im: IncomingMessage) -> domain.Message {
+  let attachments =
+    list.map(sunset.inc_images(im), fn(p) {
+      let #(mime, data) = p
+      domain.Attachment(mime_type: mime, data_base64: data)
+    })
+  domain.Message(
+    id: sunset.inc_value_hash_hex(im),
+    author_pubkey: sunset.inc_author_pubkey(im),
+    initials: short_initials(sunset.inc_author_pubkey(im)),
+    time: format_time_ms(sunset.inc_sent_at_ms(im)),
+    body: sunset.inc_body(im),
+    channel: sunset.inc_channel(im),
+    seen_by: 0,
+    you: sunset.inc_is_self(im),
+    pending: False,
+    reactions: [],
+    details: domain.NoDetails,
+    attachments: attachments,
+  )
+}
+
 /// Resolve a list of domain.Message into domain.MessageView, baking in the
 /// author display name (from name_map, falling back to short_pubkey).
 pub fn resolve_messages(
@@ -703,6 +787,7 @@ pub fn resolve_messages(
       pending: m.pending,
       reactions: m.reactions,
       details: m.details,
+      attachments: m.attachments,
     )
   })
 }
@@ -842,6 +927,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     OpenSettings -> #(Model(..model, settings_open: True), effect.none())
     CloseSettings -> #(Model(..model, settings_open: False), effect.none())
+    OpenImageTheater(att) -> #(
+      Model(..model, image_theater: Some(att)),
+      effect.none(),
+    )
+    CloseImageTheater -> #(Model(..model, image_theater: None), effect.none())
     SetThemePref(pref) -> {
       let next_mode = theme.resolve_mode(pref, storage.prefers_dark())
       let label = case pref {
@@ -1134,6 +1224,47 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           effect.from(fn(_dispatch) { composer.auto_grow("composer-textarea") }),
         )
       })
+    PickImages -> {
+      // Fire the picker via FFI; on resolve, dispatch ImagesPicked.
+      // The picker is shared across rooms; results land in whichever
+      // room is active when the callback fires (the picker dialog is
+      // blocking from the user's perspective, so room switches mid-
+      // pick are not a real concern).
+      let eff =
+        effect.from(fn(dispatch) {
+          sunset.pick_images(fn(pairs) {
+            let atts =
+              list.map(pairs, fn(p) {
+                let #(mime, data) = p
+                domain.Attachment(mime_type: mime, data_base64: data)
+              })
+            dispatch(ImagesPicked(atts))
+          })
+        })
+      #(model, eff)
+    }
+    ImagesPicked(atts) ->
+      with_active_room(model, fn(state) {
+        case atts {
+          [] -> #(state, effect.none())
+          _ -> #(
+            RoomState(
+              ..state,
+              pending_attachments: list.append(state.pending_attachments, atts),
+            ),
+            effect.none(),
+          )
+        }
+      })
+    RemoveAttachment(idx) ->
+      with_active_room(model, fn(state) {
+        let kept =
+          state.pending_attachments
+          |> list.index_map(fn(a, i) { #(i, a) })
+          |> list.filter(fn(p) { p.0 != idx })
+          |> list.map(fn(p) { p.1 })
+        #(RoomState(..state, pending_attachments: kept), effect.none())
+      })
     IdentityReady(seed) -> {
       let create_client_eff =
         effect.from(fn(dispatch) {
@@ -1265,7 +1396,9 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let #(interval, ttl, refresh) = sunset.presence_params_from_url()
       let wire_eff =
         effect.from(fn(dispatch) {
-          sunset.on_message(handle, fn(im) { dispatch(IncomingMsg(name, im)) })
+          sunset.on_messages_changed(handle, fn(ims) {
+            dispatch(MessagesSnapshot(name, ims))
+          })
           sunset.on_channels_changed(handle, fn(chans) {
             dispatch(ChannelsObserved(name, chans))
           })
@@ -1293,34 +1426,51 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           })
           sunset.start_presence(handle, interval, ttl, refresh)
         })
-      #(Model(..model, rooms: new_rooms), wire_eff)
+      // Start the voice runtime in observer mode for the active room.
+      // We only do this once per session: the observer keeps running
+      // across join/leave and across other-room opens. The runtime
+      // itself is a singleton on the wasm Client, so a second
+      // voice_observe_start would error out — observed_room guards
+      // against that and also lets `JoinVoice` know whether the
+      // observer is already in place for the room being joined.
+      let active_name = active_room_name(model)
+      let #(new_voice, observe_eff) = case
+        model.client,
+        model.voice.observed_room,
+        name == active_name
+      {
+        Some(client), None, True -> {
+          let updated =
+            VoiceModel(..model.voice, observed_room: Some(RoomId(name)))
+          let eff =
+            effect.from(fn(_dispatch) {
+              voice.voice_observe_start(client, handle, fn(_result) {
+                // Failure here is non-fatal: the rail will simply
+                // stay in the idle shape for this user, matching the
+                // pre-observer behaviour.
+                Nil
+              })
+            })
+          #(updated, eff)
+        }
+        _, _, _ -> #(model.voice, effect.none())
+      }
+      #(
+        Model(..model, rooms: new_rooms, voice: new_voice),
+        effect.batch([wire_eff, observe_eff]),
+      )
     }
-    IncomingMsg(name, im) -> {
+    MessagesSnapshot(name, ims) -> {
       case dict.get(model.rooms, name) {
         Error(_) -> #(model, effect.none())
         Ok(state) -> {
-          let new_msg =
-            domain.Message(
-              id: sunset.inc_value_hash_hex(im),
-              author_pubkey: sunset.inc_author_pubkey(im),
-              initials: short_initials(sunset.inc_author_pubkey(im)),
-              time: format_time_ms(sunset.inc_sent_at_ms(im)),
-              body: sunset.inc_body(im),
-              channel: sunset.inc_channel(im),
-              seen_by: 0,
-              you: sunset.inc_is_self(im),
-              pending: False,
-              reactions: [],
-              details: domain.NoDetails,
-            )
-          // Append; dedupe by id to handle Replay::All re-emits.
-          let updated = case
-            list.any(state.messages, fn(m) { m.id == new_msg.id })
-          {
-            True -> state.messages
-            False -> list.append(state.messages, [new_msg])
-          }
-          let new_state = RoomState(..state, messages: updated)
+          // The wasm side already orders by sender-claimed `sent_at_ms`
+          // (tie-broken on value-hash), so we render the list as-is.
+          // No Gleam-side sort, no per-message dedupe — the Rust
+          // BTreeMap is the single source of truth, and the snapshot
+          // is the full Text timeline of the room.
+          let messages = list.map(ims, incoming_to_message)
+          let new_state = RoomState(..state, messages: messages)
           #(
             Model(..model, rooms: dict.insert(model.rooms, name, new_state)),
             effect.none(),
@@ -1343,16 +1493,28 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             None -> #(model, effect.none())
             Some(handle) -> {
               let body = sanitize(state.draft)
-              case body {
-                "" -> #(model, effect.none())
-                _ -> {
+              let has_images = case state.pending_attachments {
+                [] -> False
+                _ -> True
+              }
+              // Empty body is only sendable when at least one image is
+              // attached (image-only post). Otherwise SubmitDraft is a
+              // no-op, mirroring how Slack/Teams/Signal handle this.
+              case body, has_images {
+                "", False -> #(model, effect.none())
+                _, _ -> {
                   let ChannelId(channel_str) = state.current_channel
+                  let images_payload =
+                    list.map(state.pending_attachments, fn(a) {
+                      #(a.mime_type, a.data_base64)
+                    })
                   let send_eff =
                     effect.from(fn(dispatch) {
                       sunset.send_message(
                         handle,
                         channel_str,
                         body,
+                        images_payload,
                         current_time_ms(),
                         fn(r) { dispatch(MessageSent(r)) },
                       )
@@ -1367,7 +1529,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                     effect.from(fn(_dispatch) {
                       composer.reset_textarea("composer-textarea")
                     })
-                  let cleared = RoomState(..state, draft: "")
+                  let cleared =
+                    RoomState(..state, draft: "", pending_attachments: [])
                   #(
                     Model(
                       ..model,
@@ -1592,8 +1755,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       with_active_room(model, fn(state) {
         #(RoomState(..state, peer_status_popover: None), effect.none())
       })
-    OpenRelayPopover(id) -> #(
-      Model(..model, relays_popover: option.Some(id)),
+    OpenRelayPopover(id, anchor_y) -> #(
+      Model(..model, relays_popover: option.Some(#(id, anchor_y))),
       effect.none(),
     )
     CloseRelayPopover -> #(
@@ -1604,8 +1767,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, volume: value)
-      // Also forward to FFI so real peers (when name == peer_hex) get updated.
-      let gain = int.to_float(value) /. 100.0
+      // Also forward to FFI so real peers (when name == peer_hex) get
+      // updated. The slider is linear below 100% and exponential above
+      // — see `voice_volume` for the curve and rationale.
+      let gain = voice_volume.percent_to_gain(value)
       let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
         Model(
@@ -1618,13 +1783,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     ToggleMemberDenoise(name) -> {
       let settings = member_voice_settings(model.voice_settings, name)
       let next = domain.VoiceSettings(..settings, denoise: !settings.denoise)
-      // Denoise is cosmetic in C2c — no FFI wiring yet.
+      let eff = case model.client {
+        Some(client) ->
+          effect.from(fn(_) {
+            voice.voice_set_peer_denoise(client, name, next.denoise)
+          })
+        None -> effect.none()
+      }
       #(
         Model(
           ..model,
           voice_settings: dict.insert(model.voice_settings, name, next),
         ),
-        effect.none(),
+        eff,
       )
     }
     ToggleMemberDeafen(name) -> {
@@ -1634,7 +1805,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // Mute-for-me: set GainNode to 0 or restore prior volume via FFI.
       let gain = case new_deafened {
         True -> 0.0
-        False -> int.to_float(settings.volume) /. 100.0
+        False -> voice_volume.percent_to_gain(settings.volume)
       }
       let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
@@ -1669,6 +1840,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         None -> effect.none()
       }
       #(Model(..model, voice_quality: label), eff)
+    }
+    SetVoiceEchoCancellation(enabled) -> {
+      // Persist + apply. The JS bridge writes localStorage and, if the
+      // mic is currently captured, re-acquires it with the new
+      // `echoCancellation` constraint. No-op on the encoder.
+      let eff = case model.client {
+        Some(c) ->
+          effect.from(fn(_) { voice.voice_set_echo_cancellation(c, enabled) })
+        None -> effect.none()
+      }
+      #(Model(..model, voice_echo_cancellation: enabled), eff)
     }
     ViewportChanged(v) -> {
       // Crossing the boundary in either direction closes any open drawer.
@@ -1771,16 +1953,42 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               // WASM voice runtime is ready, leading callers (UI clicks,
               // tests) to act on a half-initialised pipeline. On Error we
               // dispatch VoicePermissionDenied which surfaces a toast.
-              let eff =
-                effect.from(fn(dispatch) {
-                  voice.voice_start(client, handle, fn(result) {
-                    case result {
-                      Ok(_) -> dispatch(VoiceStarted(room_id))
-                      Error(msg) -> dispatch(VoicePermissionDenied(msg))
-                    }
+              //
+              // When the observer is already running for this room (typical
+              // case: RoomOpened started it on room load), we only need to
+              // flip the gate — `voice_activate` triggers `getUserMedia`
+              // and toggles `is_active=true`. If the observer isn't running
+              // yet (race between RoomOpened and the user clicking Join,
+              // or no client) we fall back to the legacy one-shot
+              // `voice_start` so behaviour stays the same.
+              let observer_matches = model.voice.observed_room == Some(room_id)
+              let eff = case observer_matches {
+                True ->
+                  effect.from(fn(dispatch) {
+                    voice.voice_activate(client, fn(result) {
+                      case result {
+                        Ok(_) -> dispatch(VoiceStarted(room_id))
+                        Error(msg) -> dispatch(VoicePermissionDenied(msg))
+                      }
+                    })
                   })
-                })
-              #(model, eff)
+                False ->
+                  effect.from(fn(dispatch) {
+                    voice.voice_start(client, handle, fn(result) {
+                      case result {
+                        Ok(_) -> dispatch(VoiceStarted(room_id))
+                        Error(msg) -> dispatch(VoicePermissionDenied(msg))
+                      }
+                    })
+                  })
+              }
+              // Mark this room as observed (the legacy fallback path
+              // implicitly observes too — both `voice_start` and
+              // `voice_activate` leave the durable-presence subscription
+              // up).
+              let new_voice =
+                VoiceModel(..model.voice, observed_room: Some(room_id))
+              #(Model(..model, voice: new_voice), eff)
             }
             None -> {
               let new_voice =
@@ -1807,35 +2015,75 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     VoiceStarted(room_id) -> {
       let new_voice = VoiceModel(..model.voice, self_in_call: Some(room_id))
       // Each voice_start spawns a fresh runtime that defaults to
-      // denoise on. Push the model's current value so a user who turned
-      // denoise off in a previous session sees the same state on rejoin.
-      let eff = case model.client, model.voice.denoise {
-        Some(client), False ->
-          effect.from(fn(_) { voice.voice_set_denoise(client, False) })
-        _, _ -> effect.none()
+      // denoise on for every peer. Push any peers the user has
+      // disabled denoising for in `voice_settings` so a previously
+      // toggled-off peer stays off across rejoin.
+      let eff = case model.client {
+        Some(client) -> {
+          let disabled =
+            dict.fold(model.voice_settings, [], fn(acc, hex, settings) {
+              case settings.denoise {
+                True -> acc
+                False -> [hex, ..acc]
+              }
+            })
+          case disabled {
+            [] -> effect.none()
+            _ ->
+              effect.from(fn(_) {
+                list.each(disabled, fn(hex) {
+                  voice.voice_set_peer_denoise(client, hex, False)
+                })
+              })
+          }
+        }
+        None -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
     }
 
     LeaveVoice -> {
-      // Clear peer state + levels so a fresh join doesn't reuse stale
-      // bars / talking flags. The FFI's stopCapture flushes its own
-      // EMA state and dispatches one final 0 per peer, but we reset
-      // here too so the UI is clean immediately on click rather than
-      // racing the FFI callback.
+      // After deactivate we no longer have a P2P leg with any peer,
+      // so `in_call` and `talking` are false from our perspective for
+      // every entry in the dict. Flip them eagerly rather than waiting
+      // for `membership_alive` to age out (~5 s) — otherwise the rail
+      // would keep rendering peers as "Connected" with stale waveforms
+      // for several seconds after the user clicks Leave. We keep
+      // `in_voice_channel` as-is so the roster stays visible: those
+      // peers are still in the channel, just no longer connected
+      // to us. The combiner's natural state-debouncing means the
+      // next emission for each peer matches what we set here, so no
+      // churn.
+      let new_peers =
+        dict.map_values(model.voice.peers, fn(_hex, ps) {
+          VoicePeerStateUI(
+            in_call: False,
+            talking: False,
+            is_muted: ps.is_muted,
+            in_voice_channel: ps.in_voice_channel,
+          )
+        })
       let new_voice =
         VoiceModel(
           ..model.voice,
           self_in_call: None,
           self_muted: False,
           self_deafened: False,
-          peers: dict.new(),
+          peers: new_peers,
           peer_levels: dict.new(),
           self_level: 0.0,
         )
-      let eff = case model.client {
-        Some(client) -> effect.from(fn(_) { voice.voice_stop(client) })
-        None -> effect.none()
+      // Prefer `voice_deactivate` when the observer is running for
+      // this room: it stops mic capture + heartbeats + publishing
+      // but leaves the durable-presence subscription up, so the
+      // user keeps seeing who else is in the channel after they
+      // leave. Fall back to `voice_stop` for legacy callers that
+      // started the runtime via `voice_start`.
+      let eff = case model.client, model.voice.observed_room {
+        Some(client), Some(_) ->
+          effect.from(fn(_) { voice.voice_deactivate(client) })
+        Some(client), None -> effect.from(fn(_) { voice.voice_stop(client) })
+        None, _ -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
     }
@@ -1857,17 +2105,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let eff = case model.client {
         Some(client) ->
           effect.from(fn(_) { voice.voice_set_deafened(client, new_deafened) })
-        None -> effect.none()
-      }
-      #(Model(..model, voice: new_voice), eff)
-    }
-
-    ToggleSelfDenoise -> {
-      let new_denoise = !model.voice.denoise
-      let new_voice = VoiceModel(..model.voice, denoise: new_denoise)
-      let eff = case model.client {
-        Some(client) ->
-          effect.from(fn(_) { voice.voice_set_denoise(client, new_denoise) })
         None -> effect.none()
       }
       #(Model(..model, voice: new_voice), eff)
@@ -1925,7 +2162,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let new_muted_for_me = !settings.deafened
       let gain = case new_muted_for_me {
         True -> 0.0
-        False -> int.to_float(settings.volume) /. 100.0
+        False -> voice_volume.percent_to_gain(settings.volume)
       }
       let new_settings =
         domain.VoiceSettings(..settings, deafened: new_muted_for_me)
@@ -2203,6 +2440,18 @@ fn room_view_with_state(
     _, _, _ -> element.fragment([])
   }
 
+  let image_theater_el = case model.image_theater {
+    Some(att) ->
+      image_theater.view(
+        palette: palette,
+        mime_type: att.mime_type,
+        data_base64: att.data_base64,
+        on_close: CloseImageTheater,
+        noop: NoOp,
+      )
+    None -> element.fragment([])
+  }
+
   let settings_overlay_el = case model.viewport, model.settings_open {
     domain.Desktop, True ->
       settings_popover.view(
@@ -2338,13 +2587,15 @@ fn room_view_with_state(
               member: m,
               settings: member_voice_settings(model.voice_settings, id_str),
               voice_quality: model.voice_quality,
+              echo_cancellation: model.voice_echo_cancellation,
               level: peer_level_for_member(model.voice, m, id_str),
               on_close: CloseVoicePopover,
               on_set_volume: fn(v) {
-                SetPeerVolume(id_str, int.to_float(v) /. 100.0)
+                SetPeerVolume(id_str, voice_volume.percent_to_gain(v))
               },
               on_toggle_denoise: ToggleMemberDenoise(id_str),
               on_set_voice_quality: SetVoiceQuality,
+              on_set_echo_cancellation: SetVoiceEchoCancellation,
               on_toggle_deafen: ToggleMuteForPeer(id_str),
               on_reset: ResetMemberVoice(id_str),
             ),
@@ -2377,7 +2628,7 @@ fn room_view_with_state(
   }
 
   let relay_sheet_el = case model.viewport, model.relays_popover {
-    domain.Phone, Some(id) -> {
+    domain.Phone, Some(#(id, _anchor_y)) -> {
       let rs = relays_view.relays_for_view(model.intents)
       case list.find(rs, fn(r) { r.id == id }) {
         Ok(r) ->
@@ -2430,7 +2681,7 @@ fn room_view_with_state(
   let active_voice_channel_name =
     list.find(channels_for_view, fn(c) { c.kind == domain.Voice })
     |> result.map(fn(c) { c.name })
-    |> result.unwrap("Voice Channel")
+    |> result.unwrap("general")
 
   // Self peer hex for the minibar's "open my own popover" affordance.
   // Falls back to "self" when there's no client (pre-bootstrap, never
@@ -2440,8 +2691,13 @@ fn room_view_with_state(
     |> option.map(client_pubkey_hex)
     |> option.unwrap("self")
 
-  let voice_minibar_el = case model.viewport, user_in_call {
-    domain.Phone, True ->
+  // Single in-call bar across both viewports: a strip at the top of
+  // the chat panel showing the connected channel + mute / deafen /
+  // leave. The denoise toggle (and per-peer volume / send quality)
+  // live in the user's own voice popover, opened by tapping the
+  // channel name in the bar.
+  let voice_minibar_el = case user_in_call {
+    True ->
       voice_minibar.view(
         palette: palette,
         channel_name: active_voice_channel_name,
@@ -2452,7 +2708,7 @@ fn room_view_with_state(
         self_muted: model.voice.self_muted,
         self_deafened: model.voice.self_deafened,
       )
-    _, _ -> element.fragment([])
+    False -> element.fragment([])
   }
 
   shell.view(
@@ -2486,8 +2742,6 @@ fn room_view_with_state(
       on_drag_end: DragRoomEnd,
       toggle: ToggleRoomsRail,
       viewport: model.viewport,
-      members: state.members,
-      on_open_settings: OpenSettings,
     ),
     channels.view(
       palette: palette,
@@ -2510,15 +2764,14 @@ fn room_view_with_state(
       on_open_rooms: OpenDrawer(domain.RoomsDrawer),
       on_join_voice: JoinVoice(active_room.id),
       on_leave_voice: LeaveVoice,
-      on_mute_self: ToggleSelfMute,
-      on_deafen_self: ToggleSelfDeafen,
-      on_toggle_denoise: ToggleSelfDenoise,
-      self_in_call: option.is_some(model.voice.self_in_call),
-      self_muted: model.voice.self_muted,
-      self_deafened: model.voice.self_deafened,
-      denoise_on: model.voice.denoise,
-      relays: relays_view.relays_for_view(model.intents),
-      on_open_relay: OpenRelayPopover,
+      // Scope "in call" to this room: a user can only be in one voice
+      // call at a time, so when they're in room A's call but viewing
+      // room B, B's voice block must read as observer (gray), not as
+      // joined (magenta).
+      self_in_call: case model.voice.self_in_call {
+        Some(rid) -> rid == active_room.id
+        None -> False
+      },
     ),
     main_panel.view(
       palette: palette,
@@ -2526,8 +2779,11 @@ fn room_view_with_state(
       current_channel: state.current_channel,
       messages: filtered_resolved_messages,
       draft: state.draft,
+      pending_attachments: state.pending_attachments,
       on_draft: UpdateDraft,
       on_submit: SubmitDraft,
+      on_pick_images: PickImages,
+      on_remove_attachment: RemoveAttachment,
       noop: NoOp,
       on_shortcut: fn(b, m, a, caret) { ApplyComposerShortcut(b, m, a, caret) },
       reacting_to: state.reacting_to,
@@ -2539,6 +2795,7 @@ fn room_view_with_state(
       on_add_reaction: ToggleReactionEmoji,
       on_open_full_picker: OpenFullEmojiPicker,
       on_open_detail: OpenDetail,
+      on_open_image: OpenImageTheater,
       receipts: state.receipts,
       selected_msg_id: state.selected_msg_id,
       on_toggle_selected: ToggleMessageSelected,
@@ -2551,24 +2808,30 @@ fn room_view_with_state(
       members: state.members,
       voice_minibar: voice_minibar_el,
     ),
-    case model.viewport, detail_msg {
-      domain.Desktop, Some(m) ->
-        details_panel.view(
-          palette: palette,
-          message: m,
-          receipts: receipts_for(state.receipts, m.id),
-          reactions: reactions_for(model.reactions, m.id),
-          members: state.members,
-          name_map: model.name_map,
-          on_close: CloseDetail,
-        )
-      _, _ ->
-        members.view(
-          palette: palette,
-          members: state.members,
-          on_open_status: OpenPeerStatusPopover,
-        )
-    },
+    right_rail_with_self_row(
+      palette,
+      state.members,
+      case model.viewport, detail_msg {
+        domain.Desktop, Some(m) ->
+          details_panel.view(
+            palette: palette,
+            message: m,
+            receipts: receipts_for(state.receipts, m.id),
+            reactions: reactions_for(model.reactions, m.id),
+            members: state.members,
+            name_map: model.name_map,
+            on_close: CloseDetail,
+          )
+        _, _ ->
+          members.view(
+            palette: palette,
+            members: state.members,
+            relays: relays_view.relays_for_view(model.intents),
+            on_open_status: OpenPeerStatusPopover,
+            on_open_relay: OpenRelayPopover,
+          )
+      },
+    ),
     element.fragment([
       voice_popover_overlay(palette, model, state, members_for_channels),
       peer_status_popover_overlay(palette, model, state),
@@ -2585,6 +2848,7 @@ fn room_view_with_state(
         None -> element.fragment([])
       },
       settings_overlay_el,
+      image_theater_el,
     ]),
     phone_header.view(
       palette: palette,
@@ -2600,6 +2864,44 @@ fn room_view_with_state(
       full_picker_sheet_el,
       settings_sheet_el,
     ]),
+  )
+}
+
+/// Wrap whatever pane is showing in the right rail (members roster or
+/// the per-message details panel) with the pinned self/settings row at
+/// the bottom. The row stays visible regardless of which pane is up so
+/// the settings affordance is always one click away in the right rail.
+///
+/// Sizing: on desktop the column is sized by the grid row (100dvh); on
+/// phone the wrapping drawer is a `display: flex; flex-direction: column;
+/// height: 100dvh` container. We claim that space via `flex: 1 1 auto`
+/// + `min-height: 0` — `height: 100%` doesn't reliably resolve through
+/// the drawer's safe-area padding box, leaving the pinned you-row below
+/// the viewport.
+fn right_rail_with_self_row(
+  palette: theme.Palette,
+  members: List(domain.Member),
+  inner: Element(Msg),
+) -> Element(Msg) {
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("flex", "1 1 auto"),
+        #("min-height", "0"),
+        #("height", "100%"),
+        #("background", palette.surface),
+      ]),
+    ],
+    [
+      inner,
+      self_settings_row.view(
+        palette: palette,
+        members: members,
+        on_open_settings: OpenSettings,
+      ),
+    ],
   )
 }
 
@@ -2622,13 +2924,15 @@ fn voice_popover_overlay(
             member: m,
             settings: member_voice_settings(model.voice_settings, id_str),
             voice_quality: model.voice_quality,
+            echo_cancellation: model.voice_echo_cancellation,
             level: peer_level_for_member(model.voice, m, id_str),
             on_close: CloseVoicePopover,
             on_set_volume: fn(v) {
-              SetPeerVolume(id_str, int.to_float(v) /. 100.0)
+              SetPeerVolume(id_str, voice_volume.percent_to_gain(v))
             },
             on_toggle_denoise: ToggleMemberDenoise(id_str),
             on_set_voice_quality: SetVoiceQuality,
+            on_set_echo_cancellation: SetVoiceEchoCancellation,
             on_toggle_deafen: ToggleMuteForPeer(id_str),
             on_reset: ResetMemberVoice(id_str),
           )
@@ -2664,7 +2968,7 @@ fn peer_status_popover_overlay(
 
 fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
   case model.viewport, model.relays_popover {
-    domain.Desktop, Some(id) -> {
+    domain.Desktop, Some(#(id, anchor_y)) -> {
       let rs = relays_view.relays_for_view(model.intents)
       case list.find(rs, fn(r) { r.id == id }) {
         Ok(r) ->
@@ -2673,9 +2977,13 @@ fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
             relay: r,
             now_ms: model.now_ms,
             placement: relays_view.Floating(
-              anchor_left_px: rooms_rail_width_px(model.rooms_collapsed)
-              + channels_rail_width_px
-              + 8,
+              // Sit just to the LEFT of the right rail (where the
+              // relays section lives), anchored vertically next to the
+              // row that opened it. `anchor_y` is the click's
+              // `clientY`; the popover code clamps it to keep the
+              // popover fully on-screen.
+              anchor_right_px: members_rail_width_px + 8,
+              anchor_y: anchor_y,
             ),
             on_close: CloseRelayPopover,
           )
@@ -2686,20 +2994,11 @@ fn relay_popover_overlay(palette, model: Model) -> Element(Msg) {
   }
 }
 
-/// Mirrors `shell.desktop_view`'s grid-template-columns rooms slot.
-/// Kept here (and not threaded as a constant from `shell`) because the
-/// only desktop overlay that needs the channels-rail right edge is the
-/// relay popover, and Lustre doesn't measure layout from the inside —
-/// the popover's `left` has to come from the layout's source of truth.
-fn rooms_rail_width_px(collapsed: Bool) -> Int {
-  case collapsed {
-    True -> 54
-    False -> 260
-  }
-}
-
-/// Mirrors `shell.desktop_view`'s grid-template-columns channels slot.
-const channels_rail_width_px: Int = 230
+/// Mirrors `shell.desktop_view`'s grid-template-columns right slot when
+/// the per-message details panel is closed (i.e. when the members rail —
+/// and therefore the relays section — is what we're rendering on the
+/// right). Used by the relay popover to anchor next to the rail.
+const members_rail_width_px: Int = 220
 
 fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
   let needle = string.lowercase(string.trim(search))

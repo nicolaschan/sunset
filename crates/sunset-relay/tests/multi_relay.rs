@@ -187,7 +187,7 @@ async fn alice_to_bob_via_two_relays() {
                 0,
                 sent_at,
                 sunset_core::ChannelLabel::default_general(),
-                MessageBody::Text(body.to_owned()),
+                MessageBody::text(body),
                 &mut OsRng,
             )
             .unwrap();
@@ -245,7 +245,7 @@ async fn alice_to_bob_via_two_relays() {
                 .unwrap();
             let decoded = decode_message(&bob_room, &bob_entry, &bob_block).unwrap();
             assert_eq!(decoded.author_key, alice.public());
-            assert_eq!(decoded.body, MessageBody::Text(body.to_owned()));
+            assert_eq!(decoded.body, MessageBody::text(body));
         })
         .await;
 }
@@ -326,7 +326,7 @@ async fn failover_when_relay_a_dies() {
                 0,
                 1,
                 sunset_core::ChannelLabel::default_general(),
-                MessageBody::Text("msg-1 (both relays alive)".to_owned()),
+                MessageBody::text("msg-1 (both relays alive)"),
                 &mut OsRng,
             )
             .unwrap();
@@ -363,7 +363,7 @@ async fn failover_when_relay_a_dies() {
                 0,
                 2,
                 sunset_core::ChannelLabel::default_general(),
-                MessageBody::Text("msg-2 (after relay A killed)".to_owned()),
+                MessageBody::text("msg-2 (after relay A killed)"),
                 &mut OsRng,
             )
             .unwrap();

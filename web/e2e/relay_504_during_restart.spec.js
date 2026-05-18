@@ -138,11 +138,41 @@ class Fake504Proxy {
     this.upstreamHost = upstreamHost;
     this.upstreamPort = upstreamPort;
     this.mode = "alive";
+    // Post-connect upgrade pairs (browser ↔ proxy ↔ relay piping).
     this.activeForwards = new Set();
+    // Pre-connect upgrade pairs: clientSocket is alive, upstreamSocket
+    // is mid-`net.connect()`. Without tracking these, a `proxy.close()`
+    // racing an in-flight upgrade leaks the clientSocket past
+    // `closeAllConnections()` (which doesn't touch upgrade-detached
+    // sockets) and `server.close()` hangs.
+    this.pendingForwards = new Set();
+    // Every inbound TCP socket the server accepts, even after upgrade
+    // detaches it. Node's `closeAllConnections()` explicitly excludes
+    // upgrade-detached sockets, so we keep our own list and force-kill
+    // it in `close()`.
+    this.inboundSockets = new Set();
+    // Outbound `http.request()` instances (for the HTTP forward path).
+    // Aborted in `close()` so they don't keep the event loop alive
+    // beyond the test.
+    this.outboundRequests = new Set();
 
     this.server = http.createServer();
 
+    this.server.on("connection", (socket) => {
+      this.inboundSockets.add(socket);
+      socket.on("close", () => this.inboundSockets.delete(socket));
+      // The server's own error handling stops at the request boundary;
+      // raw socket errors (during upgrade-detached state or before any
+      // request is parsed) become uncaught exceptions without this.
+      socket.on("error", () => {});
+    });
+
     this.server.on("request", (req, res) => {
+      // Defensive: errors on the request or response streams must not
+      // crash the worker if the underlying socket is torn down (e.g.
+      // by `closeAllConnections()` during shutdown).
+      req.on("error", () => {});
+      res.on("error", () => {});
       if (this.mode === "504") {
         res.writeHead(504, { "Content-Type": "text/plain" });
         res.end("Gateway Timeout");
@@ -157,12 +187,19 @@ class Fake504Proxy {
           headers: req.headers,
         },
         (upstreamRes) => {
-          res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
-          upstreamRes.pipe(res);
+          upstreamRes.on("error", () => {});
+          if (!res.destroyed) {
+            res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+            upstreamRes.pipe(res);
+          }
         },
       );
+      this.outboundRequests.add(upstreamReq);
+      const dropOutbound = () => this.outboundRequests.delete(upstreamReq);
+      upstreamReq.on("close", dropOutbound);
       upstreamReq.on("error", () => {
-        if (!res.headersSent) {
+        dropOutbound();
+        if (!res.headersSent && !res.destroyed) {
           res.writeHead(504);
           res.end();
         } else {
@@ -173,23 +210,45 @@ class Fake504Proxy {
     });
 
     this.server.on("upgrade", (req, clientSocket, head) => {
+      // Always swallow socket errors first: pipe()'s default error
+      // behavior is to emit on the destination, which crashes the
+      // worker if unhandled.
+      clientSocket.on("error", () => {});
+
       if (this.mode === "504") {
-        clientSocket.write(
-          "HTTP/1.1 504 Gateway Timeout\r\n" +
-            "Content-Length: 0\r\n" +
-            "Connection: close\r\n" +
-            "\r\n",
-        );
-        clientSocket.destroy();
+        if (!clientSocket.destroyed) {
+          clientSocket.write(
+            "HTTP/1.1 504 Gateway Timeout\r\n" +
+              "Content-Length: 0\r\n" +
+              "Connection: close\r\n" +
+              "\r\n",
+          );
+          clientSocket.destroy();
+        }
         return;
       }
+
       const upstreamSocket = net.connect(
         this.upstreamPort,
         this.upstreamHost,
       );
-      let opened = false;
-      upstreamSocket.on("connect", () => {
-        opened = true;
+      upstreamSocket.on("error", () => {});
+      const pair = { clientSocket, upstreamSocket, opened: false };
+      this.pendingForwards.add(pair);
+
+      const teardown = () => {
+        this.pendingForwards.delete(pair);
+        this.activeForwards.delete(pair);
+        if (!clientSocket.destroyed) clientSocket.destroy();
+        if (!upstreamSocket.destroyed) upstreamSocket.destroy();
+      };
+      clientSocket.once("close", teardown);
+      upstreamSocket.once("close", teardown);
+
+      upstreamSocket.once("connect", () => {
+        pair.opened = true;
+        this.pendingForwards.delete(pair);
+        this.activeForwards.add(pair);
         const lines = [
           `${req.method} ${req.url} HTTP/${req.httpVersion}`,
           ...Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`),
@@ -202,41 +261,42 @@ class Fake504Proxy {
         }
         clientSocket.pipe(upstreamSocket);
         upstreamSocket.pipe(clientSocket);
-        const pair = { clientSocket, upstreamSocket };
-        this.activeForwards.add(pair);
-        const cleanup = () => {
-          this.activeForwards.delete(pair);
-        };
-        clientSocket.on("close", cleanup);
-        upstreamSocket.on("close", cleanup);
-        clientSocket.on("error", () => {});
-        upstreamSocket.on("error", () => {});
       });
-      upstreamSocket.on("error", () => {
-        if (!opened) {
+      upstreamSocket.once("error", () => {
+        if (!pair.opened && !clientSocket.destroyed) {
           clientSocket.write(
             "HTTP/1.1 504 Gateway Timeout\r\n" +
               "Content-Length: 0\r\n" +
               "Connection: close\r\n" +
               "\r\n",
           );
-          clientSocket.destroy();
         }
+        teardown();
       });
+    });
+
+    this.server.on("clientError", (_err, socket) => {
+      if (socket && !socket.destroyed) socket.destroy();
     });
   }
 
   setMode(mode) {
     this.mode = mode;
     if (mode === "504") {
-      // Tear down everything that's currently in-flight so the browser
-      // observes the same `recv ws closed` signal it would see when CF
-      // can no longer reach the upstream.
+      // Tear down everything that's currently in-flight (both fully
+      // established forwards and pre-connect upgrade pairs) so the
+      // browser observes the same `recv ws closed` signal it would
+      // see when CF can no longer reach the upstream.
       for (const { clientSocket, upstreamSocket } of this.activeForwards) {
-        clientSocket.destroy();
-        upstreamSocket.destroy();
+        if (!clientSocket.destroyed) clientSocket.destroy();
+        if (!upstreamSocket.destroyed) upstreamSocket.destroy();
+      }
+      for (const { clientSocket, upstreamSocket } of this.pendingForwards) {
+        if (!clientSocket.destroyed) clientSocket.destroy();
+        if (!upstreamSocket.destroyed) upstreamSocket.destroy();
       }
       this.activeForwards.clear();
+      this.pendingForwards.clear();
     }
   }
 
@@ -249,26 +309,46 @@ class Fake504Proxy {
   }
 
   close() {
-    // Destroy in-flight forwards before closing the server. Node's
-    // `http.Server.close()` only stops accepting new connections; it
-    // waits indefinitely for established connections (both keep-alive
-    // HTTP and upgraded WebSocket forwards) to drain. By the end of
-    // the test the browsers have closed via `ctx.close()` and the
-    // relay has been killed in afterAll, but the FIN/close
-    // propagation through `pipe()` doesn't always complete in time
-    // for the 30 s hook timeout — especially for the half-open pairs
-    // created during the 504 window. Force them down here so close()
-    // returns promptly. `closeAllConnections()` (Node 18.2+) catches
-    // any HTTP-keep-alive sockets we didn't track in `activeForwards`.
-    for (const { clientSocket, upstreamSocket } of this.activeForwards) {
-      clientSocket.destroy();
-      upstreamSocket.destroy();
+    // Force every socket we know about to close, then close the
+    // server. Node's `server.close([cb])` invokes `cb` only once
+    // every tracked connection has emitted `close`; if a single
+    // socket lingers (e.g. a half-open upgrade pair, an
+    // upgrade-detached socket not counted by `closeAllConnections()`,
+    // or an outbound `http.request` still buffering after the relay
+    // died), the close callback never fires and the 30 s `afterAll`
+    // budget is blown.
+    //
+    // Destroy in order: pending upgrade pairs, then active forwards,
+    // then every accepted inbound socket (catches upgrade-detached
+    // ones that `closeAllConnections()` explicitly skips), then
+    // abort any outbound HTTP forwards. After that, `server.close()`
+    // has nothing to wait on.
+    for (const { clientSocket, upstreamSocket } of this.pendingForwards) {
+      if (!clientSocket.destroyed) clientSocket.destroy();
+      if (!upstreamSocket.destroyed) upstreamSocket.destroy();
     }
+    for (const { clientSocket, upstreamSocket } of this.activeForwards) {
+      if (!clientSocket.destroyed) clientSocket.destroy();
+      if (!upstreamSocket.destroyed) upstreamSocket.destroy();
+    }
+    this.pendingForwards.clear();
     this.activeForwards.clear();
+    for (const sock of this.inboundSockets) {
+      if (!sock.destroyed) sock.destroy();
+    }
+    this.inboundSockets.clear();
+    for (const req of this.outboundRequests) {
+      try {
+        req.destroy();
+      } catch {
+        // Already torn down — ignore.
+      }
+    }
+    this.outboundRequests.clear();
     if (typeof this.server.closeAllConnections === "function") {
       this.server.closeAllConnections();
     }
-    return new Promise((resolve) => this.server.close(resolve));
+    return new Promise((resolve) => this.server.close(() => resolve()));
   }
 }
 

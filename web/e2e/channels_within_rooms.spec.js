@@ -221,9 +221,14 @@ test("channels segregate messages between #general and #links", async ({
   ).toBeVisible({ timeout: 5_000 });
 
   // ── Bob switches back to #general; "ack" must NOT be in his view ──────
+  // Selector targets the text-channel row by data-channel-name. Without
+  // the type-prefixed selector, plain `hasText: "general"` would also
+  // match the voice-channel row (which now defaults to the same name).
   const bobRail = bob.locator('[data-testid="channels-rail"]');
   await openChannelsRailIfPhone(bob);
-  await bobRail.locator("button", { hasText: "general" }).click();
+  await bobRail
+    .locator('[data-testid="text-channel-row"][data-channel-name="general"]')
+    .click();
   await expect(bob.locator("#composer-textarea")).toHaveAttribute(
     "placeholder",
     "Message #general",

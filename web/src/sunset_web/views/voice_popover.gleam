@@ -3,7 +3,10 @@
 ////
 //// Shows the peer's status, a level-driven waveform reflecting their
 //// live audio, and three per-peer controls:
-////   * Volume slider — 0–100% for the local user, 0–200% for others.
+////   * Volume slider — 0–100% for the local user, 0–500% for others.
+////     The non-self curve is linear up to 100% and exponential above
+////     (each +100% doubles gain). See `voice_volume` for the
+////     mapping.
 ////   * Denoise toggle — strip background noise from this peer's
 ////     incoming stream (or your outgoing stream, on the self row).
 ////   * Mute-for-me / Reset — only on non-self rows.
@@ -25,6 +28,7 @@ import sunset_web/domain.{
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
 import sunset_web/views/voice_meter
+import sunset_web/voice_volume
 
 pub type Placement {
   Floating
@@ -37,18 +41,20 @@ pub fn view(
   member m: Member,
   settings settings: VoiceSettings,
   voice_quality voice_quality: String,
+  echo_cancellation echo_cancellation: Bool,
   level level: Float,
   on_close on_close: msg,
   on_set_volume on_set_volume: fn(Int) -> msg,
   on_toggle_denoise on_toggle_denoise: msg,
   on_set_voice_quality on_set_voice_quality: fn(String) -> msg,
+  on_set_echo_cancellation on_set_echo_cancellation: fn(Bool) -> msg,
   on_toggle_deafen on_toggle_deafen: msg,
   on_reset on_reset: msg,
 ) -> Element(msg) {
   let is_self = m.you
   let max_volume = case is_self {
-    True -> 100
-    False -> 200
+    True -> voice_volume.max_percent_self
+    False -> voice_volume.max_percent_other
   }
 
   let body_children = [
@@ -59,10 +65,12 @@ pub fn view(
       m,
       settings,
       voice_quality,
+      echo_cancellation,
       max_volume,
       on_set_volume,
       on_toggle_denoise,
       on_set_voice_quality,
+      on_set_echo_cancellation,
     ),
     case is_self {
       True -> element.fragment([])
@@ -449,14 +457,29 @@ fn body(
   m: Member,
   settings: VoiceSettings,
   voice_quality: String,
+  echo_cancellation: Bool,
   max_volume: Int,
   on_set_volume: fn(Int) -> msg,
   on_toggle_denoise: msg,
   on_set_voice_quality: fn(String) -> msg,
+  on_set_echo_cancellation: fn(Bool) -> msg,
 ) -> Element(msg) {
   let quality_row = case m.you {
     True -> quality_control(p, voice_quality, on_set_voice_quality)
     False -> element.fragment([])
+  }
+  // Echo cancellation is a send-side mic constraint, so the toggle
+  // only makes sense on the self row.
+  let echo_cancellation_row = case m.you {
+    True ->
+      echo_cancellation_control(p, echo_cancellation, on_set_echo_cancellation)
+    False -> element.fragment([])
+  }
+  // Denoise filters incoming audio per peer — meaningless on the
+  // self row since you don't receive your own frames.
+  let denoise_row = case m.you {
+    True -> element.fragment([])
+    False -> denoise_control(p, settings, on_toggle_denoise)
   }
   html.div(
     [
@@ -469,8 +492,9 @@ fn body(
     ],
     [
       volume_control(p, m, settings, max_volume, on_set_volume),
-      denoise_control(p, m, settings, on_toggle_denoise),
+      denoise_row,
       quality_row,
+      echo_cancellation_row,
     ],
   )
 }
@@ -485,9 +509,21 @@ fn quality_control(
   on_set: fn(String) -> msg,
 ) -> Element(msg) {
   let presets = [
-    #("voice", "Voice", "24 kbps mono — best for slow networks"),
-    #("high", "High", "96 kbps stereo — balanced"),
-    #("maximum", "Maximum", "510 kbps stereo — transparent"),
+    #(
+      "voice",
+      "Voice",
+      "24 kbps mono · browser noise suppression + AGC. Best for speech on slow networks.",
+    ),
+    #(
+      "high",
+      "High",
+      "96 kbps stereo · raw mic, no noise suppression. Balanced fidelity.",
+    ),
+    #(
+      "maximum",
+      "Maximum",
+      "510 kbps stereo · raw mic, no noise suppression. Highest fidelity.",
+    ),
   ]
   html.div(
     [
@@ -509,7 +545,7 @@ fn quality_control(
         ],
         [
           html.text(
-            "Opus codec settings for your outgoing audio. Other peers always hear you in stereo.",
+            "Selects the Opus codec preset and noise-suppression pipeline for your outgoing audio. Voice runs your browser's speech processing; High and Maximum send the raw mic so other peers hear full-band stereo. Echo cancellation is controlled separately below.",
           ),
         ],
       ),
@@ -656,40 +692,71 @@ fn volume_control(
           #("accent-color", p.accent),
         ]),
       ]),
-      html.div(
-        [
-          ui.css([
-            #("display", "flex"),
-            #("justify-content", "space-between"),
-            #("font-size", "10.5px"),
-            #("color", p.text_faint),
-            #("font-family", theme.font_mono),
-          ]),
-        ],
-        [
-          html.span([], [html.text("0")]),
-          html.span([], [html.text("100")]),
-          case max_volume {
-            200 -> html.span([], [html.text("200")])
-            _ -> element.fragment([])
-          },
-        ],
-      ),
+      volume_tick_labels(p, max_volume),
     ],
+  )
+}
+
+/// Render the tick labels under the volume slider.
+///
+/// The slider is linear in *percent* (its native value) — so a
+/// label's left offset matches its percent position on the track.
+/// At the self-only max (100), the `100` label collapses into the
+/// right edge so we omit the redundant rightmost tick. For other
+/// peers, the slider extends to `max_volume` (500% currently) and
+/// the `100` label sits at the linear/exponential boundary so the
+/// user can see *where* the curve transitions, not just that it
+/// does.
+fn volume_tick_labels(p: Palette, max_volume: Int) -> Element(msg) {
+  let label_style = [
+    #("position", "absolute"),
+    #("font-size", "10.5px"),
+    #("color", p.text_faint),
+    #("font-family", theme.font_mono),
+    #("top", "0"),
+  ]
+  let positioned = fn(left_pct: String, transform: String, text: String) {
+    html.span(
+      [
+        ui.css([#("left", left_pct), #("transform", transform), ..label_style]),
+      ],
+      [html.text(text)],
+    )
+  }
+  let unity_position = case max_volume {
+    n if n <= 100 -> "100%"
+    n -> int.to_string(100 * 100 / n) <> "%"
+  }
+  let children = case max_volume <= 100 {
+    True -> [
+      positioned("0", "translateX(0)", "0"),
+      positioned(unity_position, "translateX(-100%)", "100"),
+    ]
+    False -> [
+      positioned("0", "translateX(0)", "0"),
+      positioned(unity_position, "translateX(-50%)", "100"),
+      positioned("100%", "translateX(-100%)", int.to_string(max_volume)),
+    ]
+  }
+  html.div(
+    [
+      ui.css([
+        #("position", "relative"),
+        #("height", "14px"),
+        #("width", "100%"),
+      ]),
+    ],
+    children,
   )
 }
 
 fn denoise_control(
   p: Palette,
-  m: Member,
   settings: VoiceSettings,
   on_toggle: msg,
 ) -> Element(msg) {
-  let hint = case m.you {
-    True -> "Strip background noise from your outgoing audio."
-    False ->
-      "Filter background noise from their incoming stream — applied locally."
-  }
+  let hint =
+    "Filter background noise from their incoming stream — applied locally."
   html.div(
     [
       ui.css([
@@ -711,6 +778,58 @@ fn denoise_control(
         [
           control_label(p, "Denoise"),
           toggle_switch(p, settings.denoise, on_toggle, "voice-popover-denoise"),
+        ],
+      ),
+      html.div(
+        [
+          ui.css([
+            #("font-size", "12.5px"),
+            #("color", p.text_muted),
+          ]),
+        ],
+        [html.text(hint)],
+      ),
+    ],
+  )
+}
+
+/// Self-row only: independent toggle for browser-side echo cancellation
+/// on the outgoing mic stream. Persisted by `voice.ffi.mjs` under
+/// `sunset/echo-cancellation`; flipping it re-acquires the mic with
+/// the new `getUserMedia` constraint if voice is currently captured.
+fn echo_cancellation_control(
+  p: Palette,
+  enabled: Bool,
+  on_set: fn(Bool) -> msg,
+) -> Element(msg) {
+  let hint =
+    "Suppress your speakers' audio from your mic input. Recommended when not wearing headphones; turn off for full-fidelity capture."
+  html.div(
+    [
+      ui.css([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("gap", "6px"),
+      ]),
+    ],
+    [
+      html.div(
+        [
+          ui.css([
+            #("display", "flex"),
+            #("align-items", "center"),
+            #("justify-content", "space-between"),
+            #("gap", "8px"),
+          ]),
+        ],
+        [
+          control_label(p, "Echo cancellation"),
+          toggle_switch(
+            p,
+            enabled,
+            on_set(!enabled),
+            "voice-popover-echo-cancellation",
+          ),
         ],
       ),
       html.div(

@@ -25,6 +25,17 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
             let Some(inner) = weak.upgrade() else {
                 return;
             };
+            // Skip when the runtime is in observer mode (`set_active(false)`).
+            // Poll the gate every 100 ms while inactive so the first
+            // heartbeat after the user joins fires promptly — sleeping the
+            // full HEARTBEAT_INTERVAL here delays `membership_alive` on the
+            // receiving side by up to 2 s, which is the same window the
+            // dialer is racing to establish a P2P leg.
+            if !*inner.is_active.borrow() {
+                drop(inner);
+                sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
             let now_ms = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

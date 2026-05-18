@@ -3,7 +3,13 @@
 use serde::{Deserialize, Serialize};
 
 /// 32-byte BLAKE3 hash, used as content-addressed identifier for `ContentBlock`s.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `PartialOrd` / `Ord` are lexicographic over the 32 bytes. They're
+/// derived (not semantic) so the type can be used as a stable
+/// deterministic tie-break key — e.g. ordering messages that claim the
+/// same `sent_at_ms` (see `OpenRoom::ordered_messages`). The values
+/// themselves carry no meaningful order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Hash([u8; 32]);
 
 impl Hash {

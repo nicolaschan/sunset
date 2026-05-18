@@ -22,7 +22,8 @@ pub mod verifier;
 
 pub use bus::{Bus, BusEvent, BusImpl};
 pub use crypto::envelope::{
-    ChannelLabel, DEFAULT_CHANNEL, EncryptedMessage, MessageBody, ReactionAction, SignedMessage,
+    ChannelLabel, DEFAULT_CHANNEL, EncryptedMessage, ImageAttachment, MessageBody, ReactionAction,
+    SignedMessage,
 };
 pub use crypto::room::{Room, RoomFingerprint, V1_EPOCH_ID};
 pub use error::{Error, Result};
@@ -32,8 +33,8 @@ pub use liveness::{
     Clock, HasSenderTime, Liveness, LivenessState, PeerLivenessChange, SystemClock,
 };
 pub use message::{
-    ComposedMessage, DecodedMessage, ReactionPayload, compose_message, compose_reaction,
-    compose_receipt, compose_text, decode_message,
+    ComposedMessage, DecodedMessage, PostPayload, ReactionPayload, compose_message, compose_post,
+    compose_reaction, compose_receipt, compose_text, decode_message,
 };
 pub use peer::{OpenRoom, Peer};
 pub use reactions::{

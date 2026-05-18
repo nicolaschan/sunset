@@ -147,7 +147,7 @@ pub fn compose_message(
         epoch_id,
         sent_at_ms,
         ChannelLabel::default_general(),
-        MessageBody::Text(body.to_owned()),
+        MessageBody::text(body),
         &mut rng,
     )
     .map_err(|e| js_err("compose_message", e))?;
@@ -187,7 +187,7 @@ pub fn decode_message(
     let decoded = core_decode(&room, &entry, &block).map_err(|e| js_err("decode_message", e))?;
 
     let body_text = match decoded.body {
-        MessageBody::Text(t) => t,
+        MessageBody::Text { text, .. } => text,
         other => {
             return Err(JsError::new(&format!(
                 "sunset-core: decode_message: unsupported body variant: {:?}",

@@ -21,6 +21,17 @@ if (!dist) {
 const port = Number(process.env.SUNSET_WEB_PORT ?? 4173);
 const testHooks = process.env.SUNSET_TEST_HOOKS === "1";
 
+// Per-project `testIgnore` overrides the top-level `testIgnore` (it
+// does not merge). That means any project that wants to add its own
+// ignore patterns must also re-include the top-level ones, or the
+// non-voice runner (SUNSET_TEST_HOOKS=0) will start picking up
+// voice_*.spec.js. We build per-project ignore lists by prepending
+// the top-level pattern.
+function ignoreFor(...extra) {
+  const base = testHooks ? [] : [/voice_.*\.spec\.js$/];
+  return [...base, ...extra];
+}
+
 export default defineConfig({
   testDir: "e2e",
   // Voice runner only runs voice_*.spec.js; chat runner skips voice.
@@ -59,6 +70,13 @@ export default defineConfig({
           ],
         },
       },
+      // *_real_mic.spec.js depends on the deterministic sweep.wav
+      // reference signal that only the chromium-real-mic project
+      // wires up (see below). Running it under the default
+      // fake-audio device would assert tone purity on a signal that
+      // wasn't designed to satisfy it — a spurious failure shape
+      // that says nothing about the code under test.
+      testIgnore: ignoreFor(/_real_mic\.spec\.js$/),
     },
     {
       name: "mobile-chrome",
@@ -72,9 +90,18 @@ export default defineConfig({
           ],
         },
       },
+      testIgnore: ignoreFor(/_real_mic\.spec\.js$/),
     },
     // Chromium project with a fake WAV file piped as the mic input.
     // Used exclusively by voice_real_mic.spec.js (testMatch below).
+    //
+    // sweep.wav lives inside the Nix-built dist (`webVoiceUiTestDist`
+    // copies it into `$out/audio/test-fixtures/sweep.wav` via the flake
+    // — see flake.nix). The previous resolve to `web/audio/test-fixtures`
+    // (the source tree) never existed on disk, so Chromium silently
+    // fell back to its built-in fake audio generator and tests that
+    // depended on a known 440 Hz reference signal didn't actually
+    // observe one.
     {
       name: "chromium-real-mic",
       use: {
@@ -84,11 +111,16 @@ export default defineConfig({
           args: [
             "--use-fake-device-for-media-stream",
             "--use-fake-ui-for-media-stream",
-            `--use-file-for-fake-audio-capture=${resolve(__dirname, "audio/test-fixtures/sweep.wav")}`,
+            `--use-file-for-fake-audio-capture=${resolve(dist, "audio/test-fixtures/sweep.wav")}`,
           ],
         },
       },
-      testMatch: /voice_real_mic\.spec\.js/,
+      // The real-mic project pipes a deterministic 440 Hz sine into
+      // getUserMedia, so any spec that needs a clean reference signal
+      // for tone-purity / audio-quality assertions lives here. Match on
+      // the `_real_mic` suffix so new specs slot in without touching
+      // the config.
+      testMatch: /voice_.*_real_mic\.spec\.js|voice_real_mic\.spec\.js/,
     },
   ],
   webServer: {

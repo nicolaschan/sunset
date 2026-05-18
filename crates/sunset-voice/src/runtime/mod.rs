@@ -26,6 +26,7 @@ use rand_core::SeedableRng;
 
 use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
+use sunset_sync::PeerId;
 
 use crate::VoiceEncoder;
 
@@ -102,14 +103,16 @@ impl VoiceRuntime {
             rng: RefCell::new(ChaCha20Rng::seed_from_u64(now_nanos)),
             muted: RefCell::new(false),
             deafened: RefCell::new(false),
-            denoise: RefCell::new(true),
+            denoise_disabled: RefCell::new(Default::default()),
             denoisers: RefCell::new(Default::default()),
+            decoders: RefCell::new(Default::default()),
             frame_liveness,
             membership_liveness,
             voice_presence_liveness,
             last_delivered_seq: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
             last_emitted: RefCell::new(Default::default()),
+            is_active: RefCell::new(false),
         });
 
         let tasks = VoiceTasks {
@@ -134,6 +137,16 @@ impl VoiceRuntime {
     /// the active preset is mono we downmix here so the encoder gets
     /// the shape it expects.
     pub fn send_pcm(&self, pcm: &[f32]) {
+        // Drop frames when the runtime is in observer mode. Without this
+        // gate, audio captured before `stopCapture` finishes flushing
+        // (worklet `process()` ticks queued on the audio graph) can
+        // still reach the bus after `voice_deactivate`, which refreshes
+        // `frame_alive` on every receiver and keeps them seeing us as
+        // "in call" for the full FRAME_STALE_AFTER + next sweep window
+        // — well past the 6 s "leave detected" spec budget.
+        if !*self.inner.is_active.borrow() {
+            return;
+        }
         if *self.inner.muted.borrow() {
             return;
         }
@@ -212,16 +225,42 @@ impl VoiceRuntime {
         *self.inner.muted.borrow_mut() = muted;
     }
 
+    /// Toggle the runtime between observer and active modes.
+    ///
+    /// In observer mode (`false`, the default), the durable
+    /// `voice-presence/...` subscription continues to drive the combiner
+    /// so the UI knows who is in the voice channel, but the three
+    /// active tasks (heartbeat, presence publisher, auto-connect) skip
+    /// their work. Calling `set_active(true)` flips the gate so the
+    /// active tasks resume on their next iteration; `set_active(false)`
+    /// returns to observer mode.
+    pub fn set_active(&self, active: bool) {
+        *self.inner.is_active.borrow_mut() = active;
+    }
+
+    /// Read the active flag. Useful for tests; production code consults
+    /// `RuntimeInner::is_active` directly.
+    #[cfg(feature = "test-hooks")]
+    pub fn is_active(&self) -> bool {
+        *self.inner.is_active.borrow()
+    }
+
     pub fn set_deafened(&self, deafened: bool) {
         *self.inner.deafened.borrow_mut() = deafened;
     }
 
-    /// Toggle receiver-side RNNoise denoising. Defaults to `true` (on)
-    /// at runtime construction. Off bypasses the denoiser entirely;
-    /// previously-built per-peer state is kept so re-enabling resumes
-    /// where it left off rather than starting from scratch.
-    pub fn set_denoise(&self, denoise: bool) {
-        *self.inner.denoise.borrow_mut() = denoise;
+    /// Toggle receiver-side RNNoise denoising for a single peer.
+    /// Defaults to enabled for every peer (absence from the disabled
+    /// set = on). When disabled, the corresponding peer's `Denoiser`
+    /// is left intact so flipping back on resumes where it left off
+    /// rather than restarting from scratch.
+    pub fn set_peer_denoise(&self, peer: PeerId, enabled: bool) {
+        let mut disabled = self.inner.denoise_disabled.borrow_mut();
+        if enabled {
+            disabled.remove(&peer);
+        } else {
+            disabled.insert(peer);
+        }
     }
 
     /// Switch the active send-side quality preset. Rebuilds the
@@ -253,11 +292,12 @@ impl VoiceRuntime {
         *self.inner.muted.borrow()
     }
 
-    /// Read denoise toggle state. Gated behind `test-hooks`; production
-    /// code reads `inner.denoise` directly.
+    /// Read denoise toggle state for one peer. Gated behind
+    /// `test-hooks`; production code reads `inner.denoise_disabled`
+    /// directly.
     #[cfg(feature = "test-hooks")]
-    pub fn is_denoise_enabled(&self) -> bool {
-        *self.inner.denoise.borrow()
+    pub fn is_peer_denoise_enabled(&self, peer: &PeerId) -> bool {
+        !self.inner.denoise_disabled.borrow().contains(peer)
     }
 
     /// Test-only: swap the `FrameSink` with a new implementation (e.g.

@@ -9,10 +9,11 @@
 //      full-hex peer dict, so non-self peers were silently filtered out
 //      and only the local user ever showed.
 //
-//   2. The channel header reads "Voice Channel" (not "Lounge"). The
-//      fixture-driven name is what end users see in the rail; renaming
-//      it without an e2e check would let it regress on the next
-//      fixture refresh.
+//   2. The voice channel row reads "general" — the same default name
+//      as the text channel, since the channels rail's kind separator
+//      already distinguishes them. The label is what end users see in
+//      the rail; renaming it without an e2e check would let it regress
+//      on the next fixture refresh.
 //
 //   3. The waveform next to a peer's name reflects real audio energy.
 //      Each row exposes its smoothed level via `data-voice-level`
@@ -85,16 +86,18 @@ test("voice channel roster: both peers visible, waveform tracks real audio", asy
   const alice = await openPeer(browser, relay.addr);
   const bob = await openPeer(browser, relay.addr);
 
-  // Channel header reads "Voice Channel" — the rename is part of the
-  // user-visible deliverable. Scope to the voice-channel-row testid
-  // because the desktop self-controls bar at the bottom also renders
-  // the channel name (so a bare `getByText` would match twice).
+  // Voice channel row reads "general" — same default as the text
+  // channel; the rail's kind separator already distinguishes them.
+  // Scope to the voice-channel-row testid because the voice minibar
+  // at the top of the chat panel also renders the channel name once
+  // self_in_call flips true (so a bare `getByText` would match twice
+  // after joining).
   await expect(
     alice.page.locator('[data-testid="voice-channel-row"]'),
-  ).toContainText("Voice Channel");
+  ).toContainText("general");
   await expect(
     bob.page.locator('[data-testid="voice-channel-row"]'),
-  ).toContainText("Voice Channel");
+  ).toContainText("general");
 
   // Both peers join voice. On Desktop the voice-leave button appears
   // when voice_start() resolves Ok — same gating signal the rest of
@@ -290,6 +293,151 @@ test("voice channel roster: peer in channel but not connected renders dimmed wit
   await expect(
     aliceRowOnBob.locator('[data-testid="voice-waveform"]'),
   ).toHaveCount(0);
+
+  await alice.ctx.close();
+  await bob.ctx.close();
+});
+
+test("voice channel roster: peer in channel is visible to a user who hasn't joined yet, in observer (gray) mode", async ({
+  browser,
+}) => {
+  // The user-facing UX: when alice joins a voice channel, bob should
+  // see her in the rail *before* he clicks Join. Today's behaviour:
+  // the voice runtime only spins up on JoinVoice, so durable
+  // voice-presence entries never reach bob's combiner until he joins
+  // — meaning the rail stays in the "idle" shape and bob has no way
+  // to tell anyone is in the channel until he commits to joining.
+  //
+  // After the observe/activate split, bob's runtime starts observing
+  // the moment the room handle is available (RoomOpened), so alice's
+  // presence republish (every 2 s) reaches him via the relay-backed
+  // sync layer regardless of whether he joins.
+  //
+  // Observer mode (bob hasn't joined): the block must read as
+  // "this channel is live, you're not in it", NOT as "you are
+  // connected" and NOT as "you are trying to connect". So the
+  // voice-channel-row carries data-voice-self-joined="false", and
+  // the connecting affordance is suppressed for every peer (we
+  // aren't dialing anyone — bob hasn't asked to join).
+  const alice = await openPeer(browser, relay.addr);
+  const bob = await openPeer(browser, relay.addr);
+
+  // Alice joins; bob does not.
+  await alice.page
+    .locator('[data-testid="voice-channel-row"]')
+    .first()
+    .click();
+  await expect(alice.page.locator('[data-testid="voice-leave"]')).toBeVisible({
+    timeout: 2_000,
+  });
+
+  const aliceHex = await getPubkeyHex(alice.page);
+  const bobHex = await getPubkeyHex(bob.page);
+
+  // Alice's row must show in bob's rail, even though bob hasn't
+  // joined. Generous timeout: presence republish cadence is 2 s and
+  // the entry has to traverse the relay both ways, so 8 s leaves
+  // room for one missed republish without flaking.
+  const aliceRowOnBob = bob.page.locator(
+    `[data-testid="voice-member"][data-peer-hex="${aliceHex}"]`,
+  );
+  await expect(aliceRowOnBob).toBeVisible({ timeout: 8_000 });
+
+  // The channel-row itself must mark observer mode — this is the
+  // signal the styling keys off (neutral palette instead of the
+  // magenta-accent in-call treatment).
+  const channelRowOnBob = bob.page
+    .locator('[data-testid="voice-channel-row"]')
+    .first();
+  await expect(channelRowOnBob).toHaveAttribute(
+    "data-voice-self-joined",
+    "false",
+    { timeout: 2_000 },
+  );
+
+  // From bob's perspective there's no P2P leg to alice (he hasn't
+  // joined the call). Crucially the UI must NOT show the
+  // "connecting" affordance — bob isn't trying to connect to
+  // anyone; he's an observer. Showing connecting would lie about
+  // work the runtime isn't doing and add visual noise to the rail.
+  await expect(aliceRowOnBob).toHaveAttribute(
+    "data-voice-connected",
+    "false",
+    { timeout: 2_000 },
+  );
+  await expect(
+    aliceRowOnBob.locator('[data-testid="voice-member-not-connected"]'),
+  ).toHaveCount(0);
+  // Waveform meter is also suppressed (no audio path, nothing to
+  // visualise) — this is the same as the connected-but-not-in-call
+  // branch in the in-call test; keeps the assertion symmetric.
+  await expect(
+    aliceRowOnBob.locator('[data-testid="voice-waveform"]'),
+  ).toHaveCount(0);
+
+  // Bob himself must not appear in bob's roster (he hasn't joined).
+  // The runtime's voice-presence-membership task explicitly skips
+  // self-published presence; the UI's `members_for_channels` map
+  // reads self_in_call instead of `voice.peers[self]`, so a self
+  // row would only appear after a real join.
+  await expect(
+    bob.page.locator(
+      `[data-testid="voice-member"][data-peer-hex="${bobHex}"]`,
+    ),
+  ).toHaveCount(0);
+
+  // The toggle must still read "Join general" — bob hasn't joined,
+  // and clicking it should join (not leave). Pre-fix the rail would
+  // have been idle anyway; this guards against a regression where
+  // the roster appearing accidentally flipped the toggle to "Leave".
+  await expect(channelRowOnBob).toHaveAttribute("aria-label", "Join general");
+
+  // Tapping a peer row in observer mode must NOT open the per-peer
+  // voice popover. The popover's controls (volume, mute-for-me,
+  // send quality) only have an effect when there's an audio path
+  // with that peer; in observer mode there isn't one, so making the
+  // row appear interactive would lie about what tapping it does.
+  // The row is rendered as a `disabled` button so the browser
+  // suppresses the click at the platform level — assert that signal
+  // first (deterministic, observable from the DOM) and then force-
+  // click to confirm no popover surfaces even when the click is
+  // pushed past Playwright's actionability check.
+  await expect(aliceRowOnBob).toBeDisabled();
+  await aliceRowOnBob.click({ force: true });
+  await expect(
+    bob.page.locator('[data-testid="voice-popover"]'),
+  ).toHaveCount(0);
+
+  // Once bob actually joins, the same row must flip to the
+  // joined-mode treatment: the channel-row gains
+  // data-voice-self-joined="true", and the connecting affordance
+  // becomes legal again (it'll show transiently for any peer whose
+  // P2P leg hasn't completed yet — there's no easy way to assert
+  // that here without re-doing the synthetic-state dance the prior
+  // test already covers, so we just check the joined-mode signal).
+  await channelRowOnBob.click();
+  await expect(bob.page.locator('[data-testid="voice-leave"]')).toBeVisible({
+    timeout: 2_000,
+  });
+  await expect(channelRowOnBob).toHaveAttribute(
+    "data-voice-self-joined",
+    "true",
+    { timeout: 2_000 },
+  );
+
+  await bob.page.locator('[data-testid="voice-leave"]').click();
+  await expect(channelRowOnBob).toHaveAttribute(
+    "data-voice-self-joined",
+    "false",
+    { timeout: 2_000 },
+  );
+
+  // Alice leaves. Bob's rail must return to the idle shape within
+  // the presence-staleness budget. TTL is 6 s and stale-after is
+  // ~8 s, so by 12 s the entry must have been swept and the live
+  // block collapsed back to idle.
+  await alice.page.locator('[data-testid="voice-leave"]').click();
+  await expect(aliceRowOnBob).toHaveCount(0, { timeout: 12_000 });
 
   await alice.ctx.close();
   await bob.ctx.close();

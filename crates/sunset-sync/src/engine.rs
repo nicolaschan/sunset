@@ -162,6 +162,25 @@ pub(crate) struct PeerOutbound {
     /// disconnects from defunct generations (see `handle_inbound_event`).
     pub(crate) conn_id: ConnectionId,
     pub(crate) tx: mpsc::UnboundedSender<SyncMessage>,
+    /// Structural shutdown handle for the per-peer task that owns this
+    /// connection. When `PeerOutbound` is dropped (entry removed via
+    /// `remove_peer` or replaced by a fresher conn's `PeerHello`), this
+    /// `watch::Sender` drops, which makes
+    /// `watch::Receiver::changed().await` in the per-peer task's
+    /// `recv_reliable_task`, `send_task`, and `liveness_task` return
+    /// `Err`. Those tasks then exit cleanly so the connection's
+    /// underlying socket can release.
+    ///
+    /// Without this, the per-peer task's outbound channel stayed open
+    /// indefinitely (a stack-scope clone of the outbound `Sender` kept
+    /// it alive), and the only paths out of `send_task` were channel-
+    /// close (impossible) and a failing reliable send — neither of
+    /// which fires when the peer is still responsive on the wire. Each
+    /// reconnect for the same `PeerId` therefore leaked one zombie
+    /// `run_peer` task plus one TCP socket on the relay; over many
+    /// cycles the relay would run out of file descriptors and stop
+    /// accepting new WebSocket upgrades.
+    pub(crate) _shutdown: tokio::sync::watch::Sender<()>,
 }
 
 /// Mutable state inside the engine. Held under a `tokio::sync::Mutex` so
@@ -567,12 +586,20 @@ where
                 conn_id,
                 kind,
                 out_tx,
+                shutdown,
                 registered,
             } => {
                 // Register the outbound sender + transport kind under the
                 // Hello-declared peer_id. peer_outbound + peer_kinds move
                 // together so a late `current_peers()` snapshot reflects
                 // the same set as the live subscription stream.
+                //
+                // The insert here implicitly drops any previous
+                // PeerOutbound for the same peer_id (e.g. a stale
+                // generation from before a reconnect). That drop fires
+                // the OLD `_shutdown` watch::Sender, telling the OLD
+                // run_peer's tasks to wind down — see the field doc on
+                // `PeerOutbound::_shutdown`.
                 {
                     let mut state = self.state.lock().await;
                     state.peer_outbound.insert(
@@ -580,6 +607,7 @@ where
                         PeerOutbound {
                             conn_id,
                             tx: out_tx,
+                            _shutdown: shutdown,
                         },
                     );
                     state.peer_kinds.insert(peer_id.clone(), kind);
@@ -1325,12 +1353,14 @@ mod tests {
     ) -> (PeerId, mpsc::UnboundedReceiver<SyncMessage>) {
         let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
         let peer = PeerId(vk(label));
-        engine
-            .state
-            .lock()
-            .await
-            .peer_outbound
-            .insert(peer.clone(), PeerOutbound { conn_id, tx });
+        engine.state.lock().await.peer_outbound.insert(
+            peer.clone(),
+            PeerOutbound {
+                conn_id,
+                tx,
+                _shutdown: tokio::sync::watch::channel(()).0,
+            },
+        );
         (peer, rx)
     }
 
@@ -1452,6 +1482,7 @@ mod tests {
                     PeerOutbound {
                         conn_id: ConnectionId::for_test(99),
                         tx,
+                        _shutdown: tokio::sync::watch::channel(()).0,
                     },
                 );
 
@@ -1521,6 +1552,7 @@ mod tests {
                     PeerOutbound {
                         conn_id: ConnectionId::for_test(99),
                         tx,
+                        _shutdown: tokio::sync::watch::channel(()).0,
                     },
                 );
 
@@ -1784,6 +1816,7 @@ mod tests {
                     PeerOutbound {
                         conn_id: conn1,
                         tx: tx1,
+                        _shutdown: tokio::sync::watch::channel(()).0,
                     },
                 );
 
@@ -1795,6 +1828,7 @@ mod tests {
                     PeerOutbound {
                         conn_id: conn2,
                         tx: tx2,
+                        _shutdown: tokio::sync::watch::channel(()).0,
                     },
                 );
 
@@ -1841,12 +1875,14 @@ mod tests {
 
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(7);
-                engine
-                    .state
-                    .lock()
-                    .await
-                    .peer_outbound
-                    .insert(peer.clone(), PeerOutbound { conn_id: conn, tx });
+                engine.state.lock().await.peer_outbound.insert(
+                    peer.clone(),
+                    PeerOutbound {
+                        conn_id: conn,
+                        tx,
+                        _shutdown: tokio::sync::watch::channel(()).0,
+                    },
+                );
 
                 let mut events = engine.subscribe_engine_events().await;
 
@@ -1882,12 +1918,14 @@ mod tests {
 
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(7);
-                engine
-                    .state
-                    .lock()
-                    .await
-                    .peer_outbound
-                    .insert(peer.clone(), PeerOutbound { conn_id: conn, tx });
+                engine.state.lock().await.peer_outbound.insert(
+                    peer.clone(),
+                    PeerOutbound {
+                        conn_id: conn,
+                        tx,
+                        _shutdown: tokio::sync::watch::channel(()).0,
+                    },
+                );
 
                 let mut events = engine.subscribe_engine_events().await;
 
@@ -1934,12 +1972,14 @@ mod tests {
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(1);
-                engine
-                    .state
-                    .lock()
-                    .await
-                    .peer_outbound
-                    .insert(peer.clone(), PeerOutbound { conn_id: conn, tx });
+                engine.state.lock().await.peer_outbound.insert(
+                    peer.clone(),
+                    PeerOutbound {
+                        conn_id: conn,
+                        tx,
+                        _shutdown: tokio::sync::watch::channel(()).0,
+                    },
+                );
                 engine
                     .state
                     .lock()
@@ -2091,6 +2131,7 @@ mod tests {
                         PeerOutbound {
                             conn_id: ConnectionId::for_test(0),
                             tx,
+                            _shutdown: tokio::sync::watch::channel(()).0,
                         },
                     );
                 }
@@ -2353,6 +2394,7 @@ mod tests {
                         conn_id: ConnectionId::for_test(1),
                         kind: TransportKind::Primary,
                         out_tx: tx,
+                        shutdown: tokio::sync::watch::channel(()).0,
                         registered: None,
                     })
                     .await;

@@ -7,8 +7,11 @@
 // page load) to call test-hooks-only methods: voice_install_frame_recorder,
 // voice_inject_pcm, voice_recorded_frames.
 //
-// Uses a mobile (Pixel 7) viewport so the voice minibar (data-testid="voice-minibar")
-// is rendered — the minibar is phone-only in the Gleam UI.
+// Uses a mobile (Pixel 7) viewport because the channels rail lives
+// inside a drawer there — driving the test through a real drawer
+// open + tap exercises the phone-specific layout. The minibar itself
+// is identical on desktop (see voice_bar_placement.spec.js for the
+// dedicated desktop placement test).
 
 import { test, expect, devices } from "@playwright/test";
 import {

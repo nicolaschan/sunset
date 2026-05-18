@@ -253,6 +253,13 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
      }
      #app { height: 100%; background: " <> palette.bg <> "; }
      *, *::before, *::after { box-sizing: border-box; }
+     /* Suppress the OS default tap-highlight (translucent gray on iOS,
+        translucent cyan on Android Chrome) so a tap on any of our
+        buttons / channel rows / etc. doesn't briefly flash a non-brand
+        colour that fights with the magenta accent. Press feedback that
+        we want — the active-channel highlight, the action-toolbar
+        :hover, the row :hover backdrop — is driven by our own styles. */
+     * { -webkit-tap-highlight-color: transparent; }
      /* Hover highlight on every message row, full-bleed (no rounded
         corners) so the user can see exactly where one message ends and
         the next begins — matters for multi-line messages. The row
@@ -341,5 +348,22 @@ fn global_reset(mode: Mode, palette: Palette) -> Element(msg) {
         With many messages the auto margin shrinks to 0 and the
         scroll-area scrolls normally. Requires the scroll-area to be
         a flex column (which main_panel.messages_list already is). */
-     .scroll-area > :first-child { margin-top: auto; }")
+     .scroll-area > :first-child { margin-top: auto; }
+     /* Three-dot 'connecting' spinner used in the voice rail. Each dot
+        opacity-pulses 1.4s out of phase with its neighbours so the
+        eye reads the trio as moving left-to-right without any axis
+        translation that would change the icon's footprint. */
+     @keyframes voice-connecting-pulse {
+       0%, 80%, 100% { opacity: 0.25; }
+       40% { opacity: 1; }
+     }
+     .voice-connecting-dot {
+       animation: voice-connecting-pulse 1.4s ease-in-out infinite both;
+     }
+     .voice-connecting-dot:nth-child(1) { animation-delay: -0.32s; }
+     .voice-connecting-dot:nth-child(2) { animation-delay: -0.16s; }
+     .voice-connecting-dot:nth-child(3) { animation-delay: 0s; }
+     @media (prefers-reduced-motion: reduce) {
+       .voice-connecting-dot { animation: none; opacity: 0.5; }
+     }")
 }

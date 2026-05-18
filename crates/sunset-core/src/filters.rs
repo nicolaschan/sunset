@@ -50,7 +50,7 @@ mod tests {
             0,
             1,
             ChannelLabel::default_general(),
-            MessageBody::Text("x".to_owned()),
+            MessageBody::text("x"),
             &mut OsRng,
         )
         .unwrap();
@@ -70,7 +70,7 @@ mod tests {
             0,
             1,
             ChannelLabel::default_general(),
-            MessageBody::Text("x".to_owned()),
+            MessageBody::text("x"),
             &mut OsRng,
         )
         .unwrap();

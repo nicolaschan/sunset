@@ -3,7 +3,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use sunset_core::{ChannelLabel, DecodedMessage, IdentityKey};
+use sunset_core::{ChannelLabel, DecodedMessage, IdentityKey, ImageAttachment};
 
 /// JS-facing decoded text message.
 #[wasm_bindgen]
@@ -21,6 +21,12 @@ pub struct IncomingMessage {
     #[wasm_bindgen(getter_with_clone)]
     pub value_hash_hex: String,
     pub is_self: bool,
+    /// JS-side `Array<{ mime_type, data_base64 }>`. Built per-message so
+    /// the JS bridge can render each entry as a `<img>` tag directly
+    /// (`src="data:${mime_type};base64,${data_base64}"`). Empty array
+    /// for text-only messages.
+    #[wasm_bindgen(getter_with_clone)]
+    pub images: js_sys::Array,
 }
 
 /// JS-facing decoded delivery receipt.
@@ -41,12 +47,14 @@ pub struct IncomingReceipt {
     pub sent_at_ms: f64,
 }
 
-/// Build an IncomingMessage from a decoded Text. The text is passed in
-/// separately so the caller can pattern-match `MessageBody` upstream
-/// and pass only the inner String.
+/// Build an IncomingMessage from a decoded Text. The text and image
+/// list are passed in separately so the caller can pattern-match
+/// `MessageBody` upstream and pass the inner fields directly without
+/// re-cloning the body.
 pub fn from_decoded_text(
     decoded: &DecodedMessage,
     text: String,
+    images: &[ImageAttachment],
     value_hash_hex: String,
     is_self: bool,
 ) -> IncomingMessage {
@@ -58,7 +66,30 @@ pub fn from_decoded_text(
         body: text,
         value_hash_hex,
         is_self,
+        images: images_to_js(images),
     }
+}
+
+/// Encode a slice of [`ImageAttachment`]s into a JS `Array` of plain
+/// `{ mime_type, data_base64 }` objects. The JS side reads these
+/// directly without any wasm-bindgen wrapper class.
+fn images_to_js(images: &[ImageAttachment]) -> js_sys::Array {
+    let arr = js_sys::Array::new_with_length(images.len() as u32);
+    for (i, img) in images.iter().enumerate() {
+        let obj = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("mime_type"),
+            &JsValue::from_str(&img.mime_type),
+        );
+        let _ = js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("data_base64"),
+            &JsValue::from_str(&img.data_base64),
+        );
+        arr.set(i as u32, obj.into());
+    }
+    arr
 }
 
 /// Build an IncomingReceipt JS object.

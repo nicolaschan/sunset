@@ -30,17 +30,51 @@ pub fn voice_start(
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceStop")
 pub fn voice_stop(client: ClientHandle) -> Nil
 
+/// Start voice in *observer* mode: subscribes to the durable
+/// voice-presence stream so the rail can render who is in the channel,
+/// without requesting mic permission or emitting any outbound voice
+/// traffic. Use at room load. Pair with `voice_activate` on join,
+/// `voice_deactivate` on leave, and `voice_stop` on room exit.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceObserveStart")
+pub fn voice_observe_start(
+  client: ClientHandle,
+  room_handle: RoomHandle,
+  callback: fn(Result(Nil, String)) -> Nil,
+) -> Nil
+
+/// Transition from observer to active: brings up `getUserMedia` + the
+/// capture worklet, then flips the runtime's internal `is_active` gate
+/// so heartbeats, presence publishing, and auto-connect resume. On
+/// mic-permission denial `callback` receives `Error(message)`.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceActivate")
+pub fn voice_activate(
+  client: ClientHandle,
+  callback: fn(Result(Nil, String)) -> Nil,
+) -> Nil
+
+/// Inverse of `voice_activate`: returns to observer mode so the local
+/// user keeps seeing who is in the channel, without sending any audio
+/// or presence themselves. Does not drop the runtime.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceDeactivate")
+pub fn voice_deactivate(client: ClientHandle) -> Nil
+
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceSetMuted")
 pub fn voice_set_muted(client: ClientHandle, muted: Bool) -> Nil
 
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceSetDeafened")
 pub fn voice_set_deafened(client: ClientHandle, deafened: Bool) -> Nil
 
-/// Toggle receiver-side RNNoise denoising. Defaults to on when the
-/// runtime starts; pass `False` to bypass the denoiser without losing
-/// per-peer state, so flipping back on resumes from where it left off.
-@external(javascript, "./voice.ffi.mjs", "wasmVoiceSetDenoise")
-pub fn voice_set_denoise(client: ClientHandle, denoise: Bool) -> Nil
+/// Toggle receiver-side RNNoise denoising for a single peer. The
+/// runtime defaults to on for every peer; pass `False` here to bypass
+/// the denoiser for `peer_hex` without losing its per-peer state, so
+/// flipping back on resumes from where it left off. `peer_hex` is the
+/// peer's full 64-char verifying-key hex.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceSetPeerDenoise")
+pub fn voice_set_peer_denoise(
+  client: ClientHandle,
+  peer_hex: String,
+  enabled: Bool,
+) -> Nil
 
 /// Switch the active send-side voice quality preset. Persists the
 /// label to localStorage and (if voice is running) pushes the change
@@ -53,6 +87,21 @@ pub fn voice_set_quality(client: ClientHandle, label: String) -> Nil
 /// if nothing has been saved.
 @external(javascript, "./voice.ffi.mjs", "wasmVoiceGetQuality")
 pub fn voice_get_quality() -> String
+
+/// Toggle send-side echo cancellation. Persists the choice to
+/// localStorage (`"on"` / `"off"`) and, if voice capture is running,
+/// re-acquires the mic with the new `getUserMedia` constraint. The
+/// Opus encoder is unaffected (EC is a browser-side capture concern).
+/// Independent of the quality preset.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceSetEchoCancellation")
+pub fn voice_set_echo_cancellation(client: ClientHandle, enabled: Bool) -> Nil
+
+/// Read the persisted echo-cancellation preference. When nothing has
+/// been saved yet, the value is derived from the active preset (`True`
+/// for `"voice"`, `False` otherwise) so existing users see no
+/// behavior change.
+@external(javascript, "./voice.ffi.mjs", "wasmVoiceGetEchoCancellation")
+pub fn voice_get_echo_cancellation() -> Bool
 
 /// Install the global `window.__voicePeerStateHandler` callback so
 /// `wasmVoiceStart`'s `on_voice_peer_state` fires into Lustre dispatch.

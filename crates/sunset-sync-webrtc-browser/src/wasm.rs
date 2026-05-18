@@ -54,8 +54,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit,
-    RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit, RtcIceServer, RtcPeerConnection,
-    RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
+    RtcDataChannelState, RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit, RtcIceServer,
+    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
 };
 
 use sunset_store::VerifyingKey;
@@ -100,14 +100,47 @@ pub struct WebRtcRawTransport {
     completed_rx: Rc<Mutex<mpsc::UnboundedReceiver<Result<WebRtcRawConnection>>>>,
 }
 
+/// Identifies which side of the handshake registered a `per_peer` entry.
+/// Used by the dispatcher to decide whether a duplicate `Offer` is glare
+/// noise (Connect side — ignore) or a fresh handshake attempt (Accept
+/// side — cancel and restart). The two sides have different lifetimes
+/// (Connect lives until `transport.connect` returns; Accept lives until
+/// the spawned accept task drops its `PerPeerGuard`) but at any given
+/// moment at most one is registered for a given peer — glare avoidance
+/// at the caller (voice `auto_connect`'s lex-pubkey tiebreak) ensures
+/// the two sides don't race for the same peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PerPeerKind {
+    Connect,
+    Accept,
+}
+
+struct PerPeerEntry {
+    tx: mpsc::UnboundedSender<WebRtcSignalKind>,
+    kind: PerPeerKind,
+    /// Monotonic generation, bumped on every (re-)registration for the
+    /// same peer. `PerPeerGuard::drop` only removes the entry if its
+    /// generation still matches — otherwise a stale guard from a
+    /// superseded accept task would wipe out the live entry's routing
+    /// when the prior task's channel close races with the new
+    /// registration.
+    generation: u64,
+}
+
 struct Inner {
     dispatcher_started: bool,
+    /// Source of `generation` values for `PerPeerEntry`. Bumped on every
+    /// (re-)registration; the corresponding `PerPeerGuard` carries
+    /// the same value so it can compare-and-remove safely.
+    next_gen: u64,
     /// In-progress handshakes' inbound queues, keyed by remote peer.
     /// Connect-side registers before sending Offer; accept-side registers
     /// at dispatcher level the moment an Offer arrives, BEFORE the
     /// per-peer task does any await (so subsequent ICE for the same peer
-    /// has somewhere to land).
-    per_peer: HashMap<PeerId, mpsc::UnboundedSender<WebRtcSignalKind>>,
+    /// has somewhere to land). `kind` lets the dispatcher discriminate
+    /// glare-handling (Connect → ignore duplicate Offer) from
+    /// rejoin-handling (Accept → cancel + restart).
+    per_peer: HashMap<PeerId, PerPeerEntry>,
     /// Per-peer buffer for Answer / IceCandidate that arrived before
     /// `per_peer[X]` was registered. Drained by the per-peer accept task
     /// when it spawns; pruned by the dispatcher when entries exceed
@@ -133,6 +166,7 @@ impl WebRtcRawTransport {
             ice_urls,
             inner: Rc::new(RefCell::new(Inner {
                 dispatcher_started: false,
+                next_gen: 0,
                 per_peer: HashMap::new(),
                 early_ice: HashMap::new(),
                 completed_tx,
@@ -175,17 +209,45 @@ impl WebRtcRawTransport {
 
                 match kind {
                     WebRtcSignalKind::Offer(sdp) => {
-                        // If a handshake is already in flight for `from`
-                        // (active connect, or a prior accept that hasn't
-                        // finished), forward the duplicate Offer to that
-                        // queue and let the handshake's glare arm ignore
-                        // it. This is the symmetric "ignore duplicate
-                        // Offer" defense on both sides.
-                        let existing = inner_ref.borrow().per_peer.get(&from).cloned();
-                        if let Some(tx) = existing {
+                        // Disposition for the existing per_peer entry, if
+                        // any:
+                        //
+                        // * Connect-side in flight — we're actively
+                        //   dialing this peer and the inbound Offer is
+                        //   glare (the peer is dialing us back). The
+                        //   connect-side select loop's "duplicate Offer"
+                        //   arm ignores it; forward + continue.
+                        //
+                        // * Accept-side in flight — we have a pending
+                        //   accept task for an *earlier* Offer from
+                        //   this peer. If that earlier handshake is
+                        //   stuck (e.g. the peer restarted with the
+                        //   same identity and the prior RTCPeerConnection
+                        //   on their side is gone), forwarding the new
+                        //   Offer wouldn't unstick it — the accept loop
+                        //   ignores duplicate Offers and there's no
+                        //   path back to "try the new SDP/ICE creds."
+                        //   Cancel the prior accept task (dropping the
+                        //   `tx` here closes its `peer_in_rx`; the
+                        //   accept loop sees `None` and returns Err)
+                        //   and spawn a fresh one against the new
+                        //   Offer. See voice_rejoin_after_refresh.spec.js
+                        //   for the symptom this fixes.
+                        //
+                        // * None — first inbound Offer for this peer;
+                        //   the normal fresh-accept path below applies.
+                        let existing = {
+                            let g = inner_ref.borrow();
+                            g.per_peer.get(&from).map(|e| (e.tx.clone(), e.kind))
+                        };
+                        if let Some((tx, PerPeerKind::Connect)) = existing {
                             let _ = tx.unbounded_send(WebRtcSignalKind::Offer(sdp));
                             continue;
                         }
+                        // For PerPeerKind::Accept: fall through to the
+                        // fresh-accept path. Dropping the old `tx`
+                        // (via overwrite below) closes its receiver,
+                        // ending the prior accept task cleanly.
 
                         // Fresh accept. Register per_peer[from] BEFORE
                         // spawning so subsequent dispatcher events that
@@ -193,13 +255,24 @@ impl WebRtcRawTransport {
                         // the per-peer queue. Drain any buffered early
                         // ICE so the new task processes it first.
                         let (peer_tx, peer_rx) = mpsc::unbounded::<WebRtcSignalKind>();
-                        let buffered = {
+                        let (buffered, generation) = {
                             let mut g = inner_ref.borrow_mut();
-                            g.per_peer.insert(from.clone(), peer_tx);
-                            g.early_ice
+                            let generation = g.next_gen;
+                            g.next_gen = generation.wrapping_add(1);
+                            g.per_peer.insert(
+                                from.clone(),
+                                PerPeerEntry {
+                                    tx: peer_tx,
+                                    kind: PerPeerKind::Accept,
+                                    generation,
+                                },
+                            );
+                            let buffered = g
+                                .early_ice
                                 .remove(&from)
                                 .map(|b| b.candidates)
-                                .unwrap_or_default()
+                                .unwrap_or_default();
+                            (buffered, generation)
                         };
                         let completed_tx = inner_ref.borrow().completed_tx.clone();
                         spawn_local(spawn_accept_task(AcceptTask {
@@ -212,10 +285,14 @@ impl WebRtcRawTransport {
                             peer_in_rx: peer_rx,
                             buffered,
                             completed_tx,
+                            generation,
                         }));
                     }
                     other => {
-                        let target = inner_ref.borrow().per_peer.get(&from).cloned();
+                        let target = {
+                            let g = inner_ref.borrow();
+                            g.per_peer.get(&from).map(|e| e.tx.clone())
+                        };
                         if let Some(tx) = target {
                             let _ = tx.unbounded_send(other);
                         } else {
@@ -248,10 +325,20 @@ impl WebRtcRawTransport {
         });
     }
 
-    fn register_peer(&self, remote: PeerId) -> mpsc::UnboundedReceiver<WebRtcSignalKind> {
+    fn register_peer(&self, remote: PeerId) -> (mpsc::UnboundedReceiver<WebRtcSignalKind>, u64) {
         let (tx, rx) = mpsc::unbounded::<WebRtcSignalKind>();
-        self.inner.borrow_mut().per_peer.insert(remote, tx);
-        rx
+        let mut inner = self.inner.borrow_mut();
+        let generation = inner.next_gen;
+        inner.next_gen = generation.wrapping_add(1);
+        inner.per_peer.insert(
+            remote,
+            PerPeerEntry {
+                tx,
+                kind: PerPeerKind::Connect,
+                generation,
+            },
+        );
+        (rx, generation)
     }
 }
 
@@ -278,6 +365,10 @@ struct AcceptTask {
     peer_in_rx: mpsc::UnboundedReceiver<WebRtcSignalKind>,
     buffered: Vec<WebRtcSignalKind>,
     completed_tx: mpsc::UnboundedSender<Result<WebRtcRawConnection>>,
+    /// Generation of the `per_peer[from_peer]` entry this task owns.
+    /// Passed to `PerPeerGuard` so the cleanup is compare-and-remove
+    /// — a superseded task's guard won't wipe out the live entry.
+    generation: u64,
 }
 
 /// Wrapper future for `spawn_local` — runs one accept handshake to
@@ -299,7 +390,25 @@ impl RawTransport for WebRtcRawTransport {
         self.ensure_dispatcher();
 
         let remote_peer = parse_addr_peer_id(&addr)?;
-        let mut peer_in_rx = self.register_peer(remote_peer.clone());
+
+        // Every WebRTC connect attempt is a *fresh* handshake — even
+        // when the underlying `Signaler` holds long-lived per-peer
+        // crypto state (e.g. the Noise_KK session that `RelaySignaler`
+        // caches). If the remote restarted with the same identity
+        // (page refresh — see `voice_rejoin_after_refresh.spec.js`)
+        // its slot for us is fresh; continuing to encrypt our Offer
+        // against the cached session it no longer holds means our
+        // signaling entry is undecryptable on its end and our dial
+        // hangs until the supervisor's WebRTC-layer timeout.
+        // Resetting the slot here forces the next `send` to take the
+        // empty-slot arm and write a fresh KK msg1; the receiver's
+        // `decrypt_inbound` then succeeds via its own responder
+        // fallback. Implementations with no per-peer state default
+        // to a no-op `reset_peer`, so this is a zero-cost call for
+        // them.
+        self.signaler.reset_peer(&remote_peer).await;
+
+        let (mut peer_in_rx, connect_gen) = self.register_peer(remote_peer.clone());
         // Auto-cleanup if any `?` below errors out before we finish.
         // Without this, the registry would still hold a dead sender;
         // a retry's fresh Offer arriving at the dispatcher would route
@@ -308,6 +417,7 @@ impl RawTransport for WebRtcRawTransport {
         let _connect_guard = PerPeerGuard {
             inner: self.inner.clone(),
             peer: remote_peer.clone(),
+            generation: connect_gen,
         };
 
         let pc = build_peer_connection(&self.ice_urls)?;
@@ -484,14 +594,26 @@ impl RawTransport for WebRtcRawTransport {
 /// route a fresh Offer back to the dead queue. On retry, we want stale
 /// ICE to drop at the dispatcher (no per_peer entry → buffer or drop),
 /// not crash the new attempt's `addIceCandidate`.
+///
+/// `generation` carries the generation of the entry this guard is responsible
+/// for. The drop impl removes the entry only if its current generation
+/// still matches — without this check, a superseded accept task (whose
+/// channel was just closed by the rejoin-restart path) would wipe out
+/// the *replacement* accept task's routing when it exits.
 struct PerPeerGuard {
     inner: Rc<RefCell<Inner>>,
     peer: PeerId,
+    generation: u64,
 }
 
 impl Drop for PerPeerGuard {
     fn drop(&mut self) {
-        self.inner.borrow_mut().per_peer.remove(&self.peer);
+        let mut inner = self.inner.borrow_mut();
+        if let Some(entry) = inner.per_peer.get(&self.peer) {
+            if entry.generation == self.generation {
+                inner.per_peer.remove(&self.peer);
+            }
+        }
     }
 }
 
@@ -511,10 +633,12 @@ async fn run_accept_one(task: AcceptTask) -> Result<WebRtcRawConnection> {
         mut peer_in_rx,
         buffered,
         completed_tx: _,
+        generation,
     } = task;
     let _guard = PerPeerGuard {
         inner: inner.clone(),
         peer: from_peer.clone(),
+        generation,
     };
 
     let pc = build_peer_connection(&ice_urls)?;
@@ -555,6 +679,17 @@ async fn run_accept_one(task: AcceptTask) -> Result<WebRtcRawConnection> {
                 dc.set_onclose(Some(on_close.as_ref().unchecked_ref()));
                 on_close.forget();
 
+                // If the channel was already `open` by the time we
+                // attached `onopen`, the `open` event does not fire
+                // retroactively — signal opened ourselves so the accept
+                // loop can break. Otherwise on_open fires later and
+                // takes the sender; either path resolves `open_rx` once.
+                if dc.ready_state() == RtcDataChannelState::Open {
+                    if let Some(tx) = open_tx_cell.borrow_mut().take() {
+                        let _ = tx.send(());
+                    }
+                }
+
                 if let Some(tx) = dc_tx_cell.borrow_mut().take() {
                     let _ = tx.send(dc);
                 }
@@ -571,6 +706,12 @@ async fn run_accept_one(task: AcceptTask) -> Result<WebRtcRawConnection> {
                 let on_close = make_close_closure(msg_tx_for_dc_unrel.clone());
                 dc.set_onclose(Some(on_close.as_ref().unchecked_ref()));
                 on_close.forget();
+
+                if dc.ready_state() == RtcDataChannelState::Open {
+                    if let Some(tx) = open_tx_unrel_cell.borrow_mut().take() {
+                        let _ = tx.send(());
+                    }
+                }
 
                 if let Some(tx) = dc_tx_unrel_cell.borrow_mut().take() {
                     let _ = tx.send(dc);
@@ -737,6 +878,7 @@ pub struct WebRtcRawConnection {
 #[async_trait(?Send)]
 impl RawConnection for WebRtcRawConnection {
     async fn send_reliable(&self, bytes: Bytes) -> Result<()> {
+        wait_for_dc_open(&self.dc, "dc").await?;
         self.dc
             .send_with_u8_array(&bytes)
             .map_err(|e| Error::Transport(format!("dc.send: {e:?}")))
@@ -755,6 +897,7 @@ impl RawConnection for WebRtcRawConnection {
     }
 
     async fn send_unreliable(&self, bytes: Bytes) -> Result<()> {
+        wait_for_dc_open(&self.dc_unrel, "dc_unrel").await?;
         self.dc_unrel
             .send_with_u8_array(&bytes)
             .map_err(|e| Error::Transport(format!("dc_unrel.send: {e:?}")))
@@ -775,6 +918,29 @@ impl RawConnection for WebRtcRawConnection {
     async fn close(&self) -> Result<()> {
         self.dc.close();
         Ok(())
+    }
+}
+
+impl Drop for WebRtcRawConnection {
+    /// Detach every JS event handler before letting the `Closure`
+    /// fields drop. Without this, a still-queued `close` /
+    /// `message` event from either dataChannel can fire after the
+    /// corresponding `Closure<dyn FnMut(...)>` has been dropped,
+    /// surfacing as a `closure invoked recursively or after being
+    /// dropped` pageerror in the browser console (and possible UAF
+    /// under wasm-bindgen's debug build). The connect side is the
+    /// one that stores closures in `WebRtcRawConnection`; the
+    /// accept side `.forget()`s them inside `ondatachannel` so the
+    /// closures outlive the page and don't need this teardown.
+    /// `set_*(None)` is a cheap JS call that just clears the
+    /// callback slot — safe on already-closed channels.
+    fn drop(&mut self) {
+        self.dc.set_onclose(None);
+        self.dc.set_onmessage(None);
+        self.dc.set_onopen(None);
+        self.dc_unrel.set_onclose(None);
+        self.dc_unrel.set_onmessage(None);
+        self.dc_unrel.set_onopen(None);
     }
 }
 
@@ -931,6 +1097,51 @@ fn spawn_ice_forwarder(
 async fn try_add_remote_ice(pc: &RtcPeerConnection, cand_json: &str) {
     if let Err(e) = add_remote_ice(pc, cand_json).await {
         tracing::warn!(error = %e, "ignoring bad/stale remote ICE candidate");
+    }
+}
+
+/// Wait until `dc.readyState` is `Open`, or return a transport error if
+/// the channel is already `Closing` / `Closed`.
+///
+/// Chromium's `RTCDataChannel.open` event can fire ahead of the SCTP
+/// outbound stream being fully usable for sends: the receive direction
+/// works (`onmessage` delivers buffered incoming user data) but
+/// `send_with_u8_array` rejects with `InvalidStateError: readyState is
+/// not 'open'`. Under CI's CPU contention this manifests as a
+/// post-`open` window where `readyState` momentarily reads `Connecting`
+/// for the side that received the inbound channel via `ondatachannel`.
+///
+/// The accept loop in `run_accept_one` already double-signals
+/// `open_rx` if the channel is already `Open` when we attach the
+/// listener, so the loop's exit is correct. This guard catches the
+/// remaining window: it polls the actual `readyState` on each send and
+/// briefly waits if the state hasn't settled yet. The wait window
+/// (200 ms, ~2× a worst-case SCTP-ACK round trip on localhost) is
+/// well under the noise-handshake timeout (60 s) and small enough
+/// that a real "closed before send" failure still surfaces promptly.
+async fn wait_for_dc_open(dc: &RtcDataChannel, label: &str) -> Result<()> {
+    const POLL_INTERVAL_MS: u64 = 5;
+    const MAX_WAIT_MS: u64 = 200;
+    let mut elapsed_ms: u64 = 0;
+    loop {
+        match dc.ready_state() {
+            RtcDataChannelState::Open => return Ok(()),
+            RtcDataChannelState::Connecting => {
+                if elapsed_ms >= MAX_WAIT_MS {
+                    return Err(Error::Transport(format!(
+                        "{label}: readyState stuck at 'connecting' after {MAX_WAIT_MS} ms"
+                    )));
+                }
+                wasmtimer::tokio::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+                elapsed_ms += POLL_INTERVAL_MS;
+            }
+            RtcDataChannelState::Closing | RtcDataChannelState::Closed => {
+                return Err(Error::Transport(format!("{label}: channel closed")));
+            }
+            // RtcDataChannelState is non-exhaustive in web-sys; treat
+            // unknown variants as a permanent error rather than a poll.
+            _ => return Err(Error::Transport(format!("{label}: unknown readyState"))),
+        }
     }
 }
 

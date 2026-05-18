@@ -88,24 +88,66 @@ export function ensureCtx() {
 const FRAME_SAMPLES_PER_CHANNEL = 960;
 const STEREO_FRAME_TOTAL = FRAME_SAMPLES_PER_CHANNEL * 2;
 
+// Mic capture constraints. Two independent axes:
+//
+//   * `preset` — bundles noise suppression + AGC + opus encoder profile.
+//     Voice mode runs the browser's WebRTC speech processing (NS + AGC),
+//     which band-limits the input to roughly 8 kHz — appropriate at the
+//     24 kbps Opus VOIP target. High/Maximum disable NS/AGC so the
+//     encoder sees the mic's full bandwidth.
+//
+//   * `echoCancellation` — independent send-side toggle, persisted
+//     separately. Defaults derived from preset (on for voice, off for
+//     high/maximum) when nothing is persisted, so existing users see no
+//     behavior change; once toggled, it stays independent of preset.
+function micConstraints(preset, echoCancellation) {
+  const speechOptimized = preset === "voice";
+  return {
+    echoCancellation,
+    noiseSuppression: speechOptimized,
+    autoGainControl: speechOptimized,
+    // Always request the highest-fidelity capture the device offers.
+    // The encoder reconfigures per preset; the input pipeline can
+    // safely stay at maximum rate / depth / channels regardless.
+    // `ideal` lets the browser fall back when a constraint can't be
+    // met (e.g. mono mic, 16-bit-only driver).
+    sampleRate: { ideal: 48000 },
+    channelCount: { ideal: 2 },
+    sampleSize: { ideal: 24 },
+    latency: { ideal: 0.02 },
+  };
+}
+
+// Combined profile identifier covering both the preset's speech-vs-raw
+// dimension and the independent echo-cancellation toggle. A change in
+// either dimension implies the mic stream must be re-acquired with new
+// `getUserMedia` constraints.
+function micProfile(preset, echoCancellation) {
+  const base = preset === "voice" ? "speech" : "raw";
+  return base + ":" + (echoCancellation ? "ec" : "noec");
+}
+
+let currentMicProfile = null;
+
 export async function startCapture(client) {
   ensureCtx();
   await ctx.audioWorklet.addModule("/audio/voice-capture-worklet.js");
   await ctx.audioWorklet.addModule("/audio/voice-playback-worklet.js");
   startLevelDecayTimer();
+  const preset = readPersistedQuality();
+  const ec = readPersistedEchoCancellation();
+  await openCaptureStream(client, preset, ec);
+}
+
+// Acquire (or re-acquire) the mic with constraints matching `preset` and
+// `echoCancellation`, then wire the capture worklet into the audio
+// graph. Caller must have torn down any prior `captureStream` /
+// `captureNode` first.
+async function openCaptureStream(client, preset, echoCancellation) {
   captureStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      // Always request stereo capture. If the platform only has a
-      // mono mic the worklet duplicates L into R so we get the same
-      // interleaved 1920-sample frame shape regardless. See
-      // `voice-capture-worklet.js` for the rationale on not
-      // reconfiguring channelCount per quality preset.
-      channelCount: 2,
-    },
+    audio: micConstraints(preset, echoCancellation),
   });
+  currentMicProfile = micProfile(preset, echoCancellation);
   const src = ctx.createMediaStreamSource(captureStream);
   captureNode = new AudioWorkletNode(ctx, "voice-capture", {
     // The capture worklet reads from a stereo source; tell the audio
@@ -130,6 +172,55 @@ export async function startCapture(client) {
     }
   };
   src.connect(captureNode);
+}
+
+// Tear down only the mic side of the pipeline; per-peer playback
+// chains stay live so a preset switch mid-call doesn't drop the
+// audio the user is currently hearing.
+function tearDownCapture() {
+  if (captureNode) {
+    captureNode.port.onmessage = null;
+    try {
+      captureNode.disconnect();
+    } catch (_e) {
+      // ignore — already disconnected
+    }
+    captureNode = null;
+  }
+  if (captureStream) {
+    for (const t of captureStream.getTracks()) t.stop();
+    captureStream = null;
+  }
+  currentMicProfile = null;
+}
+
+function readPersistedQuality() {
+  try {
+    const stored = window.localStorage?.getItem("sunset/voice-quality");
+    if (stored === "voice" || stored === "high" || stored === "maximum") {
+      return stored;
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return "maximum";
+}
+
+// Independent echo-cancellation preference. Stored as `"on"` / `"off"`.
+// When nothing is persisted, derive from the active preset to preserve
+// pre-toggle behavior: the legacy "voice" preset implied echoCancellation
+// on; "high" / "maximum" implied it off. Once the user flips the toggle,
+// `wasmVoiceSetEchoCancellation` writes the explicit value and the
+// derivation no longer applies.
+function readPersistedEchoCancellation() {
+  try {
+    const stored = window.localStorage?.getItem("sunset/echo-cancellation");
+    if (stored === "on") return true;
+    if (stored === "off") return false;
+  } catch (_e) {
+    // ignore
+  }
+  return readPersistedQuality() === "voice";
 }
 
 function updateSelfLevel(pcm) {
@@ -235,11 +326,19 @@ function flushSelfLevelToZero() {
 }
 
 export function stopCapture() {
-  if (captureStream) {
-    for (const t of captureStream.getTracks()) t.stop();
-    captureStream = null;
-  }
-  captureNode = null;
+  // Mic side: full teardown. Stopping the MediaStream's tracks is not
+  // enough — the AudioWorkletNode stays alive in the audio graph and
+  // its `process()` keeps firing on whatever its source emits after the
+  // tracks end (silence, per WebAudio spec). If we leave
+  // `port.onmessage` attached, that handler then keeps calling
+  // `client.voice_input` for the lifetime of the AudioContext. On the
+  // next `wasmVoiceActivate` a *second* capture worklet is created on
+  // top of the leaked one, both pumping frames into `voice_input` —
+  // the encoder sees ~2× the frame rate (real audio interleaved with
+  // post-leave silence), the receiver hears 50 Hz amplitude-modulated
+  // distortion. Clearing `port.onmessage` + `.disconnect()` cuts that
+  // path off cleanly at the boundary the JS bridge already owns.
+  tearDownCapture();
   for (const [peerHex, slot] of peers) {
     try {
       slot.worklet.disconnect();
@@ -320,10 +419,17 @@ export function dropPeer(peerHex) {
   peerLastFrameMs.delete(peerHex);
 }
 
+// Maximum gain the slider can drive. The Gleam UI runs a
+// linear-then-exponential curve (`voice_volume`); the top of the
+// slider (500%) maps to gain 16.0 (= 2 ** ((500 - 100) / 100)).
+// Must agree with `voice_volume.max_gain` — otherwise the model's
+// reported volume and what's actually applied would diverge.
+const PEER_GAIN_MAX = 16.0;
+
 export function setPeerVolume(peerHex, gain) {
   const slot = peers.get(peerHex);
   if (!slot) return;
-  slot.gain.gain.value = Math.max(0, Math.min(2.0, gain));
+  slot.gain.gain.value = Math.max(0, Math.min(PEER_GAIN_MAX, gain));
 }
 
 export function getPeerGain(peerHex) {
@@ -369,17 +475,14 @@ export function wasmVoiceStart(client, roomHandle, callback) {
             }
           },
         );
-        // Re-apply the user's preferred quality preset. localStorage
-        // is the canonical persistence; default `"maximum"` matches
-        // the Rust default. Failures are non-fatal — the encoder
-        // already constructed itself with the default.
+        // Re-apply the user's preferred quality preset to the
+        // freshly-built encoder. `startCapture` already opened the mic
+        // with constraints matching this preset (read from the same
+        // localStorage key), so the encoder + capture pipeline agree
+        // on EC/NS/AGC and channel layout. Failures are non-fatal —
+        // the encoder already constructed itself with the Rust default.
         try {
-          const stored = window.localStorage?.getItem("sunset/voice-quality");
-          const label =
-            stored === "voice" || stored === "high" || stored === "maximum"
-              ? stored
-              : "maximum";
-          client.voice_set_quality(label);
+          client.voice_set_quality(readPersistedQuality());
         } catch (qe) {
           console.warn("voice_set_quality on start failed", qe);
         }
@@ -403,6 +506,88 @@ export function wasmVoiceStop(client) {
   stopCapture();
 }
 
+// Start voice in *observer* mode — no mic permission, no audio
+// context, no outbound voice traffic. Just enough to subscribe to
+// the durable voice-presence stream so the channels rail can
+// render who is in the voice channel before the local user joins.
+// Mirrors `wasmVoiceStart`'s callback shape so the Rust side wires
+// the same three handlers (PCM delivery, peer-drop, peer-state-changed)
+// — none of which can fire until `wasmVoiceActivate` opens the gate.
+export function wasmVoiceObserveStart(client, roomHandle, callback) {
+  try {
+    client.voice_observe_start(
+      roomHandle,
+      (peerId, seq, pcm) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        deliverFrame(hex, seq >>> 0, new Float32Array(pcm));
+      },
+      (peerId) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        dropPeer(hex);
+      },
+      (peerId, inCall, talking, isMuted, inVoiceChannel) => {
+        const hex = uint8ToHex(new Uint8Array(peerId));
+        if (window.__voicePeerStateHandler) {
+          window.__voicePeerStateHandler(
+            hex,
+            inCall,
+            talking,
+            isMuted,
+            inVoiceChannel,
+          );
+        }
+      },
+    );
+    callback(new Ok(null));
+  } catch (e) {
+    callback(new GError(String(e?.message || e)));
+  }
+}
+
+// Bring up mic capture, then flip the runtime out of observer mode
+// so heartbeats / presence publishes / auto-connect resume. Pairs
+// with `wasmVoiceObserveStart`. The user-quality preset is re-applied
+// here (rather than in observe-start) because it's a property of the
+// active encoder, not the observer.
+export function wasmVoiceActivate(client, callback) {
+  startCapture(client)
+    .then(() => {
+      try {
+        client.voice_activate();
+        try {
+          const stored = window.localStorage?.getItem("sunset/voice-quality");
+          const label =
+            stored === "voice" || stored === "high" || stored === "maximum"
+              ? stored
+              : "maximum";
+          client.voice_set_quality(label);
+        } catch (qe) {
+          console.warn("voice_set_quality on activate failed", qe);
+        }
+        callback(new Ok(null));
+      } catch (e) {
+        stopCapture();
+        callback(new GError(String(e?.message || e)));
+      }
+    })
+    .catch((e) => {
+      callback(new GError(String(e?.message || e)));
+    });
+}
+
+// Inverse of `wasmVoiceActivate`. Returns to observer mode so the
+// roster stays populated for the local user; stops mic capture so
+// no audio leaves the device. Does *not* drop the runtime — use
+// `wasmVoiceStop` for that (on room exit).
+export function wasmVoiceDeactivate(client) {
+  try {
+    client.voice_deactivate();
+  } catch (e) {
+    console.warn("voice_deactivate failed", e);
+  }
+  stopCapture();
+}
+
 export function wasmVoiceSetMuted(client, m) {
   try {
     client.voice_set_muted(!!m);
@@ -419,18 +604,36 @@ export function wasmVoiceSetDeafened(client, d) {
   }
 }
 
-export function wasmVoiceSetDenoise(client, on) {
-  try {
-    client.voice_set_denoise(!!on);
-  } catch (e) {
-    console.warn("voice_set_denoise failed", e);
+export function wasmVoiceSetPeerDenoise(client, peerHex, on) {
+  const bytes = hexToUint8(peerHex);
+  if (!bytes) {
+    console.warn("voice_set_peer_denoise: bad peer hex", peerHex);
+    return;
   }
+  try {
+    client.voice_set_peer_denoise(bytes, !!on);
+  } catch (e) {
+    console.warn("voice_set_peer_denoise failed", e);
+  }
+}
+
+function hexToUint8(hex) {
+  if (typeof hex !== "string" || hex.length % 2 !== 0) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(byte)) return null;
+    out[i] = byte;
+  }
+  return out;
 }
 
 // Persists the new quality preset to localStorage and pushes it
 // down to the active encoder if voice is started. The setting is
 // re-applied on every voice_start so a user who changes it before
-// joining a call sees the right preset on rejoin.
+// joining a call sees the right preset on rejoin. If the mic
+// profile differs (Voice's speech-optimized capture vs High/Maximum's
+// raw capture), the mic stream is re-acquired with new constraints.
 export function wasmVoiceSetQuality(client, label) {
   try {
     window.localStorage?.setItem("sunset/voice-quality", label);
@@ -445,20 +648,55 @@ export function wasmVoiceSetQuality(client, label) {
     if (!String(e?.message || e).includes("voice not started")) {
       console.warn("voice_set_quality failed", e);
     }
+    return;
+  }
+  // Re-acquire the mic with new constraints when the combined mic
+  // profile changes. Same-profile transitions (e.g. High ↔ Maximum
+  // with EC unchanged) only rebuild the encoder; the capture stream
+  // is unaffected.
+  const ec = readPersistedEchoCancellation();
+  const newProfile = micProfile(label, ec);
+  if (captureStream && newProfile !== currentMicProfile) {
+    tearDownCapture();
+    openCaptureStream(client, label, ec).catch((err) => {
+      console.warn("re-open mic for quality change failed", err);
+    });
   }
 }
 
 // Read the persisted preset (or the Rust default if nothing saved).
 export function wasmVoiceGetQuality() {
+  return readPersistedQuality();
+}
+
+// Persist the new echo-cancellation preference and, if voice is
+// running, re-acquire the mic with updated `getUserMedia` constraints.
+// EC is purely a send-side capture constraint — the Opus encoder is
+// unaffected, so we don't push anything to the WASM client.
+export function wasmVoiceSetEchoCancellation(_client, enabled) {
+  const ec = !!enabled;
   try {
-    const stored = window.localStorage?.getItem("sunset/voice-quality");
-    if (stored === "voice" || stored === "high" || stored === "maximum") {
-      return stored;
-    }
+    window.localStorage?.setItem(
+      "sunset/echo-cancellation",
+      ec ? "on" : "off",
+    );
   } catch (_e) {
-    // ignore
+    // Private browsing or full quota — non-fatal.
   }
-  return "maximum";
+  const preset = readPersistedQuality();
+  const newProfile = micProfile(preset, ec);
+  if (captureStream && newProfile !== currentMicProfile) {
+    tearDownCapture();
+    openCaptureStream(_client, preset, ec).catch((err) => {
+      console.warn("re-open mic for echo-cancellation change failed", err);
+    });
+  }
+}
+
+// Read the persisted echo-cancellation preference. Falls back to the
+// preset-derived default when nothing has been persisted yet.
+export function wasmVoiceGetEchoCancellation() {
+  return readPersistedEchoCancellation();
 }
 
 

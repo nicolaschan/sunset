@@ -1,6 +1,12 @@
 //// Channels rail (column 2): room header, text channels, voice
 //// channel (with grouped live detail when peers are connected),
 //// and bridge channels.
+////
+//// The in-call self-controls (mute / deafen / leave) live in the
+//// voice minibar at the top of the chat panel, not in this rail —
+//// see `views/voice_minibar.gleam`. Per-peer settings (volume,
+//// denoise, send quality, mute-for-me) live in the voice popover
+//// that opens when the user taps a member row here.
 
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
@@ -14,14 +20,12 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Channel, type ChannelId, type ConnStatus, type Member, type Relay,
-  type Room, type Viewport, type VoicePeerStateUI, Connected, Desktop, MutedP,
-  Offline, Phone, Reconnecting, TextChannel, Voice,
+  type Channel, type ChannelId, type Member, type Room, type Viewport,
+  type VoicePeerStateUI, Desktop, MutedP, Phone, TextChannel, Voice,
 }
 import sunset_web/sunset
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
-import sunset_web/views/relays as relays_view
 import sunset_web/views/voice_meter
 
 pub fn view(
@@ -42,33 +46,12 @@ pub fn view(
   on_open_rooms on_open_rooms: msg,
   on_join_voice on_join_voice: msg,
   on_leave_voice on_leave_voice: msg,
-  on_mute_self on_mute_self: msg,
-  on_deafen_self on_deafen_self: msg,
-  on_toggle_denoise on_toggle_denoise: msg,
   self_in_call self_in_call: Bool,
-  self_muted self_muted: Bool,
-  self_deafened self_deafened: Bool,
-  denoise_on denoise_on: Bool,
-  relays relays: List(Relay),
-  on_open_relay on_open_relay: fn(Float) -> msg,
 ) -> Element(msg) {
   let text_channels = list.filter(cs, fn(c) { c.kind == TextChannel })
   let voice_channels = list.filter(cs, fn(c) { c.kind == Voice })
   let in_call = list.filter(ms, fn(m) { m.in_call })
 
-  // Always anchor the desktop self-controls bar to the channels rail's
-  // first voice channel, regardless of whether anyone is in_call yet.
-  // The bar's bottom seam needs to line up with the rooms rail's "you"
-  // row and the main panel's composer (shell.spec.js's
-  // "column-bottom rows share a top y-coordinate" check), and a user
-  // who hasn't joined voice still wants to see the channel they can
-  // join. Pre-cleanup the fixture's hardcoded in_call: 3 was what made
-  // this branch fire for free; post-cleanup the rail derives in_call
-  // from real peers, so we anchor by existence rather than activity.
-  let active_voice =
-    voice_channels
-    |> list.first
-    |> result_to_option
   // `height: 100%` resolves correctly for both layouts: the drawer's
   // safe-area-padded content box on phone, and the desktop grid row
   // (which is sized to 100dvh by shell.desktop_view's
@@ -132,39 +115,10 @@ pub fn view(
               }),
             ]),
           ),
-          relays_view.rail_section(
-            palette: p,
-            relays: relays,
-            on_open: on_open_relay,
-          ),
         ],
       ),
-      case viewport, active_voice {
-        Desktop, Some(c) ->
-          self_control_bar(
-            p,
-            c.name,
-            on_leave_voice,
-            on_join_voice,
-            on_mute_self,
-            on_deafen_self,
-            on_toggle_denoise,
-            self_in_call,
-            self_muted,
-            self_deafened,
-            denoise_on,
-          )
-        _, _ -> element.fragment([])
-      },
     ],
   )
-}
-
-fn result_to_option(r: Result(a, b)) -> Option(a) {
-  case r {
-    Ok(v) -> Some(v)
-    Error(_) -> None
-  }
 }
 
 fn room_header(
@@ -202,7 +156,7 @@ fn room_header(
             #("cursor", "pointer"),
           ]),
         ],
-        [title_text(r), conn_icon(p, r.status), chevron_right(p)],
+        [title_text(r), chevron_right(p)],
       )
     Desktop ->
       html.span(
@@ -237,7 +191,11 @@ fn room_header(
     ],
     case viewport {
       Phone -> [title_el]
-      Desktop -> [title_el, conn_icon(p, r.status)]
+      // Desktop: room title only — connection state is surfaced via a
+      // text label in the rooms-rail meta_line ("reconnecting" /
+      // "offline") and via the phone header on mobile, so a duplicate
+      // dot here would only add visual noise.
+      Desktop -> [title_el]
     },
   )
 }
@@ -329,6 +287,8 @@ fn text_channel_row(
 
   html.button(
     [
+      attribute.attribute("data-testid", "text-channel-row"),
+      attribute.attribute("data-channel-name", c.name),
       event.on_click(sel(c.id)),
       ui.css([
         #("display", "flex"),
@@ -486,22 +446,21 @@ fn idle_voice_row(p: Palette, c: Channel, on_join: msg) -> Element(msg) {
       ]),
     ],
     [
-      html.span([ui.css([#("color", p.text_faint)])], [html.text("◐")]),
+      // Same mic glyph as the live voice block, in muted color so the
+      // idle state reads as "voice channel, no one in it yet" rather
+      // than introducing a different shape (the old ◐ half-circle didn't
+      // map to anything meaningful and was easy to misread as a status).
+      html.span(
+        [
+          ui.css([
+            #("color", p.text_faint),
+            #("display", "inline-flex"),
+            #("align-items", "center"),
+          ]),
+        ],
+        [voice_icon()],
+      ),
       html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
-      case c.in_call {
-        0 -> element.fragment([])
-        n ->
-          html.span(
-            [
-              ui.css([
-                #("font-size", "13.75px"),
-                #("color", p.accent),
-                #("font-weight", "600"),
-              ]),
-            ],
-            [html.text(int.to_string(n) <> " live")],
-          )
-      },
     ],
   )
 }
@@ -523,10 +482,24 @@ fn live_voice_block(
     True -> on_leave
     False -> on_join
   }
+  // Magenta accent treatment is reserved for the "you are in this
+  // call" state — it's the same brand role the voice minibar uses to
+  // signal active participation. When we're observing peers in a
+  // call we haven't joined, the block uses neutral surface tones so
+  // the user reads the rail as "this channel is live" without
+  // mistaking it for "you're connected".
+  let block_bg = case self_in_call {
+    True -> p.accent_soft
+    False -> p.surface_sunk
+  }
+  let header_color = case self_in_call {
+    True -> p.accent_deep
+    False -> p.text_muted
+  }
   html.div(
     [
       ui.css([
-        #("background", p.accent_soft),
+        #("background", block_bg),
         #("border-radius", "6px"),
         #("padding-bottom", "10px"),
       ]),
@@ -535,6 +508,10 @@ fn live_voice_block(
       html.button(
         [
           attribute.attribute("data-testid", "voice-channel-row"),
+          attribute.attribute("data-voice-self-joined", case self_in_call {
+            True -> "true"
+            False -> "false"
+          }),
           attribute.attribute("aria-label", case self_in_call {
             True -> "Leave " <> c.name
             False -> "Join " <> c.name
@@ -547,7 +524,7 @@ fn live_voice_block(
             #("padding", "6px 12px"),
             #("font-size", "16.25px"),
             #("font-weight", "600"),
-            #("color", p.accent_deep),
+            #("color", header_color),
             #("border", "none"),
             #("background", "transparent"),
             #("font-family", "inherit"),
@@ -557,19 +534,10 @@ fn live_voice_block(
           ]),
         ],
         [
-          html.span(
-            [
-              ui.css([
-                #("width", "8px"),
-                #("height", "8px"),
-                #("border-radius", "999px"),
-                #("background", p.live),
-                #("display", "inline-block"),
-                #("flex-shrink", "0"),
-              ]),
-            ],
-            [],
-          ),
+          // Voice icon — clearer than a colored dot at conveying
+          // "this is a voice channel". Inherits color from the
+          // parent button.
+          voice_icon(),
           html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
         ],
       ),
@@ -584,7 +552,7 @@ fn live_voice_block(
           ]),
         ],
         list.flatten([
-          [connector_line(p)],
+          [connector_line(p, self_in_call)],
           list.map(ms, fn(m) {
             voice_member_row(
               p,
@@ -603,10 +571,15 @@ fn live_voice_block(
   )
 }
 
-fn connector_line(p: Palette) -> Element(msg) {
+fn connector_line(p: Palette, self_in_call: Bool) -> Element(msg) {
   // Bound to the inset of the members container's padding so the line
   // only spans the rows themselves, not the surrounding whitespace at
-  // the top and bottom of the light-blue block.
+  // the top and bottom of the block. Color tracks the block's tone:
+  // accent when self is in the call, neutral when observing.
+  let #(color, opacity) = case self_in_call {
+    True -> #(p.accent, "0.35")
+    False -> #(p.text_faint, "0.55")
+  }
   html.span(
     [
       ui.css([
@@ -615,8 +588,8 @@ fn connector_line(p: Palette) -> Element(msg) {
         #("top", "4px"),
         #("bottom", "10px"),
         #("width", "2px"),
-        #("background", p.accent),
-        #("opacity", "0.35"),
+        #("background", color),
+        #("opacity", opacity),
         #("border-radius", "1px"),
       ]),
     ],
@@ -672,11 +645,20 @@ fn voice_member_row(
     _, _ -> 0.0
   }
   let speaking = connected && level >. voice_meter.speaking_threshold()
-  let dot_color = case connected, muted, speaking {
-    False, _, _ -> p.text_faint
-    True, True, _ -> p.text_faint
-    True, False, True -> p.live
-    True, False, False -> p.accent
+  // Voice member dot semantics:
+  //   * Speaking → green, the only "active" signal in the row
+  //   * In-call but quiet → no dot at all (the trailing waveform meter
+  //     already conveys "audio path live, no level"; the dot was
+  //     redundant)
+  //   * Not connected (still in voice channel) → hollow gray ring,
+  //     matching the same convention used in the members rail
+  //   * Muted → small mic-muted glyph, conveys *why* there's no audio
+  //     better than a colored dot did
+  let leading_glyph = case connected, muted, speaking {
+    False, _, _ -> hollow_dot(p.text_faint)
+    True, True, _ -> mic_muted_glyph(p)
+    True, False, True -> filled_dot(p.live)
+    True, False, False -> empty_slot()
   }
   let active = case popover_open {
     Some(open_id) -> open_id == peer_key
@@ -688,11 +670,22 @@ fn voice_member_row(
   }
   // Disconnected rows render at reduced opacity so the eye reads them
   // as "in the channel but not currently audible" without removing
-  // them from the roster.
-  let row_opacity = case connected {
-    True -> "1"
-    False -> "0.55"
+  // them from the roster. In observer mode (self not in this call) we
+  // skip the dimming — every row is "not connected to me" trivially,
+  // and the block's neutral palette already signals "not in it"; an
+  // additional 0.55 opacity on every row would just make the names
+  // hard to read.
+  let row_opacity = case connected, self_in_call {
+    True, _ -> "1"
+    False, False -> "1"
+    False, True -> "0.55"
   }
+  // Observer mode (self not in this call) makes the row purely
+  // informational: there's no audio path to this peer, so the
+  // per-peer popover (volume / mute-for-me / send quality) has
+  // nothing to act on. Disabling the button suppresses clicks at
+  // the browser level and we override `cursor` to `default` so the
+  // row doesn't read as a tappable target.
   html.button(
     [
       attribute.attribute("data-testid", "voice-member"),
@@ -710,6 +703,7 @@ fn voice_member_row(
         True -> "true"
         False -> "false"
       }),
+      attribute.disabled(!self_in_call),
       event.on_click(on_open_voice_popover(peer_key)),
       ui.css([
         #("display", "flex"),
@@ -723,23 +717,15 @@ fn voice_member_row(
         #("text-align", "left"),
         #("font-family", "inherit"),
         #("font-size", "15.625px"),
-        #("cursor", "pointer"),
+        #("cursor", case self_in_call {
+          True -> "pointer"
+          False -> "default"
+        }),
         #("opacity", row_opacity),
       ]),
     ],
     [
-      html.span(
-        [
-          ui.css([
-            #("width", "6px"),
-            #("height", "6px"),
-            #("border-radius", "999px"),
-            #("background", dot_color),
-            #("flex-shrink", "0"),
-          ]),
-        ],
-        [],
-      ),
+      leading_glyph,
       html.span(
         [
           ui.css([
@@ -762,9 +748,21 @@ fn voice_member_row(
         ]),
       ),
       html.span([ui.css([#("flex", "1")])], []),
-      case connected, muted {
-        False, _ -> not_connected_label(p)
-        True, True ->
+      // Trailing slot. Three states drive what shows here:
+      //   * Self is in the call AND we have audio flow with this peer
+      //     → live waveform meter (or "muted" pill if the peer is
+      //     muted): same affordance the previous design had.
+      //   * Self is in the call but we don't have a P2P link yet (or
+      //     anymore) → animated 'connecting' dots — we're actively
+      //     trying to reach this peer.
+      //   * Self is NOT in the call → render nothing. We aren't
+      //     dialing anyone; the rail is in observer mode and showing
+      //     a connecting affordance for every peer would lie about
+      //     work we aren't doing.
+      case self_in_call, connected, muted {
+        False, _, _ -> element.fragment([])
+        True, False, _ -> not_connected_label(p)
+        True, True, True ->
           html.span(
             [
               ui.css([
@@ -775,27 +773,46 @@ fn voice_member_row(
             ],
             [html.text("muted")],
           )
-        True, False -> waveform_meter(p, level)
+        True, True, False -> waveform_meter(p, level)
       },
     ],
   )
 }
 
 /// Affordance for a peer who is in the voice channel but we don't
-/// have a P2P connection to yet (or anymore). Replaces the waveform
-/// meter so the row reads as "joined, audio not flowing" instead of
-/// "joined, silent" (which `waveform_meter(_, 0.0)` would imply).
+/// have a P2P connection to yet (or anymore). Three pulsing dots
+/// instead of a wide "connecting…" label so the icon stays the same
+/// width as the row's normal trailing slot (the waveform meter) and
+/// doesn't push the member name around as state flips. Animation
+/// keyframes live in shell.global_reset; reduced-motion users get a
+/// static dimmed dot.
 fn not_connected_label(p: Palette) -> Element(msg) {
+  let dot =
+    html.span(
+      [
+        attribute.class("voice-connecting-dot"),
+        ui.css([
+          #("display", "inline-block"),
+          #("width", "4px"),
+          #("height", "4px"),
+          #("border-radius", "50%"),
+          #("background", p.text_faint),
+        ]),
+      ],
+      [],
+    )
   html.span(
     [
       attribute.attribute("data-testid", "voice-member-not-connected"),
+      attribute.attribute("aria-label", "connecting"),
+      attribute.title("connecting"),
       ui.css([
-        #("font-size", "13.125px"),
-        #("color", p.text_faint),
-        #("font-style", "italic"),
+        #("display", "inline-flex"),
+        #("align-items", "center"),
+        #("gap", "3px"),
       ]),
     ],
-    [html.text("connecting…")],
+    [dot, dot, dot],
   )
 }
 
@@ -883,232 +900,122 @@ fn you_tag(p: Palette) -> Element(msg) {
   )
 }
 
-/// Self-controls bar — pinned to the bottom of the channels column when
-/// the user is in a call (or there is an active voice channel to join).
-/// Shows what voice channel they're connected to on the left, with three
-/// small icon-only buttons (mic / headphones / leave) on the right.
-fn self_control_bar(
-  p: Palette,
-  channel_name: String,
-  on_leave: msg,
-  on_join: msg,
-  on_mute: msg,
-  on_deafen: msg,
-  on_toggle_denoise: msg,
-  self_in_call: Bool,
-  self_muted: Bool,
-  self_deafened: Bool,
-  denoise_on: Bool,
-) -> Element(msg) {
-  let _ = on_join
-  // Fixed 64px height with a 1px border-top so this row aligns visually
-  // with the rooms-rail you_row and the main-panel composer (their
-  // top borders sit on the same y-coordinate across the seam).
-  html.div(
+/// 7px filled dot used for the "speaking" indicator on a voice
+/// member row. Wider context lives at the call site.
+fn filled_dot(color: String) -> Element(msg) {
+  html.span(
     [
       ui.css([
+        #("width", "7px"),
+        #("height", "7px"),
+        #("border-radius", "999px"),
+        #("background", color),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [],
+  )
+}
+
+/// Hollow ring — same footprint as `filled_dot`, but reads as "off" /
+/// "not connected" without relying on the user remembering which gray
+/// means what.
+fn hollow_dot(color: String) -> Element(msg) {
+  html.span(
+    [
+      ui.css([
+        #("width", "7px"),
+        #("height", "7px"),
+        #("border-radius", "999px"),
+        #("background", "transparent"),
+        #("border", "1.5px solid " <> color),
         #("box-sizing", "border-box"),
-        #("height", "64px"),
         #("flex-shrink", "0"),
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("gap", "8px"),
-        #("padding", "0 12px"),
-        #("background", p.surface),
-        #("border-top", "1px solid " <> p.border_soft),
       ]),
     ],
-    [
-      html.div(
-        [
-          ui.css([
-            #("display", "flex"),
-            #("flex-direction", "column"),
-            #("flex", "1"),
-            #("min-width", "0"),
-          ]),
-        ],
-        [
-          html.span(
-            [
-              ui.css([
-                #("font-size", "13.125px"),
-                #("text-transform", "uppercase"),
-                #("letter-spacing", "0.06em"),
-                #("color", p.text_faint),
-                #("font-weight", "600"),
-              ]),
-            ],
-            [html.text("Connected")],
-          ),
-          html.span(
-            [
-              ui.css([
-                #("font-size", "15.625px"),
-                #("color", p.text),
-                #("font-weight", "600"),
-                #("display", "flex"),
-                #("align-items", "center"),
-                #("gap", "6px"),
-                #("margin-top", "1px"),
-              ]),
-            ],
-            [
-              html.span(
-                [
-                  ui.css([
-                    #("width", "8px"),
-                    #("height", "8px"),
-                    #("border-radius", "999px"),
-                    #("background", p.live),
-                    #("flex-shrink", "0"),
-                  ]),
-                ],
-                [],
-              ),
-              html.text(channel_name),
-            ],
-          ),
-        ],
-      ),
-      self_btn(
-        p,
-        case self_muted {
-          True -> "Unmute mic"
-          False -> "Mute mic"
-        },
-        mic_icon(),
-        self_muted,
-        Some(on_mute),
-      ),
-      self_btn(
-        p,
-        case self_deafened {
-          True -> "Undeafen"
-          False -> "Deafen"
-        },
-        headphones_icon(),
-        self_deafened,
-        Some(on_deafen),
-      ),
-      // Denoise toggle. Defaults to on; the warn highlight fires when
-      // the user has explicitly turned RNNoise off (i.e. opted into
-      // raw audio), so it sits visually beside mute / deafen as another
-      // "you're in a non-default state" indicator.
-      self_btn_with_testid(
-        p,
-        case denoise_on {
-          True -> "Disable noise reduction"
-          False -> "Enable noise reduction"
-        },
-        denoise_icon(denoise_on),
-        !denoise_on,
-        Some(on_toggle_denoise),
-        "voice-denoise-toggle",
-      ),
-      case self_in_call {
-        True -> leave_btn(p, on_leave)
-        False -> element.fragment([])
-      },
-    ],
+    [],
   )
 }
 
-fn self_btn(
-  p: Palette,
-  title: String,
-  icon: Element(msg),
-  active: Bool,
-  on_click: Option(msg),
-) -> Element(msg) {
-  self_btn_with_testid(p, title, icon, active, on_click, "")
-}
-
-fn self_btn_with_testid(
-  p: Palette,
-  title: String,
-  icon: Element(msg),
-  active: Bool,
-  on_click: Option(msg),
-  testid: String,
-) -> Element(msg) {
-  let bg = case active {
-    True -> p.warn_soft
-    False -> p.surface_alt
-  }
-  let color = case active {
-    True -> p.warn
-    False -> p.text
-  }
-  let click_attr = case on_click {
-    Some(msg) -> [event.on_click(msg)]
-    None -> []
-  }
-  let testid_attr = case testid {
-    "" -> []
-    id -> [
-      attribute.attribute("data-testid", id),
-      attribute.attribute("aria-pressed", case active {
-        True -> "true"
-        False -> "false"
-      }),
-    ]
-  }
-  html.button(
-    list.flatten([
-      [
-        attribute.title(title),
-        ui.css([
-          #("width", "32px"),
-          #("height", "32px"),
-          #("display", "inline-flex"),
-          #("align-items", "center"),
-          #("justify-content", "center"),
-          #("padding", "0"),
-          #("border", "1px solid " <> p.border_soft),
-          #("background", bg),
-          #("color", color),
-          #("border-radius", "6px"),
-          #("cursor", "pointer"),
-          #("font-family", "inherit"),
-          #("flex-shrink", "0"),
-        ]),
-      ],
-      click_attr,
-      testid_attr,
-    ]),
-    [icon],
-  )
-}
-
-fn leave_btn(p: Palette, on_click: msg) -> Element(msg) {
-  let _ = p
-  html.button(
+/// Empty 7×7 placeholder so the column of leading glyphs in the voice
+/// member rows aligns whether the row has a dot, a ring, or nothing
+/// (in-call but not currently speaking).
+fn empty_slot() -> Element(msg) {
+  html.span(
     [
-      attribute.title("Leave call"),
-      attribute.attribute("data-testid", "voice-leave"),
-      event.on_click(on_click),
       ui.css([
-        #("width", "32px"),
-        #("height", "32px"),
-        #("display", "inline-flex"),
-        #("align-items", "center"),
-        #("justify-content", "center"),
-        #("padding", "0"),
-        #("border", "none"),
-        #("background", "#a8242c"),
-        #("color", "#ffffff"),
-        #("border-radius", "6px"),
-        #("cursor", "pointer"),
-        #("font-family", "inherit"),
+        #("width", "7px"),
+        #("height", "7px"),
         #("flex-shrink", "0"),
       ]),
     ],
-    [phone_hangup_icon()],
+    [],
   )
 }
 
-fn mic_icon() -> Element(msg) {
+/// Mic-with-slash glyph for a peer who is muted. Sits where the
+/// speaking-state dot would otherwise go so the eye reads "no audio,
+/// because mic off" rather than "no audio, unknown why".
+fn mic_muted_glyph(p: Palette) -> Element(msg) {
+  element.namespaced(
+    "http://www.w3.org/2000/svg",
+    "svg",
+    [
+      attribute.attribute("width", "10"),
+      attribute.attribute("height", "10"),
+      attribute.attribute("viewBox", "0 0 12 12"),
+      attribute.attribute("fill", "none"),
+      ui.css([
+        #("color", p.text_faint),
+        #("flex-shrink", "0"),
+      ]),
+    ],
+    [
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "rect",
+        [
+          attribute.attribute("x", "4.5"),
+          attribute.attribute("y", "1.5"),
+          attribute.attribute("width", "3"),
+          attribute.attribute("height", "5"),
+          attribute.attribute("rx", "1.5"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.2"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute("d", "M2.5 6a3.5 3.5 0 007 0M6 9.5v1.5"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.2"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
+      element.namespaced(
+        "http://www.w3.org/2000/svg",
+        "path",
+        [
+          attribute.attribute("d", "M1.5 1l9 10"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.2"),
+          attribute.attribute("stroke-linecap", "round"),
+        ],
+        [],
+      ),
+    ],
+  )
+}
+
+/// Microphone glyph — leading icon on the live voice channel header.
+/// "Voice channel = use your mic" is the universal convention (Discord,
+/// Slack, etc.), and a mic icon doesn't get visually confused with the
+/// member-row speaking dots the way a speaker-with-waves design did.
+fn voice_icon() -> Element(msg) {
   element.namespaced(
     "http://www.w3.org/2000/svg",
     "svg",
@@ -1119,12 +1026,13 @@ fn mic_icon() -> Element(msg) {
       attribute.attribute("fill", "none"),
     ],
     [
+      // Mic capsule.
       element.namespaced(
         "http://www.w3.org/2000/svg",
         "rect",
         [
           attribute.attribute("x", "6"),
-          attribute.attribute("y", "2.5"),
+          attribute.attribute("y", "2"),
           attribute.attribute("width", "4"),
           attribute.attribute("height", "8"),
           attribute.attribute("rx", "2"),
@@ -1133,183 +1041,22 @@ fn mic_icon() -> Element(msg) {
         ],
         [],
       ),
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "path",
-        [
-          attribute.attribute("d", "M3.5 8a4.5 4.5 0 009 0M8 12.5V14"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.4"),
-          attribute.attribute("stroke-linecap", "round"),
-        ],
-        [],
-      ),
-    ],
-  )
-}
-
-fn headphones_icon() -> Element(msg) {
-  element.namespaced(
-    "http://www.w3.org/2000/svg",
-    "svg",
-    [
-      attribute.attribute("width", "14"),
-      attribute.attribute("height", "14"),
-      attribute.attribute("viewBox", "0 0 16 16"),
-      attribute.attribute("fill", "none"),
-    ],
-    [
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "path",
-        [
-          attribute.attribute("d", "M3 9V7a5 5 0 0110 0v2"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.4"),
-          attribute.attribute("stroke-linecap", "round"),
-        ],
-        [],
-      ),
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "rect",
-        [
-          attribute.attribute("x", "2.5"),
-          attribute.attribute("y", "9"),
-          attribute.attribute("width", "3"),
-          attribute.attribute("height", "4"),
-          attribute.attribute("rx", "1"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.3"),
-        ],
-        [],
-      ),
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "rect",
-        [
-          attribute.attribute("x", "10.5"),
-          attribute.attribute("y", "9"),
-          attribute.attribute("width", "3"),
-          attribute.attribute("height", "4"),
-          attribute.attribute("rx", "1"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.3"),
-        ],
-        [],
-      ),
-    ],
-  )
-}
-
-/// Denoise / "noise reduction" icon: a sparkle (RNNoise is ML, sparkles
-/// read as "smart filtering" in product UI), with a diagonal slash when
-/// the toggle is off so the disabled state reads at a glance.
-fn denoise_icon(on: Bool) -> Element(msg) {
-  let sparkle =
-    element.namespaced(
-      "http://www.w3.org/2000/svg",
-      "path",
-      [
-        attribute.attribute(
-          "d",
-          "M8 2.5l1.1 3.4 3.4 1.1-3.4 1.1L8 11.5l-1.1-3.4L3.5 7l3.4-1.1L8 2.5z",
-        ),
-        attribute.attribute("fill", "currentColor"),
-        attribute.attribute("fill-opacity", "0.85"),
-      ],
-      [],
-    )
-  let small_sparkle =
-    element.namespaced(
-      "http://www.w3.org/2000/svg",
-      "path",
-      [
-        attribute.attribute(
-          "d",
-          "M12.5 11l.5 1.5L14.5 13l-1.5.5L12.5 15l-.5-1.5L10.5 13l1.5-.5L12.5 11z",
-        ),
-        attribute.attribute("fill", "currentColor"),
-        attribute.attribute("fill-opacity", "0.65"),
-      ],
-      [],
-    )
-  let slash = case on {
-    True -> element.fragment([])
-    False ->
-      element.namespaced(
-        "http://www.w3.org/2000/svg",
-        "line",
-        [
-          attribute.attribute("x1", "2"),
-          attribute.attribute("y1", "14"),
-          attribute.attribute("x2", "14"),
-          attribute.attribute("y2", "2"),
-          attribute.attribute("stroke", "currentColor"),
-          attribute.attribute("stroke-width", "1.6"),
-          attribute.attribute("stroke-linecap", "round"),
-        ],
-        [],
-      )
-  }
-  element.namespaced(
-    "http://www.w3.org/2000/svg",
-    "svg",
-    [
-      attribute.attribute("width", "14"),
-      attribute.attribute("height", "14"),
-      attribute.attribute("viewBox", "0 0 16 16"),
-      attribute.attribute("fill", "none"),
-    ],
-    [sparkle, small_sparkle, slash],
-  )
-}
-
-fn phone_hangup_icon() -> Element(msg) {
-  element.namespaced(
-    "http://www.w3.org/2000/svg",
-    "svg",
-    [
-      attribute.attribute("width", "14"),
-      attribute.attribute("height", "14"),
-      attribute.attribute("viewBox", "0 0 16 16"),
-      attribute.attribute("fill", "none"),
-    ],
-    [
+      // Stand — yoke arc + vertical post + base bar.
       element.namespaced(
         "http://www.w3.org/2000/svg",
         "path",
         [
           attribute.attribute(
             "d",
-            "M3.2 9.6c-.7-.7-.7-1.9 0-2.6 2.65-2.65 6.95-2.65 9.6 0 .7.7.7 1.9 0 2.6l-1.1 1.1c-.4.4-1 .4-1.4 0L9.4 9.8c-.4-.4-.4-1 0-1.4l.5-.5a4 4 0 00-3.8 0l.5.5c.4.4.4 1 0 1.4L5.7 10.7c-.4.4-1 .4-1.4 0L3.2 9.6z",
+            "M3.5 8a4.5 4.5 0 009 0M8 12.5V14.5M5.5 14.5h5",
           ),
-          attribute.attribute("fill", "currentColor"),
+          attribute.attribute("stroke", "currentColor"),
+          attribute.attribute("stroke-width", "1.4"),
+          attribute.attribute("stroke-linecap", "round"),
         ],
         [],
       ),
     ],
-  )
-}
-
-fn conn_icon(p: Palette, status: ConnStatus) -> Element(msg) {
-  let c = case status {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
-  }
-  html.span(
-    [
-      ui.css([
-        #("width", "7px"),
-        #("height", "7px"),
-        #("border-radius", "999px"),
-        #("background", c),
-        #("display", "inline-block"),
-        #("flex-shrink", "0"),
-      ]),
-    ],
-    [],
   )
 }
 

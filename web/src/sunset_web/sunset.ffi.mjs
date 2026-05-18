@@ -146,19 +146,49 @@ export function onIntentChanged(client, callback) {
   });
 }
 
-export async function sendMessage(room, channel, body, sentAtMs, callback) {
+export async function sendMessage(
+  room,
+  channel,
+  body,
+  images,
+  sentAtMs,
+  callback,
+) {
   try {
-    const valueHashHex = await room.send_message(channel, body, sentAtMs);
+    // `images` arrives as a Gleam List of #(mime_type, data_base64) tuples
+    // packaged as 2-elem Gleam dynamic arrays. Convert to plain JS objects
+    // before crossing the wasm boundary — see `room_handle.rs::images_from_js`.
+    const imagesArray = gleamListToImageArray(images);
+    const valueHashHex = await room.send_message(
+      channel,
+      body,
+      imagesArray,
+      sentAtMs,
+    );
     callback(new Ok(valueHashHex));
   } catch (e) {
     callback(new GError(String(e)));
   }
 }
 
+/// Convert a Gleam `List(#(String, String))` of (mime, base64) pairs
+/// into the `Array<{ mime_type, data_base64 }>` shape the wasm side
+/// expects. Gleam's stdlib List exposes a `toArray()` view; each tuple
+/// is materialized as an array-like with `[0]` = mime, `[1]` = base64.
+function gleamListToImageArray(list) {
+  return list.toArray().map((pair) => ({
+    mime_type: pair[0],
+    data_base64: pair[1],
+  }));
+}
+
 export function onMessage(room, callback) {
   room.on_message((incoming) => {
     // Copy fields into a plain JS object so we can free the wasm-bindgen
     // wrapper immediately and avoid GC-delayed memory accumulation.
+    // `images` is already a plain JS Array of `{ mime_type, data_base64 }`
+    // objects (built in `messages.rs::images_to_js`), so we can keep
+    // the reference directly.
     const plain = {
       author_pubkey: incoming.author_pubkey,
       epoch_id: incoming.epoch_id,
@@ -167,6 +197,7 @@ export function onMessage(room, callback) {
       body: incoming.body,
       value_hash_hex: incoming.value_hash_hex,
       is_self: incoming.is_self,
+      images: incoming.images,
     };
     incoming.free();
     callback(plain);
@@ -237,6 +268,15 @@ export function incBody(msg) { return msg.body; }
 export function incValueHashHex(msg) { return msg.value_hash_hex; }
 export function incIsSelf(msg) { return msg.is_self; }
 export function incChannel(msg) { return msg.channel; }
+
+/// Convert the message's `images` JS Array into a Gleam
+/// `List(#(String, String))` of `(mime_type, data_base64)` pairs.
+/// Each `<img>` rendered by the timeline picks its `src` as
+/// `"data:" + mime_type + ";base64," + data_base64`.
+export function incImages(msg) {
+  const pairs = (msg.images ?? []).map((e) => [e.mime_type, e.data_base64]);
+  return toList(pairs);
+}
 
 // Presence + membership FFI shims.
 
@@ -363,6 +403,48 @@ export function onChannelsChanged(room, callback) {
   room.on_channels_changed((arr) => callback(toList(Array.from(arr))));
 }
 
+// Sorted snapshot of every Text message in the room, ordered by the
+// sender-claimed `sent_at_ms` ascending (tie-broken on value-hash for
+// stability). The wasm side hands back an `Array<IncomingMessage>`;
+// `incomingToPlain` copies the fields out and frees each wasm wrapper
+// so we don't hold cross-boundary pointers. Returned as a Gleam
+// List(IncomingMessage).
+export function orderedMessages(room) {
+  const arr = Array.from(room.ordered_messages());
+  return toList(arr.map(incomingToPlain));
+}
+
+// Register a callback fired (immediately with the current snapshot,
+// then on every change) with a Gleam List(IncomingMessage) sorted by
+// sender-claimed `sent_at_ms`. The bridge owns the sort so all client
+// surfaces — Gleam UI, future TUI, etc. — render identical order.
+export function onMessagesChanged(room, callback) {
+  room.on_messages_changed((arr) => {
+    const items = Array.from(arr).map(incomingToPlain);
+    callback(toList(items));
+  });
+}
+
+/// Shared helper: copy fields off a wasm-bindgen `IncomingMessage`
+/// into a plain JS object and free the wrapper. Used by both
+/// `onMessage` (single-message fire) and `onMessagesChanged` /
+/// `orderedMessages` (snapshot fires) so the conversion stays in one
+/// place.
+function incomingToPlain(incoming) {
+  const plain = {
+    author_pubkey: incoming.author_pubkey,
+    epoch_id: incoming.epoch_id,
+    sent_at_ms: incoming.sent_at_ms,
+    channel: incoming.channel,
+    body: incoming.body,
+    value_hash_hex: incoming.value_hash_hex,
+    is_self: incoming.is_self,
+    images: incoming.images,
+  };
+  incoming.free();
+  return plain;
+}
+
 /// Schedule a recurring callback every `ms` milliseconds. Returns
 /// nothing — there is no cancel handle in v1; the ticker runs for the
 /// page lifetime. Use only for cheap, idempotent dispatches.
@@ -434,8 +516,6 @@ export function registerEmojiPicker() {
   return emojiPickerLoaded;
 }
 
-export function truncFloat(f) { return Math.trunc(f); }
-
 /// Read `?heartbeat_interval_ms=NNN` from the current URL. Returns 0
 /// when absent or unparseable, signalling Client::new to use the
 /// SyncConfig default (15 s). e2e-only knob.
@@ -445,4 +525,141 @@ export function heartbeatIntervalMsFromUrl() {
   if (raw === null) return 0;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/// Image attachment picker. The first time it's called we lazily create
+/// a hidden `<input type="file" multiple accept="image/*">` and reuse
+/// it for every subsequent open — Safari and Firefox both insist the
+/// click come from a user-gesture handler, so the input has to live in
+/// the DOM, not be created on demand inside a Promise.
+let imagePickerInput = null;
+function getImagePickerInput() {
+  if (imagePickerInput && document.body.contains(imagePickerInput)) {
+    return imagePickerInput;
+  }
+  const el = document.createElement("input");
+  el.type = "file";
+  el.multiple = true;
+  // Browser-renderable raster formats only: jpeg, png, webp, gif.
+  // The user picker filters to these, and the composer side double-
+  // checks before adding to the staging area.
+  el.accept = "image/jpeg,image/png,image/webp,image/gif";
+  el.setAttribute("data-testid", "composer-image-input");
+  el.style.position = "fixed";
+  el.style.left = "-9999px";
+  el.style.top = "-9999px";
+  el.style.width = "1px";
+  el.style.height = "1px";
+  el.style.opacity = "0";
+  el.style.pointerEvents = "none";
+  document.body.appendChild(el);
+  imagePickerInput = el;
+  return el;
+}
+
+/// Open the OS image picker. `callback` is invoked exactly once per
+/// open: with a Gleam `List(#(String, String))` of `(mime_type,
+/// data_base64)` pairs, possibly empty (user cancelled or picked
+/// nothing). Each image is read via FileReader as a data URI and the
+/// `data:.../;base64,` prefix is stripped.
+export function pickImages(callback) {
+  const input = getImagePickerInput();
+  // Reset value so picking the same file twice in a row still fires
+  // `change`. (Without this, the browser silently dedupes.)
+  input.value = "";
+  let done = false;
+  const finish = (pairs) => {
+    if (done) return;
+    done = true;
+    input.removeEventListener("change", onChange);
+    input.removeEventListener("cancel", onCancel);
+    callback(toList(pairs));
+  };
+  const onChange = async () => {
+    const files = Array.from(input.files ?? []);
+    console.info(`pickImages: change fired, files=${files.length}`);
+    try {
+      const pairs = await Promise.all(files.map(readImage));
+      const valid = pairs.filter((p) => p !== null);
+      finish(valid);
+    } catch (e) {
+      console.warn("pickImages: readImage failed", e);
+      finish([]);
+    }
+  };
+  const onCancel = () => {
+    // iOS Safari has been observed firing `cancel` even after a
+    // successful Photo Library selection. If files are actually
+    // present, ignore the spurious cancel and let `change` handle it.
+    const count = input.files ? input.files.length : 0;
+    console.info(`pickImages: cancel fired, files=${count}`);
+    if (count > 0) return;
+    finish([]);
+  };
+  input.addEventListener("change", onChange);
+  // `cancel` is the modern event when the user dismisses the picker
+  // without selecting; older browsers just never fire `change`.
+  input.addEventListener("cancel", onCancel);
+  input.click();
+}
+
+const ALLOWED_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+]);
+
+/// Resolve an allowed MIME type for `file`, falling back to the
+/// filename extension when `file.type` is empty or unrecognized. iOS
+/// WebKit sometimes hands Photo Library picks back with `file.type =
+/// ""` (Live Photos, edited photos, certain iOS versions), so trusting
+/// `file.type` alone silently drops valid images on iPhone.
+function inferImageType(file) {
+  if (ALLOWED_IMAGE_TYPES.has(file.type)) return file.type;
+  const name = (file.name || "").toLowerCase();
+  const dot = name.lastIndexOf(".");
+  if (dot < 0) return null;
+  const ext = name.slice(dot + 1);
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "png") return "image/png";
+  if (ext === "webp") return "image/webp";
+  if (ext === "gif") return "image/gif";
+  return null;
+}
+
+function readImage(file) {
+  const type = inferImageType(file);
+  if (type === null) {
+    console.warn(
+      `pickImages: skipping ${file.name} (type=${file.type}, size=${file.size})`,
+    );
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const result = fr.result;
+      if (typeof result !== "string") {
+        resolve(null);
+        return;
+      }
+      // result is `"data:<mime>;base64,<payload>"` — strip the prefix.
+      const comma = result.indexOf(",");
+      if (comma < 0) {
+        resolve(null);
+        return;
+      }
+      resolve([type, result.slice(comma + 1)]);
+    };
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(file);
+  });
+}
+
+/// Programmatically build a data URL from a `(mime_type, data_base64)`
+/// Gleam tuple. Used by the timeline renderer so the Gleam side doesn't
+/// have to concatenate strings byte-by-byte at render time.
+export function imageDataUrl(mimeType, dataBase64) {
+  return `data:${mimeType};base64,${dataBase64}`;
 }

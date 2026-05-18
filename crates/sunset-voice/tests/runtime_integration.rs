@@ -4,6 +4,7 @@
 //! assertions. All `Bus` traffic loops back through a broadcast channel.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -164,6 +165,24 @@ impl Dialer for CountingDialer {
     }
 }
 
+/// Dialer test stub that records BOTH `ensure_direct` and `release`
+/// calls so tests can assert the auto-connect FSM's cleanup path
+/// (membership-stale → release → fresh dial on the next presence
+/// event) without depending on the production WebDialer.
+struct ReleaseTrackingDialer {
+    dial_calls: DroppedSink,
+    release_calls: DroppedSink,
+}
+#[async_trait::async_trait(?Send)]
+impl Dialer for ReleaseTrackingDialer {
+    async fn ensure_direct(&self, peer: PeerId) {
+        self.dial_calls.borrow_mut().push(peer);
+    }
+    async fn release(&self, peer: PeerId) {
+        self.release_calls.borrow_mut().push(peer);
+    }
+}
+
 struct RecordingFrameSink {
     delivered: DeliveredSink,
     dropped: DroppedSink,
@@ -268,6 +287,9 @@ async fn heartbeat_publishes_periodically_with_is_muted_flag() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Runtimes default to observer mode; the heartbeat task only
+            // publishes once the local user has joined the call.
+            runtime.set_active(true);
             tokio::task::spawn_local(tasks.heartbeat);
 
             // Subscribe ahead of the first heartbeat.
@@ -351,6 +373,10 @@ async fn send_pcm_publishes_frame_when_unmuted() {
                 frame_sink,
                 peer_state_sink,
             );
+            // `send_pcm` drops frames when the runtime is in observer
+            // mode (the default after `new`); activate so the publish
+            // path runs.
+            runtime.set_active(true);
             let mut rx = tx.subscribe();
 
             // Default quality is `Maximum` (stereo): 1920 interleaved
@@ -416,6 +442,7 @@ async fn send_pcm_drops_frames_when_muted() {
                 frame_sink,
                 peer_state_sink,
             );
+            runtime.set_active(true);
             runtime.set_muted(true);
 
             let mut rx = tx.subscribe();
@@ -821,7 +848,7 @@ async fn auto_connect_dials_on_voice_presence_only_once() {
             let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
                 events: Rc::new(RefCell::new(vec![])),
             });
-            let (_runtime, tasks) = VoiceRuntime::new(
+            let (runtime, tasks) = VoiceRuntime::new(
                 bus,
                 room.clone(),
                 bob.clone(),
@@ -829,6 +856,9 @@ async fn auto_connect_dials_on_voice_presence_only_once() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Active mode is required for auto_connect to dial; observer
+            // mode drains the presence stream without entering the FSM.
+            runtime.set_active(true);
             tokio::task::spawn_local(tasks.auto_connect);
 
             // Yield to let auto_connect task start up and register its sink.
@@ -846,6 +876,126 @@ async fn auto_connect_dials_on_voice_presence_only_once() {
                 calls.borrow().len(),
                 1,
                 "ensure_direct must be called exactly once"
+            );
+        })
+        .await;
+}
+
+/// Regression for the leave-then-rejoin failure mode: when
+/// `membership_liveness` decides a peer is `Stale`, the auto-connect
+/// FSM must call `Dialer::release(peer)` so the host can tear down
+/// any session-scoped state (in production: the supervisor's
+/// direct-WebRTC intent). Without this, the next voice-presence
+/// event for the same peer triggers `ensure_direct` whose
+/// `connect_direct` is deduplicated by the supervisor against a
+/// stale `Connected` / `Backoff` intent — the user-visible
+/// symptom is "rejoined but no audio until the engine's 45 s
+/// heartbeat timeout."
+///
+/// We assert two things in sequence:
+///   1. `release(peer)` is called when membership goes Stale, AND
+///   2. The auto_connect_state for `peer` is reset to `Unknown`, so
+///      that a follow-up presence event triggers a fresh
+///      `ensure_direct` call (rather than being skipped by the
+///      Dialing-state dedup inside auto_connect itself).
+#[tokio::test(flavor = "current_thread")]
+async fn auto_connect_releases_dialer_on_membership_stale_and_redials() {
+    use sunset_core::liveness::Liveness;
+    use sunset_store::VerifyingKey;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // bob is the runtime owner; alice is the remote peer.
+            // Force `bob < alice` so the dialing arm of glare avoidance
+            // fires (otherwise bob is the acceptor and never dials).
+            let (bob, alice, room) = make_pair_self_smaller(9, 8);
+            let (bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bus: Rc<dyn DynBus> = bus_impl.clone();
+
+            let dial_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
+            let release_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
+            let dialer: Rc<dyn Dialer> = Rc::new(ReleaseTrackingDialer {
+                dial_calls: dial_calls.clone(),
+                release_calls: release_calls.clone(),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (runtime, tasks) = VoiceRuntime::new(
+                bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            // Activate before spawning — auto_connect waits for
+            // `is_active=true` before subscribing to the presence
+            // stream, so without this flip the injected presence event
+            // is queued but never consumed.
+            runtime.set_active(true);
+            tokio::task::spawn_local(tasks.auto_connect);
+            // Give the auto_connect task time to clear its poll-for-active
+            // loop (100 ms cadence) and reach subscribe_prefix.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // First presence event from alice: should trigger one dial.
+            let entry = make_presence_entry(&alice, &room);
+            bus_impl.inject_durable(entry.clone()).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                dial_calls.borrow().len(),
+                1,
+                "first voice-presence must trigger exactly one ensure_direct"
+            );
+            assert!(
+                release_calls.borrow().is_empty(),
+                "no release before membership goes stale"
+            );
+
+            // Force membership_liveness to fire Stale for alice. The
+            // existing dropping_runtime_terminates_all_tasks test uses
+            // the same observe + run_sweep pattern.
+            let (_, membership_liveness): (std::sync::Arc<Liveness>, std::sync::Arc<Liveness>) =
+                runtime.test_liveness();
+            let alice_peer = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                alice.store_verifying_key().as_bytes(),
+            )));
+            membership_liveness
+                .observe(alice_peer.clone(), std::time::SystemTime::UNIX_EPOCH)
+                .await;
+            membership_liveness.run_sweep().await;
+
+            // Yield enough for the auto_connect select! arm to consume
+            // the Stale event and call dialer.release.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let releases = release_calls.borrow().clone();
+            assert_eq!(
+                releases.len(),
+                1,
+                "release should fire exactly once on the Stale event"
+            );
+            assert_eq!(releases[0], alice_peer);
+
+            // Re-inject the presence entry (simulating the peer rejoining
+            // and republishing). Since auto_connect_state was reset to
+            // Unknown by the Stale handler, a second dial must fire —
+            // proving the rejoin path doesn't sit forever in the
+            // pre-fix "stuck dialing" state.
+            bus_impl.inject_durable(entry.clone()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert_eq!(
+                dial_calls.borrow().len(),
+                2,
+                "after Stale → release, the next presence event must trigger a fresh dial"
             );
         })
         .await;
@@ -876,7 +1026,7 @@ async fn auto_connect_skips_dial_when_self_pk_is_larger() {
             let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
                 events: Rc::new(RefCell::new(vec![])),
             });
-            let (_runtime, tasks) = VoiceRuntime::new(
+            let (runtime, tasks) = VoiceRuntime::new(
                 bus,
                 room.clone(),
                 larger.clone(),
@@ -884,6 +1034,11 @@ async fn auto_connect_skips_dial_when_self_pk_is_larger() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Activate so the gate doesn't trivially mask the glare-avoidance
+            // path under test (we want auto_connect to *reach* the comparison
+            // and then decline to dial because self_pk > peer_pk, not because
+            // it skipped processing entirely).
+            runtime.set_active(true);
             tokio::task::spawn_local(tasks.auto_connect);
             tokio::task::yield_now().await;
 
@@ -998,7 +1153,7 @@ async fn voice_presence_publisher_emits_periodically() {
             let room_fp = room.fingerprint().to_hex();
             let presence_prefix = Bytes::from(format!("voice-presence/{room_fp}/"));
 
-            let (_runtime, tasks) = VoiceRuntime::new(
+            let (runtime, tasks) = VoiceRuntime::new(
                 bus,
                 room.clone(),
                 alice.clone(),
@@ -1006,6 +1161,9 @@ async fn voice_presence_publisher_emits_periodically() {
                 frame_sink,
                 peer_state_sink,
             );
+            // Activate so the publisher actually publishes. Observer-mode
+            // (the default) intentionally skips publication.
+            runtime.set_active(true);
 
             // Subscribe to durable presence entries before spawning the publisher.
             let mut stream = bus_impl
@@ -1014,6 +1172,9 @@ async fn voice_presence_publisher_emits_periodically() {
                 .expect("subscribe succeeded");
 
             tokio::task::spawn_local(tasks.voice_presence_publisher);
+            // Keep the runtime alive for the duration of the test so the
+            // task's `weak.upgrade()` keeps succeeding.
+            let _runtime = runtime;
 
             use futures::StreamExt as _;
 
@@ -1166,15 +1327,16 @@ async fn dropping_runtime_terminates_all_tasks() {
         .await;
 }
 
-/// `set_denoise(false)` plumbs through to the receiver path: with denoise
-/// off the inbound PCM is delivered raw (modulo Opus quantization), with
-/// denoise on the same packets are attenuated by RNNoise. The test feeds
-/// pseudo-random noise through a real encrypt → bus → decrypt → decode →
-/// sink loop and compares RMS energy at the sink. The runtime has no
-/// internal buffer between decode and sink — frames arrive synchronously
-/// with the subscribe loop's `inject` calls.
+/// `set_peer_denoise(alice, false)` plumbs through to the receiver
+/// path for that one peer: with denoise off the inbound PCM is
+/// delivered raw (modulo Opus quantization), with denoise on the same
+/// packets are attenuated by RNNoise. The test feeds pseudo-random
+/// noise through a real encrypt → bus → decrypt → decode → sink loop
+/// and compares RMS energy at the sink. The runtime has no internal
+/// buffer between decode and sink — frames arrive synchronously with
+/// the subscribe loop's `inject` calls.
 #[tokio::test(flavor = "current_thread")]
-async fn set_denoise_toggle_attenuates_inbound_noise() {
+async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
     async fn run(denoise_on: bool) -> f32 {
         let delivered_rms_sum = Rc::new(RefCell::new(0.0_f32));
         let delivered_rms_count = Rc::new(RefCell::new(0_usize));
@@ -1225,8 +1387,9 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
                         frame_sink,
                         peer_state_sink,
                     );
-                    runtime.set_denoise(denoise_on);
-                    assert_eq!(runtime.is_denoise_enabled(), denoise_on);
+                    let alice_peer = PeerId(alice_pk.clone());
+                    runtime.set_peer_denoise(alice_peer.clone(), denoise_on);
+                    assert_eq!(runtime.is_peer_denoise_enabled(&alice_peer), denoise_on);
 
                     tokio::task::spawn_local(tasks.subscribe);
                     tokio::task::yield_now().await;
@@ -1314,4 +1477,355 @@ async fn set_denoise_toggle_attenuates_inbound_noise() {
         on_rms * 2.0 < off_rms,
         "denoise on should attenuate inbound noise vs off: on={on_rms}, off={off_rms}",
     );
+}
+
+/// Observer-mode contract: with `is_active=false`, the runtime emits
+/// `in_voice_channel` for remote peers (so the rail can render the
+/// roster before the local user joins the call) but does *not* publish
+/// our own durable presence. Flipping to `is_active=true` resumes the
+/// publisher; flipping back stops it. This is the load-bearing
+/// guarantee for "show who is in the voice channel even when I haven't
+/// joined yet".
+#[tokio::test(flavor = "current_thread")]
+async fn observer_mode_emits_in_voice_channel_without_publishing_self() {
+    use futures::StreamExt as _;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (bob, alice, room) = make_pair_self_smaller(40, 41);
+            let alice_pk = alice.store_verifying_key();
+            let bob_pk = bob.store_verifying_key();
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob_pk.clone());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let events: EventSink = Rc::new(RefCell::new(vec![]));
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: events.clone(),
+            });
+
+            // Subscribe to our own presence prefix *before* spawning the
+            // publisher so the assertion below can observe "nothing was
+            // ever published while observing".
+            let room_fp = room.fingerprint().to_hex();
+            let presence_prefix = Bytes::from(format!("voice-presence/{room_fp}/"));
+            let mut own_presence_stream = bob_bus_impl
+                .subscribe_prefix(presence_prefix)
+                .await
+                .expect("presence prefix subscribe");
+
+            let (runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            // Runtime defaults to observer mode. Spawn the three
+            // observer-side tasks plus the three gated tasks so we
+            // can verify the gates' behaviour end-to-end.
+            assert!(!runtime.is_active(), "default mode is observer");
+            tokio::task::spawn_local(tasks.combiner);
+            tokio::task::spawn_local(tasks.voice_presence_membership);
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::spawn_local(tasks.auto_connect);
+            tokio::task::spawn_local(tasks.heartbeat);
+            tokio::task::spawn_local(tasks.voice_presence_publisher);
+
+            tokio::task::yield_now().await;
+
+            // Inject a remote durable-presence entry from alice. The
+            // combiner should emit `in_voice_channel=true` even though
+            // we never activated.
+            let entry = make_presence_entry(&alice, &room);
+            bob_bus_impl.inject_durable(entry.clone()).await;
+
+            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snap = events.borrow().last().cloned();
+                    if let Some(ev) = snap {
+                        if ev.in_voice_channel {
+                            return ev;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("combiner emits in_voice_channel within 2s");
+            assert_eq!(observed.peer, PeerId(alice_pk.clone()));
+            assert!(
+                observed.in_voice_channel,
+                "observer must see alice in channel"
+            );
+            assert!(!observed.in_call, "no P2P → in_call must stay false");
+
+            // Helper macro: wait up to `$budget` for the next durable
+            // entry on `own_presence_stream` whose `verifying_key` equals
+            // `bob_pk`. Alice's injected entry from the previous step
+            // also flows through this stream, so filtering by key is
+            // what isolates self-publishes from observer-side traffic.
+            macro_rules! next_self_publish {
+                ($budget:expr) => {{
+                    let bob_pk = bob_pk.clone();
+                    tokio::time::timeout($budget, async {
+                        loop {
+                            match own_presence_stream.next().await {
+                                Some(BusEvent::Durable { entry, .. })
+                                    if entry.verifying_key == bob_pk =>
+                                {
+                                    return Some(entry);
+                                }
+                                Some(_) => continue,
+                                None => return None,
+                            }
+                        }
+                    })
+                    .await
+                }};
+            }
+
+            // The publisher's first publish would land within
+            // VOICE_PRESENCE_REFRESH_INTERVAL (2 s) if it were running.
+            // Give it 1.5 s (well past task startup, well under the
+            // 2 s republish cadence) — observer mode must not publish.
+            let saw_self = next_self_publish!(Duration::from_millis(1500));
+            assert!(
+                saw_self.is_err(),
+                "publisher must stay silent in observer mode (saw {saw_self:?})"
+            );
+
+            // Activate. The publisher's loop wakes from its sleep on its
+            // own cadence (≤2 s) — wait up to 3 s for the first self-publish.
+            runtime.set_active(true);
+            assert!(runtime.is_active());
+            let first_pub = next_self_publish!(Duration::from_secs(3))
+                .expect("first own-presence publish within 3s after activate")
+                .expect("stream open");
+            assert_eq!(
+                first_pub.verifying_key, bob_pk,
+                "self-publish carries bob's key"
+            );
+
+            // Deactivate. The publisher's next iteration must observe
+            // `is_active=false` and skip. There may be one in-flight
+            // republish if we deactivate mid-sleep, so allow up to one
+            // grace publish and then require silence.
+            runtime.set_active(false);
+            // Drain any already-emitted entries within the first refresh
+            // interval, then require no further entries for a full
+            // republish cycle. With the 2 s interval, a 4 s window after
+            // drain leaves >1 republish-worth of margin.
+            let _maybe_grace = next_self_publish!(Duration::from_secs(2));
+            let after_grace = next_self_publish!(Duration::from_secs(4));
+            assert!(
+                after_grace.is_err(),
+                "publisher must stop after set_active(false) (saw {after_grace:?})"
+            );
+
+            drop(runtime);
+        })
+        .await;
+}
+
+/// Two senders publishing frames interleaved through one receiver:
+/// each peer's decoded audio must arrive intact. Opus decoders are
+/// stateful — SILK predictor history, CELT pitch tracking, and mode
+/// switching all assume one continuous stream — so a single shared
+/// decoder corrupts every frame on a stream change. With per-peer
+/// decoders each stream owns its own state and the RMS energy
+/// survives round-trip on both sides simultaneously.
+///
+/// The shape that fails on shared-decoder code:
+///   - alice encodes a 440 Hz sine, carol a 880 Hz sine, both at
+///     amplitude 0.5 → expected decoded RMS ~0.35 per peer.
+///   - Frames are interleaved A0, C0, A1, C1, … forcing the decoder
+///     to alternate sources on every call.
+///   - Per-peer decoders: each peer's average decoded RMS stays
+///     within ~15 % of the ideal 0.353.
+///   - Shared decoder: at least one peer's RMS collapses well below
+///     0.30 because predictor state from the other stream poisons
+///     every frame.
+#[tokio::test(flavor = "current_thread")]
+async fn multi_peer_decoders_do_not_corrupt_each_other() {
+    type PerPeerRms = Rc<RefCell<HashMap<PeerId, (f32, usize)>>>;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(70);
+            let (carol, _) = make_identity_and_room(71);
+            let (bob, _) = make_identity_and_room(72);
+            let alice_pk = alice.store_verifying_key();
+            let carol_pk = carol.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+
+            let per_peer_rms: PerPeerRms = Rc::new(RefCell::new(HashMap::new()));
+            struct PerPeerRmsSink {
+                rms: PerPeerRms,
+            }
+            impl FrameSink for PerPeerRmsSink {
+                fn deliver(&self, peer: &PeerId, _seq: u32, pcm: &[f32]) {
+                    let s: f32 = pcm.iter().map(|s| s * s).sum();
+                    let rms = (s / pcm.len() as f32).sqrt();
+                    let mut map = self.rms.borrow_mut();
+                    let entry = map.entry(peer.clone()).or_insert((0.0, 0));
+                    entry.0 += rms;
+                    entry.1 += 1;
+                }
+                fn drop_peer(&self, _peer: &PeerId) {}
+            }
+
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(PerPeerRmsSink {
+                rms: per_peer_rms.clone(),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            // Receiver-side denoise off per peer: RNNoise is trained
+            // on speech and attenuates pure 440/880 Hz sines as
+            // "non-speech," which would mask whatever the decoder
+            // delivers. Disabling it isolates the decoder contract
+            // this test exists to verify. The denoise plumbing has
+            // its own dedicated test
+            // (`set_peer_denoise_toggle_attenuates_inbound_noise`).
+            let (runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            runtime.set_peer_denoise(PeerId(alice_pk.clone()), false);
+            runtime.set_peer_denoise(PeerId(carol_pk.clone()), false);
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::yield_now().await;
+
+            const FRAMES: u64 = 40;
+            // 0.5 amplitude → expected RMS 0.5/sqrt(2) ≈ 0.353.
+            const AMPLITUDE: f32 = 0.5;
+            const ALICE_HZ: f32 = 440.0;
+            const CAROL_HZ: f32 = 880.0;
+            // Both use VoiceQuality::Voice (mono) — the runtime's
+            // decoder is always 2-channel and upmixes mono packets, so
+            // the per-peer delivered PCM is stereo regardless. Mono
+            // saves a downmix round and isolates the cross-peer
+            // corruption from any stereo decoding concerns.
+            let mut enc_alice =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+            let mut enc_carol =
+                sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+
+            fn sine_pcm(start_frame: u64, hz: f32) -> Vec<f32> {
+                let mut pcm = vec![0.0_f32; sunset_voice::FRAME_SAMPLES_PER_CHANNEL];
+                let base = start_frame * sunset_voice::FRAME_SAMPLES_PER_CHANNEL as u64;
+                for (i, s) in pcm.iter_mut().enumerate() {
+                    let n = (base + i as u64) as f32;
+                    let t = n / sunset_voice::SAMPLE_RATE as f32;
+                    *s = AMPLITUDE * (2.0 * std::f32::consts::PI * hz * t).sin();
+                }
+                pcm
+            }
+
+            async fn publish(
+                bus_impl: &TestBus,
+                room: &Rc<Room>,
+                sender: &Identity,
+                sender_pk: &VerifyingKey,
+                seq: u64,
+                bytes: Vec<u8>,
+            ) {
+                let pkt = sunset_voice::packet::VoicePacket::Frame {
+                    codec_id: sunset_voice::CODEC_ID.to_string(),
+                    seq,
+                    sender_time_ms: 1000 + seq * 20,
+                    payload: bytes,
+                };
+                let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seq);
+                let ev = sunset_voice::packet::encrypt(room, 0, &sender.public(), &pkt, &mut rng)
+                    .unwrap();
+                let payload = postcard::to_stdvec(&ev).unwrap();
+                let room_fp = room.fingerprint().to_hex();
+                let name = Bytes::from(format!(
+                    "voice/{room_fp}/{}",
+                    hex::encode(sender_pk.as_bytes())
+                ));
+                bus_impl
+                    .inject(SignedDatagram {
+                        verifying_key: sender_pk.clone(),
+                        name,
+                        payload: Bytes::from(payload),
+                        signature: Bytes::new(),
+                    })
+                    .await;
+            }
+
+            // Interleave: A0, C0, A1, C1, …  This forces every decode
+            // to alternate sources, which is the worst case for the
+            // shared-decoder bug (every call sees mismatched state).
+            for seq in 0..FRAMES {
+                let pcm_a = sine_pcm(seq, ALICE_HZ);
+                let pcm_c = sine_pcm(seq, CAROL_HZ);
+                let bytes_a = enc_alice.encode(&pcm_a).unwrap();
+                let bytes_c = enc_carol.encode(&pcm_c).unwrap();
+                publish(&bob_bus_impl, &room, &alice, &alice_pk, seq, bytes_a).await;
+                publish(&bob_bus_impl, &room, &carol, &carol_pk, seq, bytes_c).await;
+            }
+
+            // Wait until both peers have at least 30 frames delivered.
+            // The subscribe loop is synchronous w.r.t. inject and the
+            // sink, so under nominal load this resolves in ms — the
+            // 2-second budget is CI tolerance.
+            let alice_peer = PeerId(alice_pk.clone());
+            let carol_peer = PeerId(carol_pk.clone());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let counts = {
+                        let map = per_peer_rms.borrow();
+                        (
+                            map.get(&alice_peer).map(|(_, n)| *n).unwrap_or(0),
+                            map.get(&carol_peer).map(|(_, n)| *n).unwrap_or(0),
+                        )
+                    };
+                    if counts.0 >= 30 && counts.1 >= 30 {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("both peers delivered ≥30 frames within 2s");
+
+            let map = per_peer_rms.borrow();
+            let (alice_sum, alice_n) = map[&alice_peer];
+            let (carol_sum, carol_n) = map[&carol_peer];
+            let alice_avg = alice_sum / alice_n as f32;
+            let carol_avg = carol_sum / carol_n as f32;
+            // Ideal: 0.5/sqrt(2) ≈ 0.353. Denoise is off for both
+            // peers (see above), so RMS lands within Opus quantization
+            // distance of the ideal. 0.30 is ~15 % below ideal: easily
+            // passed by intact per-peer decoders; failed by
+            // shared-decoder corruption because predictor state from
+            // the other stream poisons every alternating frame.
+            assert!(
+                alice_avg > 0.30,
+                "alice average RMS collapsed: {alice_avg} (expected ~0.35)"
+            );
+            assert!(
+                carol_avg > 0.30,
+                "carol average RMS collapsed: {carol_avg} (expected ~0.35)"
+            );
+        })
+        .await;
 }

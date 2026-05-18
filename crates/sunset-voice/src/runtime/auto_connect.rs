@@ -54,6 +54,29 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         let membership_arc = inner.membership_liveness.clone();
         drop(inner);
 
+        // Don't subscribe to the durable presence stream until the local
+        // user is in the call. If we subscribed in observer mode and
+        // simply discarded events, we'd swallow whatever presence entries
+        // arrived between observe_start and activate — the next dial
+        // wouldn't fire until each peer's next republish (≤ 2 s away),
+        // tightening the test/UX budget for nothing. By deferring the
+        // subscribe, `subscribe_prefix` runs once active and the bus
+        // immediately replays the current durable state so the FSM can
+        // act on it. Poll-loop because we have no Notify primitive on
+        // RuntimeInner; 100 ms is fast enough that the click-to-dial
+        // latency is dominated by getUserMedia, not by this check.
+        loop {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let active = *inner.is_active.borrow();
+            drop(inner);
+            if active {
+                break;
+            }
+            sleep(std::time::Duration::from_millis(100)).await;
+        }
+
         let mut presence_stream = match bus.subscribe_prefix(prefix.clone()).await {
             Ok(s) => s,
             Err(e) => {
@@ -113,16 +136,30 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 }
                 Some(ev) = life_sub.next() => {
                     if ev.state == LivenessState::Stale {
-                        let Some(inner) = weak.upgrade() else { return; };
-                        let mut state = inner.auto_connect_state.borrow_mut();
-                        state.insert(ev.peer.clone(), AutoConnectState::Unknown);
-                        drop(state);
-                        // Drop per-peer playback resources.
-                        inner.frame_sink.borrow().drop_peer(&ev.peer);
-                        // Forget the last seq we delivered so re-entry
-                        // starts fresh (the host-side jitter buffer is
-                        // also reset via `drop_peer`).
-                        inner.last_delivered_seq.borrow_mut().remove(&ev.peer);
+                        let dialer_to_release = {
+                            let Some(inner) = weak.upgrade() else { return; };
+                            let mut state = inner.auto_connect_state.borrow_mut();
+                            state.insert(ev.peer.clone(), AutoConnectState::Unknown);
+                            drop(state);
+                            // Drop per-peer playback resources.
+                            inner.frame_sink.borrow().drop_peer(&ev.peer);
+                            // Forget the last seq we delivered so re-entry
+                            // starts fresh (the host-side jitter buffer is
+                            // also reset via `drop_peer`).
+                            inner.last_delivered_seq.borrow_mut().remove(&ev.peer);
+                            inner.dialer.clone()
+                        };
+                        // Release any session-scoped connection state
+                        // the host registered for this peer (most
+                        // notably the supervisor's direct-WebRTC
+                        // intent — see `Dialer::release` docs). Without
+                        // this, on the *next* presence event for the
+                        // same peer, `ensure_direct` would short-circuit
+                        // against the still-live intent and never
+                        // start a fresh dial — the post-rejoin "stuck
+                        // dialing" failure mode the rejoin spec exists
+                        // to catch.
+                        dialer_to_release.release(ev.peer).await;
                     }
                 }
                 else => return,
@@ -141,4 +178,13 @@ fn is_valid_presence_name(name: &Bytes, prefix: &Bytes, vk: &VerifyingKey) -> bo
     let suffix = &name[prefix.len()..];
     let expected = hex::encode(vk.as_bytes());
     suffix == expected.as_bytes()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep(d: std::time::Duration) {
+    wasmtimer::tokio::sleep(d).await;
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep(d: std::time::Duration) {
+    tokio::time::sleep(d).await;
 }

@@ -80,16 +80,19 @@ pub fn on_intent_changed(
   callback: fn(IntentSnapshot) -> Nil,
 ) -> Nil
 
-/// Compose + insert a message into the named channel. `callback`
-/// receives the value-hash hex on success. `channel` must be a valid
-/// `ChannelLabel` (1..=64 ASCII printable bytes); the wasm side
-/// rejects anything outside that range with `Error("send_message
-/// channel: ...")`.
+/// Compose + insert a chat post into the named channel. `body` may be
+/// the empty string when `images` is non-empty (image-only post).
+/// `images` is a list of `#(mime_type, data_base64)` pairs; pass an
+/// empty list for a text-only message. `callback` receives the value-
+/// hash hex on success. `channel` must be a valid `ChannelLabel`
+/// (1..=64 ASCII printable bytes); the wasm side rejects anything
+/// outside that range with `Error("send_message channel: ...")`.
 @external(javascript, "./sunset.ffi.mjs", "sendMessage")
 pub fn send_message(
   room: RoomHandle,
   channel: String,
   body: String,
+  images: List(#(String, String)),
   sent_at_ms: Int,
   callback: fn(Result(String, String)) -> Nil,
 ) -> Nil
@@ -148,6 +151,24 @@ pub fn inc_is_self(msg: IncomingMessage) -> Bool
 /// (defaults to `"general"` for legacy un-channeled sends).
 @external(javascript, "./sunset.ffi.mjs", "incChannel")
 pub fn inc_channel(msg: IncomingMessage) -> String
+
+/// Image attachments on this message, as `#(mime_type, data_base64)`
+/// pairs. Empty list for text-only messages.
+@external(javascript, "./sunset.ffi.mjs", "incImages")
+pub fn inc_images(msg: IncomingMessage) -> List(#(String, String))
+
+/// Open the OS image picker (multi-select, raster only). Calls back
+/// once with the picked images as `#(mime_type, data_base64)` pairs.
+/// The list is empty if the user cancelled or picked nothing
+/// browser-renderable.
+@external(javascript, "./sunset.ffi.mjs", "pickImages")
+pub fn pick_images(callback: fn(List(#(String, String))) -> Nil) -> Nil
+
+/// Build a `data:<mime>;base64,<payload>` URL string for use as an
+/// `<img src>`. The FFI side does the string concatenation so the
+/// rendered URL stays out of the Gleam profiler.
+@external(javascript, "./sunset.ffi.mjs", "imageDataUrl")
+pub fn image_data_url(mime_type: String, data_base64: String) -> String
 
 pub type MemberJs
 
@@ -248,6 +269,25 @@ pub fn observed_channels(room: RoomHandle) -> List(String)
 pub fn on_channels_changed(
   room: RoomHandle,
   callback: fn(List(String)) -> Nil,
+) -> Nil
+
+/// Sorted snapshot of every Text message in this room, ordered by
+/// sender-claimed `sent_at_ms` ascending (tie-broken on value-hash so
+/// renders don't flip-flop). Receipts and Reactions are excluded —
+/// they don't render as messages. The wasm side does the sort, so all
+/// clients render identical order without local ordering logic.
+@external(javascript, "./sunset.ffi.mjs", "orderedMessages")
+pub fn ordered_messages(room: RoomHandle) -> List(IncomingMessage)
+
+/// Register a callback fired (immediately with the current sorted
+/// snapshot, then again on every change) with the full Text-message
+/// timeline of this room, sorted by sender-claimed `sent_at_ms`. Use
+/// instead of `on_message` when the host wants to render the full
+/// timeline in claimed-time order without its own sort.
+@external(javascript, "./sunset.ffi.mjs", "onMessagesChanged")
+pub fn on_messages_changed(
+  room: RoomHandle,
+  callback: fn(List(IncomingMessage)) -> Nil,
 ) -> Nil
 
 /// Snapshot payload delivered to `on_reactions_changed`. Opaque on the

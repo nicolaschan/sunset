@@ -29,4 +29,16 @@ pub trait Signaler: 'static {
 
     /// Wait for the next inbound signaling message addressed to us.
     async fn recv(&self) -> Result<SignalMessage>;
+
+    /// Drop any persistent per-peer state (cryptographic session, partial
+    /// handshakes, etc.) for `peer`, forcing the next outbound
+    /// `send(peer, ...)` to re-establish from scratch. Called at the
+    /// start of each transport-level handshake attempt (e.g. WebRTC
+    /// `connect`) so that a remote that has restarted with the same
+    /// identity isn't told to decrypt against a key it no longer holds.
+    ///
+    /// Default impl is a no-op — implementations that hold no
+    /// cross-handshake state (stub transports, in-memory tests) are
+    /// already correct without it.
+    async fn reset_peer(&self, _peer: &PeerId) {}
 }

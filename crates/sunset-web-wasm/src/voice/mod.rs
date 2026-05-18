@@ -44,10 +44,20 @@ pub(crate) fn new_voice_cell() -> VoiceCell {
     Rc::new(RefCell::new(None))
 }
 
-/// Start the voice subsystem. Constructs `WebDialer`, `WebFrameSink`,
-/// `WebPeerStateSink`, builds `VoiceRuntime`, and spawns all five
-/// runtime tasks via `wasm_bindgen_futures::spawn_local`.
-pub(crate) fn voice_start(
+/// Start the voice subsystem in *observer* mode. Constructs `WebDialer`,
+/// `WebFrameSink`, `WebPeerStateSink`, builds `VoiceRuntime`, and spawns
+/// all six runtime tasks. The runtime starts inactive: the three
+/// observer-side tasks (durable-presence subscription, combiner, voice
+/// subscribe) run normally so the UI learns who is in the channel, but
+/// the three active tasks (heartbeat, presence publisher, auto-connect)
+/// short-circuit until `voice_activate` flips the gate.
+///
+/// Use this at room load: the call's roster is visible from the moment
+/// the user lands in the room, without requiring mic permission or
+/// emitting any outbound voice traffic. Pair with `voice_activate` when
+/// the user joins the call, `voice_deactivate` when they leave, and
+/// `voice_stop` when they leave the room.
+pub(crate) fn voice_observe_start(
     cell: &VoiceCell,
     identity: &sunset_core::Identity,
     room_handle: &RoomHandle,
@@ -70,6 +80,7 @@ pub(crate) fn voice_start(
     });
     let dialer: Rc<dyn sunset_voice::Dialer> = Rc::new(dialer::WebDialer {
         open_room: room_handle.open_room_rc(),
+        intent_ids: RefCell::new(Default::default()),
     });
     let peer_state_sink: Rc<dyn sunset_voice::PeerStateSink> =
         Rc::new(peer_state_sink::WebPeerStateSink {
@@ -104,6 +115,56 @@ pub(crate) fn voice_start(
     });
 
     Ok(())
+}
+
+/// Transition the runtime from observer to active. Requires
+/// `voice_observe_start` to have been called first; the JS side is
+/// expected to have already brought up mic capture (`startCapture`)
+/// before invoking. Idempotent if already active.
+pub(crate) fn voice_activate(cell: &VoiceCell) -> Result<(), JsError> {
+    let slot = cell.borrow();
+    let av = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    av.runtime.set_active(true);
+    Ok(())
+}
+
+/// Transition the runtime from active back to observer. Stops
+/// heartbeats and presence publishing; the durable-presence
+/// subscription continues so the roster stays populated. Idempotent
+/// if already in observer mode.
+pub(crate) fn voice_deactivate(cell: &VoiceCell) -> Result<(), JsError> {
+    let slot = cell.borrow();
+    let av = slot
+        .as_ref()
+        .ok_or_else(|| JsError::new("voice not started"))?;
+    av.runtime.set_active(false);
+    Ok(())
+}
+
+/// One-shot start that does observer-start + activate in a single call.
+/// Preserved for tests and any caller that expresses "I'm in the room
+/// AND in the call" in a single step.
+pub(crate) fn voice_start(
+    cell: &VoiceCell,
+    identity: &sunset_core::Identity,
+    room_handle: &RoomHandle,
+    bus: &BusArc,
+    on_pcm: Function,
+    on_drop_peer: Function,
+    on_voice_peer_state: Function,
+) -> Result<(), JsError> {
+    voice_observe_start(
+        cell,
+        identity,
+        room_handle,
+        bus,
+        on_pcm,
+        on_drop_peer,
+        on_voice_peer_state,
+    )?;
+    voice_activate(cell)
 }
 
 pub(crate) fn voice_stop(cell: &VoiceCell) -> Result<(), JsError> {
@@ -149,10 +210,20 @@ pub(crate) fn voice_set_deafened(cell: &VoiceCell, deafened: bool) {
     }
 }
 
-pub(crate) fn voice_set_denoise(cell: &VoiceCell, denoise: bool) {
-    if let Some(v) = cell.borrow().as_ref() {
-        v.runtime.set_denoise(denoise);
+pub(crate) fn voice_set_peer_denoise(
+    cell: &VoiceCell,
+    peer_bytes: &[u8],
+    enabled: bool,
+) -> Result<(), JsError> {
+    if peer_bytes.len() != 32 {
+        return Err(JsError::new("peer_id must be 32 bytes"));
     }
+    let pk = sunset_store::VerifyingKey::new(bytes::Bytes::copy_from_slice(peer_bytes));
+    let peer = sunset_sync::PeerId(pk);
+    if let Some(v) = cell.borrow().as_ref() {
+        v.runtime.set_peer_denoise(peer, enabled);
+    }
+    Ok(())
 }
 
 /// Switch the active send-side voice quality preset. Accepts
@@ -238,6 +309,12 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
             &obj,
             &JsValue::from_str("seq"),
             &JsValue::from_f64(frame.seq as f64),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("tone_purity_440"),
+            &JsValue::from_f64(frame.tone_purity_440 as f64),
         )
         .unwrap();
         arr.push(&obj);

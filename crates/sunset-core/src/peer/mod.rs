@@ -172,6 +172,9 @@ where
             cancel_decode: cancel,
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
             observed_channels,
+            decoded_text_messages: Rc::new(std::cell::RefCell::new(
+                std::collections::BTreeMap::new(),
+            )),
         });
 
         open_rooms.insert(fp, Rc::downgrade(&state));
@@ -410,8 +413,8 @@ mod tests {
                 let received: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
                 let received_clone = received.clone();
                 room.on_message(move |decoded, is_self| {
-                    if let crate::MessageBody::Text(t) = &decoded.body {
-                        received_clone.borrow_mut().push((t.clone(), is_self));
+                    if let crate::MessageBody::Text { text, .. } = &decoded.body {
+                        received_clone.borrow_mut().push((text.clone(), is_self));
                     }
                 });
 
@@ -457,7 +460,7 @@ mod tests {
                     crate::V1_EPOCH_ID,
                     1_700_000_000_000,
                     crate::ChannelLabel::default_general(),
-                    crate::MessageBody::Text("from-other".to_owned()),
+                    crate::MessageBody::text("from-other"),
                     &mut rng,
                 )
                 .expect("compose_message");
@@ -543,10 +546,10 @@ mod tests {
                     Rc::new(RefCell::new(Vec::new()));
                 let received_cb = received.clone();
                 room.on_message(move |decoded, _is_self| {
-                    if let crate::MessageBody::Text(t) = &decoded.body {
+                    if let crate::MessageBody::Text { text, .. } = &decoded.body {
                         received_cb
                             .borrow_mut()
-                            .push((decoded.channel.as_str().to_owned(), t.clone()));
+                            .push((decoded.channel.as_str().to_owned(), text.clone()));
                     }
                 });
 
@@ -813,6 +816,378 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ordered_messages_sorts_by_claimed_time_regardless_of_arrival_order() {
+        // Insert two Text entries whose store-arrival order is reversed
+        // relative to their sender-claimed `sent_at_ms`. The
+        // `ordered_messages` snapshot must return them in claimed-time
+        // order — that's the whole contract.
+        use rand_core::SeedableRng;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(60)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                // Spawn the decode loop so the BTreeMap fills up as
+                // entries land.
+                room.on_message(|_, _| {});
+
+                let other = ident(61);
+                let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
+                // Compose two texts: one claimed at t=100 (older), one at
+                // t=200 (newer). Insert *the newer one first*.
+                let older = crate::compose_text(
+                    &other,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    100,
+                    crate::ChannelLabel::default_general(),
+                    "older",
+                    &mut rng,
+                )
+                .expect("compose older");
+                let newer = crate::compose_text(
+                    &other,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    200,
+                    crate::ChannelLabel::default_general(),
+                    "newer",
+                    &mut rng,
+                )
+                .expect("compose newer");
+
+                use sunset_store::Store as _;
+                peer.store()
+                    .insert(newer.entry, Some(newer.block))
+                    .await
+                    .expect("insert newer first");
+                peer.store()
+                    .insert(older.entry, Some(older.block))
+                    .await
+                    .expect("insert older second");
+
+                // Wait for both to land in the snapshot.
+                let mut snap: Vec<crate::DecodedMessage> = Vec::new();
+                for _ in 0..100 {
+                    snap = room.ordered_messages();
+                    if snap.len() >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let texts: Vec<&str> = snap
+                    .iter()
+                    .filter_map(|m| match &m.body {
+                        crate::MessageBody::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    texts,
+                    vec!["older", "newer"],
+                    "ordered_messages must sort by sender-claimed sent_at_ms"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordered_messages_breaks_ties_deterministically() {
+        // Two texts claiming the exact same `sent_at_ms` must appear in
+        // a deterministic order so the UI doesn't flip-flop between
+        // renders. Tie-break is on `value_hash` (content-addressed and
+        // unique).
+        use rand_core::SeedableRng;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(62)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                room.on_message(|_, _| {});
+
+                let other_a = ident(63);
+                let other_b = ident(64);
+                let mut rng = rand_chacha::ChaCha20Rng::from_seed([13; 32]);
+                let m_a = crate::compose_text(
+                    &other_a,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    1000,
+                    crate::ChannelLabel::default_general(),
+                    "from-a",
+                    &mut rng,
+                )
+                .expect("compose a");
+                let m_b = crate::compose_text(
+                    &other_b,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    1000,
+                    crate::ChannelLabel::default_general(),
+                    "from-b",
+                    &mut rng,
+                )
+                .expect("compose b");
+
+                use sunset_store::Store as _;
+                // Insertion order #1: a, b
+                peer.store()
+                    .insert(m_a.entry.clone(), Some(m_a.block.clone()))
+                    .await
+                    .expect("insert a");
+                peer.store()
+                    .insert(m_b.entry.clone(), Some(m_b.block.clone()))
+                    .await
+                    .expect("insert b");
+
+                let mut order1: Vec<sunset_store::Hash> = Vec::new();
+                for _ in 0..100 {
+                    order1 = room
+                        .ordered_messages()
+                        .iter()
+                        .map(|m| m.value_hash)
+                        .collect();
+                    if order1.len() >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(order1.len(), 2);
+
+                // Now build a *second* peer and insert in reverse order
+                // (b, a). The resulting snapshot order must match the
+                // first peer's — i.e. the order doesn't depend on
+                // arrival order when sent_at_ms ties.
+                let peer2 = helpers::mk_peer(ident(65)).await;
+                let room2 = peer2.open_room("alpha").await.expect("open_room2");
+                room2.on_message(|_, _| {});
+                peer2
+                    .store()
+                    .insert(m_b.entry, Some(m_b.block))
+                    .await
+                    .expect("insert b first on peer2");
+                peer2
+                    .store()
+                    .insert(m_a.entry, Some(m_a.block))
+                    .await
+                    .expect("insert a second on peer2");
+                let mut order2: Vec<sunset_store::Hash> = Vec::new();
+                for _ in 0..100 {
+                    order2 = room2
+                        .ordered_messages()
+                        .iter()
+                        .map(|m| m.value_hash)
+                        .collect();
+                    if order2.len() >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(order1, order2, "tie-breaking must be deterministic");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordered_messages_excludes_receipts_and_reactions() {
+        // The snapshot is the rendered-message timeline. Receipts and
+        // Reactions are side data — they must not appear.
+        use rand_core::SeedableRng;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(66)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                room.on_message(|_, _| {});
+
+                let other = ident(67);
+                let mut rng = rand_chacha::ChaCha20Rng::from_seed([5; 32]);
+                let text = crate::compose_text(
+                    &other,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    1,
+                    crate::ChannelLabel::default_general(),
+                    "real-text",
+                    &mut rng,
+                )
+                .expect("compose text");
+                let text_hash = text.entry.value_hash;
+                let receipt = crate::compose_receipt(
+                    &other,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    2,
+                    crate::ChannelLabel::default_general(),
+                    text_hash,
+                    &mut rng,
+                )
+                .expect("compose receipt");
+                let reaction = crate::compose_reaction(
+                    &other,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    3,
+                    crate::ChannelLabel::default_general(),
+                    &crate::ReactionPayload {
+                        for_value_hash: text_hash,
+                        emoji: "👍",
+                        action: crate::ReactionAction::Add,
+                    },
+                    &mut rng,
+                )
+                .expect("compose reaction");
+
+                use sunset_store::Store as _;
+                peer.store()
+                    .insert(text.entry, Some(text.block))
+                    .await
+                    .expect("insert text");
+                peer.store()
+                    .insert(receipt.entry, Some(receipt.block))
+                    .await
+                    .expect("insert receipt");
+                peer.store()
+                    .insert(reaction.entry, Some(reaction.block))
+                    .await
+                    .expect("insert reaction");
+
+                let mut snap = Vec::new();
+                for _ in 0..100 {
+                    snap = room.ordered_messages();
+                    if !snap.is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let bodies: Vec<&str> = snap
+                    .iter()
+                    .filter_map(|m| match &m.body {
+                        crate::MessageBody::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(bodies, vec!["real-text"]);
+                // Yield more to give receipt + reaction a chance to be
+                // misclassified (they shouldn't be).
+                for _ in 0..50 {
+                    tokio::task::yield_now().await;
+                }
+                let bodies_after: Vec<crate::MessageBody> = room
+                    .ordered_messages()
+                    .into_iter()
+                    .map(|m| m.body)
+                    .collect();
+                assert_eq!(
+                    bodies_after.len(),
+                    1,
+                    "snapshot must contain only Text bodies, got {bodies_after:?}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_messages_changed_fires_with_empty_snapshot_immediately() {
+        // Mirror on_channels_changed: registering must fire once with
+        // the current (possibly empty) snapshot so a late-registering
+        // host doesn't sit empty waiting for the next message.
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(68)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let snapshots: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+                let snapshots_cb = snapshots.clone();
+                room.on_messages_changed(move |msgs| {
+                    snapshots_cb.borrow_mut().push(msgs.len());
+                });
+
+                assert_eq!(snapshots.borrow().clone(), vec![0]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_messages_changed_fires_sorted_snapshot_on_out_of_order_arrival() {
+        // Insert (newer, older) order; the callback must eventually fire
+        // a snapshot containing [older, newer] in claimed-time order.
+        use rand_core::SeedableRng;
+        use std::cell::RefCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(69)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                let snapshots: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+                let snapshots_cb = snapshots.clone();
+                room.on_messages_changed(move |msgs| {
+                    let texts: Vec<String> = msgs
+                        .iter()
+                        .filter_map(|m| match &m.body {
+                            crate::MessageBody::Text { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    snapshots_cb.borrow_mut().push(texts);
+                });
+
+                let other = ident(70);
+                let mut rng = rand_chacha::ChaCha20Rng::from_seed([9; 32]);
+                let older = crate::compose_text(
+                    &other,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    100,
+                    crate::ChannelLabel::default_general(),
+                    "older",
+                    &mut rng,
+                )
+                .expect("compose older");
+                let newer = crate::compose_text(
+                    &other,
+                    &room.inner.room,
+                    crate::V1_EPOCH_ID,
+                    200,
+                    crate::ChannelLabel::default_general(),
+                    "newer",
+                    &mut rng,
+                )
+                .expect("compose newer");
+
+                use sunset_store::Store as _;
+                peer.store()
+                    .insert(newer.entry, Some(newer.block))
+                    .await
+                    .expect("insert newer first");
+                peer.store()
+                    .insert(older.entry, Some(older.block))
+                    .await
+                    .expect("insert older second");
+
+                // Wait for a snapshot containing both texts in
+                // claimed-time order.
+                let target = vec!["older".to_owned(), "newer".to_owned()];
+                let mut saw_target = false;
+                for _ in 0..200 {
+                    if snapshots.borrow().iter().any(|s| s == &target) {
+                        saw_target = true;
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    saw_target,
+                    "expected a snapshot of [older, newer]; observed {:?}",
+                    snapshots.borrow()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn on_receipt_fires_for_inserted_receipt() {
         use rand_core::SeedableRng;
         use std::cell::RefCell;
@@ -1061,6 +1436,111 @@ mod tests {
                         .is_empty(),
                     "last_signature should be cleared after on_members_changed registration"
                 );
+            })
+            .await;
+    }
+
+    /// `connect_direct` should register a supervisor intent (visible
+    /// via `Peer::intents()`) and return its `IntentId` so
+    /// session-scoped callers (e.g. the voice runtime) can later
+    /// `cancel_direct` it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_direct_returns_intent_id_and_registers_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(60)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let other_pk = [42u8; 32];
+                let id = room
+                    .connect_direct(other_pk)
+                    .await
+                    .expect("connect_direct returns IntentId");
+
+                // The supervisor should now have one intent (the direct
+                // one) and its label should be the canonical
+                // `webrtc://<pk>#x25519=<x>` URL.
+                let snaps = peer.intents().await;
+                assert_eq!(snaps.len(), 1);
+                assert_eq!(snaps[0].id, id);
+                assert!(
+                    snaps[0].label.starts_with("webrtc://"),
+                    "expected webrtc:// label, got {}",
+                    snaps[0].label
+                );
+            })
+            .await;
+    }
+
+    /// `cancel_direct` should drop the supervisor intent so a follow-up
+    /// `connect_direct` for the same peer creates a *fresh* intent
+    /// rather than deduping against the cancelled one.
+    ///
+    /// This is the load-bearing invariant for the voice
+    /// leave-and-rejoin path: the WebDialer drops on `voice_stop` and
+    /// runs `cancel_direct` for every intent it accumulated; the next
+    /// `voice_start` then dials cleanly instead of short-circuiting
+    /// against a stale `Connected` / `Backoff` intent whose underlying
+    /// WebRTC connection died silently during the gap.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_direct_dedupes_until_cancelled_then_fresh_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(61)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                let other_pk = [42u8; 32];
+                let id_1 = room.connect_direct(other_pk).await.expect("first dial");
+
+                // Repeat call dedupes (supervisor returns existing id).
+                let id_again = room.connect_direct(other_pk).await.expect("dedup dial");
+                assert_eq!(
+                    id_again, id_1,
+                    "supervisor.add should dedupe by Connectable identity"
+                );
+                assert_eq!(peer.intents().await.len(), 1);
+
+                // Cancel: the intent disappears from snapshots.
+                room.cancel_direct(id_1).await;
+                assert!(
+                    peer.intents().await.iter().all(|s| s.id != id_1),
+                    "cancelled intent should be removed from snapshot"
+                );
+
+                // Fresh dial after cancel: a NEW IntentId is allocated.
+                let id_2 = room
+                    .connect_direct(other_pk)
+                    .await
+                    .expect("fresh dial after cancel");
+                assert_ne!(
+                    id_2, id_1,
+                    "after cancel_direct the dedup slate is clear so a fresh \
+                     connect_direct must allocate a new IntentId"
+                );
+            })
+            .await;
+    }
+
+    /// `cancel_direct` is a no-op for an `IntentId` that doesn't exist
+    /// (already-cancelled, or never registered). This is the
+    /// safety net for the WebDialer's `Drop`-side cleanup: if voice
+    /// drops before the supervisor processes the original Add (rare),
+    /// the cleanup must not panic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_direct_is_noop_for_unknown_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(62)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+
+                // Cancel an IntentId we never registered — must complete
+                // cleanly without panic, without error, without state
+                // leaking onto the supervisor.
+                room.cancel_direct(99_999).await;
+                assert!(peer.intents().await.is_empty());
             })
             .await;
     }

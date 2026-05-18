@@ -48,16 +48,28 @@ rel = "preconnect"
 href = "https://fonts.gstatic.com"
 crossorigin = ""
 
+# Inter + JetBrains Mono are the prose / mono faces. Noto Color Emoji
+# is appended to give us a consistent emoji rendering across hosts —
+# without it, the same emoji renders very differently on macOS (Apple
+# Color Emoji), Windows (Segoe UI Emoji), Linux (whatever the distro
+# ships, often a black-and-white fallback), and Android. The browser
+# falls through font-family entries glyph-by-glyph, so listing the
+# emoji font after Inter / JetBrains Mono in `theme.gleam` keeps Latin
+# text on Inter / JetBrains Mono while emoji codepoints hit the
+# Google Fonts copy. We bundle the file via the existing Google Fonts
+# CSS request rather than self-hosting so the same `preconnect` covers
+# the fetch and there's no extra build / asset pipeline to maintain.
 [[tools.lustre.html.links]]
 rel = "stylesheet"
-href = "https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap"
+href = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Color+Emoji&display=swap"
 
 # theme-color paints the browser-chrome (URL bar, address bar) with
-# the sunset accent colour. Not split light/dark — the warm terracotta
-# reads correctly under either system theme.
+# the sunset accent colour. Not split light/dark — the deep magenta-rose
+# reads correctly under either system theme. Keep this in sync with
+# `theme.gleam`'s light-palette `accent` token.
 [[tools.lustre.html.meta]]
 name = "theme-color"
-content = "#bb5a3a"
+content = "#a83565"
 
 # Standalone display when the page is launched from the home screen
 # (PWA install). The `apple-mobile-web-app-*` variants are Apple's

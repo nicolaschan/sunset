@@ -10,7 +10,7 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type ConnStatus, type Room, type RoomId, Connected, Offline, Reconnecting,
+  type Room, type RoomId, Connected, Offline, Reconnecting,
 }
 import sunset_web/theme.{type Palette}
 import sunset_web/ui
@@ -35,8 +35,6 @@ pub fn view(
   on_drag_end on_drag_end: msg,
   toggle toggle: msg,
   viewport viewport: domain.Viewport,
-  members members: List(domain.Member),
-  on_open_settings on_open_settings: msg,
 ) -> Element(msg) {
   // On phone the rail lives inside a 320px-wide drawer, so it should
   // fill the drawer's width rather than the desktop 260px column.
@@ -45,11 +43,9 @@ pub fn view(
     domain.Desktop, True -> "54px"
     domain.Desktop, False -> "260px"
   }
-  // On phone the rail fills the drawer's safe-area-padded content
-  // box, not the raw viewport — the drawer wrapper already accounts
-  // for the iOS status bar / home indicator insets, and a 100dvh rail
-  // would overflow the drawer's clipping box and hide the bottom
-  // you_row behind the home indicator. On desktop the rail still
+  // On phone the rail fills the drawer's safe-area-padded content box,
+  // not the raw viewport — the drawer wrapper already accounts for the
+  // iOS status bar / home indicator insets. On desktop the rail still
   // anchors to the viewport via dvh so it fills the grid row.
   let height_props = case viewport {
     domain.Phone -> [#("height", "100%"), #("min-height", "0")]
@@ -62,11 +58,6 @@ pub fn view(
     domain.Phone -> "0"
     domain.Desktop -> "1px solid " <> p.border
   }
-  // The current user
-  let you =
-    members
-    |> list.find(fn(m) { m.you })
-    |> option.from_result
   html.aside(
     [
       attribute.attribute("data-testid", "rooms-rail"),
@@ -113,7 +104,6 @@ pub fn view(
         on_drop,
         on_drag_end,
       ),
-      you_row(you, p, col, on_open_settings),
     ],
   )
 }
@@ -499,7 +489,6 @@ fn room_full(
           ]),
         ],
         [
-          conn_dot(p, r.status),
           html.div(
             [
               ui.css([
@@ -636,10 +625,46 @@ fn room_mini(
     True -> p.accent_soft
     False -> "transparent"
   }
-  let dot = case r.status {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
+  // Collapsed-rail rooms: a status indicator only appears when the
+  // room is *not* Connected — Connected is the default and showing a
+  // dot for it adds noise without information. Reconnecting → amber
+  // dot; Offline → muted gray dot.
+  let problem_dot = case r.status {
+    Connected -> element.fragment([])
+    Reconnecting ->
+      html.span(
+        [
+          attribute.title("Reconnecting"),
+          ui.css([
+            #("position", "absolute"),
+            #("top", "2px"),
+            #("right", "2px"),
+            #("width", "7px"),
+            #("height", "7px"),
+            #("border-radius", "999px"),
+            #("background", p.warn),
+            #("border", "1.5px solid " <> p.surface),
+          ]),
+        ],
+        [],
+      )
+    Offline ->
+      html.span(
+        [
+          attribute.title("Offline"),
+          ui.css([
+            #("position", "absolute"),
+            #("top", "2px"),
+            #("right", "2px"),
+            #("width", "7px"),
+            #("height", "7px"),
+            #("border-radius", "999px"),
+            #("background", p.text_faint),
+            #("border", "1.5px solid " <> p.surface),
+          ]),
+        ],
+        [],
+      )
   }
   html.button(
     [
@@ -664,20 +689,7 @@ fn room_mini(
       ]),
     ],
     [
-      html.span(
-        [
-          ui.css([
-            #("position", "absolute"),
-            #("top", "2px"),
-            #("right", "2px"),
-            #("width", "7px"),
-            #("height", "7px"),
-            #("border-radius", "999px"),
-            #("background", dot),
-          ]),
-        ],
-        [],
-      ),
+      problem_dot,
       html.span([], [html.text(string.uppercase(string.slice(r.name, 0, 1)))]),
       case r.unread {
         0 -> element.fragment([])
@@ -708,27 +720,6 @@ fn room_mini(
   )
 }
 
-fn conn_dot(p: Palette, s: ConnStatus) -> Element(msg) {
-  let c = case s {
-    Connected -> p.live
-    Reconnecting -> p.warn
-    Offline -> p.text_faint
-  }
-  html.span(
-    [
-      ui.css([
-        #("width", "7px"),
-        #("height", "7px"),
-        #("border-radius", "999px"),
-        #("background", c),
-        #("display", "inline-block"),
-        #("flex-shrink", "0"),
-      ]),
-    ],
-    [],
-  )
-}
-
 fn unread_pill(p: Palette, n: Int) -> Element(msg) {
   html.span(
     [
@@ -747,98 +738,6 @@ fn unread_pill(p: Palette, n: Int) -> Element(msg) {
       ]),
     ],
     [html.text(int_to_string(n))],
-  )
-}
-
-fn you_row(
-  you: Option(domain.Member),
-  p: Palette,
-  collapsed: Bool,
-  on_open_settings: msg,
-) -> Element(msg) {
-  // Pinned at the bottom of the rooms rail. The fixed 64px height +
-  // border-top is shared by the channels-rail self-bar and the main
-  // panel composer so all three column-bottom rows visually align.
-  // The whole row is a button: clicking it opens the settings popover
-  // (theme + reset). Collapsed-rail variant centers a single dot.
-  let padding = case collapsed {
-    True -> "0"
-    False -> "0 14px"
-  }
-  let justify = case collapsed {
-    True -> "center"
-    False -> "flex-start"
-  }
-  let your_name = you |> option.map(fn(a) { a.name }) |> option.unwrap("?")
-  html.button(
-    [
-      attribute.attribute("data-testid", "you-row"),
-      attribute.title("Settings"),
-      attribute.attribute("aria-label", "Open settings"),
-      event.on_click(on_open_settings),
-      ui.css([
-        #("box-sizing", "border-box"),
-        #("height", "64px"),
-        #("flex-shrink", "0"),
-        #("display", "flex"),
-        #("align-items", "center"),
-        #("justify-content", justify),
-        #("gap", "8px"),
-        #("padding", padding),
-        #("border", "none"),
-        #("border-top", "1px solid " <> p.border_soft),
-        #("background", "transparent"),
-        #("color", p.text),
-        #("font-family", "inherit"),
-        #("font-size", "16.25px"),
-        #("text-align", "left"),
-        #("cursor", "pointer"),
-        #("width", "100%"),
-      ]),
-    ],
-    [
-      html.span(
-        [
-          ui.css([
-            #("color", p.live),
-            #("font-size", "12.5px"),
-            #("line-height", "1"),
-          ]),
-        ],
-        [html.text("●")],
-      ),
-      case collapsed {
-        True -> element.fragment([])
-        False ->
-          html.span(
-            [
-              ui.css([
-                #("flex", "1"),
-                #("display", "flex"),
-                #("align-items", "baseline"),
-                #("gap", "6px"),
-                #("min-width", "0"),
-              ]),
-            ],
-            [
-              html.span(
-                [ui.css([#("font-weight", "500"), #("color", p.text)])],
-                [html.text("you")],
-              ),
-              html.span(
-                [
-                  ui.css([
-                    #("font-family", theme.font_mono),
-                    #("font-size", "13.125px"),
-                    #("color", p.text_faint),
-                  ]),
-                ],
-                [html.text(your_name)],
-              ),
-            ],
-          )
-      },
-    ],
   )
 }
 
