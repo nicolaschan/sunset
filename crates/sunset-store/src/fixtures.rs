@@ -1,18 +1,16 @@
 //! Canonical synchronous test fixtures shared by the conformance suite, the
 //! crate's own unit tests, and every backend's unit tests.
 //!
-//! Always-compiled `pub(crate)` module — within the crate, anything
-//! `#[cfg(test)]` reaches it via `use crate::fixtures::{vk, n, ...}`. For
-//! external consumers, the same items are re-exported from
-//! [`crate::test_helpers`] under the `test-helpers` feature gate; backends
-//! that already enable `sunset-store = { features = ["test-helpers"] }`
-//! in their `[dev-dependencies]` therefore reach for
+//! Gated on `cfg(any(test, feature = "test-helpers"))` so the module exists
+//! exactly when something can use it. Inside the crate, `#[cfg(test)] mod`
+//! blocks reach it directly via `use crate::fixtures::{vk, n, ...}`. External
+//! consumers reach the same items through [`crate::test_helpers`] (which
+//! `pub use`s them) once they enable the `test-helpers` feature; backends
+//! that declare `sunset-store = { features = ["test-helpers"] }` in their
+//! `[dev-dependencies]` therefore write
 //! `sunset_store::test_helpers::{vk, n, block, entry, entry_expiring_at}`.
 //!
-//! The module is unconditional so rust-analyzer (and any other tool that
-//! indexes without enabling features) sees the module tree consistently;
-//! these functions are dead code in production builds and are stripped by
-//! LTO. There is no third place — local re-declarations in backends are
+//! There is no third place — local re-declarations in backends are
 //! duplication.
 
 use std::sync::Arc;
