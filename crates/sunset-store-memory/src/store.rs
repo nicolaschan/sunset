@@ -298,61 +298,32 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
+    use sunset_store::test_helpers::{block, entry, entry_expiring_at, n, vk};
     use sunset_store::{Filter, Replay};
-
-    fn vk(b: &'static [u8]) -> VerifyingKey {
-        VerifyingKey::new(bytes::Bytes::from_static(b))
-    }
-    fn n(b: &'static [u8]) -> bytes::Bytes {
-        bytes::Bytes::from_static(b)
-    }
-
-    fn entry_pointing_to(
-        block: &ContentBlock,
-        vk_bytes: &'static [u8],
-        name: &'static [u8],
-        priority: u64,
-    ) -> SignedKvEntry {
-        SignedKvEntry {
-            verifying_key: vk(vk_bytes),
-            name: n(name),
-            value_hash: block.hash(),
-            priority,
-            expires_at: None,
-            signature: bytes::Bytes::from_static(b"sig"),
-        }
-    }
-
-    fn small_block(payload: &'static [u8]) -> ContentBlock {
-        ContentBlock {
-            data: bytes::Bytes::from_static(payload),
-            references: vec![],
-        }
-    }
 
     #[tokio::test]
     async fn insert_then_get_entry_roundtrip() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"hello");
-        let entry = entry_pointing_to(&block, b"alice", b"room/x", 1);
-        store.insert(entry.clone(), Some(block)).await.unwrap();
+        let b = block(b"hello");
+        let e = entry(&b, b"alice", b"room/x", 1);
+        store.insert(e.clone(), Some(b)).await.unwrap();
         let back = store
             .get_entry(&vk(b"alice"), b"room/x")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(back, entry);
+        assert_eq!(back, e);
     }
 
     #[tokio::test]
     async fn insert_rejects_hash_mismatch() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"hello");
-        let mut entry = entry_pointing_to(&block, b"alice", b"r", 1);
-        entry.value_hash = Hash::from_bytes([0u8; 32]);
-        let other_block = small_block(b"goodbye");
+        let b = block(b"hello");
+        let mut e = entry(&b, b"alice", b"r", 1);
+        e.value_hash = Hash::from_bytes([0u8; 32]);
+        let other = block(b"goodbye");
         assert!(matches!(
-            store.insert(entry, Some(other_block)).await,
+            store.insert(e, Some(other)).await,
             Err(Error::HashMismatch)
         ));
     }
@@ -360,24 +331,21 @@ mod tests {
     #[tokio::test]
     async fn insert_rejects_lower_or_equal_priority() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
-        let first = entry_pointing_to(&block, b"alice", b"r", 5);
-        store
-            .insert(first.clone(), Some(block.clone()))
-            .await
-            .unwrap();
+        let b = block(b"x");
+        let first = entry(&b, b"alice", b"r", 5);
+        store.insert(first.clone(), Some(b.clone())).await.unwrap();
 
         // Equal priority -> Stale.
-        let same = entry_pointing_to(&block, b"alice", b"r", 5);
+        let same = entry(&b, b"alice", b"r", 5);
         assert!(matches!(
-            store.insert(same, Some(block.clone())).await,
+            store.insert(same, Some(b.clone())).await,
             Err(Error::Stale)
         ));
 
         // Lower priority -> Stale.
-        let lower = entry_pointing_to(&block, b"alice", b"r", 4);
+        let lower = entry(&b, b"alice", b"r", 4);
         assert!(matches!(
-            store.insert(lower, Some(block.clone())).await,
+            store.insert(lower, Some(b.clone())).await,
             Err(Error::Stale)
         ));
     }
@@ -385,16 +353,13 @@ mod tests {
     #[tokio::test]
     async fn insert_replaces_with_higher_priority() {
         let store = MemoryStore::with_accept_all();
-        let block_v1 = small_block(b"v1");
-        let block_v2 = small_block(b"v2");
+        let b1 = block(b"v1");
+        let b2 = block(b"v2");
 
-        let v1 = entry_pointing_to(&block_v1, b"alice", b"r", 1);
-        let v2 = entry_pointing_to(&block_v2, b"alice", b"r", 2);
-        store.insert(v1, Some(block_v1)).await.unwrap();
-        store
-            .insert(v2.clone(), Some(block_v2.clone()))
-            .await
-            .unwrap();
+        let v1 = entry(&b1, b"alice", b"r", 1);
+        let v2 = entry(&b2, b"alice", b"r", 2);
+        store.insert(v1, Some(b1)).await.unwrap();
+        store.insert(v2.clone(), Some(b2.clone())).await.unwrap();
 
         let current = store.get_entry(&vk(b"alice"), b"r").await.unwrap().unwrap();
         assert_eq!(current, v2);
@@ -403,15 +368,15 @@ mod tests {
     #[tokio::test]
     async fn insert_lazy_ref_succeeds_without_blob() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"future");
-        let entry = entry_pointing_to(&block, b"alice", b"r", 1);
+        let b = block(b"future");
+        let e = entry(&b, b"alice", b"r", 1);
         // Insert entry only; blob is not yet here.
-        store.insert(entry, None).await.unwrap();
+        store.insert(e, None).await.unwrap();
         // Reading the blob via its hash returns None until it arrives.
-        assert!(store.get_content(&block.hash()).await.unwrap().is_none());
+        assert!(store.get_content(&b.hash()).await.unwrap().is_none());
         // Later, the blob can be put separately.
-        store.put_content(block.clone()).await.unwrap();
-        assert!(store.get_content(&block.hash()).await.unwrap().is_some());
+        store.put_content(b.clone()).await.unwrap();
+        assert!(store.get_content(&b.hash()).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -431,10 +396,10 @@ mod tests {
             }
         }
         let store = MemoryStore::new(Arc::new(RejectAll));
-        let block = small_block(b"x");
-        let entry = entry_pointing_to(&block, b"alice", b"r", 1);
+        let b = block(b"x");
+        let e = entry(&b, b"alice", b"r", 1);
         assert!(matches!(
-            store.insert(entry, Some(block)).await,
+            store.insert(e, Some(b)).await,
             Err(Error::SignatureInvalid)
         ));
     }
@@ -453,26 +418,17 @@ mod tests {
     #[tokio::test]
     async fn iter_keyspace_returns_only_matching_writer() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         store
-            .insert(
-                entry_pointing_to(&block, b"alice", b"a", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"alice", b"a", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"alice", b"b", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"alice", b"b", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"bob", b"a", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"bob", b"a", 1), Some(b.clone()))
             .await
             .unwrap();
 
@@ -484,26 +440,17 @@ mod tests {
     #[tokio::test]
     async fn iter_namespace_returns_all_writers_at_name() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         store
-            .insert(
-                entry_pointing_to(&block, b"alice", b"room/g", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"alice", b"room/g", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"bob", b"room/g", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"bob", b"room/g", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"alice", b"room/h", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"alice", b"room/h", 1), Some(b.clone()))
             .await
             .unwrap();
 
@@ -514,26 +461,17 @@ mod tests {
     #[tokio::test]
     async fn iter_name_prefix_matches_prefix() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"room/g", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"room/g", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"room/h", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"room/h", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"presence/x", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"presence/x", 1), Some(b.clone()))
             .await
             .unwrap();
 
@@ -544,19 +482,13 @@ mod tests {
     #[tokio::test]
     async fn iter_specific_returns_at_most_one() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"x", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"x", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"b", b"x", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"b", b"x", 1), Some(b.clone()))
             .await
             .unwrap();
 
@@ -568,26 +500,17 @@ mod tests {
     #[tokio::test]
     async fn iter_union_is_or() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"room/g", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"room/g", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"b", b"presence/x", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"b", b"presence/x", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"c", b"unrelated", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"c", b"unrelated", 1), Some(b.clone()))
             .await
             .unwrap();
 
@@ -599,46 +522,23 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    fn entry_with_expiry(
-        block: &ContentBlock,
-        vk_bytes: &'static [u8],
-        name: &'static [u8],
-        priority: u64,
-        expires_at: u64,
-    ) -> SignedKvEntry {
-        SignedKvEntry {
-            verifying_key: vk(vk_bytes),
-            name: n(name),
-            value_hash: block.hash(),
-            priority,
-            expires_at: Some(expires_at),
-            signature: bytes::Bytes::from_static(b"sig"),
-        }
-    }
-
     #[tokio::test]
     async fn delete_expired_removes_only_past_entries() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         store
-            .insert(
-                entry_with_expiry(&block, b"a", b"old", 1, 100),
-                Some(block.clone()),
-            )
+            .insert(entry_expiring_at(&b, b"a", b"old", 1, 100), Some(b.clone()))
             .await
             .unwrap();
         store
             .insert(
-                entry_with_expiry(&block, b"a", b"future", 1, 1000),
-                Some(block.clone()),
+                entry_expiring_at(&b, b"a", b"future", 1, 1000),
+                Some(b.clone()),
             )
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"forever", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"forever", 1), Some(b.clone()))
             .await
             .unwrap();
 
@@ -664,12 +564,9 @@ mod tests {
     #[tokio::test]
     async fn delete_expired_at_boundary_includes_equal() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         store
-            .insert(
-                entry_with_expiry(&block, b"a", b"x", 1, 100),
-                Some(block.clone()),
-            )
+            .insert(entry_expiring_at(&b, b"a", b"x", 1, 100), Some(b.clone()))
             .await
             .unwrap();
         let removed = store.delete_expired(100).await.unwrap();
@@ -680,17 +577,17 @@ mod tests {
     async fn gc_blobs_keeps_reachable_drops_orphans() {
         let store = MemoryStore::with_accept_all();
         // A live entry pointing at a block with a transitive reference.
-        let leaf = small_block(b"leaf");
+        let leaf = block(b"leaf");
         let head = ContentBlock {
             data: bytes::Bytes::from_static(b"head"),
             references: vec![leaf.hash()],
         };
-        let entry = entry_pointing_to(&head, b"a", b"x", 1);
+        let e = entry(&head, b"a", b"x", 1);
         store.put_content(leaf.clone()).await.unwrap();
-        store.insert(entry, Some(head.clone())).await.unwrap();
+        store.insert(e, Some(head.clone())).await.unwrap();
 
         // An orphan block, unreferenced.
-        let orphan = small_block(b"orphan");
+        let orphan = block(b"orphan");
         store.put_content(orphan.clone()).await.unwrap();
 
         let reclaimed = store.gc_blobs().await.unwrap();
@@ -704,9 +601,9 @@ mod tests {
     async fn gc_blobs_handles_dangling_value_hash() {
         // KV entry references a blob we don't have locally (lazy ref); GC must not crash.
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"future");
-        let entry = entry_pointing_to(&block, b"a", b"x", 1);
-        store.insert(entry, None).await.unwrap(); // no blob yet
+        let b = block(b"future");
+        let e = entry(&b, b"a", b"x", 1);
+        store.insert(e, None).await.unwrap(); // no blob yet
         let reclaimed = store.gc_blobs().await.unwrap();
         assert_eq!(reclaimed, 0);
     }
@@ -714,13 +611,10 @@ mod tests {
     #[tokio::test]
     async fn subscribe_replay_none_only_emits_future_events() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         // Pre-existing entry — should NOT replay.
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"r", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"r", 1), Some(b.clone()))
             .await
             .unwrap();
 
@@ -731,10 +625,7 @@ mod tests {
 
         // Future event — should arrive.
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"r2", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"r2", 1), Some(b.clone()))
             .await
             .unwrap();
         let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next())
@@ -751,19 +642,13 @@ mod tests {
     #[tokio::test]
     async fn subscribe_replay_all_emits_history_then_live() {
         let store = MemoryStore::with_accept_all();
-        let block = small_block(b"x");
+        let b = block(b"x");
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"r1", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"r1", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"r2", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"r2", 1), Some(b.clone()))
             .await
             .unwrap();
 
@@ -781,10 +666,7 @@ mod tests {
         }
         // One live.
         store
-            .insert(
-                entry_pointing_to(&block, b"a", b"r3", 1),
-                Some(block.clone()),
-            )
+            .insert(entry(&b, b"a", b"r3", 1), Some(b.clone()))
             .await
             .unwrap();
         let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next())
@@ -801,10 +683,10 @@ mod tests {
     #[tokio::test]
     async fn subscribe_replaced_event_on_higher_priority_overwrite() {
         let store = MemoryStore::with_accept_all();
-        let b1 = small_block(b"v1");
-        let b2 = small_block(b"v2");
+        let b1 = block(b"v1");
+        let b2 = block(b"v2");
         store
-            .insert(entry_pointing_to(&b1, b"a", b"r", 1), Some(b1.clone()))
+            .insert(entry(&b1, b"a", b"r", 1), Some(b1.clone()))
             .await
             .unwrap();
         let mut sub = store
@@ -812,7 +694,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .insert(entry_pointing_to(&b2, b"a", b"r", 2), Some(b2.clone()))
+            .insert(entry(&b2, b"a", b"r", 2), Some(b2.clone()))
             .await
             .unwrap();
         let evt = tokio::time::timeout(std::time::Duration::from_millis(200), sub.next())

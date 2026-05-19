@@ -114,14 +114,8 @@ pub async fn list_blob_hashes(root: &Path) -> Result<Vec<Hash>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sunset_store::test_helpers::block;
     use tempfile::TempDir;
-
-    fn block(data: &[u8]) -> ContentBlock {
-        ContentBlock {
-            data: bytes::Bytes::copy_from_slice(data),
-            references: vec![],
-        }
-    }
 
     #[tokio::test]
     async fn write_then_read_roundtrip() {

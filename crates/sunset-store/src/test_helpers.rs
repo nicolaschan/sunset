@@ -1,64 +1,19 @@
 //! Generic conformance suite. Any `Store` implementation can be exercised
 //! against this suite to verify it satisfies the documented contract.
 //!
-//! Gated by the `test-helpers` feature so production builds don't pull these in.
-
-use std::sync::Arc;
+//! Gated by the `test-helpers` feature so production builds don't pull these
+//! in. The synchronous fixture constructors (`vk`, `n`, `block`, `entry`,
+//! `entry_expiring_at`, `CountingVerifier`) live in [`crate::fixtures`] and
+//! are available unconditionally inside the crate (and re-exported from this
+//! module when the `test-helpers` feature is on) — they're the canonical
+//! helpers every backend's unit tests should reach for.
 
 use crate::error::{Error, Result};
 use crate::filter::{Event, Filter, Replay};
 use crate::store::Store;
-use crate::types::{ContentBlock, SignedKvEntry, VerifyingKey};
-use crate::verifier::SignatureVerifier;
+use crate::types::{ContentBlock, SignedKvEntry};
 
-/// Helper: a verifying key from static bytes.
-pub fn vk(b: &'static [u8]) -> VerifyingKey {
-    VerifyingKey::new(bytes::Bytes::from_static(b))
-}
-
-/// Helper: a name from static bytes.
-pub fn n(b: &'static [u8]) -> bytes::Bytes {
-    bytes::Bytes::from_static(b)
-}
-
-/// Helper: a small leaf block.
-pub fn block(payload: &'static [u8]) -> ContentBlock {
-    ContentBlock {
-        data: bytes::Bytes::from_static(payload),
-        references: vec![],
-    }
-}
-
-/// Helper: an entry pointing at `block`'s hash, with the given key/name/priority.
-pub fn entry(
-    block: &ContentBlock,
-    vk_bytes: &'static [u8],
-    name: &'static [u8],
-    priority: u64,
-) -> SignedKvEntry {
-    SignedKvEntry {
-        verifying_key: vk(vk_bytes),
-        name: n(name),
-        value_hash: block.hash(),
-        priority,
-        expires_at: None,
-        signature: bytes::Bytes::from_static(b"sig"),
-    }
-}
-
-/// A verifier that asserts entries pass through it. Useful to detect when a
-/// backend forgets to call its verifier on insert.
-pub struct CountingVerifier(pub Arc<std::sync::atomic::AtomicUsize>);
-impl SignatureVerifier for CountingVerifier {
-    fn verify(&self, _entry: &SignedKvEntry) -> Result<()> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-    fn verify_raw(&self, _vk: &VerifyingKey, _payload: &[u8], _sig: &[u8]) -> Result<()> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-}
+pub use crate::fixtures::{CountingVerifier, block, entry, entry_expiring_at, n, vk};
 
 /// Drain a subscription stream until an event matching `predicate` is found.
 /// Times out after a short duration. The conformance suite uses this so tests

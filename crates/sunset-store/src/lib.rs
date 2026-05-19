@@ -9,6 +9,8 @@ pub mod store;
 pub mod types;
 pub mod verifier;
 
+pub(crate) mod fixtures;
+
 #[cfg(feature = "test-helpers")]
 pub mod test_helpers;
 
