@@ -101,13 +101,18 @@ test("three emoji body renders jumbo at 36px with data-emoji-count=3", async ({
 });
 
 test("surrounding whitespace doesn't disqualify jumbo", async ({ browser }) => {
-  // A user typing "  🌅 🌙  " is still emoji-only — two clusters.
+  // A user typing "  🌅 🌙  " is still emoji-only — two clusters. The
+  // parser strips inter-emoji whitespace so the rendered body reads as
+  // a single tight "🌅🌙" (emoji glyphs carry their own spacing).
   const { ctx, page, composer } = await openChat(browser, "jumbo-whitespace");
   await send(composer, "  🌅 🌙  ");
   const jumbo = page.locator('[data-testid="emoji-jumbo"]').last();
   await expect(jumbo).toBeVisible({ timeout: 15_000 });
   await expect(jumbo).toHaveAttribute("data-emoji-count", "2");
   expect(await fontSizePx(jumbo)).toBe(44);
+  // Pin the whitespace-collapse contract: parse strips, render concats
+  // without a separator.
+  await expect(jumbo).toHaveText("🌅🌙");
   await ctx.close();
 });
 
