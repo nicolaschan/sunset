@@ -25,6 +25,11 @@ pub enum Block {
         language: Option<String>,
         source: String,
     },
+    /// Body is 1–3 emoji grapheme clusters (mod surrounding whitespace).
+    /// Renderers display these at a larger size (iMessage / Signal "jumbo
+    /// emoji"). The parser produces this only at the document top level —
+    /// nested occurrences are not generated.
+    Jumbo(Vec<String>),
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -58,8 +63,70 @@ mod inline;
 
 /// Parse a message body into a `Document`. Total: malformed input
 /// degrades to literal text rather than erroring.
+///
+/// Whole-body shortcut: if the trimmed body is 1–3 emoji grapheme
+/// clusters with nothing else, the document is a single `Block::Jumbo`
+/// carrying those clusters — bypassing the block/inline split entirely.
+/// The renderer uses this to pick a larger font size.
 pub fn parse(input: &str) -> Document {
-    Document(blocks::split(input))
+    if let Some(emojis) = try_jumbo(input) {
+        Document(vec![Block::Jumbo(emojis)])
+    } else {
+        Document(blocks::split(input))
+    }
+}
+
+/// `Some(graphemes)` when the trimmed body is exactly 1–3 emoji
+/// grapheme clusters with only whitespace between them. `None` otherwise.
+///
+/// "Emoji" means a grapheme whose base codepoint has a pictographic
+/// `EmojiStatus` — not the keycap-base set (digits, `#`, `*` carry
+/// `Emoji=YES` but render as text by default), not bare zero-width
+/// joiners or variation selectors, and not plain text.
+fn try_jumbo(input: &str) -> Option<Vec<String>> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut emojis: Vec<String> = Vec::with_capacity(3);
+    for grapheme in input.trim().graphemes(true) {
+        if grapheme.chars().all(char::is_whitespace) {
+            continue;
+        }
+        if !is_pictographic(grapheme) {
+            return None;
+        }
+        emojis.push(grapheme.to_owned());
+        if emojis.len() > 3 {
+            return None;
+        }
+    }
+    if emojis.is_empty() {
+        None
+    } else {
+        Some(emojis)
+    }
+}
+
+fn is_pictographic(grapheme: &str) -> bool {
+    use unicode_properties::UnicodeEmoji;
+    use unicode_properties::emoji::EmojiStatus;
+
+    // Blacklist the three non-pictographic `EmojiStatus` variants:
+    //   NonEmoji                       — plain text (`!`, `.`, letters, …)
+    //   NonEmojiButEmojiComponent      — bare ZWJ / variation selectors / etc.
+    //   EmojiOtherAndEmojiComponent    — keycap-base codepoints (digits,
+    //                                    `#`, `*`) that carry Emoji=YES
+    //                                    but default to text rendering.
+    // Anything else qualifies. New `EmojiStatus` variants from upstream
+    // default to "qualifies" — the right additive direction for an
+    // emoji classifier.
+    grapheme.chars().next().is_some_and(|first| {
+        !matches!(
+            first.emoji_status(),
+            EmojiStatus::NonEmoji
+                | EmojiStatus::NonEmojiButEmojiComponent
+                | EmojiStatus::EmojiOtherAndEmojiComponent
+        )
+    })
 }
 
 /// Render a `Document` back to a flat string with all formatting markers
@@ -108,6 +175,11 @@ fn write_block(out: &mut String, block: &Block) {
         }
         Block::CodeBlock { source, .. } => {
             out.push_str(source);
+        }
+        Block::Jumbo(emojis) => {
+            for e in emojis {
+                out.push_str(e);
+            }
         }
     }
 }
@@ -699,5 +771,152 @@ mod tests {
                 Inline::Text("hello".to_owned()),
             ])])
         );
+    }
+
+    // ----- Jumbo emoji -----
+
+    fn jumbo(es: &[&str]) -> Document {
+        Document(vec![Block::Jumbo(
+            es.iter().map(|s| (*s).to_owned()).collect(),
+        )])
+    }
+
+    #[test]
+    fn single_emoji_is_jumbo() {
+        assert_eq!(parse("🌅"), jumbo(&["🌅"]));
+    }
+
+    #[test]
+    fn two_emoji_is_jumbo() {
+        assert_eq!(parse("🌅🌙"), jumbo(&["🌅", "🌙"]));
+    }
+
+    #[test]
+    fn three_emoji_is_jumbo() {
+        assert_eq!(parse("🌅🌙🔥"), jumbo(&["🌅", "🌙", "🔥"]));
+    }
+
+    #[test]
+    fn four_or_more_emoji_is_paragraph() {
+        // Beyond three the rendered glyphs would push past the bubble; the
+        // body falls back to a normal paragraph at the standard font size.
+        assert!(matches!(
+            parse("🌅🌙🔥👀"),
+            Document(blocks)
+                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
+        ));
+    }
+
+    #[test]
+    fn surrounding_whitespace_doesnt_disqualify_jumbo() {
+        // A user typing "  🌅  " is still emoji-only.
+        assert_eq!(parse("  🌅  "), jumbo(&["🌅"]));
+        assert_eq!(parse("🌅 🌙"), jumbo(&["🌅", "🌙"]));
+        assert_eq!(parse("\n🌅\t"), jumbo(&["🌅"]));
+    }
+
+    #[test]
+    fn mixed_text_and_emoji_is_paragraph() {
+        // Anything that mixes text and emoji renders normally.
+        assert!(matches!(
+            parse("hi 🌅"),
+            Document(blocks)
+                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
+        ));
+        assert!(matches!(
+            parse("🌅!"),
+            Document(blocks)
+                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
+        ));
+    }
+
+    #[test]
+    fn plain_text_is_not_jumbo() {
+        assert!(matches!(
+            parse("hello"),
+            Document(blocks)
+                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
+        ));
+    }
+
+    #[test]
+    fn empty_is_not_jumbo() {
+        // The parser already treats empty/whitespace bodies as a non-emoji
+        // shape (existing tests pin `parse("")` to `Document(Vec::new())`).
+        // The jumbo path must agree — never produce a `Block::Jumbo([])`.
+        for body in ["", "   ", "\n\t"] {
+            let parsed = parse(body);
+            assert!(
+                !matches!(&parsed, Document(blocks)
+                    if blocks.iter().any(|b| matches!(b, Block::Jumbo(_)))),
+                "expected {body:?} to NOT be jumbo, got {parsed:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn zwj_family_is_one_emoji_cluster() {
+        // 👨‍👩‍👧 is a single grapheme composed of three people codepoints
+        // joined by ZWJs (U+200D). `graphemes(true)` folds it into one
+        // segment; the Extended_Pictographic property on the base (👨)
+        // qualifies it.
+        assert_eq!(
+            parse("👨\u{200D}👩\u{200D}👧"),
+            jumbo(&["👨\u{200D}👩\u{200D}👧"]),
+        );
+    }
+
+    #[test]
+    fn skin_tone_modifier_is_one_emoji_cluster() {
+        // 👋🏽 = WAVING HAND + MEDIUM SKIN TONE modifier. One grapheme.
+        assert_eq!(parse("👋\u{1F3FD}"), jumbo(&["👋\u{1F3FD}"]));
+    }
+
+    #[test]
+    fn three_zwj_families_is_three_emoji() {
+        let body = "👨\u{200D}👩\u{200D}👧 👨\u{200D}👩\u{200D}👦 👨\u{200D}👧";
+        assert_eq!(
+            parse(body),
+            jumbo(&[
+                "👨\u{200D}👩\u{200D}👧",
+                "👨\u{200D}👩\u{200D}👦",
+                "👨\u{200D}👧",
+            ]),
+        );
+    }
+
+    #[test]
+    fn keycap_base_codepoints_are_not_jumbo() {
+        // Digits, `#`, `*` carry `Emoji=YES` but render as plain text by
+        // default. Pin this so a future refactor that loosens the
+        // `EmojiStatus` blacklist doesn't silently flip `"123"` to jumbo.
+        for body in ["123", "1", "0", "#", "*", "##", "**", "*1"] {
+            let parsed = parse(body);
+            assert!(
+                matches!(parsed, Document(ref blocks)
+                    if blocks.first().is_none_or(|b| matches!(b, Block::Paragraph(_)))),
+                "expected {body:?} to NOT be jumbo, got {parsed:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn punctuation_only_is_not_jumbo() {
+        assert!(matches!(
+            parse("!!!"),
+            Document(blocks)
+                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
+        ));
+        assert!(matches!(
+            parse("..."),
+            Document(blocks)
+                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
+        ));
+    }
+
+    #[test]
+    fn to_plain_renders_jumbo_as_concatenated_emoji() {
+        let doc = parse("🌅🌙🔥");
+        assert_eq!(to_plain(&doc), "🌅🌙🔥");
     }
 }

@@ -114,6 +114,10 @@ pub type Block {
   Quote(content: List(Block))
   UnorderedList(items: List(List(Block)))
   CodeBlock(language: Option(String), source: String)
+  /// 1–3 emoji grapheme clusters. The parser only produces this at the
+  /// document top level (whole-body shortcut); renderers display the
+  /// emoji at a larger font size (iMessage / Signal "jumbo emoji").
+  Jumbo(emojis: List(String))
 }
 
 pub type Inline {
@@ -163,7 +167,13 @@ fn block_decoder() -> decode.Decoder(Block) {
     quote_decoder(),
     unordered_list_decoder(),
     code_block_decoder(),
+    jumbo_decoder(),
   ])
+}
+
+fn jumbo_decoder() -> decode.Decoder(Block) {
+  use emojis <- decode.field("Jumbo", decode.list(decode.string))
+  decode.success(Jumbo(emojis))
 }
 
 fn paragraph_decoder() -> decode.Decoder(Block) {
@@ -333,6 +343,37 @@ fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
 
     CodeBlock(language, source) ->
       render_code_block(language, source, ctx.palette)
+
+    Jumbo(emojis) -> render_jumbo(emojis)
+  }
+}
+
+/// Render a 1–3 emoji body at the iMessage-style "jumbo" size. The count
+/// drives the font-size choice and rides through the DOM as a `data-emoji-count`
+/// attribute so the e2e suite can pin per-N sizing. `data-testid` is the
+/// stable hook for those tests.
+fn render_jumbo(emojis: List(String)) -> Element(msg) {
+  let count = list.length(emojis)
+  html.div(
+    [
+      attribute.attribute("data-testid", "emoji-jumbo"),
+      attribute.attribute("data-emoji-count", int.to_string(count)),
+      attribute.attribute(
+        "style",
+        "font-size: "
+          <> jumbo_font_size(count)
+          <> "; line-height: 1.15; margin-top: 2px;",
+      ),
+    ],
+    [html.text(string.concat(emojis))],
+  )
+}
+
+fn jumbo_font_size(count: Int) -> String {
+  case count {
+    1 -> "54px"
+    2 -> "44px"
+    _ -> "36px"
   }
 }
 
