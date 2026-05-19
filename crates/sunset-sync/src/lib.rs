@@ -24,6 +24,9 @@ pub mod transport;
 pub mod types;
 
 #[cfg(feature = "test-helpers")]
+pub mod test_helpers;
+
+#[cfg(feature = "test-helpers")]
 pub mod test_transport;
 
 #[cfg(test)]

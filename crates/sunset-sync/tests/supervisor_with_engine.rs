@@ -14,6 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use sunset_store::VerifyingKey;
 use sunset_store_memory::MemoryStore;
+use sunset_sync::test_helpers::wait_for;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{
     BackoffPolicy, Connectable, IntentState, PeerAddr, PeerId, PeerSupervisor, Signer, SyncConfig,
@@ -32,22 +33,6 @@ impl Signer for StubSigner {
     fn sign(&self, _: &[u8]) -> Bytes {
         Bytes::from_static(&[0u8; 64])
     }
-}
-
-/// Poll `condition` until it returns `true` or the deadline elapses.
-async fn wait_for<F, Fut>(deadline: Duration, interval: Duration, mut condition: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < deadline {
-        if condition().await {
-            return true;
-        }
-        tokio::time::sleep(interval).await;
-    }
-    false
 }
 
 #[tokio::test(flavor = "current_thread")]

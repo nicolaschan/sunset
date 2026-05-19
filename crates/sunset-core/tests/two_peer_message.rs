@@ -29,6 +29,7 @@ use sunset_core::{
 };
 use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
+use sunset_sync::test_helpers::wait_for;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
 
@@ -207,20 +208,4 @@ async fn alice_encrypts_bob_decrypts() {
             bob_run.abort();
         })
         .await;
-}
-
-/// Poll `condition` until it returns `true` or the deadline elapses.
-async fn wait_for<F, Fut>(deadline: Duration, interval: Duration, mut condition: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < deadline {
-        if condition().await {
-            return true;
-        }
-        tokio::time::sleep(interval).await;
-    }
-    false
 }
