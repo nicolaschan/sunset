@@ -9,6 +9,9 @@ pub mod store;
 pub mod types;
 pub mod verifier;
 
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) mod fixtures;
+
 #[cfg(feature = "test-helpers")]
 pub mod test_helpers;
 

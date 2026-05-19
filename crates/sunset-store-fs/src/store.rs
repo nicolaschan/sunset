@@ -308,30 +308,9 @@ mod tests {
 #[cfg(test)]
 mod iter_tests {
     use super::*;
-    use bytes::Bytes;
     use futures::StreamExt;
-    use sunset_store::{ContentBlock, SignedKvEntry, VerifyingKey};
+    use sunset_store::test_helpers::{block, entry, vk};
     use tempfile::TempDir;
-
-    fn vk(b: &[u8]) -> VerifyingKey {
-        VerifyingKey(Bytes::copy_from_slice(b))
-    }
-    fn block(d: &[u8]) -> ContentBlock {
-        ContentBlock {
-            data: Bytes::copy_from_slice(d),
-            references: vec![],
-        }
-    }
-    fn entry(vk_bytes: &[u8], name: &[u8], priority: u64, blob: &ContentBlock) -> SignedKvEntry {
-        SignedKvEntry {
-            verifying_key: vk(vk_bytes),
-            name: Bytes::copy_from_slice(name),
-            value_hash: blob.hash(),
-            priority,
-            expires_at: None,
-            signature: Bytes::copy_from_slice(b"sig"),
-        }
-    }
 
     #[tokio::test]
     async fn iter_keyspace_returns_only_matching_writer() {
@@ -339,15 +318,15 @@ mod iter_tests {
         let store = FsStore::new(dir.path()).await.unwrap();
         let b = block(b"v");
         store
-            .insert(entry(b"a", b"k1", 1, &b), Some(b.clone()))
+            .insert(entry(&b, b"a", b"k1", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(entry(b"a", b"k2", 1, &b), Some(b.clone()))
+            .insert(entry(&b, b"a", b"k2", 1), Some(b.clone()))
             .await
             .unwrap();
         store
-            .insert(entry(b"b", b"k1", 1, &b), Some(b))
+            .insert(entry(&b, b"b", b"k1", 1), Some(b))
             .await
             .unwrap();
         let got: Vec<_> = store
@@ -367,36 +346,15 @@ mod iter_tests {
 #[cfg(test)]
 mod insert_tests {
     use super::*;
-    use bytes::Bytes;
-    use sunset_store::{ContentBlock, SignedKvEntry, VerifyingKey};
+    use sunset_store::test_helpers::{block, entry, entry_expiring_at, vk};
     use tempfile::TempDir;
-
-    fn vk(b: &[u8]) -> VerifyingKey {
-        VerifyingKey(Bytes::copy_from_slice(b))
-    }
-    fn block(d: &[u8]) -> ContentBlock {
-        ContentBlock {
-            data: Bytes::copy_from_slice(d),
-            references: vec![],
-        }
-    }
-    fn entry(vk_bytes: &[u8], name: &[u8], priority: u64, blob: &ContentBlock) -> SignedKvEntry {
-        SignedKvEntry {
-            verifying_key: vk(vk_bytes),
-            name: Bytes::copy_from_slice(name),
-            value_hash: blob.hash(),
-            priority,
-            expires_at: None,
-            signature: Bytes::copy_from_slice(b"sig"),
-        }
-    }
 
     #[tokio::test]
     async fn insert_then_get_entry() {
         let dir = TempDir::new().unwrap();
         let store = FsStore::new(dir.path()).await.unwrap();
         let b = block(b"v");
-        let e = entry(b"a", b"k", 1, &b);
+        let e = entry(&b, b"a", b"k", 1);
         store.insert(e.clone(), Some(b)).await.unwrap();
         let got = store.get_entry(&vk(b"a"), b"k").await.unwrap().unwrap();
         assert_eq!(got, e);
@@ -409,11 +367,11 @@ mod insert_tests {
         let b1 = block(b"v1");
         let b2 = block(b"v2");
         store
-            .insert(entry(b"a", b"k", 1, &b1), Some(b1))
+            .insert(entry(&b1, b"a", b"k", 1), Some(b1))
             .await
             .unwrap();
         store
-            .insert(entry(b"a", b"k", 2, &b2.clone()), Some(b2.clone()))
+            .insert(entry(&b2, b"a", b"k", 2), Some(b2.clone()))
             .await
             .unwrap();
         let got = store.get_entry(&vk(b"a"), b"k").await.unwrap().unwrap();
@@ -426,11 +384,11 @@ mod insert_tests {
         let store = FsStore::new(dir.path()).await.unwrap();
         let b = block(b"v");
         store
-            .insert(entry(b"a", b"k", 1, &b), Some(b.clone()))
+            .insert(entry(&b, b"a", b"k", 1), Some(b.clone()))
             .await
             .unwrap();
         let err = store
-            .insert(entry(b"a", b"k", 1, &b), Some(b))
+            .insert(entry(&b, b"a", b"k", 1), Some(b))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Stale));
@@ -442,7 +400,7 @@ mod insert_tests {
         let store = FsStore::new(dir.path()).await.unwrap();
         let b1 = block(b"v1");
         let b2 = block(b"v2");
-        let mut e = entry(b"a", b"k", 1, &b1);
+        let mut e = entry(&b1, b"a", b"k", 1);
         e.value_hash = b1.hash();
         // supply b2 (whose hash differs) — must be rejected.
         let err = store.insert(e, Some(b2)).await.unwrap_err();
@@ -456,7 +414,7 @@ mod insert_tests {
         assert_eq!(store.current_cursor().await.unwrap(), Cursor(1));
         let b = block(b"v");
         store
-            .insert(entry(b"a", b"k", 1, &b), Some(b))
+            .insert(entry(&b, b"a", b"k", 1), Some(b))
             .await
             .unwrap();
         assert_eq!(store.current_cursor().await.unwrap(), Cursor(2));
@@ -467,8 +425,7 @@ mod insert_tests {
         let dir = TempDir::new().unwrap();
         let store = FsStore::new(dir.path()).await.unwrap();
         let b = block(b"v");
-        let mut e = entry(b"a", b"k", 1, &b);
-        e.expires_at = Some(100);
+        let e = entry_expiring_at(&b, b"a", b"k", 1, 100);
         store.insert(e, Some(b)).await.unwrap();
         let n = store.delete_expired(100).await.unwrap();
         assert_eq!(n, 1);
@@ -479,7 +436,7 @@ mod insert_tests {
     async fn entries_persist_across_reopen() {
         let dir = TempDir::new().unwrap();
         let b = block(b"v");
-        let e = entry(b"a", b"k", 1, &b);
+        let e = entry(&b, b"a", b"k", 1);
         {
             let store = FsStore::new(dir.path()).await.unwrap();
             store.insert(e.clone(), Some(b)).await.unwrap();
@@ -493,30 +450,9 @@ mod insert_tests {
 #[cfg(test)]
 mod subscribe_tests {
     use super::*;
-    use bytes::Bytes;
     use futures::StreamExt;
-    use sunset_store::{ContentBlock, SignedKvEntry, VerifyingKey};
+    use sunset_store::test_helpers::{block, entry, vk};
     use tempfile::TempDir;
-
-    fn vk(b: &[u8]) -> VerifyingKey {
-        VerifyingKey(Bytes::copy_from_slice(b))
-    }
-    fn block(d: &[u8]) -> ContentBlock {
-        ContentBlock {
-            data: Bytes::copy_from_slice(d),
-            references: vec![],
-        }
-    }
-    fn entry(vk_bytes: &[u8], name: &[u8], priority: u64, blob: &ContentBlock) -> SignedKvEntry {
-        SignedKvEntry {
-            verifying_key: vk(vk_bytes),
-            name: Bytes::copy_from_slice(name),
-            value_hash: blob.hash(),
-            priority,
-            expires_at: None,
-            signature: Bytes::copy_from_slice(b"sig"),
-        }
-    }
 
     #[tokio::test]
     async fn subscribe_replay_all_then_live() {
@@ -524,7 +460,7 @@ mod subscribe_tests {
         let store = FsStore::new(dir.path()).await.unwrap();
         let b1 = block(b"v1");
         store
-            .insert(entry(b"a", b"k1", 1, &b1), Some(b1))
+            .insert(entry(&b1, b"a", b"k1", 1), Some(b1))
             .await
             .unwrap();
         let mut s = store
@@ -540,7 +476,7 @@ mod subscribe_tests {
 
         let b2 = block(b"v2");
         store
-            .insert(entry(b"a", b"k2", 1, &b2.clone()), Some(b2))
+            .insert(entry(&b2, b"a", b"k2", 1), Some(b2.clone()))
             .await
             .unwrap();
         // The next event the subscriber receives that is NOT BlobAdded should be Inserted for k2.
@@ -563,29 +499,8 @@ mod subscribe_tests {
 #[cfg(test)]
 mod gc_tests {
     use super::*;
-    use bytes::Bytes;
-    use sunset_store::{ContentBlock, SignedKvEntry, VerifyingKey};
+    use sunset_store::test_helpers::{block, entry};
     use tempfile::TempDir;
-
-    fn vk(b: &[u8]) -> VerifyingKey {
-        VerifyingKey(Bytes::copy_from_slice(b))
-    }
-    fn block(d: &[u8]) -> ContentBlock {
-        ContentBlock {
-            data: Bytes::copy_from_slice(d),
-            references: vec![],
-        }
-    }
-    fn entry(vk_bytes: &[u8], name: &[u8], priority: u64, blob: &ContentBlock) -> SignedKvEntry {
-        SignedKvEntry {
-            verifying_key: vk(vk_bytes),
-            name: Bytes::copy_from_slice(name),
-            value_hash: blob.hash(),
-            priority,
-            expires_at: None,
-            signature: Bytes::copy_from_slice(b"sig"),
-        }
-    }
 
     #[tokio::test]
     async fn gc_blobs_continues_past_corrupt_reachable_blob() {
@@ -594,13 +509,13 @@ mod gc_tests {
         // Insert a normal blob + entry referencing it (the "good root").
         let b_good = block(b"good");
         store
-            .insert(entry(b"a", b"k", 1, &b_good), Some(b_good.clone()))
+            .insert(entry(&b_good, b"a", b"k", 1), Some(b_good.clone()))
             .await
             .unwrap();
         // Insert a second blob that's a root, then corrupt it on disk.
         let b_corrupt = block(b"to-be-corrupted");
         store
-            .insert(entry(b"a", b"k2", 1, &b_corrupt), Some(b_corrupt.clone()))
+            .insert(entry(&b_corrupt, b"a", b"k2", 1), Some(b_corrupt.clone()))
             .await
             .unwrap();
         // Corrupt the on-disk blob (overwrite with garbage).
@@ -629,7 +544,7 @@ mod gc_tests {
         let b_orphan = block(b"orphan");
         store.put_content(b_orphan.clone()).await.unwrap();
         store
-            .insert(entry(b"a", b"k", 1, &b_used), Some(b_used.clone()))
+            .insert(entry(&b_used, b"a", b"k", 1), Some(b_used.clone()))
             .await
             .unwrap();
         let n = store.gc_blobs().await.unwrap();

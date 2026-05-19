@@ -70,13 +70,7 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn vk(b: &'static [u8]) -> VerifyingKey {
-        VerifyingKey::new(bytes::Bytes::from_static(b))
-    }
-    fn n(b: &'static [u8]) -> bytes::Bytes {
-        bytes::Bytes::from_static(b)
-    }
+    use crate::fixtures::{n, vk};
 
     #[test]
     fn filter_specific_matches_exact() {
