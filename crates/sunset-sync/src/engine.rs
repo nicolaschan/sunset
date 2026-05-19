@@ -161,6 +161,9 @@ pub(crate) struct PeerOutbound {
     /// Compared against `InboundEvent::Disconnected.conn_id` to filter stale
     /// disconnects from defunct generations (see `handle_inbound_event`).
     pub(crate) conn_id: ConnectionId,
+    /// Which transport produced this connection. Surfaced to callers via
+    /// `current_peers()` so a UI can render the routing state.
+    pub(crate) kind: crate::transport::TransportKind,
     pub(crate) tx: mpsc::UnboundedSender<SyncMessage>,
     /// Structural shutdown handle for the per-peer task that owns this
     /// connection. When `PeerOutbound` is dropped (entry removed via
@@ -188,13 +191,11 @@ pub(crate) struct PeerOutbound {
 pub(crate) struct EngineState {
     pub trust: TrustSet,
     pub registry: SubscriptionRegistry,
-    /// Per-peer outbound message senders, keyed by `(peer_id, conn_id)`.
+    /// Per-peer outbound state, keyed by `PeerId`. Each entry carries
+    /// the sender, the connection generation, and the transport kind
+    /// — kept together so a late `current_peers()` snapshot can't see
+    /// a peer in one map but not the other.
     pub peer_outbound: HashMap<PeerId, PeerOutbound>,
-    /// Per-peer transport kind (Primary vs Secondary). Updated in
-    /// lockstep with `peer_outbound` so callers can snapshot
-    /// `(peer, kind)` after subscribing late and missing the
-    /// corresponding `PeerAdded` event.
-    pub peer_kinds: HashMap<PeerId, crate::transport::TransportKind>,
     /// Live `EngineEvent` subscribers. Dead senders (closed by the
     /// receiver being dropped) are evicted lazily on the next emit.
     pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
@@ -257,7 +258,6 @@ where
                 trust: TrustSet::default(),
                 registry: SubscriptionRegistry::new(),
                 peer_outbound: HashMap::new(),
-                peer_kinds: HashMap::new(),
                 event_subs: Vec::new(),
                 ephemeral_subs: Vec::new(),
             })),
@@ -377,9 +377,9 @@ where
     pub async fn current_peers(&self) -> Vec<(PeerId, crate::transport::TransportKind)> {
         let state = self.state.lock().await;
         state
-            .peer_kinds
+            .peer_outbound
             .iter()
-            .map(|(pk, k)| (pk.clone(), *k))
+            .map(|(pk, po)| (pk.clone(), po.kind))
             .collect()
     }
 
@@ -567,7 +567,6 @@ where
             EngineCommand::RemovePeer { peer_id, ack } => {
                 let removed = {
                     let mut state = self.state.lock().await;
-                    state.peer_kinds.remove(&peer_id);
                     state.peer_outbound.remove(&peer_id).is_some()
                 };
                 if removed {
@@ -589,12 +588,8 @@ where
                 shutdown,
                 registered,
             } => {
-                // Register the outbound sender + transport kind under the
-                // Hello-declared peer_id. peer_outbound + peer_kinds move
-                // together so a late `current_peers()` snapshot reflects
-                // the same set as the live subscription stream.
-                //
-                // The insert here implicitly drops any previous
+                // Register the outbound state under the Hello-declared
+                // peer_id. The insert here implicitly drops any previous
                 // PeerOutbound for the same peer_id (e.g. a stale
                 // generation from before a reconnect). That drop fires
                 // the OLD `_shutdown` watch::Sender, telling the OLD
@@ -606,11 +601,11 @@ where
                         peer_id.clone(),
                         PeerOutbound {
                             conn_id,
+                            kind,
                             tx: out_tx,
                             _shutdown: shutdown,
                         },
                     );
-                    state.peer_kinds.insert(peer_id.clone(), kind);
                 }
                 self.emit_engine_event(EngineEvent::PeerAdded {
                     peer_id: peer_id.clone(),
@@ -651,7 +646,6 @@ where
                     let mut state = self.state.lock().await;
                     match state.peer_outbound.get(&peer_id) {
                         Some(po) if po.conn_id == conn_id => {
-                            state.peer_kinds.remove(&peer_id);
                             state.peer_outbound.remove(&peer_id);
                             true
                         }
@@ -1302,6 +1296,7 @@ mod tests {
 
     use crate::Signer;
     use crate::test_transport::{TestNetwork, TestTransport};
+    use crate::transport::TransportKind;
 
     fn vk(b: &[u8]) -> VerifyingKey {
         VerifyingKey::new(Bytes::copy_from_slice(b))
@@ -1357,6 +1352,7 @@ mod tests {
             peer.clone(),
             PeerOutbound {
                 conn_id,
+                kind: TransportKind::Unknown,
                 tx,
                 _shutdown: tokio::sync::watch::channel(()).0,
             },
@@ -1481,6 +1477,7 @@ mod tests {
                     PeerId(vk(b"requester")),
                     PeerOutbound {
                         conn_id: ConnectionId::for_test(99),
+                        kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
                     },
@@ -1551,6 +1548,7 @@ mod tests {
                     PeerId(vk(b"remote")),
                     PeerOutbound {
                         conn_id: ConnectionId::for_test(99),
+                        kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
                     },
@@ -1815,6 +1813,7 @@ mod tests {
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn1,
+                        kind: TransportKind::Unknown,
                         tx: tx1,
                         _shutdown: tokio::sync::watch::channel(()).0,
                     },
@@ -1827,6 +1826,7 @@ mod tests {
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn2,
+                        kind: TransportKind::Unknown,
                         tx: tx2,
                         _shutdown: tokio::sync::watch::channel(()).0,
                     },
@@ -1879,6 +1879,7 @@ mod tests {
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn,
+                        kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
                     },
@@ -1922,6 +1923,7 @@ mod tests {
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn,
+                        kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
                     },
@@ -1976,16 +1978,11 @@ mod tests {
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn,
+                        kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
                     },
                 );
-                engine
-                    .state
-                    .lock()
-                    .await
-                    .peer_kinds
-                    .insert(peer.clone(), crate::transport::TransportKind::Unknown);
 
                 let mut events = engine.subscribe_engine_events().await;
 
@@ -2130,6 +2127,7 @@ mod tests {
                         relay.clone(),
                         PeerOutbound {
                             conn_id: ConnectionId::for_test(0),
+                            kind: TransportKind::Unknown,
                             tx,
                             _shutdown: tokio::sync::watch::channel(()).0,
                         },
