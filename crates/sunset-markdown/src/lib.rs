@@ -25,10 +25,10 @@ pub enum Block {
         language: Option<String>,
         source: String,
     },
-    /// Body is 1–3 emoji grapheme clusters (mod surrounding whitespace).
-    /// Renderers display these at a larger size (iMessage / Signal "jumbo
-    /// emoji"). The parser produces this only at the document top level —
-    /// nested occurrences are not generated.
+    /// Produced only by `parse` as the entire document for bodies that are
+    /// 1–3 emoji grapheme clusters (modulo surrounding whitespace); never
+    /// nested. Renderers display these at a larger size (iMessage / Signal
+    /// "jumbo emoji").
     Jumbo(Vec<String>),
 }
 
@@ -63,11 +63,6 @@ mod inline;
 
 /// Parse a message body into a `Document`. Total: malformed input
 /// degrades to literal text rather than erroring.
-///
-/// Whole-body shortcut: if the trimmed body is 1–3 emoji grapheme
-/// clusters with nothing else, the document is a single `Block::Jumbo`
-/// carrying those clusters — bypassing the block/inline split entirely.
-/// The renderer uses this to pick a larger font size.
 pub fn parse(input: &str) -> Document {
     if let Some(emojis) = try_jumbo(input) {
         Document(vec![Block::Jumbo(emojis)])
@@ -76,13 +71,8 @@ pub fn parse(input: &str) -> Document {
     }
 }
 
-/// `Some(graphemes)` when the trimmed body is exactly 1–3 emoji
-/// grapheme clusters with only whitespace between them. `None` otherwise.
-///
-/// "Emoji" means a grapheme whose base codepoint has a pictographic
-/// `EmojiStatus` — not the keycap-base set (digits, `#`, `*` carry
-/// `Emoji=YES` but render as text by default), not bare zero-width
-/// joiners or variation selectors, and not plain text.
+/// `Some(graphemes)` for bodies that satisfy `Block::Jumbo`'s invariant;
+/// `None` otherwise.
 fn try_jumbo(input: &str) -> Option<Vec<String>> {
     use unicode_segmentation::UnicodeSegmentation;
 
@@ -918,5 +908,65 @@ mod tests {
     fn to_plain_renders_jumbo_as_concatenated_emoji() {
         let doc = parse("🌅🌙🔥");
         assert_eq!(to_plain(&doc), "🌅🌙🔥");
+    }
+
+    /// True if any `Block::Jumbo` appears anywhere in the document tree —
+    /// at the top level or nested inside a Quote / UnorderedList item.
+    fn contains_jumbo(doc: &Document) -> bool {
+        fn walk(block: &Block) -> bool {
+            match block {
+                Block::Jumbo(_) => true,
+                Block::Quote(blocks) => blocks.iter().any(walk),
+                Block::UnorderedList(items) => items.iter().flatten().any(walk),
+                Block::Paragraph(_) | Block::Heading { .. } | Block::CodeBlock { .. } => false,
+            }
+        }
+        doc.0.iter().any(walk)
+    }
+
+    #[test]
+    fn jumbo_inside_quote_is_paragraph() {
+        // The jumbo shortcut only fires at the document top level. A quoted
+        // emoji-only line renders normally — never as `Block::Jumbo` at any
+        // depth.
+        let parsed = parse("> 🌅");
+        assert_eq!(
+            parsed,
+            Document(vec![Block::Quote(vec![Block::Paragraph(vec![
+                Inline::Text("🌅".to_owned())
+            ])])])
+        );
+        assert!(!contains_jumbo(&parsed));
+    }
+
+    #[test]
+    fn jumbo_inside_unordered_list_is_paragraph() {
+        // Same invariant for list items: emoji-only content inside a list
+        // never becomes `Block::Jumbo`.
+        let parsed = parse("- 🌅");
+        assert_eq!(
+            parsed,
+            Document(vec![Block::UnorderedList(vec![vec![Block::Paragraph(
+                vec![Inline::Text("🌅".to_owned())]
+            )]])])
+        );
+        assert!(!contains_jumbo(&parsed));
+    }
+
+    #[test]
+    fn bare_zwj_only_is_not_jumbo() {
+        // A bare zero-width joiner is `EmojiStatus::NonEmojiButEmojiComponent`
+        // — it's an emoji building block, not an emoji on its own. Pin the
+        // blacklist arm against future loosening.
+        let parsed = parse("\u{200D}");
+        assert!(!contains_jumbo(&parsed));
+    }
+
+    #[test]
+    fn bare_variation_selector_only_is_not_jumbo() {
+        // A bare VS16 (U+FE0F) is also `NonEmojiButEmojiComponent`. Same
+        // arm, different codepoint family.
+        let parsed = parse("\u{FE0F}");
+        assert!(!contains_jumbo(&parsed));
     }
 }
