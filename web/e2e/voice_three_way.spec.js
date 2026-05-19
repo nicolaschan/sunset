@@ -50,6 +50,10 @@ async function getPubkeyBytes(page) {
   return page.evaluate(() => Array.from(new Uint8Array(window.sunsetClient.public_key)));
 }
 
+function pubkeyHex(bytes) {
+  return bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // Wait for a peer's recorder to accumulate ≥ minFrames from a given sender.
 async function waitForFrames(receiverPage, senderBytes, minFrames, timeoutMs) {
   const handle = await receiverPage.waitForFunction(
@@ -99,6 +103,34 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
   // before flipping `self_in_call`). Once visible, test-hook methods are
   // safe to call.
 
+  // Wait for the mutual P2P voice legs to come up before injecting.
+  // `data-voice-connected="true"` is the UI's user-facing "audio flow
+  // exists with that peer" indicator (see voice_channel_roster.spec.js
+  // — the disconnected branch instead renders a `voice-member-not-connected`
+  // affordance). With three peers there are three handshakes racing in
+  // parallel; the alice↔carol leg in particular is established last
+  // because carol joins last, and on slow runners can still be coming
+  // up when injection starts. A real user about to speak in a 3-way
+  // call would wait until every other peer's row shows the connected
+  // state before expecting their voice to be heard, so encoding that
+  // wait here matches what the UI promises.
+  const peers = [alice, bob, carol];
+  const peerBytes = await Promise.all(peers.map((p) => getPubkeyBytes(p.page)));
+  const peerHexes = peerBytes.map(pubkeyHex);
+  await Promise.all(
+    peers.flatMap((self, i) =>
+      peerHexes
+        .filter((_, j) => i !== j)
+        .map((otherHex) =>
+          expect(
+            self.page.locator(
+              `[data-testid="voice-member"][data-peer-hex="${otherHex}"]`,
+            ),
+          ).toHaveAttribute("data-voice-connected", "true", { timeout: 10_000 }),
+        ),
+    ),
+  );
+
   // Detach the fake mic from the capture worklet on every peer so
   // only `voice_inject_pcm` frames flow into `runtime.send_pcm`.
   // Without this Chromium's fake-device 440 Hz tone interleaves with
@@ -116,8 +148,8 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
     );
   }
 
-  const aliceBytes = await getPubkeyBytes(alice.page);
-  const carolBytes = await getPubkeyBytes(carol.page);
+  const aliceBytes = peerBytes[0];
+  const carolBytes = peerBytes[2];
 
   // Alice injects 50 frames — bob and carol must each receive ≥ 40
   // total frames with non-trivial RMS (real Opus-decoded audio, not
