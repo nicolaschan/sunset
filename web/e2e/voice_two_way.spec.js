@@ -19,6 +19,8 @@ import {
   teardownRelay,
   freshSeedHex,
   syntheticPcm,
+  waitForVoiceConnected,
+  assertOpusFramesDelivered,
 } from "./helpers/voice.js";
 
 let relay;
@@ -62,16 +64,6 @@ async function openPeer(browser, relayAddr) {
   return { page, ctx };
 }
 
-// Helper: get the local pubkey hex from the wasm client.
-async function getPubkeyHex(page) {
-  return page.evaluate(() => {
-    const pk = window.sunsetClient.public_key;
-    return Array.from(new Uint8Array(pk))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-  });
-}
-
 test("alice + bob hear each other through real Gleam UI", async ({
   browser,
 }) => {
@@ -92,10 +84,7 @@ test("alice + bob hear each other through real Gleam UI", async ({
     timeout: 500,
   });
 
-  // The minibar appears once `voice_start()` resolves Ok on the WASM side
-  // (the Gleam UI dispatches `VoiceStarted` from the FFI's success
-  // callback before flipping `self_in_call`). Once visible, test-hook
-  // methods like `voice_install_frame_recorder` are safe to call.
+  const [aliceHex] = await waitForVoiceConnected([alice, bob]);
 
   // Detach the fake mic from the capture worklet on the injecting
   // side so only `voice_inject_pcm` frames flow into
@@ -127,23 +116,18 @@ test("alice + bob hear each other through real Gleam UI", async ({
     await alice.page.waitForTimeout(20);
   }
 
-  // Bob's recorder must accumulate ≥ 40 frames from Alice within 3 s.
-  const aliceHex = await getPubkeyHex(alice.page);
-  const aliceBytes = Array.from(
-    new Uint8Array(aliceHex.match(/.{2}/g).map((b) => parseInt(b, 16))),
-  );
-
   // Bob must receive ≥ 40 Opus-decoded frames from Alice within
   // 3 s. The recorder's `rms` field tells real frames (≥ 0.05 for an
   // Opus-decoded 0.5-amplitude sine) from silence underrun padding
   // (≈ 0). Per-frame attribution to Alice is enforced by the
   // recorder keying its ring buffer by PeerId.
   const recordedHandle = await bob.page.waitForFunction(
-    ([bytes]) => {
+    ([hex]) => {
       try {
-        const arr = window.sunsetClient.voice_recorded_frames(
-          new Uint8Array(bytes),
+        const bytes = new Uint8Array(
+          hex.match(/.{2}/g).map((b) => parseInt(b, 16)),
         );
+        const arr = window.sunsetClient.voice_recorded_frames(bytes);
         return Array.isArray(arr) && arr.filter((f) => f.rms >= 0.05).length >= 40
           ? arr
           : null;
@@ -151,7 +135,7 @@ test("alice + bob hear each other through real Gleam UI", async ({
         return null;
       }
     },
-    [aliceBytes],
+    [aliceHex],
     { timeout: 3_000 },
   );
   const frames = await recordedHandle.jsonValue();
@@ -168,51 +152,3 @@ test("alice + bob hear each other through real Gleam UI", async ({
   await alice.ctx.close();
   await bob.ctx.close();
 });
-
-/**
- * Validates that a peer's recorded frames look like real Opus-decoded
- * audio rather than silence underrun padding or stuck repeats.
- *
- *   - At least `minCount` of the recorded frames have RMS ≥ 0.05
- *     (Opus-decoded sine at amplitude 0.5 lands ~0.35 RMS; jitter
- *     pump's silence underrun is 0.0; this threshold rejects the
- *     latter cleanly).
- *   - No stretch of identical SHA-256 checksums longer than 5
- *     among the *non-silence* frames. Long silence runs are fine —
- *     they're the jitter pump correctly padding underruns with
- *     zero-PCM, not stuck-frame stutter — but a real user would
- *     still notice if every Opus-decoded frame was the same audio
- *     repeated.
- *
- * Pre-Opus this helper validated the per-counter `(seq, checksum)`
- * map back to the injected sequence. With a lossy codec individual
- * sample values do not survive, so identification by injected
- * counter is no longer meaningful — these two checks encode what's
- * actually shippable to a real user.
- *
- * @param {Array<{len: number, checksum: string, rms: number}>} frames
- * @param {number} minCount  Minimum non-silence frames expected.
- * @param {string} label     Used in failure messages.
- */
-function assertOpusFramesDelivered(frames, minCount, label) {
-  const real = frames.filter((f) => f.rms >= 0.05);
-  expect(
-    real.length,
-    `${label}: only ${real.length} non-silence frames; expected ≥ ${minCount}`,
-  ).toBeGreaterThanOrEqual(minCount);
-
-  let runLen = 0;
-  let runVal = null;
-  for (const f of real) {
-    if (f.checksum === runVal) {
-      runLen += 1;
-    } else {
-      runVal = f.checksum;
-      runLen = 1;
-    }
-    expect(
-      runLen,
-      `${label}: stuck-frame: ${runLen} consecutive non-silence frames with the same decoded PCM`,
-    ).toBeLessThanOrEqual(5);
-  }
-}

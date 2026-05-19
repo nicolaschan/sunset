@@ -9,6 +9,8 @@ import {
   teardownRelay,
   freshSeedHex,
   syntheticPcm,
+  waitForVoiceConnected,
+  assertOpusFramesDelivered,
 } from "./helpers/voice.js";
 
 let relay;
@@ -46,28 +48,21 @@ async function openPeer(browser, relayAddr) {
   return { page, ctx };
 }
 
-async function getPubkeyBytes(page) {
-  return page.evaluate(() => Array.from(new Uint8Array(window.sunsetClient.public_key)));
-}
-
-function pubkeyHex(bytes) {
-  return bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 // Wait for a peer's recorder to accumulate ≥ minFrames from a given sender.
-async function waitForFrames(receiverPage, senderBytes, minFrames, timeoutMs) {
+async function waitForFrames(receiverPage, senderHex, minFrames, timeoutMs) {
   const handle = await receiverPage.waitForFunction(
-    ([bytes, min]) => {
+    ([hex, min]) => {
       try {
-        const arr = window.sunsetClient.voice_recorded_frames(
-          new Uint8Array(bytes),
+        const bytes = new Uint8Array(
+          hex.match(/.{2}/g).map((b) => parseInt(b, 16)),
         );
+        const arr = window.sunsetClient.voice_recorded_frames(bytes);
         return Array.isArray(arr) && arr.length >= min ? arr : null;
       } catch (_e) {
         return null;
       }
     },
-    [senderBytes, minFrames],
+    [senderHex, minFrames],
     { timeout: timeoutMs },
   );
   return handle.jsonValue();
@@ -98,38 +93,11 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
     timeout: 500,
   });
 
-  // The minibar appears once `voice_start()` resolves Ok on the WASM side
-  // (Gleam UI dispatches `VoiceStarted` from the FFI's success callback
-  // before flipping `self_in_call`). Once visible, test-hook methods are
-  // safe to call.
-
-  // Wait for the mutual P2P voice legs to come up before injecting.
-  // `data-voice-connected="true"` is the UI's user-facing "audio flow
-  // exists with that peer" indicator (see voice_channel_roster.spec.js
-  // — the disconnected branch instead renders a `voice-member-not-connected`
-  // affordance). With three peers there are three handshakes racing in
-  // parallel; the alice↔carol leg in particular is established last
-  // because carol joins last, and on slow runners can still be coming
-  // up when injection starts. A real user about to speak in a 3-way
-  // call would wait until every other peer's row shows the connected
-  // state before expecting their voice to be heard, so encoding that
-  // wait here matches what the UI promises.
-  const peers = [alice, bob, carol];
-  const peerBytes = await Promise.all(peers.map((p) => getPubkeyBytes(p.page)));
-  const peerHexes = peerBytes.map(pubkeyHex);
-  await Promise.all(
-    peers.flatMap((self, i) =>
-      peerHexes
-        .filter((_, j) => i !== j)
-        .map((otherHex) =>
-          expect(
-            self.page.locator(
-              `[data-testid="voice-member"][data-peer-hex="${otherHex}"]`,
-            ),
-          ).toHaveAttribute("data-voice-connected", "true", { timeout: 10_000 }),
-        ),
-    ),
-  );
+  const [aliceHex, , carolHex] = await waitForVoiceConnected([
+    alice,
+    bob,
+    carol,
+  ]);
 
   // Detach the fake mic from the capture worklet on every peer so
   // only `voice_inject_pcm` frames flow into `runtime.send_pcm`.
@@ -148,9 +116,6 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
     );
   }
 
-  const aliceBytes = peerBytes[0];
-  const carolBytes = peerBytes[2];
-
   // Alice injects 50 frames — bob and carol must each receive ≥ 40
   // total frames with non-trivial RMS (real Opus-decoded audio, not
   // silence underrun padding).
@@ -163,10 +128,10 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
     await alice.page.waitForTimeout(20);
   }
 
-  const bobFromAlice = await waitForFrames(bob.page, aliceBytes, 40, 4_000);
+  const bobFromAlice = await waitForFrames(bob.page, aliceHex, 40, 4_000);
   assertOpusFramesDelivered(bobFromAlice, 40, "alice → bob");
 
-  const carolFromAlice = await waitForFrames(carol.page, aliceBytes, 40, 4_000);
+  const carolFromAlice = await waitForFrames(carol.page, aliceHex, 40, 4_000);
   assertOpusFramesDelivered(carolFromAlice, 40, "alice → carol");
 
   // Carol injects 50 frames — alice and bob must each receive ≥ 40
@@ -181,60 +146,13 @@ test("three-way voice: all peers hear each other", async ({ browser }) => {
     await carol.page.waitForTimeout(20);
   }
 
-  const aliceFromCarol = await waitForFrames(alice.page, carolBytes, 40, 4_000);
+  const aliceFromCarol = await waitForFrames(alice.page, carolHex, 40, 4_000);
   assertOpusFramesDelivered(aliceFromCarol, 40, "carol → alice");
 
-  const bobFromCarol = await waitForFrames(bob.page, carolBytes, 40, 4_000);
+  const bobFromCarol = await waitForFrames(bob.page, carolHex, 40, 4_000);
   assertOpusFramesDelivered(bobFromCarol, 40, "carol → bob");
 
   await alice.ctx.close();
   await bob.ctx.close();
   await carol.ctx.close();
 });
-
-/**
- * Validates that a peer's recorded frames look like real Opus-decoded
- * audio rather than silence padding or stuck repeats.
- *
- *   - At least `minCount` of the recorded frames have RMS ≥ 0.05
- *     (Opus-decoded sine at amplitude 0.5 lands ~0.35 RMS; silence
- *     underrun is 0.0; this threshold rejects the latter cleanly).
- *   - No stretch of identical SHA-256 checksums longer than 5
- *     among the *non-silence* frames. Long silence runs are fine —
- *     they're the jitter pump correctly padding underruns with
- *     zero-PCM, not stuck-frame stutter — but a real user would
- *     still notice if every Opus-decoded frame from a peer was the
- *     same audio repeated.
- *
- * Pre-Opus this check matched per-frame counters back to the
- * injected sequence; with a lossy codec individual sample values
- * don't survive, so identification by injected-counter is no longer
- * meaningful. The two assertions here encode what's actually
- * shippable to a real user.
- *
- * @param {Array<{len: number, checksum: string, rms: number}>} frames
- * @param {number} minCount  Minimum non-silence frames expected.
- * @param {string} label     Used in failure messages.
- */
-function assertOpusFramesDelivered(frames, minCount, label) {
-  const real = frames.filter((f) => f.rms >= 0.05);
-  expect(
-    real.length,
-    `${label}: only ${real.length} non-silence frames; expected ≥ ${minCount}`,
-  ).toBeGreaterThanOrEqual(minCount);
-
-  let runLen = 0;
-  let runVal = null;
-  for (const f of real) {
-    if (f.checksum === runVal) {
-      runLen += 1;
-    } else {
-      runVal = f.checksum;
-      runLen = 1;
-    }
-    expect(
-      runLen,
-      `${label}: stuck-frame: ${runLen} consecutive non-silence frames with the same decoded PCM`,
-    ).toBeLessThanOrEqual(5);
-  }
-}
