@@ -166,8 +166,9 @@ pub(crate) struct PeerOutbound {
     pub(crate) kind: crate::transport::TransportKind,
     pub(crate) tx: mpsc::UnboundedSender<SyncMessage>,
     /// Structural shutdown handle for the per-peer task that owns this
-    /// connection. When `PeerOutbound` is dropped (entry removed via
-    /// `remove_peer` or replaced by a fresher conn's `PeerHello`), this
+    /// connection. When `PeerOutbound` is dropped (the matching
+    /// `InboundEvent::Disconnected` removes it from `peer_outbound`,
+    /// or `remove_peer` clears every conn for the peer), this
     /// `watch::Sender` drops, which makes
     /// `watch::Receiver::changed().await` in the per-peer task's
     /// `recv_reliable_task`, `send_task`, and `liveness_task` return
@@ -183,6 +184,12 @@ pub(crate) struct PeerOutbound {
     /// `run_peer` task plus one TCP socket on the relay; over many
     /// cycles the relay would run out of file descriptors and stop
     /// accepting new WebSocket upgrades.
+    ///
+    /// Note: a second `PeerHello` for the same `PeerId` no longer
+    /// drops the prior `PeerOutbound` — both conns coexist in
+    /// `peer_outbound[peer]` as a `Vec`. The shutdown sender only
+    /// fires when *this* conn's `Disconnected` event arrives, or when
+    /// the engine kicks the peer entirely via `remove_peer`.
     pub(crate) _shutdown: tokio::sync::watch::Sender<()>,
 }
 
@@ -191,11 +198,21 @@ pub(crate) struct PeerOutbound {
 pub(crate) struct EngineState {
     pub trust: TrustSet,
     pub registry: SubscriptionRegistry,
-    /// Per-peer outbound state, keyed by `PeerId`. Each entry carries
-    /// the sender, the connection generation, and the transport kind
-    /// — kept together so a late `current_peers()` snapshot can't see
-    /// a peer in one map but not the other.
-    pub peer_outbound: HashMap<PeerId, PeerOutbound>,
+    /// Per-peer outbound state, keyed by `PeerId`. The value is a
+    /// `Vec<PeerOutbound>` because a single `PeerId` may have multiple
+    /// live connections at once — the canonical case being two browser
+    /// tabs of the same origin sharing an identity in localStorage and
+    /// each dialing the relay independently. Earlier revisions stored
+    /// one `PeerOutbound` per `PeerId` and treated the second
+    /// `PeerHello` as a "fresh generation replaces the stale one,"
+    /// which sent `Goodbye` to whichever tab connected first and put
+    /// the two tabs into a Goodbye/redial ping-pong forever.
+    ///
+    /// Invariant: every key in this map has a non-empty `Vec`. When
+    /// removing the last conn for a peer the key is removed entirely,
+    /// so `keys()` exactly enumerates connected peers and
+    /// `PeerRemoved` fires precisely on the N→0 transition.
+    pub peer_outbound: HashMap<PeerId, Vec<PeerOutbound>>,
     /// Live `EngineEvent` subscribers. Dead senders (closed by the
     /// receiver being dropped) are evicted lazily on the next emit.
     pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
@@ -205,6 +222,75 @@ pub(crate) struct EngineState {
     /// Dead senders (closed receivers) are evicted lazily on the
     /// next dispatch.
     pub ephemeral_subs: Vec<(Filter, mpsc::UnboundedSender<sunset_store::SignedDatagram>)>,
+}
+
+impl EngineState {
+    /// Append a new outbound conn for `peer`. Returns `true` iff this
+    /// was the first conn for the peer — the 0→1 transition that
+    /// should fire `PeerAdded`.
+    pub(crate) fn add_peer_outbound(&mut self, peer: PeerId, po: PeerOutbound) -> bool {
+        let vec = self.peer_outbound.entry(peer).or_default();
+        let was_empty = vec.is_empty();
+        vec.push(po);
+        was_empty
+    }
+
+    /// Remove the conn matching `conn_id` for `peer`. Returns `true`
+    /// iff that was the last conn for `peer` (N→0 transition — fire
+    /// `PeerRemoved`). Returns `false` when the conn wasn't present
+    /// (stale `Disconnected` from a defunct generation) or another
+    /// conn for the same peer is still live.
+    pub(crate) fn remove_peer_outbound_by_conn(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+    ) -> bool {
+        let Some(vec) = self.peer_outbound.get_mut(peer) else {
+            return false;
+        };
+        let before = vec.len();
+        vec.retain(|po| po.conn_id != conn_id);
+        if vec.len() == before {
+            return false;
+        }
+        if vec.is_empty() {
+            self.peer_outbound.remove(peer);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove every outbound conn for `peer` (engine `RemovePeer`
+    /// command — kicks the peer entirely, regardless of how many tabs
+    /// they had open). Returns `true` iff at least one conn existed.
+    pub(crate) fn remove_all_peer_outbound(&mut self, peer: &PeerId) -> bool {
+        matches!(self.peer_outbound.remove(peer), Some(v) if !v.is_empty())
+    }
+
+    /// Fan-out send: enqueue `msg` on every outbound conn registered
+    /// for `peer`. No-op when the peer isn't connected. The sync
+    /// protocol is idempotent (content-addressed inserts → `Stale`),
+    /// so duplicate delivery across multiple tabs is correct, not
+    /// wasteful: each tab needs the message.
+    ///
+    /// Takes `msg` by reference and clones for each outbound channel
+    /// — the channels can't share an owned `SyncMessage` because
+    /// they each move it independently.
+    pub(crate) fn send_to_peer(&self, peer: &PeerId, msg: &SyncMessage) {
+        if let Some(vec) = self.peer_outbound.get(peer) {
+            for po in vec {
+                let _ = po.tx.send(msg.clone());
+            }
+        }
+    }
+
+    /// Iterate every outbound conn across all peers — for messages
+    /// that broadcast to the entire peer set (e.g. self-authored
+    /// `EventDelivery` push).
+    pub(crate) fn iter_all_peer_outbound(&self) -> impl Iterator<Item = &PeerOutbound> {
+        self.peer_outbound.values().flat_map(|v| v.iter())
+    }
 }
 
 pub struct SyncEngine<S: Store, T: Transport> {
@@ -363,9 +449,7 @@ where
             .registry
             .peers_matching(&datagram.verifying_key, &datagram.name)
         {
-            if let Some(po) = state.peer_outbound.get(&peer) {
-                let _ = po.tx.send(msg.clone());
-            }
+            state.send_to_peer(&peer, &msg);
         }
         Ok(())
     }
@@ -374,12 +458,18 @@ where
     /// peer's transport kind. Pairs with `subscribe_engine_events()`
     /// to seed initial state for a subscriber that joins after some
     /// peers are already connected (no-replay race).
+    ///
+    /// When a peer has multiple concurrent connections (e.g. two
+    /// browser tabs sharing an identity), this returns the kind of
+    /// the first-recorded conn — they are virtually always the same
+    /// `TransportKind` anyway (a tab pair both negotiate WT-then-WS
+    /// the same way) and the UI doesn't differentiate.
     pub async fn current_peers(&self) -> Vec<(PeerId, crate::transport::TransportKind)> {
         let state = self.state.lock().await;
         state
             .peer_outbound
             .iter()
-            .map(|(pk, po)| (pk.clone(), po.kind))
+            .filter_map(|(pk, conns)| conns.first().map(|po| (pk.clone(), po.kind)))
             .collect()
     }
 
@@ -565,11 +655,13 @@ where
                 let _ = ack.send(Ok(()));
             }
             EngineCommand::RemovePeer { peer_id, ack } => {
-                let removed = {
-                    let mut state = self.state.lock().await;
-                    state.peer_outbound.remove(&peer_id).is_some()
-                };
-                if removed {
+                // `remove_peer` kicks the peer entirely — every conn,
+                // regardless of how many tabs they had open. Each
+                // dropped `PeerOutbound` fires its `_shutdown` watch
+                // so the per-conn send_task wakes up, sends Goodbye
+                // over its socket, and closes.
+                let had_any = self.state.lock().await.remove_all_peer_outbound(&peer_id);
+                if had_any {
                     self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
                         .await;
                 }
@@ -589,15 +681,23 @@ where
                 registered,
             } => {
                 // Register the outbound state under the Hello-declared
-                // peer_id. The insert here implicitly drops any previous
-                // PeerOutbound for the same peer_id (e.g. a stale
-                // generation from before a reconnect). That drop fires
-                // the OLD `_shutdown` watch::Sender, telling the OLD
-                // run_peer's tasks to wind down — see the field doc on
-                // `PeerOutbound::_shutdown`.
-                {
+                // peer_id. We APPEND rather than insert/replace: a
+                // single `PeerId` may have several live connections
+                // simultaneously (the canonical case is two browser
+                // tabs of the same origin sharing localStorage and
+                // each dialing the relay). The prior "replace and
+                // drop the old PeerOutbound" semantics sent `Goodbye`
+                // to whichever tab connected first, putting the two
+                // tabs into a Goodbye/redial ping-pong forever.
+                //
+                // `PeerAdded` only fires on the 0→1 transition (the
+                // first conn for this peer); subsequent additions are
+                // structurally "another connection from a peer we're
+                // already connected to" and don't change the engine's
+                // notion of who is connected.
+                let was_first = {
                     let mut state = self.state.lock().await;
-                    state.peer_outbound.insert(
+                    state.add_peer_outbound(
                         peer_id.clone(),
                         PeerOutbound {
                             conn_id,
@@ -605,13 +705,15 @@ where
                             tx: out_tx,
                             _shutdown: shutdown,
                         },
-                    );
+                    )
+                };
+                if was_first {
+                    self.emit_engine_event(EngineEvent::PeerAdded {
+                        peer_id: peer_id.clone(),
+                        kind,
+                    })
+                    .await;
                 }
-                self.emit_engine_event(EngineEvent::PeerAdded {
-                    peer_id: peer_id.clone(),
-                    kind,
-                })
-                .await;
                 // Wake the `add_peer().await` caller now that
                 // `peer_outbound` is populated, so an immediately-
                 // following `publish_subscription` / `insert` lands a
@@ -642,17 +744,18 @@ where
                     reason = %reason,
                     "peer disconnected",
                 );
-                let removed = {
-                    let mut state = self.state.lock().await;
-                    match state.peer_outbound.get(&peer_id) {
-                        Some(po) if po.conn_id == conn_id => {
-                            state.peer_outbound.remove(&peer_id);
-                            true
-                        }
-                        _ => false,
-                    }
-                };
-                if removed {
+                // Remove just *this* conn from the peer's Vec; emit
+                // `PeerRemoved` only when that was the last conn for
+                // the peer. Stale `Disconnected`s for already-dead
+                // generations (`conn_id` not in the Vec) are silently
+                // ignored — `remove_peer_outbound_by_conn` returns
+                // `false` in that case.
+                let was_last = self
+                    .state
+                    .lock()
+                    .await
+                    .remove_peer_outbound_by_conn(&peer_id, conn_id);
+                if was_last {
                     self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
                         .await;
                 }
@@ -804,9 +907,7 @@ where
             bloom: bloom.to_bytes(),
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(to) {
-            let _ = po.tx.send(msg);
-        }
+        state.send_to_peer(to, &msg);
     }
 
     async fn handle_peer_message(&self, from: PeerId, message: SyncMessage) {
@@ -878,9 +979,7 @@ where
             blobs,
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(&from) {
-            let _ = po.tx.send(msg);
-        }
+        state.send_to_peer(&from, &msg);
     }
 
     async fn handle_blob_request(&self, from: PeerId, hash: sunset_store::Hash) {
@@ -890,9 +989,7 @@ where
             _ => return,
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(&from) {
-            let _ = po.tx.send(SyncMessage::BlobResponse { block });
-        }
+        state.send_to_peer(&from, &SyncMessage::BlobResponse { block });
     }
 
     async fn handle_blob_response(&self, block: sunset_store::ContentBlock) {
@@ -955,11 +1052,12 @@ where
                     .is_some();
                 if !have {
                     let state = self.state.lock().await;
-                    if let Some(po) = state.peer_outbound.get(&from) {
-                        let _ = po.tx.send(SyncMessage::BlobRequest {
+                    state.send_to_peer(
+                        &from,
+                        &SyncMessage::BlobRequest {
                             hash: entry.value_hash,
-                        });
-                    }
+                        },
+                    );
                 }
             }
         }
@@ -1009,9 +1107,7 @@ where
                             range: DigestRange::All,
                         };
                         let state = self.state.lock().await;
-                        if let Some(po) = state.peer_outbound.get(&peer_id) {
-                            let _ = po.tx.send(msg);
-                        }
+                        state.send_to_peer(&peer_id, &msg);
                     }
                 }
             }
@@ -1045,7 +1141,7 @@ where
         };
         let state = self.state.lock().await;
         if entry.verifying_key == self.local_peer.0 {
-            for po in state.peer_outbound.values() {
+            for po in state.iter_all_peer_outbound() {
                 let _ = po.tx.send(msg.clone());
             }
         } else {
@@ -1053,9 +1149,7 @@ where
                 .registry
                 .peers_matching(&entry.verifying_key, &entry.name)
             {
-                if let Some(po) = state.peer_outbound.get(&peer) {
-                    let _ = po.tx.send(msg.clone());
-                }
+                state.send_to_peer(&peer, &msg);
             }
         }
     }
@@ -1348,7 +1442,7 @@ mod tests {
     ) -> (PeerId, mpsc::UnboundedReceiver<SyncMessage>) {
         let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
         let peer = PeerId(vk(label));
-        engine.state.lock().await.peer_outbound.insert(
+        engine.state.lock().await.add_peer_outbound(
             peer.clone(),
             PeerOutbound {
                 conn_id,
@@ -1473,7 +1567,7 @@ mod tests {
 
                 // Pre-register a fake outbound channel so handle_blob_request has somewhere to send.
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.add_peer_outbound(
                     PeerId(vk(b"requester")),
                     PeerOutbound {
                         conn_id: ConnectionId::for_test(99),
@@ -1544,7 +1638,7 @@ mod tests {
                     .unwrap();
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.add_peer_outbound(
                     PeerId(vk(b"remote")),
                     PeerOutbound {
                         conn_id: ConnectionId::for_test(99),
@@ -1795,21 +1889,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn stale_disconnected_from_old_connection_is_filtered() {
+    async fn disconnect_one_of_two_conns_keeps_peer_connected() {
+        // A `PeerId` may have multiple live conns (two browser tabs of
+        // the same origin, share an identity in localStorage and each
+        // dial the relay). When one of them disconnects, the engine
+        // must NOT fire `PeerRemoved` — the peer is still connected
+        // via the other conn — and the surviving conn must still be
+        // routable through `send_to_peer`.
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
-
-                // Simulate two generations: register peer with conn_id=1,
-                // then replace with conn_id=2, then deliver a stale
-                // Disconnected for conn_id=1.
                 let peer = PeerId(vk(b"bob"));
 
-                // Generation 1.
+                // Conn 1.
                 let (tx1, _rx1) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn1 = ConnectionId::for_test(1);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.add_peer_outbound(
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn1,
@@ -1819,10 +1915,10 @@ mod tests {
                     },
                 );
 
-                // Replace with generation 2 (simulating a fresh PeerHello).
+                // Conn 2 — same peer_id (the "two tabs" case).
                 let (tx2, mut rx2) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn2 = ConnectionId::for_test(2);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.add_peer_outbound(
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn2,
@@ -1832,34 +1928,34 @@ mod tests {
                     },
                 );
 
-                // Subscribe to engine events to assert NO PeerRemoved fires.
                 let mut events = engine.subscribe_engine_events().await;
 
-                // Deliver a stale Disconnected for the old generation.
+                // Drop conn 1.
                 engine
                     .handle_inbound_event(InboundEvent::Disconnected {
                         peer_id: peer.clone(),
                         conn_id: conn1,
-                        reason: "stale".into(),
+                        reason: "tab closed".into(),
                     })
                     .await;
 
-                // No PeerRemoved should arrive within a short timeout.
+                // No PeerRemoved fires — conn 2 is still live.
                 let got =
                     tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await;
                 assert!(
                     got.is_err(),
-                    "stale Disconnected for old conn must NOT emit PeerRemoved"
+                    "disconnecting one of two conns must NOT emit PeerRemoved while another is live"
                 );
 
-                // The fresh sender (gen 2) must still be live: a manual
-                // send through it should succeed.
-                let state = engine.state.lock().await;
-                let po = state.peer_outbound.get(&peer).expect("gen2 still present");
-                assert_eq!(po.conn_id, conn2);
-                let _ = po.tx.send(SyncMessage::Goodbye {});
-                drop(state);
-                let received = rx2.recv().await.expect("gen2 sender still alive");
+                // The surviving conn must still be routable.
+                {
+                    let state = engine.state.lock().await;
+                    let vec = state.peer_outbound.get(&peer).expect("vec still present");
+                    assert_eq!(vec.len(), 1, "only conn 2 should remain");
+                    assert_eq!(vec[0].conn_id, conn2);
+                    state.send_to_peer(&peer, &SyncMessage::Goodbye {});
+                }
+                let received = rx2.recv().await.expect("conn 2 sender still alive");
                 assert!(matches!(received, SyncMessage::Goodbye { .. }));
             })
             .await;
@@ -1875,7 +1971,7 @@ mod tests {
 
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(7);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.add_peer_outbound(
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn,
@@ -1919,7 +2015,7 @@ mod tests {
 
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(7);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.add_peer_outbound(
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn,
@@ -1964,6 +2060,222 @@ mod tests {
             .await;
     }
 
+    /// End-to-end coverage for the two-tabs-same-identity case driven
+    /// through the actual `handle_inbound_event(PeerHello)` path
+    /// (not direct `peer_outbound` mutation). Without the
+    /// `HashMap<PeerId, Vec<PeerOutbound>>` shape, a second Hello for
+    /// the same peer dropped the first PeerOutbound, fired its
+    /// `_shutdown` watch, and the first conn's send_task wrote a
+    /// `Goodbye` over the socket — putting two tabs of the same
+    /// browser into a ~1 s Goodbye/redial loop forever (#FIREFOX-LOOP).
+    ///
+    /// Contract this test pins:
+    ///   • Two PeerHellos for the same peer_id → both `PeerOutbound`s
+    ///     coexist; neither `_shutdown` fires.
+    ///   • `PeerAdded` is emitted exactly once (the 0→1 transition).
+    ///   • A `Disconnected` for the first conn alone does NOT emit
+    ///     `PeerRemoved`.
+    ///   • A `Disconnected` for the second/last conn DOES emit
+    ///     `PeerRemoved` (the N→0 transition).
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_hellos_same_peer_keep_both_conns_alive() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let peer = PeerId(vk(b"bob"));
+
+                let mut events = engine.subscribe_engine_events().await;
+
+                // First PeerHello — fresh conn for this peer.
+                let (tx1, _rx1) = mpsc::unbounded_channel::<SyncMessage>();
+                let (shutdown1, mut shutdown1_rx) = tokio::sync::watch::channel(());
+                let conn1 = ConnectionId::for_test(1);
+                engine
+                    .handle_inbound_event(InboundEvent::PeerHello {
+                        peer_id: peer.clone(),
+                        conn_id: conn1,
+                        kind: TransportKind::Unknown,
+                        out_tx: tx1,
+                        shutdown: shutdown1,
+                        registered: None,
+                    })
+                    .await;
+
+                // 0→1: PeerAdded fires.
+                match tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                    .await
+                    .expect("PeerAdded must fire on first conn")
+                    .expect("event channel open")
+                {
+                    EngineEvent::PeerAdded { peer_id, .. } => assert_eq!(peer_id, peer),
+                    other => panic!("expected PeerAdded, got {other:?}"),
+                }
+
+                // Second PeerHello — same peer_id, different conn (the
+                // canonical "second tab from the same browser" case).
+                let (tx2, _rx2) = mpsc::unbounded_channel::<SyncMessage>();
+                let (shutdown2, _shutdown2_rx) = tokio::sync::watch::channel(());
+                let conn2 = ConnectionId::for_test(2);
+                engine
+                    .handle_inbound_event(InboundEvent::PeerHello {
+                        peer_id: peer.clone(),
+                        conn_id: conn2,
+                        kind: TransportKind::Unknown,
+                        out_tx: tx2,
+                        shutdown: shutdown2,
+                        registered: None,
+                    })
+                    .await;
+
+                // The first conn's `_shutdown` watch::Sender must NOT
+                // have fired — that's the trigger run_peer's
+                // send_task uses to write Goodbye and close. Polling
+                // `changed().await` would block forever if no change
+                // happened, so check via a short timeout.
+                let shutdown_fired = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    shutdown1_rx.changed(),
+                )
+                .await;
+                assert!(
+                    shutdown_fired.is_err(),
+                    "first conn's _shutdown must NOT fire when a second Hello arrives — \
+                     that would cause it to send Goodbye and tear down (the original \
+                     two-tabs-same-browser bug)"
+                );
+
+                // Both PeerOutbound entries coexist in the engine's state.
+                {
+                    let state = engine.state.lock().await;
+                    let vec = state.peer_outbound.get(&peer).expect("peer present");
+                    assert_eq!(
+                        vec.len(),
+                        2,
+                        "engine must hold both conns for the same peer_id, not replace"
+                    );
+                    let conn_ids: std::collections::HashSet<_> =
+                        vec.iter().map(|po| po.conn_id).collect();
+                    assert!(conn_ids.contains(&conn1));
+                    assert!(conn_ids.contains(&conn2));
+                }
+
+                // No second PeerAdded — only the 0→1 transition emits.
+                let extra =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await;
+                assert!(
+                    extra.is_err(),
+                    "PeerAdded must only fire on the 0→1 transition, not on every Hello"
+                );
+
+                // Disconnect conn 1 — peer still has conn 2 → no PeerRemoved.
+                engine
+                    .handle_inbound_event(InboundEvent::Disconnected {
+                        peer_id: peer.clone(),
+                        conn_id: conn1,
+                        reason: "one tab closed".into(),
+                    })
+                    .await;
+                let got =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await;
+                assert!(
+                    got.is_err(),
+                    "dropping one of two conns must NOT emit PeerRemoved"
+                );
+
+                // Disconnect conn 2 — last one → PeerRemoved (N→0).
+                engine
+                    .handle_inbound_event(InboundEvent::Disconnected {
+                        peer_id: peer.clone(),
+                        conn_id: conn2,
+                        reason: "last tab closed".into(),
+                    })
+                    .await;
+                match tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                    .await
+                    .expect("PeerRemoved must fire on N→0")
+                    .expect("event channel open")
+                {
+                    EngineEvent::PeerRemoved { peer_id } => assert_eq!(peer_id, peer),
+                    other => panic!("expected PeerRemoved, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// Self-authored entries fan out to *every* conn — including
+    /// every conn for a peer that has multiple. Without this, only
+    /// one of the user's two tabs would receive their own message
+    /// echo, and inserts authored by the local peer would silently
+    /// half-deliver to multi-conn peers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_authored_broadcast_fans_out_to_every_conn_per_peer() {
+        use sunset_store::Store as _;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let peer = PeerId(vk(b"bob"));
+
+                // Two conns for `bob` (the two-tabs case).
+                let (tx1, mut rx1) = mpsc::unbounded_channel::<SyncMessage>();
+                let (tx2, mut rx2) = mpsc::unbounded_channel::<SyncMessage>();
+                {
+                    let mut state = engine.state.lock().await;
+                    state.add_peer_outbound(
+                        peer.clone(),
+                        PeerOutbound {
+                            conn_id: ConnectionId::for_test(1),
+                            kind: TransportKind::Unknown,
+                            tx: tx1,
+                            _shutdown: tokio::sync::watch::channel(()).0,
+                        },
+                    );
+                    state.add_peer_outbound(
+                        peer.clone(),
+                        PeerOutbound {
+                            conn_id: ConnectionId::for_test(2),
+                            kind: TransportKind::Unknown,
+                            tx: tx2,
+                            _shutdown: tokio::sync::watch::channel(()).0,
+                        },
+                    );
+                }
+
+                // Self-authored insert → handle_local_store_event
+                // fans out to every conn.
+                use sunset_store::{ContentBlock, SignedKvEntry};
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"self-authored"),
+                    references: vec![],
+                };
+                let entry = SignedKvEntry {
+                    verifying_key: engine.local_peer.0.clone(),
+                    name: Bytes::from_static(b"chat/k1"),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::from_static(&[0u8; 64]),
+                };
+                engine
+                    .store
+                    .insert(entry.clone(), Some(block))
+                    .await
+                    .unwrap();
+                engine
+                    .handle_local_store_event(sunset_store::Event::Inserted(entry))
+                    .await;
+
+                // BOTH conns must have received the EventDelivery.
+                let m1 = rx1.try_recv().expect("conn 1 must receive");
+                let m2 = rx2.try_recv().expect("conn 2 must receive");
+                assert!(matches!(m1, SyncMessage::EventDelivery { .. }));
+                assert!(matches!(m2, SyncMessage::EventDelivery { .. }));
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn remove_peer_drops_outbound_and_emits_removed() {
         let local = tokio::task::LocalSet::new();
@@ -1974,7 +2286,7 @@ mod tests {
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(1);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.add_peer_outbound(
                     peer.clone(),
                     PeerOutbound {
                         conn_id: conn,
@@ -2123,7 +2435,7 @@ mod tests {
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
                 {
                     let mut state = engine.state.lock().await;
-                    state.peer_outbound.insert(
+                    state.add_peer_outbound(
                         relay.clone(),
                         PeerOutbound {
                             conn_id: ConnectionId::for_test(0),

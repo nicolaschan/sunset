@@ -25,18 +25,23 @@ pub(crate) enum InboundEvent {
         kind: crate::transport::TransportKind,
         out_tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>,
         /// Engine-owned shutdown signal: when the engine drops this
-        /// Sender (because `peer_outbound` got replaced by a newer
-        /// conn's PeerHello, or `remove_peer` deleted the entry), each
-        /// per-peer task observes `Receiver::changed().await` returning
-        /// `Err` and exits cleanly. Without this signal the OLD
-        /// per-peer task lingers indefinitely — `out_tx_clone` in
-        /// `run_peer`'s outer scope keeps the outbound channel open, so
-        /// `send_task` can't exit via channel-close; and as long as the
-        /// peer keeps responding to Pings, liveness never times out
-        /// either. Many reconnect cycles for the same peer
-        /// (browser tab close + reopen, mobile network blip) would
+        /// Sender (because the matching `Disconnected` removed this
+        /// conn from `peer_outbound[peer_id]`, or `remove_peer`
+        /// cleared every conn for the peer), each per-peer task
+        /// observes `Receiver::changed().await` returning `Err` and
+        /// exits cleanly. Without this signal the OLD per-peer task
+        /// lingers indefinitely — `out_tx_clone` in `run_peer`'s
+        /// outer scope keeps the outbound channel open, so
+        /// `send_task` can't exit via channel-close; and as long as
+        /// the peer keeps responding to Pings, liveness never times
+        /// out either. Many reconnect cycles for the same peer would
         /// otherwise leak one zombie run_peer task + one zombie TCP
         /// socket per cycle.
+        ///
+        /// A second `PeerHello` for the same `PeerId` no longer drops
+        /// this signal — `peer_outbound` is a `HashMap<PeerId,
+        /// Vec<PeerOutbound>>` and the new conn is appended alongside
+        /// the existing one (the two-browser-tabs case).
         shutdown: tokio::sync::watch::Sender<()>,
         /// One-shot fired by the engine after `peer_outbound` is
         /// populated, to wake the `add_peer().await` caller. Threading
@@ -178,10 +183,12 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             // Build the engine-owned shutdown signal here. The Sender
             // ships out in PeerHello; the Receiver stays in this
             // run_peer and is cloned into each task's select arm. When
-            // the engine later drops `peer_outbound[peer_id]` (replace
-            // on reconnect or `remove_peer`), the Sender drops and each
-            // task's `changed().await` returns `Err` — the structural
-            // teardown signal that doesn't otherwise exist (see the
+            // the engine later removes this specific conn from
+            // `peer_outbound[peer_id]` (matching `Disconnected`, or
+            // `remove_peer` clearing every conn for the peer), the
+            // Sender drops and each task's `changed().await` returns
+            // `Err` — the structural teardown signal that doesn't
+            // otherwise exist (see the
             // `shutdown` field doc on InboundEvent::PeerHello).
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
             let _ = inbound_tx.send(InboundEvent::PeerHello {
@@ -1261,18 +1268,20 @@ mod tests {
     }
 
     /// Regression: when the engine drops `PeerOutbound` (because the
-    /// peer was replaced by a fresher conn or `remove_peer` deleted the
-    /// entry), the OLD per-peer task must wind down. Without the
+    /// matching `Disconnected` removed this conn from the peer's
+    /// `Vec<PeerOutbound>`, or `remove_peer` cleared every conn for
+    /// the peer), the per-peer task must wind down. Without the
     /// `shutdown` watch::Sender threaded through `PeerHello` →
-    /// `PeerOutbound::_shutdown`, the task would run forever as long as
-    /// the underlying transport stayed responsive — every reconnect of
-    /// the same `PeerId` to a relay would leak one zombie task plus one
-    /// TCP socket, and after many cycles the relay would exhaust its
-    /// file-descriptor budget and refuse new WebSocket upgrades.
+    /// `PeerOutbound::_shutdown`, the task would run forever as long
+    /// as the underlying transport stayed responsive — every
+    /// reconnect of the same `PeerId` to a relay would leak one
+    /// zombie task plus one TCP socket, and after many cycles the
+    /// relay would exhaust its file-descriptor budget and refuse new
+    /// WebSocket upgrades.
     ///
     /// Shape: drive Hello to completion, then drop the engine-side
-    /// shutdown handle (mirroring the `state.peer_outbound.insert(...)`
-    /// replacement path that drops the old `PeerOutbound`). The bob
+    /// shutdown handle (mirroring the path the engine takes after a
+    /// matching `Disconnected` event removes this conn). The bob
     /// side stays healthy and responsive throughout, which is the
     /// scenario the bug needed: with bob alive, liveness never times
     /// out and send_task never sees a failing send, so the task can
@@ -1330,17 +1339,17 @@ mod tests {
                 // Extract the engine-shutdown handle alice's run_peer
                 // ships in its PeerHello event. Dropping it later is the
                 // signal under test — exactly the drop that fires when
-                // the engine does
-                // `state.peer_outbound.insert(peer_id, NEW_PeerOutbound)`
-                // and discards the OLD entry.
+                // the engine removes this conn from
+                // `state.peer_outbound[peer_id]` after a matching
+                // `Disconnected` (or `remove_peer` for the peer).
                 let alice_shutdown = match a_in_rx.recv().await.unwrap() {
                     InboundEvent::PeerHello {
                         shutdown, out_tx, ..
                     } => {
-                        // Drop the engine-side outbound channel as well,
-                        // matching what `state.peer_outbound.insert`
-                        // does to the previous entry's `tx`. Keep the
-                        // shutdown Sender alive for now.
+                        // Drop the engine-side outbound channel as
+                        // well, matching what removing the entry
+                        // does to the discarded `PeerOutbound.tx`.
+                        // Keep the shutdown Sender alive for now.
                         drop(out_tx);
                         shutdown
                     }
