@@ -77,8 +77,6 @@ const jumboCases = [
     fontPx: 36,
   },
   {
-    // 👨‍👩‍👧 is a single grapheme cluster: three people codepoints joined
-    // by ZWJs. The parser folds it into one cluster.
     name: "ZWJ family as one cluster",
     hash: "jumbo-zwj-family",
     body: "👨\u{200D}👩\u{200D}👧",

@@ -835,10 +835,6 @@ mod tests {
 
     #[test]
     fn zwj_family_is_one_emoji_cluster() {
-        // 👨‍👩‍👧 is a single grapheme composed of three people codepoints
-        // joined by ZWJs (U+200D). `graphemes(true)` folds it into one
-        // segment; the Extended_Pictographic property on the base (👨)
-        // qualifies it.
         assert_eq!(
             parse("👨\u{200D}👩\u{200D}👧"),
             jumbo(&["👨\u{200D}👩\u{200D}👧"]),
@@ -847,7 +843,6 @@ mod tests {
 
     #[test]
     fn skin_tone_modifier_is_one_emoji_cluster() {
-        // 👋🏽 = WAVING HAND + MEDIUM SKIN TONE modifier. One grapheme.
         assert_eq!(parse("👋\u{1F3FD}"), jumbo(&["👋\u{1F3FD}"]));
     }
 
@@ -866,9 +861,8 @@ mod tests {
 
     #[test]
     fn keycap_base_codepoints_are_not_jumbo() {
-        // Digits, `#`, `*` carry `Emoji=YES` but render as plain text by
-        // default. Pin this so a future refactor that loosens the
-        // `EmojiStatus` blacklist doesn't silently flip `"123"` to jumbo.
+        // Digits, `#`, `*` carry `Emoji=YES` per Unicode but render as text
+        // by default — they're keycap bases, not standalone emoji.
         for body in ["123", "1", "0", "#", "*", "##", "**", "*1"] {
             let parsed = parse(body);
             assert!(
@@ -899,8 +893,6 @@ mod tests {
         assert_eq!(to_plain(&doc), "🌅🌙🔥");
     }
 
-    /// True if any `Block::Jumbo` appears anywhere in the document tree —
-    /// at the top level or nested inside a Quote / UnorderedList item.
     fn contains_jumbo(doc: &Document) -> bool {
         fn walk(block: &Block) -> bool {
             match block {
@@ -915,9 +907,6 @@ mod tests {
 
     #[test]
     fn jumbo_inside_quote_is_paragraph() {
-        // The jumbo shortcut only fires at the document top level. A quoted
-        // emoji-only line renders normally — never as `Block::Jumbo` at any
-        // depth.
         let parsed = parse("> 🌅");
         assert_eq!(
             parsed,
@@ -930,8 +919,6 @@ mod tests {
 
     #[test]
     fn jumbo_inside_unordered_list_is_paragraph() {
-        // Same invariant for list items: emoji-only content inside a list
-        // never becomes `Block::Jumbo`.
         let parsed = parse("- 🌅");
         assert_eq!(
             parsed,
@@ -944,17 +931,12 @@ mod tests {
 
     #[test]
     fn bare_zwj_only_is_not_jumbo() {
-        // A bare zero-width joiner is `EmojiStatus::NonEmojiButEmojiComponent`
-        // — it's an emoji building block, not an emoji on its own. Pin the
-        // blacklist arm against future loosening.
         let parsed = parse("\u{200D}");
         assert!(!contains_jumbo(&parsed));
     }
 
     #[test]
     fn bare_variation_selector_only_is_not_jumbo() {
-        // A bare VS16 (U+FE0F) is also `NonEmojiButEmojiComponent`. Same
-        // arm, different codepoint family.
         let parsed = parse("\u{FE0F}");
         assert!(!contains_jumbo(&parsed));
     }
