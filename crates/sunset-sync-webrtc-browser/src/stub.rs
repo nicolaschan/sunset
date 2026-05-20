@@ -3,10 +3,7 @@
 
 use std::rc::Rc;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-
-use sunset_sync::{Error, PeerAddr, PeerId, RawConnection, RawTransport, Result, Signaler};
+use sunset_sync::{PeerId, Signaler};
 
 pub struct WebRtcRawTransport {
     _signaler: Rc<dyn Signaler>,
@@ -24,47 +21,9 @@ impl WebRtcRawTransport {
     }
 }
 
-#[async_trait(?Send)]
-impl RawTransport for WebRtcRawTransport {
-    type Connection = WebRtcRawConnection;
-
-    async fn connect(&self, _: PeerAddr) -> Result<Self::Connection> {
-        Err(Error::Transport(
-            "sunset-sync-webrtc-browser: native stub — must be built for wasm32".into(),
-        ))
-    }
-
-    async fn accept(&self) -> Result<Self::Connection> {
-        std::future::pending::<()>().await;
-        unreachable!();
-    }
-}
-
 pub struct WebRtcRawConnection;
 
-#[async_trait(?Send)]
-impl RawConnection for WebRtcRawConnection {
-    async fn send_reliable(&self, _: Bytes) -> Result<()> {
-        Err(Error::Transport(
-            "sunset-sync-webrtc-browser: native stub".into(),
-        ))
-    }
-    async fn recv_reliable(&self) -> Result<Bytes> {
-        Err(Error::Transport(
-            "sunset-sync-webrtc-browser: native stub".into(),
-        ))
-    }
-    async fn send_unreliable(&self, _: Bytes) -> Result<()> {
-        Err(Error::Transport(
-            "sunset-sync-webrtc-browser: native stub".into(),
-        ))
-    }
-    async fn recv_unreliable(&self) -> Result<Bytes> {
-        Err(Error::Transport(
-            "sunset-sync-webrtc-browser: native stub".into(),
-        ))
-    }
-    async fn close(&self) -> Result<()> {
-        Ok(())
-    }
-}
+sunset_sync::native_stub_impls!(
+    transport = WebRtcRawTransport,
+    connection = WebRtcRawConnection,
+);

@@ -12,6 +12,7 @@ pub mod error;
 pub mod fallback_transport;
 pub mod message;
 pub mod multi_transport;
+pub mod native_stub;
 pub mod peer;
 pub mod reserved;
 pub mod signaler;
