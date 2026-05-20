@@ -26,5 +26,4 @@ pub struct WebRtcRawConnection;
 sunset_sync::native_stub_impls!(
     transport = WebRtcRawTransport,
     connection = WebRtcRawConnection,
-    crate_name = "sunset-sync-webrtc-browser",
 );

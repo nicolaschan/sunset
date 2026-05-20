@@ -14,5 +14,4 @@ pub struct WebSocketRawConnection;
 sunset_sync::native_stub_impls!(
     transport = WebSocketRawTransport,
     connection = WebSocketRawConnection,
-    crate_name = "sunset-sync-ws-browser",
 );
