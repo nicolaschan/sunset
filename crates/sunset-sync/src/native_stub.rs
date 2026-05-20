@@ -23,6 +23,15 @@ macro_rules! native_stub_impls {
         transport = $transport:ident,
         connection = $connection:ident $(,)?
     ) => {
+        impl $connection {
+            fn stub_err(detail: &str) -> ::sunset_sync::Error {
+                let crate_name = env!("CARGO_PKG_NAME");
+                ::sunset_sync::Error::Transport(::std::format!(
+                    "{crate_name}: native stub{detail}"
+                ))
+            }
+        }
+
         #[::async_trait::async_trait(?Send)]
         impl ::sunset_sync::RawTransport for $transport {
             type Connection = $connection;
@@ -31,10 +40,7 @@ macro_rules! native_stub_impls {
                 &self,
                 _: ::sunset_sync::PeerAddr,
             ) -> ::sunset_sync::Result<Self::Connection> {
-                Err(::sunset_sync::Error::Transport(
-                    concat!(env!("CARGO_PKG_NAME"), ": native stub — must be built for wasm32")
-                        .into(),
-                ))
+                Err($connection::stub_err(" — must be built for wasm32"))
             }
 
             async fn accept(&self) -> ::sunset_sync::Result<Self::Connection> {
@@ -46,24 +52,16 @@ macro_rules! native_stub_impls {
         #[::async_trait::async_trait(?Send)]
         impl ::sunset_sync::RawConnection for $connection {
             async fn send_reliable(&self, _: ::bytes::Bytes) -> ::sunset_sync::Result<()> {
-                Err(::sunset_sync::Error::Transport(
-                    concat!(env!("CARGO_PKG_NAME"), ": native stub").into(),
-                ))
+                Err(Self::stub_err(""))
             }
             async fn recv_reliable(&self) -> ::sunset_sync::Result<::bytes::Bytes> {
-                Err(::sunset_sync::Error::Transport(
-                    concat!(env!("CARGO_PKG_NAME"), ": native stub").into(),
-                ))
+                Err(Self::stub_err(""))
             }
             async fn send_unreliable(&self, _: ::bytes::Bytes) -> ::sunset_sync::Result<()> {
-                Err(::sunset_sync::Error::Transport(
-                    concat!(env!("CARGO_PKG_NAME"), ": native stub").into(),
-                ))
+                Err(Self::stub_err(""))
             }
             async fn recv_unreliable(&self) -> ::sunset_sync::Result<::bytes::Bytes> {
-                Err(::sunset_sync::Error::Transport(
-                    concat!(env!("CARGO_PKG_NAME"), ": native stub").into(),
-                ))
+                Err(Self::stub_err(""))
             }
             async fn close(&self) -> ::sunset_sync::Result<()> {
                 Ok(())
