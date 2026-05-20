@@ -118,8 +118,6 @@ const notJumboCases = [
     body: "hi 🌅",
     rowText: "hi 🌅",
   },
-  // Digits, `#`, and `*` carry Emoji=YES but render as text by default —
-  // the parser's `EmojiStatus` blacklist excludes them.
   {
     name: "keycap-base codepoints",
     hash: "jumbo-keycap",

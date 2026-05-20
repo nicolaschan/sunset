@@ -22,16 +22,14 @@ import sunset_web/theme.{type Palette}
 @external(javascript, "./markdown.ffi.mjs", "parseMarkdown")
 fn parse_markdown_ffi(body: String) -> Dynamic
 
-/// Parse a body string to its block-level AST. Calls the Rust parser
-/// over FFI; on any decode failure returns a single Paragraph wrapping
-/// the body as literal text.
-///
-/// Exposed so tests can assert against parsed AST without re-rendering.
-pub fn parse(body: String) -> List(Block) {
+/// Parse a body string to its AST. Calls the Rust parser over FFI; on any
+/// decode failure returns a single Paragraph wrapping the body as literal
+/// text.
+pub fn parse(body: String) -> Document {
   let ast = parse_markdown_ffi(body)
-  case decode.run(ast, decode.list(block_decoder())) {
-    Ok(bs) -> bs
-    Error(_) -> [Paragraph([Text(body)])]
+  case decode.run(ast, document_decoder()) {
+    Ok(doc) -> doc
+    Error(_) -> Blocks([Paragraph([Text(body)])])
   }
 }
 
@@ -62,7 +60,7 @@ pub fn render(
   on_toggle_spoiler: fn(SpoilerKey) -> msg,
   p: Palette,
 ) -> Element(msg) {
-  render_blocks(
+  render_document(
     parse(body),
     message_id,
     is_spoiler_revealed,
@@ -71,32 +69,39 @@ pub fn render(
   )
 }
 
-/// Render a pre-parsed AST to a Lustre element. Used by `render` and
-/// directly by tests that build AST values by hand to avoid the FFI
-/// dependency in unit-test environments.
-pub fn render_blocks(
-  blocks: List(Block),
+/// Render a pre-parsed `Document`. Used by `render` and directly by tests
+/// that build AST values by hand to avoid the FFI dependency in unit-test
+/// environments.
+pub fn render_document(
+  doc: Document,
   message_id: String,
   is_spoiler_revealed: fn(SpoilerKey) -> Bool,
   on_toggle_spoiler: fn(SpoilerKey) -> msg,
   p: Palette,
 ) -> Element(msg) {
-  let ctx =
-    Ctx(
-      palette: p,
-      message_id: message_id,
-      is_revealed: is_spoiler_revealed,
-      on_toggle: on_toggle_spoiler,
-    )
-  html.div(
-    [
-      attribute.attribute(
-        "style",
-        "display: flex; flex-direction: column; gap: 4px;",
-      ),
-    ],
-    list.index_map(blocks, fn(b, i) { render_block(b, ctx, int.to_string(i)) }),
-  )
+  case doc {
+    Jumbo(emojis) -> render_jumbo(emojis)
+    Blocks(blocks) -> {
+      let ctx =
+        Ctx(
+          palette: p,
+          message_id: message_id,
+          is_revealed: is_spoiler_revealed,
+          on_toggle: on_toggle_spoiler,
+        )
+      html.div(
+        [
+          attribute.attribute(
+            "style",
+            "display: flex; flex-direction: column; gap: 4px;",
+          ),
+        ],
+        list.index_map(blocks, fn(b, i) {
+          render_block(b, ctx, int.to_string(i))
+        }),
+      )
+    }
+  }
 }
 
 /// Strip all formatting and return concatenated text. Useful for
@@ -108,16 +113,17 @@ pub fn to_plain(body: String) -> String
 // ----- AST types -----
 // Pub so tests can construct AST values directly without going through FFI.
 
+pub type Document {
+  Blocks(content: List(Block))
+  Jumbo(emojis: List(String))
+}
+
 pub type Block {
   Paragraph(content: List(Inline))
   Heading(level: Int, content: List(Inline))
   Quote(content: List(Block))
   UnorderedList(items: List(List(Block)))
   CodeBlock(language: Option(String), source: String)
-  /// 1–3 emoji grapheme clusters. The parser only produces this at the
-  /// document top level (whole-body shortcut); renderers display the
-  /// emoji at a larger font size (iMessage / Signal "jumbo emoji").
-  Jumbo(emojis: List(String))
 }
 
 pub type Inline {
@@ -161,19 +167,27 @@ fn lazy_block_list() -> decode.Decoder(List(Block)) {
 //
 // `decode.one_of` tries each branch in order.
 
+fn document_decoder() -> decode.Decoder(Document) {
+  decode.one_of(document_blocks_decoder(), [document_jumbo_decoder()])
+}
+
+fn document_blocks_decoder() -> decode.Decoder(Document) {
+  use blocks <- decode.field("Blocks", decode.list(block_decoder()))
+  decode.success(Blocks(blocks))
+}
+
+fn document_jumbo_decoder() -> decode.Decoder(Document) {
+  use emojis <- decode.field("Jumbo", decode.list(decode.string))
+  decode.success(Jumbo(emojis))
+}
+
 fn block_decoder() -> decode.Decoder(Block) {
   decode.one_of(paragraph_decoder(), [
     heading_decoder(),
     quote_decoder(),
     unordered_list_decoder(),
     code_block_decoder(),
-    jumbo_decoder(),
   ])
-}
-
-fn jumbo_decoder() -> decode.Decoder(Block) {
-  use emojis <- decode.field("Jumbo", decode.list(decode.string))
-  decode.success(Jumbo(emojis))
 }
 
 fn paragraph_decoder() -> decode.Decoder(Block) {
@@ -343,8 +357,6 @@ fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
 
     CodeBlock(language, source) ->
       render_code_block(language, source, ctx.palette)
-
-    Jumbo(emojis) -> render_jumbo(emojis)
   }
 }
 

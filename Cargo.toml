@@ -106,8 +106,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 unicode-segmentation = "1"
 # `default-features = false` drops the general/alphabetic/numeric tables we
-# don't use; the `emoji` feature is enough for the EmojiStatus discrimination
-# in `sunset_markdown::parse`'s jumbo-detection path.
+# don't use; only the `emoji` feature is needed.
 unicode-properties = { version = "0.1", default-features = false, features = ["emoji"] }
 url = "2"
 sunset-store = { path = "crates/sunset-store" }

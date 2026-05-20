@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Document(pub Vec<Block>);
+pub enum Document {
+    Blocks(Vec<Block>),
+    Jumbo(Vec<String>),
+}
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,12 +28,8 @@ pub enum Block {
         language: Option<String>,
         source: String,
     },
-    Jumbo(Vec<String>),
 }
 
-/// Maximum emoji-cluster count for `Block::Jumbo`. The parser falls back to
-/// normal block parsing past this — beyond three, the rendered glyphs would
-/// push out of the message bubble.
 const MAX_JUMBO_EMOJI: usize = 3;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -65,10 +64,9 @@ mod inline;
 /// Parse a message body into a `Document`. Total: malformed input
 /// degrades to literal text rather than erroring.
 pub fn parse(input: &str) -> Document {
-    if let Some(emojis) = try_jumbo(input) {
-        Document(vec![Block::Jumbo(emojis)])
-    } else {
-        Document(blocks::split(input))
+    match try_jumbo(input) {
+        Some(emojis) => Document::Jumbo(emojis),
+        None => Document::Blocks(blocks::split(input)),
     }
 }
 
@@ -115,14 +113,19 @@ fn grapheme_base_is_pictographic(grapheme: &str) -> bool {
 /// Render a `Document` back to a flat string with all formatting markers
 /// stripped. Idempotent on already-plain text.
 pub fn to_plain(doc: &Document) -> String {
-    let mut out = String::new();
-    for (i, block) in doc.0.iter().enumerate() {
-        if i > 0 {
-            out.push_str("\n\n");
+    match doc {
+        Document::Jumbo(emojis) => emojis.concat(),
+        Document::Blocks(blocks) => {
+            let mut out = String::new();
+            for (i, block) in blocks.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("\n\n");
+                }
+                write_block(&mut out, block);
+            }
+            out
         }
-        write_block(&mut out, block);
     }
-    out
 }
 
 fn write_block(out: &mut String, block: &Block) {
@@ -159,11 +162,6 @@ fn write_block(out: &mut String, block: &Block) {
         Block::CodeBlock { source, .. } => {
             out.push_str(source);
         }
-        Block::Jumbo(emojis) => {
-            for e in emojis {
-                out.push_str(e);
-            }
-        }
     }
 }
 
@@ -194,14 +192,14 @@ mod tests {
 
     #[test]
     fn empty_input_is_empty_document() {
-        assert_eq!(parse(""), Document(Vec::new()));
+        assert_eq!(parse(""), Document::Blocks(Vec::new()));
     }
 
     #[test]
     fn plain_text_is_one_paragraph() {
         assert_eq!(
             parse("hello"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text(
                 "hello".to_owned()
             )])])
         );
@@ -211,7 +209,7 @@ mod tests {
     fn blank_line_splits_paragraphs() {
         assert_eq!(
             parse("first\n\nsecond"),
-            Document(vec![
+            Document::Blocks(vec![
                 Block::Paragraph(vec![Inline::Text("first".to_owned())]),
                 Block::Paragraph(vec![Inline::Text("second".to_owned())]),
             ])
@@ -222,7 +220,7 @@ mod tests {
     fn single_newline_in_paragraph_is_line_break() {
         assert_eq!(
             parse("first\nsecond"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("first".to_owned()),
                 Inline::LineBreak,
                 Inline::Text("second".to_owned()),
@@ -234,7 +232,7 @@ mod tests {
     fn trailing_blank_lines_dont_emit_empty_paragraph() {
         assert_eq!(
             parse("hello\n\n\n"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text(
                 "hello".to_owned()
             )])])
         );
@@ -244,7 +242,7 @@ mod tests {
     fn bold_wraps_inner_text() {
         assert_eq!(
             parse("a **b** c"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::Bold(vec![Inline::Text("b".to_owned())]),
                 Inline::Text(" c".to_owned()),
@@ -256,7 +254,7 @@ mod tests {
     fn unclosed_bold_degrades_to_literal_text() {
         assert_eq!(
             parse("a **b c"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text(
                 "a **b c".to_owned()
             )])])
         );
@@ -266,7 +264,7 @@ mod tests {
     fn empty_bold_pair_collapses_to_literal_text() {
         assert_eq!(
             parse("a **** b"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text(
                 "a **** b".to_owned()
             )])])
         );
@@ -276,7 +274,7 @@ mod tests {
     fn italic_with_asterisk() {
         assert_eq!(
             parse("a *b* c"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::Italic(vec![Inline::Text("b".to_owned())]),
                 Inline::Text(" c".to_owned()),
@@ -288,7 +286,7 @@ mod tests {
     fn italic_with_underscore() {
         assert_eq!(
             parse("a _b_ c"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::Italic(vec![Inline::Text("b".to_owned())]),
                 Inline::Text(" c".to_owned()),
@@ -303,7 +301,7 @@ mod tests {
         // is not alphanumeric".
         assert_eq!(
             parse("foo_bar_baz"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text(
                 "foo_bar_baz".to_owned()
             )])])
         );
@@ -313,7 +311,7 @@ mod tests {
     fn bold_wraps_italic() {
         assert_eq!(
             parse("**a *b* c**"),
-            Document(vec![Block::Paragraph(vec![Inline::Bold(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Bold(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::Italic(vec![Inline::Text("b".to_owned())]),
                 Inline::Text(" c".to_owned()),
@@ -325,7 +323,7 @@ mod tests {
     fn underline_double_underscore() {
         assert_eq!(
             parse("a __b__ c"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::Underline(vec![Inline::Text("b".to_owned())]),
                 Inline::Text(" c".to_owned()),
@@ -337,7 +335,7 @@ mod tests {
     fn underline_wraps_italic() {
         assert_eq!(
             parse("__a _b_ c__"),
-            Document(vec![Block::Paragraph(vec![Inline::Underline(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Underline(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::Italic(vec![Inline::Text("b".to_owned())]),
                 Inline::Text(" c".to_owned()),
@@ -349,7 +347,7 @@ mod tests {
     fn strikethrough() {
         assert_eq!(
             parse("a ~~b~~ c"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::Strikethrough(vec![Inline::Text("b".to_owned())]),
                 Inline::Text(" c".to_owned()),
@@ -361,7 +359,7 @@ mod tests {
     fn single_tilde_is_literal() {
         assert_eq!(
             parse("a ~b~ c"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text(
                 "a ~b~ c".to_owned()
             )])])
         );
@@ -371,7 +369,7 @@ mod tests {
     fn spoiler() {
         assert_eq!(
             parse("a ||secret|| c"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::Spoiler(vec![Inline::Text("secret".to_owned())]),
                 Inline::Text(" c".to_owned()),
@@ -383,7 +381,7 @@ mod tests {
     fn spoiler_wraps_bold() {
         assert_eq!(
             parse("||spoiler with **bold**||"),
-            Document(vec![Block::Paragraph(vec![Inline::Spoiler(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Spoiler(vec![
                 Inline::Text("spoiler with ".to_owned()),
                 Inline::Bold(vec![Inline::Text("bold".to_owned())]),
             ])])])
@@ -394,7 +392,7 @@ mod tests {
     fn inline_code() {
         assert_eq!(
             parse("a `b` c"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("a ".to_owned()),
                 Inline::InlineCode("b".to_owned()),
                 Inline::Text(" c".to_owned()),
@@ -406,7 +404,7 @@ mod tests {
     fn inline_code_does_not_parse_markdown_inside() {
         assert_eq!(
             parse("`**not bold**`"),
-            Document(vec![Block::Paragraph(vec![Inline::InlineCode(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::InlineCode(
                 "**not bold**".to_owned()
             )])])
         );
@@ -416,7 +414,7 @@ mod tests {
     fn unclosed_backtick_is_literal() {
         assert_eq!(
             parse("a `b c"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text(
                 "a `b c".to_owned()
             )])])
         );
@@ -426,7 +424,7 @@ mod tests {
     fn empty_backtick_pair_is_literal() {
         assert_eq!(
             parse("``"),
-            Document(vec![Block::Paragraph(vec![Inline::Text("``".to_owned())])])
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text("``".to_owned())])])
         );
     }
 
@@ -434,7 +432,7 @@ mod tests {
     fn masked_link_basic() {
         assert_eq!(
             parse("see [the docs](https://example.com) here"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("see ".to_owned()),
                 Inline::Link {
                     label: vec![Inline::Text("the docs".to_owned())],
@@ -450,7 +448,7 @@ mod tests {
     fn masked_link_label_can_contain_bold() {
         assert_eq!(
             parse("[**important**](https://x.com)"),
-            Document(vec![Block::Paragraph(vec![Inline::Link {
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Link {
                 label: vec![Inline::Bold(vec![Inline::Text("important".to_owned())])],
                 url: "https://x.com".to_owned(),
                 autolink: false,
@@ -465,7 +463,7 @@ mod tests {
         // punctuation and gets excluded from the URL.
         assert_eq!(
             parse("see [docs(https://example.com) here"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("see [docs(".to_owned()),
                 Inline::Link {
                     label: vec![Inline::Text("https://example.com".to_owned())],
@@ -481,7 +479,7 @@ mod tests {
     fn autolink_https() {
         assert_eq!(
             parse("see https://example.com here"),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("see ".to_owned()),
                 Inline::Link {
                     label: vec![Inline::Text("https://example.com".to_owned())],
@@ -497,7 +495,7 @@ mod tests {
     fn autolink_excludes_trailing_punctuation() {
         assert_eq!(
             parse("visit https://example.com."),
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("visit ".to_owned()),
                 Inline::Link {
                     label: vec![Inline::Text("https://example.com".to_owned())],
@@ -513,7 +511,7 @@ mod tests {
     fn autolink_at_start() {
         assert_eq!(
             parse("https://example.com"),
-            Document(vec![Block::Paragraph(vec![Inline::Link {
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Link {
                 label: vec![Inline::Text("https://example.com".to_owned())],
                 url: "https://example.com".to_owned(),
                 autolink: true,
@@ -525,7 +523,7 @@ mod tests {
     fn fenced_code_block_no_language() {
         assert_eq!(
             parse("```\nhello world\n```"),
-            Document(vec![Block::CodeBlock {
+            Document::Blocks(vec![Block::CodeBlock {
                 language: None,
                 source: "hello world".to_owned(),
             }])
@@ -536,7 +534,7 @@ mod tests {
     fn fenced_code_block_with_language() {
         assert_eq!(
             parse("```rust\nfn main() {}\n```"),
-            Document(vec![Block::CodeBlock {
+            Document::Blocks(vec![Block::CodeBlock {
                 language: Some("rust".to_owned()),
                 source: "fn main() {}".to_owned(),
             }])
@@ -547,7 +545,7 @@ mod tests {
     fn fenced_code_block_preserves_internal_blank_lines() {
         assert_eq!(
             parse("```\nline 1\n\nline 3\n```"),
-            Document(vec![Block::CodeBlock {
+            Document::Blocks(vec![Block::CodeBlock {
                 language: None,
                 source: "line 1\n\nline 3".to_owned(),
             }])
@@ -558,7 +556,7 @@ mod tests {
     fn fenced_code_block_does_not_parse_markdown_inside() {
         assert_eq!(
             parse("```\n**not bold**\n```"),
-            Document(vec![Block::CodeBlock {
+            Document::Blocks(vec![Block::CodeBlock {
                 language: None,
                 source: "**not bold**".to_owned(),
             }])
@@ -569,7 +567,7 @@ mod tests {
     fn single_line_quote() {
         assert_eq!(
             parse("> hello"),
-            Document(vec![Block::Quote(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Quote(vec![Block::Paragraph(vec![
                 Inline::Text("hello".to_owned())
             ])])])
         );
@@ -579,7 +577,7 @@ mod tests {
     fn quote_only_on_consecutive_lines() {
         assert_eq!(
             parse("> hello\nworld"),
-            Document(vec![
+            Document::Blocks(vec![
                 Block::Quote(vec![Block::Paragraph(vec![Inline::Text(
                     "hello".to_owned()
                 )])]),
@@ -592,7 +590,7 @@ mod tests {
     fn block_quote_to_end() {
         assert_eq!(
             parse(">>> hello\nworld\nmore"),
-            Document(vec![Block::Quote(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Quote(vec![Block::Paragraph(vec![
                 Inline::Text("hello".to_owned()),
                 Inline::LineBreak,
                 Inline::Text("world".to_owned()),
@@ -606,7 +604,7 @@ mod tests {
     fn quote_can_contain_bold() {
         assert_eq!(
             parse("> **important**"),
-            Document(vec![Block::Quote(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Quote(vec![Block::Paragraph(vec![
                 Inline::Bold(vec![Inline::Text("important".to_owned())])
             ])])])
         );
@@ -616,7 +614,7 @@ mod tests {
     fn unordered_list() {
         assert_eq!(
             parse("- one\n- two\n- three"),
-            Document(vec![Block::UnorderedList(vec![
+            Document::Blocks(vec![Block::UnorderedList(vec![
                 vec![Block::Paragraph(vec![Inline::Text("one".to_owned())])],
                 vec![Block::Paragraph(vec![Inline::Text("two".to_owned())])],
                 vec![Block::Paragraph(vec![Inline::Text("three".to_owned())])],
@@ -628,7 +626,7 @@ mod tests {
     fn list_item_can_contain_inline_formatting() {
         assert_eq!(
             parse("- **bold** item"),
-            Document(vec![Block::UnorderedList(vec![vec![Block::Paragraph(
+            Document::Blocks(vec![Block::UnorderedList(vec![vec![Block::Paragraph(
                 vec![
                     Inline::Bold(vec![Inline::Text("bold".to_owned())]),
                     Inline::Text(" item".to_owned()),
@@ -641,7 +639,7 @@ mod tests {
     fn list_ends_at_non_list_line() {
         assert_eq!(
             parse("- one\n- two\nafter"),
-            Document(vec![
+            Document::Blocks(vec![
                 Block::UnorderedList(vec![
                     vec![Block::Paragraph(vec![Inline::Text("one".to_owned())])],
                     vec![Block::Paragraph(vec![Inline::Text("two".to_owned())])],
@@ -655,7 +653,7 @@ mod tests {
     fn h1_h2_h3() {
         assert_eq!(
             parse("# one\n## two\n### three"),
-            Document(vec![
+            Document::Blocks(vec![
                 Block::Heading {
                     level: HeadingLevel::H1,
                     content: vec![Inline::Text("one".to_owned())],
@@ -676,7 +674,7 @@ mod tests {
     fn h4_or_more_is_paragraph() {
         assert_eq!(
             parse("#### not a heading"),
-            Document(vec![Block::Paragraph(vec![Inline::Text(
+            Document::Blocks(vec![Block::Paragraph(vec![Inline::Text(
                 "#### not a heading".to_owned()
             )])])
         );
@@ -686,7 +684,7 @@ mod tests {
     fn heading_can_contain_inline_formatting() {
         assert_eq!(
             parse("# **bold** title"),
-            Document(vec![Block::Heading {
+            Document::Blocks(vec![Block::Heading {
                 level: HeadingLevel::H1,
                 content: vec![
                     Inline::Bold(vec![Inline::Text("bold".to_owned())]),
@@ -748,7 +746,7 @@ mod tests {
         // emits it as a paragraph containing "```" then "hello".
         assert_eq!(
             result,
-            Document(vec![Block::Paragraph(vec![
+            Document::Blocks(vec![Block::Paragraph(vec![
                 Inline::Text("```".to_owned()),
                 Inline::LineBreak,
                 Inline::Text("hello".to_owned()),
@@ -756,12 +754,16 @@ mod tests {
         );
     }
 
-    // ----- Jumbo emoji -----
-
     fn jumbo(es: &[&str]) -> Document {
-        Document(vec![Block::Jumbo(
-            es.iter().map(|s| (*s).to_owned()).collect(),
-        )])
+        Document::Jumbo(es.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    fn assert_not_jumbo(body: &str) {
+        let parsed = parse(body);
+        assert!(
+            !matches!(parsed, Document::Jumbo(_)),
+            "expected {body:?} to NOT be jumbo, got {parsed:?}",
+        );
     }
 
     #[test]
@@ -780,56 +782,32 @@ mod tests {
     }
 
     #[test]
-    fn four_or_more_emoji_is_paragraph() {
-        // Beyond three the rendered glyphs would push past the bubble; the
-        // body falls back to a normal paragraph at the standard font size.
-        assert!(matches!(
-            parse("🌅🌙🔥👀"),
-            Document(blocks)
-                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
-        ));
+    fn four_or_more_emoji_is_not_jumbo() {
+        assert_not_jumbo("🌅🌙🔥👀");
     }
 
     #[test]
     fn surrounding_whitespace_doesnt_disqualify_jumbo() {
-        // A user typing "  🌅  " is still emoji-only.
         assert_eq!(parse("  🌅  "), jumbo(&["🌅"]));
         assert_eq!(parse("🌅 🌙"), jumbo(&["🌅", "🌙"]));
         assert_eq!(parse("\n🌅\t"), jumbo(&["🌅"]));
     }
 
     #[test]
-    fn mixed_text_and_emoji_is_paragraph() {
-        // Anything that mixes text and emoji renders normally.
-        assert!(matches!(
-            parse("hi 🌅"),
-            Document(blocks)
-                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
-        ));
-        assert!(matches!(
-            parse("🌅!"),
-            Document(blocks)
-                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
-        ));
+    fn mixed_text_and_emoji_is_not_jumbo() {
+        assert_not_jumbo("hi 🌅");
+        assert_not_jumbo("🌅!");
     }
 
     #[test]
     fn plain_text_is_not_jumbo() {
-        assert!(matches!(
-            parse("hello"),
-            Document(blocks)
-                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
-        ));
+        assert_not_jumbo("hello");
     }
 
     #[test]
     fn empty_is_not_jumbo() {
         for body in ["", "   ", "\n\t"] {
-            let parsed = parse(body);
-            assert!(
-                !contains_jumbo(&parsed),
-                "expected {body:?} to NOT be jumbo, got {parsed:?}",
-            );
+            assert_not_jumbo(body);
         }
     }
 
@@ -864,80 +842,48 @@ mod tests {
         // Digits, `#`, `*` carry `Emoji=YES` per Unicode but render as text
         // by default — they're keycap bases, not standalone emoji.
         for body in ["123", "1", "0", "#", "*", "##", "**", "*1"] {
-            let parsed = parse(body);
-            assert!(
-                matches!(parsed, Document(ref blocks)
-                    if blocks.first().is_none_or(|b| matches!(b, Block::Paragraph(_)))),
-                "expected {body:?} to NOT be jumbo, got {parsed:?}",
-            );
+            assert_not_jumbo(body);
         }
     }
 
     #[test]
     fn punctuation_only_is_not_jumbo() {
-        assert!(matches!(
-            parse("!!!"),
-            Document(blocks)
-                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
-        ));
-        assert!(matches!(
-            parse("..."),
-            Document(blocks)
-                if matches!(blocks.as_slice(), [Block::Paragraph(_)])
-        ));
+        assert_not_jumbo("!!!");
+        assert_not_jumbo("...");
     }
 
     #[test]
     fn to_plain_renders_jumbo_as_concatenated_emoji() {
-        let doc = parse("🌅🌙🔥");
-        assert_eq!(to_plain(&doc), "🌅🌙🔥");
-    }
-
-    fn contains_jumbo(doc: &Document) -> bool {
-        fn walk(block: &Block) -> bool {
-            match block {
-                Block::Jumbo(_) => true,
-                Block::Quote(blocks) => blocks.iter().any(walk),
-                Block::UnorderedList(items) => items.iter().flatten().any(walk),
-                Block::Paragraph(_) | Block::Heading { .. } | Block::CodeBlock { .. } => false,
-            }
-        }
-        doc.0.iter().any(walk)
+        assert_eq!(to_plain(&parse("🌅🌙🔥")), "🌅🌙🔥");
     }
 
     #[test]
-    fn jumbo_inside_quote_is_paragraph() {
-        let parsed = parse("> 🌅");
+    fn quoted_emoji_line_is_not_jumbo() {
         assert_eq!(
-            parsed,
-            Document(vec![Block::Quote(vec![Block::Paragraph(vec![
+            parse("> 🌅"),
+            Document::Blocks(vec![Block::Quote(vec![Block::Paragraph(vec![
                 Inline::Text("🌅".to_owned())
             ])])])
         );
-        assert!(!contains_jumbo(&parsed));
     }
 
     #[test]
-    fn jumbo_inside_unordered_list_is_paragraph() {
-        let parsed = parse("- 🌅");
+    fn listed_emoji_item_is_not_jumbo() {
         assert_eq!(
-            parsed,
-            Document(vec![Block::UnorderedList(vec![vec![Block::Paragraph(
+            parse("- 🌅"),
+            Document::Blocks(vec![Block::UnorderedList(vec![vec![Block::Paragraph(
                 vec![Inline::Text("🌅".to_owned())]
             )]])])
         );
-        assert!(!contains_jumbo(&parsed));
     }
 
     #[test]
     fn bare_zwj_only_is_not_jumbo() {
-        let parsed = parse("\u{200D}");
-        assert!(!contains_jumbo(&parsed));
+        assert_not_jumbo("\u{200D}");
     }
 
     #[test]
     fn bare_variation_selector_only_is_not_jumbo() {
-        let parsed = parse("\u{FE0F}");
-        assert!(!contains_jumbo(&parsed));
+        assert_not_jumbo("\u{FE0F}");
     }
 }
