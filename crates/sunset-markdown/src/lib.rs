@@ -25,12 +25,13 @@ pub enum Block {
         language: Option<String>,
         source: String,
     },
-    /// Produced only by `parse` as the entire document for bodies that are
-    /// 1–3 emoji grapheme clusters (modulo surrounding whitespace); never
-    /// nested. Renderers display these at a larger size (iMessage / Signal
-    /// "jumbo emoji").
     Jumbo(Vec<String>),
 }
+
+/// Maximum emoji-cluster count for `Block::Jumbo`. The parser falls back to
+/// normal block parsing past this — beyond three, the rendered glyphs would
+/// push out of the message bubble.
+const MAX_JUMBO_EMOJI: usize = 3;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,21 +72,19 @@ pub fn parse(input: &str) -> Document {
     }
 }
 
-/// `Some(graphemes)` for bodies that satisfy `Block::Jumbo`'s invariant;
-/// `None` otherwise.
 fn try_jumbo(input: &str) -> Option<Vec<String>> {
     use unicode_segmentation::UnicodeSegmentation;
 
-    let mut emojis: Vec<String> = Vec::with_capacity(3);
+    let mut emojis: Vec<String> = Vec::with_capacity(MAX_JUMBO_EMOJI);
     for grapheme in input.trim().graphemes(true) {
         if grapheme.chars().all(char::is_whitespace) {
             continue;
         }
-        if !is_pictographic(grapheme) {
+        if !grapheme_base_is_pictographic(grapheme) {
             return None;
         }
         emojis.push(grapheme.to_owned());
-        if emojis.len() > 3 {
+        if emojis.len() > MAX_JUMBO_EMOJI {
             return None;
         }
     }
@@ -96,22 +95,16 @@ fn try_jumbo(input: &str) -> Option<Vec<String>> {
     }
 }
 
-fn is_pictographic(grapheme: &str) -> bool {
+fn grapheme_base_is_pictographic(grapheme: &str) -> bool {
     use unicode_properties::UnicodeEmoji;
     use unicode_properties::emoji::EmojiStatus;
 
-    // Blacklist the three non-pictographic `EmojiStatus` variants:
-    //   NonEmoji                       — plain text (`!`, `.`, letters, …)
-    //   NonEmojiButEmojiComponent      — bare ZWJ / variation selectors / etc.
-    //   EmojiOtherAndEmojiComponent    — keycap-base codepoints (digits,
-    //                                    `#`, `*`) that carry Emoji=YES
-    //                                    but default to text rendering.
-    // Anything else qualifies. New `EmojiStatus` variants from upstream
-    // default to "qualifies" — the right additive direction for an
-    // emoji classifier.
-    grapheme.chars().next().is_some_and(|first| {
+    // Blacklist (not whitelist) so new `EmojiStatus` variants from upstream
+    // default to "qualifies as pictographic" — the additive-safe direction
+    // for an emoji classifier.
+    grapheme.chars().next().is_some_and(|base| {
         !matches!(
-            first.emoji_status(),
+            base.emoji_status(),
             EmojiStatus::NonEmoji
                 | EmojiStatus::NonEmojiButEmojiComponent
                 | EmojiStatus::EmojiOtherAndEmojiComponent
@@ -831,14 +824,10 @@ mod tests {
 
     #[test]
     fn empty_is_not_jumbo() {
-        // The parser already treats empty/whitespace bodies as a non-emoji
-        // shape (existing tests pin `parse("")` to `Document(Vec::new())`).
-        // The jumbo path must agree — never produce a `Block::Jumbo([])`.
         for body in ["", "   ", "\n\t"] {
             let parsed = parse(body);
             assert!(
-                !matches!(&parsed, Document(blocks)
-                    if blocks.iter().any(|b| matches!(b, Block::Jumbo(_)))),
+                !contains_jumbo(&parsed),
                 "expected {body:?} to NOT be jumbo, got {parsed:?}",
             );
         }

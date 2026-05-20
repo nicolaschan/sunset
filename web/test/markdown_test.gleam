@@ -248,31 +248,29 @@ pub fn to_plain_returns_something_with_text_test() {
   should.be_true(string.contains(result, "bold"))
 }
 
-pub fn render_jumbo_one_emoji_test() {
-  let html = render_html([markdown.Jumbo(["🌅"])])
+fn assert_jumbo_renders(emojis: List(String), count: String, font_size: String) {
+  let html = render_html([markdown.Jumbo(emojis)])
   should.be_true(string.contains(html, "data-testid=\"emoji-jumbo\""))
-  should.be_true(string.contains(html, "data-emoji-count=\"1\""))
-  should.be_true(string.contains(html, "font-size: 54px"))
-  should.be_true(string.contains(html, "🌅"))
+  should.be_true(string.contains(html, "data-emoji-count=\"" <> count <> "\""))
+  should.be_true(string.contains(html, "font-size: " <> font_size))
+  should.be_true(string.contains(html, "line-height: 1.15"))
+  should.be_true(string.contains(html, "margin-top: 2px"))
+  should.be_true(string.contains(html, string.concat(emojis)))
+}
+
+pub fn render_jumbo_one_emoji_test() {
+  assert_jumbo_renders(["🌅"], "1", "54px")
 }
 
 pub fn render_jumbo_two_emoji_test() {
-  let html = render_html([markdown.Jumbo(["🌅", "🌙"])])
-  should.be_true(string.contains(html, "data-emoji-count=\"2\""))
-  should.be_true(string.contains(html, "font-size: 44px"))
-  should.be_true(string.contains(html, "🌅🌙"))
+  assert_jumbo_renders(["🌅", "🌙"], "2", "44px")
 }
 
 pub fn render_jumbo_three_emoji_test() {
-  let html = render_html([markdown.Jumbo(["🌅", "🌙", "🔥"])])
-  should.be_true(string.contains(html, "data-emoji-count=\"3\""))
-  should.be_true(string.contains(html, "font-size: 36px"))
-  should.be_true(string.contains(html, "🌅🌙🔥"))
+  assert_jumbo_renders(["🌅", "🌙", "🔥"], "3", "36px")
 }
 
 pub fn render_paragraph_does_not_emit_jumbo_testid_test() {
-  // Sibling guard: the jumbo testid must come only from a Jumbo block,
-  // never bleed into normal-paragraph rendering.
   let html = render_html([markdown.Paragraph([markdown.Text("hello")])])
   should.be_false(string.contains(html, "emoji-jumbo"))
   should.be_false(string.contains(html, "data-emoji-count"))

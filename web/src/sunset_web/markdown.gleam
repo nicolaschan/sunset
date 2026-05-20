@@ -348,10 +348,6 @@ fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
   }
 }
 
-/// Render a 1–3 emoji body at the iMessage-style "jumbo" size. The count
-/// drives the font-size choice and rides through the DOM as a `data-emoji-count`
-/// attribute so the e2e suite can pin per-N sizing. `data-testid` is the
-/// stable hook for those tests.
 fn render_jumbo(emojis: List(String)) -> Element(msg) {
   let count = list.length(emojis)
   html.div(
