@@ -6,13 +6,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sunset_store::{
     AcceptAllVerifier, ContentBlock, Cursor, EntryStream, Error, Event, EventStream, Filter, Hash,
-    Replay, Result, SignatureVerifier, SignedKvEntry, Store, VerifyingKey,
+    Replay, Result, SignatureVerifier, SignedKvEntry, Store, Subscription, SubscriptionList,
+    VerifyingKey,
 };
 use tokio::sync::Mutex;
 use tokio_rusqlite::Connection;
 
 use crate::schema;
-use crate::subscription::SubscriptionList;
 use crate::{blobs, kv};
 
 pub struct FsStore {
@@ -57,7 +57,7 @@ impl FsStore {
             root: Arc::new(root),
             conn,
             verifier,
-            subscriptions: Arc::new(SubscriptionList::new()),
+            subscriptions: Arc::new(SubscriptionList::default()),
             writer_mutex: Arc::new(Mutex::new(())),
         })
     }
@@ -168,8 +168,6 @@ impl Store for FsStore {
     }
 
     async fn subscribe<'a>(&'a self, filter: Filter, replay: Replay) -> Result<EventStream<'a>> {
-        use crate::subscription::Subscription;
-
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event>>();
         let sub = Arc::new(Subscription {
             filter: filter.clone(),

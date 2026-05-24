@@ -6,11 +6,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sunset_store::{
     ContentBlock, Cursor, Error, Event, Hash, Result, SignatureVerifier, SignedKvEntry, Store,
-    VerifyingKey,
+    Subscription, SubscriptionList, VerifyingKey,
 };
 use tokio::sync::Mutex;
-
-use crate::subscription::{Subscription, SubscriptionList};
 
 /// Composite key: `(verifying_key, name)`.
 type KvKey = (VerifyingKey, bytes::Bytes);

@@ -16,10 +16,10 @@ futures.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, optional = true }
+tokio.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
 
 [features]
-test-helpers = ["dep:tokio"]
+test-helpers = []

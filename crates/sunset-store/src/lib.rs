@@ -6,6 +6,7 @@ pub mod canonical;
 pub mod error;
 pub mod filter;
 pub mod store;
+pub mod subscription;
 pub mod types;
 pub mod verifier;
 
@@ -19,5 +20,6 @@ pub use canonical::{datagram_signing_payload, signing_payload};
 pub use error::{Error, Result};
 pub use filter::{Event, Filter, Replay};
 pub use store::{EntryStream, EventStream, Store};
+pub use subscription::{Subscription, SubscriptionList};
 pub use types::{ContentBlock, Cursor, Hash, SignedDatagram, SignedKvEntry, VerifyingKey};
 pub use verifier::{AcceptAllVerifier, SignatureVerifier};
