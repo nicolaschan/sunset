@@ -119,61 +119,8 @@ impl Liveness {
     pub async fn observe(&self, peer: PeerId, sender_time: SystemTime) {
         let now = self.clock.now();
         let mut inner = self.inner.lock().await;
-        // First: process the new observation.
-        let observe_change = match inner.peers.get_mut(&peer) {
-            Some(entry) if sender_time <= entry.last_heard_at => None,
-            Some(entry) => {
-                let was_live = entry.state == LivenessState::Live;
-                entry.last_heard_at = sender_time;
-                entry.state = LivenessState::Live;
-                if was_live {
-                    None
-                } else {
-                    Some(PeerLivenessChange {
-                        peer: peer.clone(),
-                        state: LivenessState::Live,
-                        last_heard_at: sender_time,
-                    })
-                }
-            }
-            None => {
-                inner.peers.insert(
-                    peer.clone(),
-                    PeerEntry {
-                        last_heard_at: sender_time,
-                        state: LivenessState::Live,
-                    },
-                );
-                Some(PeerLivenessChange {
-                    peer: peer.clone(),
-                    state: LivenessState::Live,
-                    last_heard_at: sender_time,
-                })
-            }
-        };
-        // Second: sweep all OTHER peers and emit Stale for any timed out.
-        let stale_after = self.stale_after;
-        let mut stale_changes: Vec<PeerLivenessChange> = Vec::new();
-        for (other_peer, entry) in inner.peers.iter_mut() {
-            if other_peer == &peer {
-                continue;
-            }
-            if entry.state == LivenessState::Live
-                && now
-                    .duration_since(entry.last_heard_at)
-                    .ok()
-                    .is_some_and(|d| d > stale_after)
-            {
-                entry.state = LivenessState::Stale;
-                stale_changes.push(PeerLivenessChange {
-                    peer: other_peer.clone(),
-                    state: LivenessState::Stale,
-                    last_heard_at: entry.last_heard_at,
-                });
-            }
-        }
-        // Broadcast: stale events first, then the new observation.
-        // Order matches Task 4 test `observe_triggers_sweep_for_other_peers`.
+        let observe_change = Self::record_observation(&mut inner, &peer, sender_time);
+        let stale_changes = Self::sweep_stale(&mut inner, now, self.stale_after, Some(&peer));
         for c in &stale_changes {
             broadcast(&mut inner.subscribers, c);
         }
@@ -237,9 +184,72 @@ impl Liveness {
     pub async fn run_sweep(&self) {
         let now = self.clock.now();
         let mut inner = self.inner.lock().await;
-        let stale_after = self.stale_after;
-        let mut to_emit: Vec<PeerLivenessChange> = Vec::new();
+        let stale_changes = Self::sweep_stale(&mut inner, now, self.stale_after, None);
+        for c in &stale_changes {
+            broadcast(&mut inner.subscribers, c);
+        }
+    }
+
+    /// Apply the observation to `peer`'s entry, returning the resulting
+    /// state change if one occurred. Out-of-order (older than stored)
+    /// observations leave state untouched and return `None`. Live→Live
+    /// is silent (`None`); None→Live and Stale→Live both emit `Live`.
+    /// Caller must hold the inner lock.
+    fn record_observation(
+        inner: &mut Inner,
+        peer: &PeerId,
+        sender_time: SystemTime,
+    ) -> Option<PeerLivenessChange> {
+        use std::collections::hash_map::Entry;
+        match inner.peers.entry(peer.clone()) {
+            Entry::Occupied(mut occ) => {
+                let entry = occ.get_mut();
+                if sender_time <= entry.last_heard_at {
+                    return None;
+                }
+                let was_live = entry.state == LivenessState::Live;
+                entry.last_heard_at = sender_time;
+                entry.state = LivenessState::Live;
+                if was_live {
+                    None
+                } else {
+                    Some(PeerLivenessChange {
+                        peer: peer.clone(),
+                        state: LivenessState::Live,
+                        last_heard_at: sender_time,
+                    })
+                }
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(PeerEntry {
+                    last_heard_at: sender_time,
+                    state: LivenessState::Live,
+                });
+                Some(PeerLivenessChange {
+                    peer: peer.clone(),
+                    state: LivenessState::Live,
+                    last_heard_at: sender_time,
+                })
+            }
+        }
+    }
+
+    /// Walk every peer (optionally skipping `except`) and transition
+    /// any `Live` entry whose `last_heard_at` is older than `stale_after`
+    /// relative to `now` into `Stale`, returning the resulting change
+    /// events. Idempotent — already-`Stale` entries are untouched.
+    /// Caller must hold the inner lock.
+    fn sweep_stale(
+        inner: &mut Inner,
+        now: SystemTime,
+        stale_after: Duration,
+        except: Option<&PeerId>,
+    ) -> Vec<PeerLivenessChange> {
+        let mut changes = Vec::new();
         for (peer, entry) in inner.peers.iter_mut() {
+            if except == Some(peer) {
+                continue;
+            }
             if entry.state == LivenessState::Live
                 && now
                     .duration_since(entry.last_heard_at)
@@ -247,16 +257,14 @@ impl Liveness {
                     .is_some_and(|d| d > stale_after)
             {
                 entry.state = LivenessState::Stale;
-                to_emit.push(PeerLivenessChange {
+                changes.push(PeerLivenessChange {
                     peer: peer.clone(),
                     state: LivenessState::Stale,
                     last_heard_at: entry.last_heard_at,
                 });
             }
         }
-        for change in &to_emit {
-            broadcast(&mut inner.subscribers, change);
-        }
+        changes
     }
 
     /// Convenience: observe an event whose decoded payload knows its
