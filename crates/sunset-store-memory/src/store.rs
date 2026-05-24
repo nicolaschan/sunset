@@ -6,11 +6,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sunset_store::{
     ContentBlock, Cursor, Error, Event, Hash, Result, SignatureVerifier, SignedKvEntry, Store,
-    VerifyingKey,
+    Subscription, SubscriptionList, VerifyingKey,
 };
 use tokio::sync::Mutex;
-
-use crate::subscription::{Subscription, SubscriptionList};
 
 /// Composite key: `(verifying_key, name)`.
 type KvKey = (VerifyingKey, bytes::Bytes);
@@ -120,16 +118,14 @@ impl Store for MemoryStore {
                 sequence,
             },
         );
-        // Broadcast WHILE holding the inner lock to serialize with subscribe.
-        if let Some(old) = prev {
-            self.subscriptions
-                .broadcast(&Event::Replaced { old, new: entry });
+        // Broadcasts run WHILE holding the inner lock to serialize with subscribe.
+        let entry_event = if let Some(old) = prev {
+            Event::Replaced { old, new: entry }
         } else {
-            self.subscriptions.broadcast(&Event::Inserted(entry));
-        }
-        if let Some(h) = blob_added_hash {
-            self.subscriptions.broadcast(&Event::BlobAdded(h));
-        }
+            Event::Inserted(entry)
+        };
+        self.subscriptions
+            .publish_insert(&entry_event, blob_added_hash);
         Ok(())
     }
 

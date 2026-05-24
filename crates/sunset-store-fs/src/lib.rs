@@ -6,6 +6,5 @@ mod gc;
 mod kv;
 mod schema;
 mod store;
-mod subscription;
 
 pub use store::FsStore;

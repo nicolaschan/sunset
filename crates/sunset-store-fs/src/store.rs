@@ -6,13 +6,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sunset_store::{
     AcceptAllVerifier, ContentBlock, Cursor, EntryStream, Error, Event, EventStream, Filter, Hash,
-    Replay, Result, SignatureVerifier, SignedKvEntry, Store, VerifyingKey,
+    Replay, Result, SignatureVerifier, SignedKvEntry, Store, Subscription, SubscriptionList,
+    VerifyingKey,
 };
 use tokio::sync::Mutex;
 use tokio_rusqlite::Connection;
 
 use crate::schema;
-use crate::subscription::SubscriptionList;
 use crate::{blobs, kv};
 
 pub struct FsStore {
@@ -57,7 +57,7 @@ impl FsStore {
             root: Arc::new(root),
             conn,
             verifier,
-            subscriptions: Arc::new(SubscriptionList::new()),
+            subscriptions: Arc::new(SubscriptionList::default()),
             writer_mutex: Arc::new(Mutex::new(())),
         })
     }
@@ -109,22 +109,18 @@ impl Store for FsStore {
             .await
             .map_err(unwrap_store_error)?;
 
-        // Broadcasts are sent under the writer_mutex by virtue of `_w` above —
-        // do not drop the guard before this block.
-        match outcome {
-            kv::InsertOutcome::Inserted => {
-                self.subscriptions.broadcast(&Event::Inserted(entry));
-            }
-            kv::InsertOutcome::Replaced { old, .. } => {
-                self.subscriptions
-                    .broadcast(&Event::Replaced { old, new: entry });
-            }
-        }
-        if blob_was_new {
-            if let Some(b) = blob {
-                self.subscriptions.broadcast(&Event::BlobAdded(b.hash()));
-            }
-        }
+        // Broadcasts run WHILE holding `_w` above — do not drop the guard
+        // before this block.
+        let entry_event = match outcome {
+            kv::InsertOutcome::Inserted => Event::Inserted(entry),
+            kv::InsertOutcome::Replaced { old, .. } => Event::Replaced { old, new: entry },
+        };
+        let blob_added = if blob_was_new {
+            blob.map(|b| b.hash())
+        } else {
+            None
+        };
+        self.subscriptions.publish_insert(&entry_event, blob_added);
 
         Ok(())
     }
@@ -168,8 +164,6 @@ impl Store for FsStore {
     }
 
     async fn subscribe<'a>(&'a self, filter: Filter, replay: Replay) -> Result<EventStream<'a>> {
-        use crate::subscription::Subscription;
-
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event>>();
         let sub = Arc::new(Subscription {
             filter: filter.clone(),

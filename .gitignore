@@ -32,3 +32,8 @@ desktop/gen/
 # Bake stamp left by `desktop/scripts/bake-icons.sh` to avoid redundant
 # re-renders. The icon PNG/ICO/ICNS outputs themselves are committed.
 desktop/icons/.bake-stamp
+
+# Per-run artifacts written by the `review-fix-loop` / `overnight-cleanup`
+# skills. Mirrored to `~/.claude/overnight-runs/` for durable storage;
+# the in-tree copy is just scratch.
+.review-fix-loop/
