@@ -108,6 +108,21 @@ fn spawn_accept_loop<T: crate::transport::Transport + 'static>(
     });
 }
 
+/// Extract the filter-hash component from a `_sunset-sync/subscribe/<hex>/<hex>`
+/// entry name. Returns None if the name doesn't have the expected shape.
+fn decode_filter_hash_from_name(name: &[u8]) -> Option<crate::routing::FilterHash> {
+    let prefix = crate::routing::SUBSCRIBE_PREFIX;
+    let rest = name.strip_prefix(prefix)?;
+    let rest = std::str::from_utf8(rest).ok()?;
+    let (hash_hex, _) = rest.split_once('/')?;
+    if hash_hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hash_hex, &mut out).ok()?;
+    Some(out)
+}
+
 /// A command sent from the public API into the running engine.
 pub(crate) enum EngineCommand {
     AddPeer {
@@ -210,9 +225,7 @@ pub(crate) struct PeerSession {
     /// What this peer currently wants from me, keyed by `FilterHash` for
     /// O(1) Withdrawn lookups (the entry name carries the hash, not the
     /// filter). Populated by the SUBSCRIBE_PREFIX branch in
-    /// handle_local_store_event (added in a later task); cleared with the
-    /// session on peer drop.
-    #[allow(dead_code)]
+    /// handle_local_store_event; cleared with the session on peer drop.
     pub(crate) interests:
         std::collections::HashMap<crate::routing::FilterHash, sunset_store::Filter>,
 }
@@ -1165,6 +1178,66 @@ where
                         }
                     }
                 }
+            }
+        } else if entry.name.as_ref().starts_with(crate::routing::SUBSCRIBE_PREFIX) {
+            let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
+                return;
+            };
+            let Ok(sub_entry) =
+                postcard::from_bytes::<crate::routing::SubscriptionEntry>(&block.data)
+            else {
+                tracing::warn!(
+                    name = %String::from_utf8_lossy(&entry.name),
+                    "malformed SubscriptionEntry value; ignoring"
+                );
+                return;
+            };
+            let Some(filter_hash) = decode_filter_hash_from_name(&entry.name) else {
+                tracing::warn!(
+                    name = %String::from_utf8_lossy(&entry.name),
+                    "SUBSCRIBE_PREFIX entry with malformed name; ignoring"
+                );
+                return;
+            };
+            let receiver = PeerId(entry.verifying_key.clone());
+            let is_self_authored = entry.verifying_key == self.local_peer.0;
+
+            match sub_entry {
+                crate::routing::SubscriptionEntry::Active { filter, provider }
+                    if provider == self.local_peer =>
+                {
+                    let was_new = {
+                        let mut state = self.state.lock().await;
+                        if let Some(session) = state.peer_sessions.get_mut(&receiver) {
+                            session.interests.insert(filter_hash, filter.clone()).is_none()
+                        } else {
+                            // Receiver isn't connected right now; their entry
+                            // will replay through this branch when they
+                            // reconnect (the engine emits a per-entry replay
+                            // on AddPeer via the existing bootstrap path).
+                            return;
+                        }
+                    };
+                    if was_new && !is_self_authored {
+                        let state = self.state.lock().await;
+                        if let Some(session) = state.peer_sessions.get(&receiver) {
+                            let _ = session.tx.send(SyncMessage::DigestRequest {
+                                filter,
+                                range: DigestRange::All,
+                            });
+                        }
+                    }
+                }
+                crate::routing::SubscriptionEntry::Withdrawn => {
+                    let mut state = self.state.lock().await;
+                    if let Some(session) = state.peer_sessions.get_mut(&receiver) {
+                        session.interests.remove(&filter_hash);
+                    }
+                }
+                // Active naming someone else: Phase 3 recursive subscription
+                // will revisit (we may want to subscribe upstream). Phase 2
+                // ignores.
+                _ => {}
             }
         }
 
