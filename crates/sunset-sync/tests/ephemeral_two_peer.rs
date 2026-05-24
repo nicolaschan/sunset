@@ -14,9 +14,11 @@ use bytes::Bytes;
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use sunset_store::{
-    AcceptAllVerifier, Filter, SignedDatagram, VerifyingKey, canonical::datagram_signing_payload,
+    AcceptAllVerifier, Filter, SignedDatagram, Store as _, VerifyingKey,
+    canonical::datagram_signing_payload,
 };
 use sunset_store_memory::MemoryStore;
+use sunset_sync::routing::{SubscriptionPolicy, subscription_name};
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine, TrustSet};
 
@@ -56,6 +58,7 @@ fn build_engine(
     addr: &str,
 ) -> (
     Rc<SyncEngine<MemoryStore, sunset_sync::test_transport::TestTransport>>,
+    Arc<MemoryStore>,
     Arc<StubSigner>,
 ) {
     let signer = Arc::new(StubSigner::new(seed));
@@ -66,13 +69,13 @@ fn build_engine(
         PeerAddr::new(Bytes::copy_from_slice(addr.as_bytes())),
     );
     let engine = Rc::new(SyncEngine::new(
-        store,
+        store.clone(),
         transport,
         SyncConfig::default(),
         local_peer,
         signer.clone() as Arc<dyn Signer>,
     ));
-    (engine, signer)
+    (engine, store, signer)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -81,8 +84,8 @@ async fn ephemeral_routes_subscriber_match() {
     local
         .run_until(async {
             let net = TestNetwork::new();
-            let (alice, alice_signer) = build_engine(&net, [1u8; 32], "alice");
-            let (bob, _bob_signer) = build_engine(&net, [2u8; 32], "bob");
+            let (alice, alice_store, alice_signer) = build_engine(&net, [1u8; 32], "alice");
+            let (bob, _bob_store, _bob_signer) = build_engine(&net, [2u8; 32], "bob");
 
             // Run both engines first — public APIs like set_trust /
             // add_peer go through the engine's command channel and won't
@@ -100,20 +103,16 @@ async fn ephemeral_routes_subscriber_match() {
             alice.set_trust(TrustSet::All).await.unwrap();
             bob.set_trust(TrustSet::All).await.unwrap();
 
-            // Bob subscribes to voice/ FIRST so the registry entry is in
-            // Bob's store before the bootstrap digest exchange runs. After
-            // alice connects, Bob's bootstrap digest will already contain
-            // the subscription entry, so alice will pull it during the
-            // initial digest round.
-            bob.publish_subscription(
-                Filter::NamePrefix(Bytes::from_static(b"voice/")),
-                Duration::from_secs(60),
-            )
-            .await
-            .unwrap();
-            let mut bob_sub = bob
-                .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
-                .await;
+            // Bob subscribes to voice/ FIRST so the per-(filter,
+            // provider=alice) SubscriptionEntry is in Bob's store before
+            // alice connects. After PeerHello, sync replicates that
+            // entry to alice; alice's engine processes it and populates
+            // `peer_sessions[bob].interests`, arming the forward path.
+            let voice_filter = Filter::NamePrefix(Bytes::from_static(b"voice/"));
+            bob.subscribe(voice_filter.clone(), SubscriptionPolicy::store_data())
+                .await
+                .unwrap();
+            let mut bob_sub = bob.subscribe_ephemeral(voice_filter.clone()).await;
 
             // Connect alice → bob (triggers PeerHello + bootstrap digest).
             alice
@@ -121,13 +120,22 @@ async fn ephemeral_routes_subscriber_match() {
                 .await
                 .unwrap();
 
-            // Wait for Alice's registry to learn Bob's filter via the
-            // bootstrap digest exchange / EventDelivery push. Poll instead
-            // of a flat sleep so the test isn't flaky on slow CI.
+            // Wait for Bob's SubscriptionEntry::Active(provider=alice)
+            // to land in alice's store. The new path writes per-(filter,
+            // provider) entries instead of populating the legacy
+            // `state.registry`, so observe the on-the-wire artifact.
             let bob_vk = _bob_signer.vk();
+            let alice_pid = PeerId(alice_signer.vk());
+            let expected_name = subscription_name(&voice_filter, &alice_pid);
             let propagated = async {
                 loop {
-                    if alice.knows_peer_subscription(&bob_vk).await {
+                    if alice_store
+                        .get_entry(&bob_vk, &expected_name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;

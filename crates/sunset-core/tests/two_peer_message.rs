@@ -29,6 +29,7 @@ use sunset_core::{
 };
 use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
+use sunset_sync::routing::{SubscriptionPolicy, subscription_name};
 use sunset_sync::test_helpers::wait_for;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
@@ -107,21 +108,29 @@ async fn alice_encrypts_bob_decrypts() {
             });
 
             // ---- bob declares interest in #general ----
+            let bob_filter = room_messages_filter(&bob_room);
             bob_engine
-                .publish_subscription(room_messages_filter(&bob_room), Duration::from_secs(60))
+                .subscribe(bob_filter.clone(), SubscriptionPolicy::store_data())
                 .await
                 .unwrap();
 
             // ---- alice connects to bob ----
             alice_engine.add_peer(bob_addr).await.unwrap();
 
+            // Wait for Bob's SubscriptionEntry::Active(provider=alice)
+            // to land in alice's store; equivalent under the new path
+            // to "alice has learned bob's interest".
+            let expected_name = subscription_name(&bob_filter, &alice_peer);
             let registered = wait_for(
                 Duration::from_secs(2),
                 Duration::from_millis(20),
                 || async {
-                    alice_engine
-                        .knows_peer_subscription(&bob.store_verifying_key())
+                    alice_store
+                        .get_entry(&bob.store_verifying_key(), &expected_name)
                         .await
+                        .ok()
+                        .flatten()
+                        .is_some()
                 },
             )
             .await;

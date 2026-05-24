@@ -7,6 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use sunset_store::{ContentBlock, Filter, SignedKvEntry, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
+use sunset_sync::routing::SubscriptionPolicy;
 use sunset_sync::test_helpers::wait_for;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
@@ -81,7 +82,10 @@ async fn alice_writes_bob_receives() {
 
             // Bob declares interest in the `chat` keyspace.
             bob_engine
-                .publish_subscription(Filter::Keyspace(vk(b"chat")), Duration::from_secs(60))
+                .subscribe(
+                    Filter::Keyspace(vk(b"chat")),
+                    SubscriptionPolicy::store_data(),
+                )
                 .await
                 .unwrap();
 
