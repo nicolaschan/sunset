@@ -343,8 +343,8 @@ where
     /// `SignedDatagram` whose `(verifying_key, name)` matches the
     /// filter to this receiver. Subscription is in-process only; for
     /// remote peers to route ephemeral traffic to us, the caller must
-    /// also publish the filter via `publish_subscription` (the Bus
-    /// layer does this transparently in `bus.subscribe`).
+    /// also publish the filter via `subscribe` / `subscribe_via` (the
+    /// Bus layer does this transparently in `bus.subscribe`).
     pub async fn subscribe_ephemeral(
         &self,
         filter: Filter,
@@ -354,12 +354,13 @@ where
         rx
     }
 
-    /// Publish a signed ephemeral datagram. Routes via the subscription
-    /// registry: every peer whose filter matches receives the datagram
-    /// over the unreliable channel. Locally, in-process subscribers
-    /// whose filter matches also receive a copy. Fire-and-forget — does
-    /// NOT verify the signature on send (the caller is the signer); does
-    /// NOT persist; does NOT retry. Returns `Ok(())` even if no peers
+    /// Publish a signed ephemeral datagram. Routes via the routing
+    /// substrate (peer_sessions interests / Routes): every peer whose
+    /// filter matches receives the datagram over the unreliable
+    /// channel. Locally, in-process subscribers whose filter matches
+    /// also receive a copy. Fire-and-forget — does NOT verify the
+    /// signature on send (the caller is the signer); does NOT
+    /// persist; does NOT retry. Returns `Ok(())` even if no peers
     /// match.
     pub async fn publish_ephemeral(&self, datagram: sunset_store::SignedDatagram) -> Result<()> {
         // Loopback: deliver to local subscribers first.
@@ -755,8 +756,8 @@ where
                 .await;
                 // Wake the `add_peer().await` caller now that
                 // `peer_sessions` is populated, so an immediately-
-                // following `publish_subscription` / `insert` lands a
-                // peer to push to. We also pass `kind` through the
+                // following `subscribe` / `insert` lands a peer to
+                // push to. We also pass `kind` through the
                 // oneshot so the supervisor can write
                 // `(peer_id, kind)` atomically — without it, the
                 // supervisor would have to wait for the separate
@@ -847,9 +848,9 @@ where
     /// of our entries matching `filter`; the receiver uses its own
     /// store + the bloom to compute "entries we have that the sender
     /// doesn't" and replies with those as `EventDelivery`. Reused
-    /// for both the per-peer bootstrap exchange (filter =
-    /// SUBSCRIBE_NAME) and the post-`publish_subscription` catch-up
-    /// exchange (filter = the just-published subscription's filter).
+    /// for both the per-peer bootstrap exchange (filter prefix =
+    /// SUBSCRIBE_PREFIX) and the post-`subscribe` catch-up exchange
+    /// (filter = the just-subscribed filter).
     async fn send_filter_digest(&self, to: &PeerId, filter: &Filter) {
         let bloom = match build_digest(
             &*self.store,
@@ -1116,19 +1117,20 @@ where
         // Push flow.
         //
         // Self-authored entries are broadcast to every currently-connected
-        // peer regardless of registry filter. The registry-driven push is
-        // only safe once bootstrap-digest has primed the registry with the
-        // peer's filter; for an entry inserted right after `add_peer`
-        // returns (e.g., the very first `publish_subscription` of a
-        // freshly-connected client), the registry may still be empty and
-        // a registry-filtered push would lose the entry on the floor
-        // until anti-entropy (default 30 s) caught up. My own entries
-        // going to my own peers don't need filter consent — the receiving
-        // peer is free to route or drop based on its own rules.
+        // peer regardless of routes / peer_sessions interests. The
+        // routes-driven push is only safe once bootstrap-digest +
+        // SUBSCRIBE_PREFIX backfill have primed peer_sessions with the
+        // peer's interests; for an entry inserted right after `add_peer`
+        // returns (e.g., the very first `subscribe` of a freshly-
+        // connected client), interests may still be empty and a
+        // routes-filtered push would lose the entry on the floor until
+        // anti-entropy (default 30 s) caught up. My own entries going to
+        // my own peers don't need filter consent — the receiving peer is
+        // free to route or drop based on its own rules.
         //
-        // Forwarded entries (authored by someone else) keep registry-
-        // filtered semantics: a relay MUST NOT broadcast a third party's
-        // chat traffic to peers whose subscription doesn't match.
+        // Forwarded entries (authored by someone else) keep
+        // routes-filtered semantics: a relay MUST NOT broadcast a third
+        // party's chat traffic to peers whose subscription doesn't match.
         let blob = self
             .store
             .get_content(&entry.value_hash)

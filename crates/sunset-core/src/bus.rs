@@ -209,11 +209,11 @@ mod tests {
             Arc::new(identity.clone()) as Arc<dyn Signer>,
         ));
         let bus = BusImpl::new(store, engine.clone(), identity.clone());
-        // bus.subscribe calls engine.publish_subscription, which sends a
-        // command to the engine's run loop and awaits a oneshot ack —
-        // it deadlocks unless run() is driving the loop. Spawn run()
-        // here so all bus-level tests get a working engine for free;
-        // tests should `.abort()` the handle in their cleanup.
+        // bus.subscribe calls engine.subscribe, which sends a command
+        // to the engine's run loop and awaits a oneshot ack — it
+        // deadlocks unless run() is driving the loop. Spawn run() here
+        // so all bus-level tests get a working engine for free; tests
+        // should `.abort()` the handle in their cleanup.
         let run_handle = tokio::task::spawn_local(async move {
             let _ = engine.run().await;
         });
