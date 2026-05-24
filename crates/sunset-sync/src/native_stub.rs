@@ -26,9 +26,7 @@ macro_rules! native_stub_impls {
         impl $connection {
             fn stub_err(detail: &str) -> ::sunset_sync::Error {
                 let crate_name = env!("CARGO_PKG_NAME");
-                ::sunset_sync::Error::Transport(::std::format!(
-                    "{crate_name}: native stub{detail}"
-                ))
+                ::sunset_sync::Error::Transport(::std::format!("{crate_name}: native stub{detail}"))
             }
         }
 
