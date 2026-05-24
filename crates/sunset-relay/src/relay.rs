@@ -457,7 +457,13 @@ impl RelayHandle {
 
         // Subscription publish + federated dials happen on the engine side.
         self.engine
-            .publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))
+            .subscribe(
+                self.subscription_filter.clone(),
+                sunset_sync::routing::SubscriptionPolicy {
+                    target_n: 0,
+                    freshness_threshold: Duration::from_secs(30),
+                },
+            )
             .await?;
         tracing::info!("published broad subscription");
         self.dial_configured_peers().await;
@@ -505,7 +511,13 @@ impl RelayHandle {
         let _serve_task = tokio::spawn(async move { axum::serve(listener, app).await });
 
         self.engine
-            .publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))
+            .subscribe(
+                self.subscription_filter.clone(),
+                sunset_sync::routing::SubscriptionPolicy {
+                    target_n: 0,
+                    freshness_threshold: Duration::from_secs(30),
+                },
+            )
             .await?;
         self.dial_configured_peers().await;
 

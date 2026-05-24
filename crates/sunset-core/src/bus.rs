@@ -120,11 +120,14 @@ where
     async fn subscribe(&self, filter: Filter) -> Result<LocalBoxStream<'static, BusEvent>> {
         use futures::stream::StreamExt as _;
 
-        // Publish our subscription so peers learn what we want. TTL is
-        // 1 hour; consumers that need a different lifetime can call
-        // engine.publish_subscription directly.
+        // Publish our subscription so peers learn what we want via the
+        // high-level subscribe API (records a BroadcastIntent and
+        // auto-resubscribes on PeerHello).
         self.engine
-            .publish_subscription(filter.clone(), std::time::Duration::from_secs(3600))
+            .subscribe(
+                filter.clone(),
+                sunset_sync::routing::SubscriptionPolicy::store_data(),
+            )
             .await
             .map_err(|e| crate::Error::Sync(format!("{e}")))?;
 

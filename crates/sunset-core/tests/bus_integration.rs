@@ -23,27 +23,28 @@ use futures::StreamExt as _;
 use rand_core::OsRng;
 
 use sunset_core::{Bus, BusEvent, BusImpl, Identity};
-use sunset_store::{AcceptAllVerifier, Filter};
+use sunset_store::{AcceptAllVerifier, Filter, Store};
 use sunset_store_memory::MemoryStore;
+use sunset_sync::routing::subscription_name;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine, TrustSet};
 
 type TestEngine = SyncEngine<MemoryStore, sunset_sync::test_transport::TestTransport>;
+type TestBus = BusImpl<MemoryStore, sunset_sync::test_transport::TestTransport>;
+type Built = (
+    TestBus,
+    Rc<TestEngine>,
+    Arc<MemoryStore>,
+    tokio::task::JoinHandle<()>,
+    Identity,
+);
 
 /// Build a bus + engine wired into `net` at the transport address `addr`.
 /// Spawns `engine.run()` so subsequent engine commands (set_trust,
-/// add_peer, publish_subscription) actually make progress instead of
-/// deadlocking on the engine's command channel. The returned
-/// `JoinHandle` is the caller's responsibility to abort during cleanup.
-fn build(
-    net: &TestNetwork,
-    addr: &str,
-) -> (
-    BusImpl<MemoryStore, sunset_sync::test_transport::TestTransport>,
-    Rc<TestEngine>,
-    tokio::task::JoinHandle<()>,
-    Identity,
-) {
+/// add_peer, subscribe) actually make progress instead of deadlocking on
+/// the engine's command channel. The returned `JoinHandle` is the
+/// caller's responsibility to abort during cleanup.
+fn build(net: &TestNetwork, addr: &str) -> Built {
     let identity = Identity::generate(&mut OsRng);
     let local_peer = PeerId(identity.store_verifying_key());
     let store = Arc::new(MemoryStore::new(Arc::new(AcceptAllVerifier)));
@@ -60,14 +61,14 @@ fn build(
         local_peer,
         Arc::new(identity.clone()) as Arc<dyn Signer>,
     ));
-    let bus = BusImpl::new(store, engine.clone(), identity.clone());
+    let bus = BusImpl::new(store.clone(), engine.clone(), identity.clone());
     let run_handle = {
         let engine = engine.clone();
         tokio::task::spawn_local(async move {
             let _ = engine.run().await;
         })
     };
-    (bus, engine, run_handle, identity)
+    (bus, engine, store, run_handle, identity)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -76,8 +77,10 @@ async fn ephemeral_publish_arrives_at_remote_subscriber() {
     local
         .run_until(async {
             let net = TestNetwork::new();
-            let (alice_bus, alice_engine, alice_run, _alice_identity) = build(&net, "alice");
-            let (bob_bus, alice_view_of_bob, bob_run, bob_identity) = build(&net, "bob");
+            let (alice_bus, alice_engine, alice_store, alice_run, alice_identity) =
+                build(&net, "alice");
+            let (bob_bus, alice_view_of_bob, _bob_store, bob_run, bob_identity) =
+                build(&net, "bob");
 
             // Trust everyone in the test. Must come AFTER engine.run()
             // is spawned (set_trust round-trips through the engine's
@@ -101,13 +104,27 @@ async fn ephemeral_publish_arrives_at_remote_subscriber() {
                 .await
                 .unwrap();
 
-            // Wait for Alice's registry to learn Bob's filter. Poll
-            // `knows_peer_subscription` so we don't depend on a flat
-            // sleep — flaky on slow CI.
+            // Wait for Bob's SubscriptionEntry::Active to land in
+            // Alice's store: Bob's `engine.subscribe` writes a
+            // per-(filter, provider=alice) entry to Bob's store, which
+            // sync replicates to Alice, which then populates Alice's
+            // `peer_sessions[bob].interests`. Poll the store directly
+            // rather than depending on internal engine state.
             let bob_vk = bob_identity.store_verifying_key();
+            let alice_pid = PeerId(alice_identity.store_verifying_key());
+            let expected_name = subscription_name(
+                &Filter::NamePrefix(Bytes::from_static(b"voice/")),
+                &alice_pid,
+            );
             let propagated = async {
                 loop {
-                    if alice_engine.knows_peer_subscription(&bob_vk).await {
+                    if alice_store
+                        .get_entry(&bob_vk, &expected_name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;

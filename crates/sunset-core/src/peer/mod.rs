@@ -97,41 +97,20 @@ where
             crate::signaling::RelaySignaler::new(self.identity.clone(), fp.to_hex(), &self.store);
         self.rtc_signaler_dispatcher.register(fp, signaler.clone());
 
-        // Publish the room subscription.
+        // Publish the room subscription via the high-level subscribe
+        // API (records a BroadcastIntent + auto-resubscribes on
+        // PeerHello, so we don't need an explicit renewal loop here).
         let filter = crate::filters::room_filter(&room);
         self.engine
-            .publish_subscription(filter, std::time::Duration::from_secs(3600))
+            .subscribe(
+                filter,
+                sunset_sync::routing::SubscriptionPolicy::store_data(),
+            )
             .await
-            .map_err(|e| crate::Error::Other(format!("publish_subscription: {e}")))?;
+            .map_err(|e| crate::Error::Other(format!("subscribe: {e}")))?;
 
         // Build cancel signal up front so we can hand it to background tasks.
         let cancel = Rc::new(std::cell::Cell::new(false));
-
-        // Spawn the subscription renewal task. Re-publishes at TTL/2.
-        let engine_for_renewal = self.engine.clone();
-        let room_for_renewal = room.clone();
-        let cancel_for_renewal = cancel.clone();
-        const SUBSCRIPTION_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-        sunset_sync::spawn::spawn_local(async move {
-            #[cfg(not(target_arch = "wasm32"))]
-            use tokio::time::sleep;
-            #[cfg(target_arch = "wasm32")]
-            use wasmtimer::tokio::sleep;
-            let renewal = SUBSCRIPTION_TTL / 2;
-            loop {
-                sleep(renewal).await;
-                if cancel_for_renewal.get() {
-                    return;
-                }
-                let f = crate::filters::room_filter(&room_for_renewal);
-                if let Err(e) = engine_for_renewal
-                    .publish_subscription(f, SUBSCRIPTION_TTL)
-                    .await
-                {
-                    tracing::warn!("subscription renewal failed: {e}");
-                }
-            }
-        });
 
         // The per-room signaler doesn't need a strong ref on RoomState:
         // RelaySignaler::new spawned its dispatcher task with its own

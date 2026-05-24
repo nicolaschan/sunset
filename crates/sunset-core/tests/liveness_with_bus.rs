@@ -17,12 +17,21 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 use sunset_core::{Bus, BusEvent, BusImpl, HasSenderTime, Identity, Liveness, LivenessState};
-use sunset_store::{AcceptAllVerifier, Filter};
+use sunset_store::{AcceptAllVerifier, Filter, Store};
 use sunset_store_memory::MemoryStore;
+use sunset_sync::routing::subscription_name;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine, TrustSet};
 
 type TestEngine = SyncEngine<MemoryStore, sunset_sync::test_transport::TestTransport>;
+type TestBus = BusImpl<MemoryStore, sunset_sync::test_transport::TestTransport>;
+type Built = (
+    TestBus,
+    Rc<TestEngine>,
+    Arc<MemoryStore>,
+    tokio::task::JoinHandle<()>,
+    Identity,
+);
 
 /// Mimics what a real consumer (e.g. voice) would publish inside its
 /// encrypted payload — a sender-claimed timestamp + opaque bytes.
@@ -48,15 +57,7 @@ impl HasSenderTime for TestEvent {
     }
 }
 
-fn build(
-    net: &TestNetwork,
-    addr: &str,
-) -> (
-    BusImpl<MemoryStore, sunset_sync::test_transport::TestTransport>,
-    Rc<TestEngine>,
-    tokio::task::JoinHandle<()>,
-    Identity,
-) {
+fn build(net: &TestNetwork, addr: &str) -> Built {
     let identity = Identity::generate(&mut OsRng);
     let local_peer = PeerId(identity.store_verifying_key());
     let store = Arc::new(MemoryStore::new(Arc::new(AcceptAllVerifier)));
@@ -71,14 +72,14 @@ fn build(
         local_peer,
         Arc::new(identity.clone()) as Arc<dyn Signer>,
     ));
-    let bus = BusImpl::new(store, engine.clone(), identity.clone());
+    let bus = BusImpl::new(store.clone(), engine.clone(), identity.clone());
     let run_handle = {
         let engine = engine.clone();
         tokio::task::spawn_local(async move {
             let _ = engine.run().await;
         })
     };
-    (bus, engine, run_handle, identity)
+    (bus, engine, store, run_handle, identity)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -87,8 +88,10 @@ async fn liveness_tracks_alice_via_bob_bus_subscription() {
     local
         .run_until(async {
             let net = TestNetwork::new();
-            let (alice_bus, alice_engine, alice_run, alice_identity) = build(&net, "alice");
-            let (bob_bus, alice_view_of_bob, bob_run, bob_identity) = build(&net, "bob");
+            let (alice_bus, alice_engine, alice_store, alice_run, alice_identity) =
+                build(&net, "alice");
+            let (bob_bus, alice_view_of_bob, _bob_store, bob_run, bob_identity) =
+                build(&net, "bob");
 
             alice_engine.set_trust(TrustSet::All).await.unwrap();
             alice_view_of_bob.set_trust(TrustSet::All).await.unwrap();
@@ -106,11 +109,26 @@ async fn liveness_tracks_alice_via_bob_bus_subscription() {
                 .await
                 .unwrap();
 
-            // Wait for Alice's registry to learn Bob's filter.
+            // Wait for Bob's SubscriptionEntry::Active(provider=alice)
+            // to land in Alice's store. The new subscribe path writes
+            // per-(filter, provider) entries instead of populating the
+            // legacy `state.registry`, so we observe the on-the-wire
+            // artifact directly rather than poking engine state.
             let bob_vk = bob_identity.store_verifying_key();
+            let alice_pid = PeerId(alice_identity.store_verifying_key());
+            let expected_name = subscription_name(
+                &Filter::NamePrefix(Bytes::from_static(b"liveness-test/")),
+                &alice_pid,
+            );
             let propagated = async {
                 loop {
-                    if alice_engine.knows_peer_subscription(&bob_vk).await {
+                    if alice_store
+                        .get_entry(&bob_vk, &expected_name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
