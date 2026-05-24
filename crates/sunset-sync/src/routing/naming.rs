@@ -37,6 +37,21 @@ pub fn subscription_name(filter: &Filter, provider: &PeerId) -> Bytes {
     ))
 }
 
+/// Extract the filter-hash component from a `_sunset-sync/subscribe/<hex>/<hex>`
+/// entry name. Returns None if the name doesn't have the expected shape.
+/// Inverse of `subscription_name`.
+pub fn decode_filter_hash_from_name(name: &[u8]) -> Option<crate::routing::FilterHash> {
+    let rest = name.strip_prefix(SUBSCRIBE_PREFIX)?;
+    let rest = std::str::from_utf8(rest).ok()?;
+    let (hash_hex, _) = rest.split_once('/')?;
+    if hash_hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hash_hex, &mut out).ok()?;
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +103,15 @@ mod tests {
         assert!(parts.next().is_none());
         assert_eq!(filter_hex.len(), 64); // blake3 = 32 bytes = 64 hex chars
         assert_eq!(provider_hex, hex::encode(b"provider-1"));
+    }
+
+    #[test]
+    fn subscription_name_decode_round_trip() {
+        let f = Filter::Namespace(Bytes::from_static(b"room/x"));
+        let p = pid(b"provider");
+        let name = subscription_name(&f, &p);
+        let hash = decode_filter_hash_from_name(&name).expect("decode");
+        assert_eq!(hash, crate::routing::filter_hash(&f));
     }
 
     #[test]

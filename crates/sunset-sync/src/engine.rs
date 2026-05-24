@@ -106,21 +106,6 @@ fn spawn_accept_loop<T: crate::transport::Transport + 'static>(
     });
 }
 
-/// Extract the filter-hash component from a `_sunset-sync/subscribe/<hex>/<hex>`
-/// entry name. Returns None if the name doesn't have the expected shape.
-fn decode_filter_hash_from_name(name: &[u8]) -> Option<crate::routing::FilterHash> {
-    let prefix = crate::routing::SUBSCRIBE_PREFIX;
-    let rest = name.strip_prefix(prefix)?;
-    let rest = std::str::from_utf8(rest).ok()?;
-    let (hash_hex, _) = rest.split_once('/')?;
-    if hash_hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(hash_hex, &mut out).ok()?;
-    Some(out)
-}
-
 /// A command sent from the public API into the running engine.
 pub(crate) enum EngineCommand {
     AddPeer {
@@ -1075,7 +1060,8 @@ where
                 );
                 return;
             };
-            let Some(filter_hash) = decode_filter_hash_from_name(&entry.name) else {
+            let Some(filter_hash) = crate::routing::decode_filter_hash_from_name(&entry.name)
+            else {
                 tracing::warn!(
                     name = %String::from_utf8_lossy(&entry.name),
                     "SUBSCRIBE_PREFIX entry with malformed name; ignoring"

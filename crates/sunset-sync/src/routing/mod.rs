@@ -23,7 +23,10 @@ pub mod types;
 
 pub use coverage::covers;
 pub use forward::forward_targets;
-pub use naming::{LINKS_NAME, PROVIDER_TICK_NAME, SUBSCRIBE_PREFIX, subscription_name};
+pub use naming::{
+    LINKS_NAME, PROVIDER_TICK_NAME, SUBSCRIBE_PREFIX, decode_filter_hash_from_name,
+    subscription_name,
+};
 pub use policy::SubscriptionPolicy;
 pub use routes::{BroadcastIntent, FilterHash, Outbound, OutboundKey, Routes, filter_hash};
 pub use types::{LinkState, Neighbor, ProviderTick, SubscriptionEntry};
