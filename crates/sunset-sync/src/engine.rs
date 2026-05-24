@@ -130,6 +130,15 @@ pub(crate) enum EngineCommand {
         provider: PeerId,
         ack: oneshot::Sender<Result<()>>,
     },
+    Subscribe {
+        filter: Filter,
+        policy: crate::routing::SubscriptionPolicy,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    Unsubscribe {
+        filter: Filter,
+        ack: oneshot::Sender<Result<()>>,
+    },
     SetTrust {
         trust: TrustSet,
         ack: oneshot::Sender<Result<()>>,
@@ -464,6 +473,36 @@ where
         rx.await.map_err(|_| Error::Closed)?
     }
 
+    /// Declare interest in `filter` from any directly-connected peer.
+    /// Implemented as an auto-resubscriber: for each currently-connected
+    /// peer, calls `subscribe_via`; on future peer connects, the
+    /// engine's AddPeer handler re-runs `subscribe_via` for any active
+    /// intent.
+    pub async fn subscribe(
+        &self,
+        filter: Filter,
+        policy: crate::routing::SubscriptionPolicy,
+    ) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::Subscribe {
+                filter,
+                policy,
+                ack,
+            })
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Cancel a `subscribe()`. Idempotent.
+    pub async fn unsubscribe(&self, filter: Filter) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::Unsubscribe { filter, ack })
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
     /// Replace the trust set. Subsequent inbound events are filtered
     /// against the new set.
     pub async fn set_trust(&self, trust: TrustSet) -> Result<()> {
@@ -640,6 +679,18 @@ where
                 ack,
             } => {
                 let r = self.do_unsubscribe_via(filter, provider).await;
+                let _ = ack.send(r);
+            }
+            EngineCommand::Subscribe {
+                filter,
+                policy,
+                ack,
+            } => {
+                let r = self.do_subscribe(filter, policy).await;
+                let _ = ack.send(r);
+            }
+            EngineCommand::Unsubscribe { filter, ack } => {
+                let r = self.do_unsubscribe(filter).await;
                 let _ = ack.send(r);
             }
             EngineCommand::SetTrust { trust, ack } => {
@@ -1465,6 +1516,58 @@ where
             .insert(entry, Some(block))
             .await
             .map_err(Error::Store)?;
+        Ok(())
+    }
+
+    /// Declare interest in `filter` from any directly-connected peer.
+    /// Records a `BroadcastIntent` and calls `subscribe_via` for every
+    /// peer currently in `peer_sessions`. The auto-resubscriber hook on
+    /// AddPeer (added in a later task) replays for future peer
+    /// connects.
+    async fn do_subscribe(
+        &self,
+        filter: Filter,
+        policy: crate::routing::SubscriptionPolicy,
+    ) -> Result<()> {
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let peers: Vec<PeerId> = {
+            let mut state = self.state.lock().await;
+            state.routes.broadcast_intents.insert(
+                filter_hash,
+                crate::routing::BroadcastIntent {
+                    filter: filter.clone(),
+                    policy,
+                },
+            );
+            state.peer_sessions.keys().cloned().collect()
+        };
+        for peer in peers {
+            self.do_subscribe_via(filter.clone(), peer, policy).await?;
+        }
+        Ok(())
+    }
+
+    /// Cancel a `subscribe()` — clear the broadcast intent and
+    /// `unsubscribe_via` every `(filter, provider)` pair it produced.
+    /// Idempotent.
+    async fn do_unsubscribe(&self, filter: Filter) -> Result<()> {
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let providers: Vec<PeerId> = {
+            let mut state = self.state.lock().await;
+            if state.routes.broadcast_intents.remove(&filter_hash).is_none() {
+                return Ok(());
+            }
+            state
+                .routes
+                .my_subs
+                .keys()
+                .filter(|k| k.filter_hash == filter_hash)
+                .map(|k| k.provider.clone())
+                .collect()
+        };
+        for provider in providers {
+            self.do_unsubscribe_via(filter.clone(), provider).await?;
+        }
         Ok(())
     }
 
