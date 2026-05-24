@@ -212,13 +212,13 @@ pub type Model {
     /// `on_pick` does — toggle a reaction on a message, or insert into
     /// the composer draft.
     full_picker_target: Option(FullPickerTarget),
-    /// Click-relative position of the trigger that opened the desktop
-    /// full emoji picker, plus the viewport height at the time of the
-    /// click. `None` for sheet-mode (mobile) opens; for desktop opens
-    /// it lets the overlay anchor itself near the trigger and decide
-    /// whether there's space to render below or above. Cleared on
+    /// Click coordinates + viewport dimensions captured when the
+    /// trigger opened the desktop full emoji picker. `None` for
+    /// sheet-mode (mobile) opens; for desktop opens it lets the
+    /// overlay anchor itself near the trigger (both horizontally and
+    /// vertically) and clamp to the visible viewport. Cleared on
     /// `CloseFullEmojiPicker`.
-    full_picker_anchor: Option(#(Float, Float)),
+    full_picker_anchor: Option(domain.PickerAnchor),
     /// Per-target reaction state from the bridge tracker. TEMPORARILY
     /// global on the merged branch — the reactions tracker in
     /// sunset-core::reactions is currently per-Client (not per-room).
@@ -336,7 +336,10 @@ pub type Msg {
   /// is captured by the trigger's click decoder on desktop so the
   /// overlay can anchor itself to the click; mobile uses a bottom
   /// sheet and passes `None`.
-  OpenFullEmojiPicker(target: FullPickerTarget, anchor: Option(#(Float, Float)))
+  OpenFullEmojiPicker(
+    target: FullPickerTarget,
+    anchor: Option(domain.PickerAnchor),
+  )
   CloseFullEmojiPicker
   /// Insert an emoji into the active room's composer draft at the
   /// textarea's current cursor position. Dispatched by the composer
@@ -2453,21 +2456,18 @@ fn room_view_with_state(
     model.full_picker_target,
     model.full_picker_anchor
   {
-    domain.Desktop, Some(target), Some(#(anchor_y, viewport_h)) ->
+    domain.Desktop, Some(target), Some(anchor) ->
       html.div(
         [
           attribute.attribute("data-testid", "full-emoji-picker-overlay"),
-          // Position the picker against the click anchor:
-          //   * `top` is clamped via CSS to keep the picker fully on-
-          //     screen even at the viewport edges.
-          //   * `left` is centered horizontally — the picker is
-          //     ~360px wide, so we offset by 180px and clamp to keep
-          //     a small gutter from the edges.
-          // Vertical placement flips above the trigger when there
-          // isn't ~`PICKER_HEIGHT + 16px` of room below the click,
-          // so the picker doesn't visually fall off the bottom of
-          // the viewport.
-          ui.css(picker_anchor_styles(palette, anchor_y, viewport_h)),
+          // Position the picker against the click anchor (both axes).
+          // Horizontal: center on the click X, clamped to keep the
+          // picker on-screen. Vertical: flip above the trigger when
+          // there isn't `PICKER_HEIGHT + 16px` of room below the
+          // click, so the picker doesn't fall off the bottom — the
+          // composer-side trigger is always near the viewport bottom
+          // and almost always flips above.
+          ui.css(picker_anchor_styles(palette, anchor)),
         ],
         [
           emoji_picker.view(
@@ -3193,45 +3193,63 @@ pub fn relay_status_pill(
 /// `viewport_h` is the live `view.innerHeight`).
 ///
 /// Placement rule: open below the trigger when there's at least one
-/// picker height + 16px of room; otherwise flip above. Horizontal
-/// position is centered on the right side of the chat (the trigger
-/// always sits in the message-row toolbar at the right edge), with a
-/// `clamp` to keep the picker fully on-screen. The picker is sized
-/// at ~360×400px by emoji-picker-element's defaults.
+/// picker height + 8px of room; otherwise flip above. Horizontally,
+/// center the picker on the click X, clamped so the picker stays
+/// fully on-screen with an 8px gutter on either side. The picker is
+/// ~360×410px by emoji-picker-element's defaults.
 fn picker_anchor_styles(
   palette: theme.Palette,
-  anchor_y: Float,
-  viewport_h: Float,
+  anchor: domain.PickerAnchor,
 ) -> List(#(String, String)) {
   let picker_h = 410.0
+  let picker_w = 360.0
   let gap = 8.0
-  let space_below = viewport_h -. anchor_y
+  let edge_gutter = 8.0
+  let domain.PickerAnchor(
+    client_x: anchor_x,
+    client_y: anchor_y,
+    viewport_h: viewport_h,
+  ) = anchor
   // Vertical placement:
   //   * room below → place picker just below the trigger
   //   * not enough room below → flip above the trigger
+  let space_below = viewport_h -. anchor_y
   let top_css = case space_below >. picker_h +. gap {
     True ->
-      "clamp(8px, "
+      "clamp("
+      <> float_px(edge_gutter)
+      <> ", "
       <> float_px(anchor_y +. gap)
       <> ", calc(100dvh - "
-      <> float_px(picker_h +. 8.0)
+      <> float_px(picker_h +. edge_gutter)
       <> "))"
     False ->
-      "clamp(8px, "
+      "clamp("
+      <> float_px(edge_gutter)
+      <> ", "
       <> float_px(anchor_y -. picker_h -. gap)
       <> ", calc(100dvh - "
-      <> float_px(picker_h +. 8.0)
+      <> float_px(picker_h +. edge_gutter)
       <> "))"
   }
-  // Horizontal: keep the picker right-anchored in the chat column —
-  // the trigger sits at the right edge of the message row, so
-  // pinning the picker's right edge a small gutter inside the
-  // viewport's right edge feels natural.
-  let right_css = "clamp(8px, 16px, calc(100dvw - 372px))"
+  // Horizontal: center the picker on the click, then clamp so it
+  // stays on-screen. Works for triggers on either side of the chat
+  // (reaction picker triggers from the right of message rows;
+  // composer picker triggers from the left of the composer). The
+  // right-edge bound is in `100dvw` units so the browser handles
+  // viewport changes without us re-rendering.
+  let left_css =
+    "clamp("
+    <> float_px(edge_gutter)
+    <> ", "
+    <> float_px(anchor_x -. picker_w /. 2.0)
+    <> ", calc(100dvw - "
+    <> float_px(picker_w +. edge_gutter)
+    <> "))"
   [
     #("position", "fixed"),
     #("top", top_css),
-    #("right", right_css),
+    #("left", left_css),
     #("z-index", "100"),
     #("background", palette.surface),
     #("border", "1px solid " <> palette.border),

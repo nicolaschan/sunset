@@ -20,8 +20,8 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Attachment, type ChannelId, type Member, type MessageView, type Reaction,
-  ChannelId, OfflineP,
+  type Attachment, type ChannelId, type Member, type MessageView,
+  type PickerAnchor, type Reaction, ChannelId, OfflineP, PickerAnchor,
 }
 import sunset_web/markdown
 import sunset_web/sunset
@@ -47,11 +47,9 @@ pub fn view(
   detail_msg_id detail_msg_id: Option(String),
   on_toggle_reaction_picker on_react_toggle: fn(String) -> msg,
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker on_open_full_picker: fn(String, Option(#(Float, Float))) ->
+  on_open_full_picker on_open_full_picker: fn(String, Option(PickerAnchor)) ->
     msg,
-  on_open_composer_emoji_picker on_open_composer_emoji_picker: fn(
-    #(Float, Float),
-  ) ->
+  on_open_composer_emoji_picker on_open_composer_emoji_picker: fn(PickerAnchor) ->
     msg,
   on_open_detail on_open_detail: fn(String) -> msg,
   on_open_image on_open_image: fn(Attachment) -> msg,
@@ -167,7 +165,7 @@ fn messages_list(
   detail_msg_id: Option(String),
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
+  on_open_full_picker: fn(String, Option(PickerAnchor)) -> msg,
   on_open_detail: fn(String) -> msg,
   on_open_image: fn(Attachment) -> msg,
   receipts: Dict(String, Dict(String, Int)),
@@ -256,7 +254,7 @@ fn message_view(
   selected: Bool,
   on_react_toggle: fn(String) -> msg,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
+  on_open_full_picker: fn(String, Option(PickerAnchor)) -> msg,
   on_open_detail: fn(String) -> msg,
   on_open_image: fn(Attachment) -> msg,
   on_toggle_selected: fn(String) -> msg,
@@ -527,7 +525,7 @@ fn reaction_picker(
   p: Palette,
   msg_id: String,
   on_add_reaction: fn(String, String) -> msg,
-  on_open_full_picker: fn(String, Option(#(Float, Float))) -> msg,
+  on_open_full_picker: fn(String, Option(PickerAnchor)) -> msg,
 ) -> Element(msg) {
   let quick_buttons =
     list.map(quick_reactions, fn(emoji) {
@@ -558,17 +556,20 @@ fn reaction_picker(
       [
         attribute.title("More reactions"),
         attribute.attribute("data-testid", "reaction-picker-more"),
-        // Capture the click's `clientY` and the live viewport height
-        // (`view.innerHeight`) so the desktop overlay can decide
-        // whether there's more room above or below the trigger before
-        // it positions itself. Both fields are read directly off the
-        // MouseEvent — the `view` accessor is the WindowProxy that
-        // owns the document, which is non-null for any UIEvent fired
-        // from a click.
+        // Capture the click's `clientX` / `clientY` plus the live
+        // viewport height (`view.innerHeight`) so the desktop overlay
+        // can position itself near the trigger on both axes and flip
+        // above vs below depending on remaining room. Read directly
+        // off the MouseEvent — `view` is the WindowProxy that owns
+        // the document, non-null for any UIEvent fired from a click.
         event.on("click", {
+          use cx <- decode.subfield(["clientX"], decode.float)
           use cy <- decode.subfield(["clientY"], decode.float)
           use vh <- decode.subfield(["view", "innerHeight"], decode.float)
-          decode.success(on_open_full_picker(msg_id, option.Some(#(cy, vh))))
+          decode.success(on_open_full_picker(
+            msg_id,
+            option.Some(PickerAnchor(client_x: cx, client_y: cy, viewport_h: vh)),
+          ))
         }),
         ui.css([
           #("width", "32px"),
@@ -914,7 +915,7 @@ fn composer(
   on_remove_attachment: fn(Int) -> msg,
   noop: msg,
   on_shortcut: fn(String, String, String, Bool) -> msg,
-  on_open_emoji_picker: fn(#(Float, Float)) -> msg,
+  on_open_emoji_picker: fn(PickerAnchor) -> msg,
 ) -> Element(msg) {
   // The composer's outer height drives the column-bottom seam shared
   // with the channels-rail self-bar and the members-rail you_row (64px); the
@@ -1203,14 +1204,14 @@ fn attach_button(p: Palette, on_click: msg) -> Element(msg) {
 /// Composer-side emoji picker trigger. Desktop only — phones have the
 /// native OS emoji keyboard, so the button is rendered as
 /// `element.fragment([])` (no DOM) on `domain.Phone`. The trigger
-/// captures the click's `clientY` + the live `view.innerHeight` so the
-/// overlay can anchor itself near the button and decide whether to
-/// flip above the trigger (composer sits at the bottom of the
-/// viewport, so most opens will flip-above).
+/// captures the click's coordinates + viewport height so the overlay
+/// can anchor itself near the button on both axes. The composer sits
+/// at the bottom of the viewport, so most opens flip-above the
+/// trigger.
 fn emoji_picker_button(
   p: Palette,
   viewport: domain.Viewport,
-  on_open: fn(#(Float, Float)) -> msg,
+  on_open: fn(PickerAnchor) -> msg,
 ) -> Element(msg) {
   case viewport {
     domain.Phone -> element.fragment([])
@@ -1221,9 +1222,12 @@ fn emoji_picker_button(
           attribute.attribute("aria-label", "Insert emoji"),
           attribute.attribute("data-testid", "composer-emoji-picker-trigger"),
           event.on("click", {
+            use cx <- decode.subfield(["clientX"], decode.float)
             use cy <- decode.subfield(["clientY"], decode.float)
             use vh <- decode.subfield(["view", "innerHeight"], decode.float)
-            decode.success(on_open(#(cy, vh)))
+            decode.success(
+              on_open(PickerAnchor(client_x: cx, client_y: cy, viewport_h: vh)),
+            )
           }),
           ui.css([
             #("display", "inline-flex"),

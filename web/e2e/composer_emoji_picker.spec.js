@@ -109,6 +109,53 @@ test("mobile: emoji button is hidden (native OS emoji keyboard covers this)", as
   await ctx.close();
 });
 
+// The picker pops up near the trigger button — the composer button
+// lives at the left of the composer (next to the upload-image icon),
+// so the picker must anchor near the left edge of the chat column,
+// not at the right edge of the viewport (where the reaction picker
+// opens because its trigger sits on the right of message rows).
+test("desktop: composer picker opens horizontally near the trigger button", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "desktop-only feature",
+  );
+  const { ctx, page } = await openChat(browser);
+
+  const trigger = page.locator(
+    '[data-testid="composer-emoji-picker-trigger"]',
+  );
+  const triggerBox = await trigger.boundingBox();
+  expect(triggerBox).not.toBeNull();
+
+  await trigger.click();
+  const overlay = page.locator('[data-testid="full-emoji-picker-overlay"]');
+  await expect(overlay).toBeVisible({ timeout: 10_000 });
+
+  const overlayBox = await overlay.boundingBox();
+  expect(overlayBox).not.toBeNull();
+
+  // The picker should sit horizontally near the trigger — the
+  // trigger's left edge is the natural anchor. Allow up to half a
+  // picker width of horizontal slack (the picker may center on or
+  // extend out from the trigger), but flag a hard miss if the picker
+  // opens on the opposite half of the viewport.
+  // The picker is ~360px wide. To read as "near the trigger" the
+  // picker's horizontal extent must overlap the trigger's vertical
+  // line — i.e. trigger center within ±half-picker-width of overlay
+  // center. A picker that opens at the far right of the viewport
+  // (e.g. the reaction picker's right-anchored position) when the
+  // trigger sits on the left of the composer fails this comfortably.
+  const triggerCenterX = triggerBox.x + triggerBox.width / 2;
+  const overlayCenterX = overlayBox.x + overlayBox.width / 2;
+  expect(Math.abs(overlayCenterX - triggerCenterX)).toBeLessThan(
+    overlayBox.width / 2 + 8,
+  );
+
+  await ctx.close();
+});
+
 test("desktop: clicking the emoji button opens the full picker", async ({
   browser,
 }, testInfo) => {
@@ -186,7 +233,12 @@ test("desktop: clicking outside the picker (backdrop) dismisses it", async ({
   const overlay = page.locator('[data-testid="full-emoji-picker-overlay"]');
   await expect(overlay).toBeVisible({ timeout: 10_000 });
 
-  await page.locator('[data-testid="full-emoji-picker-backdrop"]').click();
+  // Click a corner of the backdrop the picker doesn't cover. Picker
+  // anchors at the trigger and is ~360x410, so the top-left of the
+  // viewport (which the backdrop also occupies) is guaranteed-empty.
+  await page
+    .locator('[data-testid="full-emoji-picker-backdrop"]')
+    .click({ position: { x: 4, y: 4 } });
   await expect(overlay).toHaveCount(0);
 
   await ctx.close();
