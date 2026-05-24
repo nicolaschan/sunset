@@ -20,8 +20,8 @@ pub fn covers(superset: &Filter, subset: &Filter) -> bool {
         }
         Filter::Keyspace(super_vk) => covers_keyspace(super_vk, subset),
         Filter::Namespace(super_name) => covers_namespace(super_name, subset),
-        // Other superset variants implemented in subsequent tasks.
-        _ => unimplemented!("covers: superset variant not yet implemented"),
+        Filter::NamePrefix(super_prefix) => covers_name_prefix(super_prefix, subset),
+        Filter::Union(super_alts) => covers_union(super_alts, subset),
     }
 }
 
@@ -62,6 +62,24 @@ fn covers_namespace(super_name: &Bytes, subset: &Filter) -> bool {
         }),
         Filter::Keyspace(_) | Filter::NamePrefix(_) => false,
     }
+}
+
+/// `NamePrefix(super_prefix)` covers `subset` iff every match of `subset`
+/// has a name starting with `super_prefix`.
+fn covers_name_prefix(super_prefix: &Bytes, subset: &Filter) -> bool {
+    match subset {
+        Filter::Specific(_, sub_name) => sub_name.starts_with(super_prefix.as_ref()),
+        Filter::Namespace(sub_name) => sub_name.starts_with(super_prefix.as_ref()),
+        Filter::NamePrefix(sub_prefix) => sub_prefix.starts_with(super_prefix.as_ref()),
+        Filter::Union(alts) => alts.iter().all(|alt| {
+            covers(&Filter::NamePrefix(super_prefix.clone()), alt)
+        }),
+        Filter::Keyspace(_) => false,
+    }
+}
+
+fn covers_union(_super_alts: &[Filter], _subset: &Filter) -> bool {
+    unimplemented!("covers: Union superset implemented in next task")
 }
 
 #[cfg(test)]
@@ -171,5 +189,38 @@ mod tests {
         // Even NamePrefix matching only the same name string isn't covered —
         // a prefix matches anything-with-that-prefix, not the exact name.
         assert!(!covers(&s, &Filter::NamePrefix(n(b"room/x"))));
+    }
+
+    #[test]
+    fn name_prefix_covers_specifics_under_prefix() {
+        let s = Filter::NamePrefix(n(b"room/"));
+        assert!(covers(&s, &Filter::Specific(vk(b"a"), n(b"room/general"))));
+        assert!(covers(&s, &Filter::Specific(vk(b"a"), n(b"room/"))));
+        assert!(!covers(&s, &Filter::Specific(vk(b"a"), n(b"other"))));
+    }
+
+    #[test]
+    fn name_prefix_covers_namespaces_and_longer_prefixes_under_it() {
+        let s = Filter::NamePrefix(n(b"room/"));
+        assert!(covers(&s, &Filter::Namespace(n(b"room/general"))));
+        assert!(covers(&s, &Filter::NamePrefix(n(b"room/x/"))));
+        assert!(covers(&s, &Filter::NamePrefix(n(b"room/"))));
+        assert!(!covers(&s, &Filter::NamePrefix(n(b"r")))); // shorter, broader
+    }
+
+    #[test]
+    fn name_prefix_does_not_cover_keyspace() {
+        let s = Filter::NamePrefix(n(b"room/"));
+        assert!(!covers(&s, &Filter::Keyspace(vk(b"a"))));
+    }
+
+    #[test]
+    fn empty_prefix_covers_everything_name_based() {
+        let s = Filter::NamePrefix(n(b""));
+        assert!(covers(&s, &Filter::Specific(vk(b"x"), n(b"anything"))));
+        assert!(covers(&s, &Filter::Namespace(n(b"anything"))));
+        assert!(covers(&s, &Filter::NamePrefix(n(b"x/"))));
+        // Still doesn't cover Keyspace (writer-keyed, not name-keyed).
+        assert!(!covers(&s, &Filter::Keyspace(vk(b"x"))));
     }
 }
