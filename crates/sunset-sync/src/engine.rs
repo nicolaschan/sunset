@@ -119,6 +119,17 @@ pub(crate) enum EngineCommand {
         ttl: std::time::Duration,
         ack: oneshot::Sender<Result<()>>,
     },
+    SubscribeVia {
+        filter: Filter,
+        provider: PeerId,
+        policy: crate::routing::SubscriptionPolicy,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    UnsubscribeVia {
+        filter: Filter,
+        provider: PeerId,
+        ack: oneshot::Sender<Result<()>>,
+    },
     SetTrust {
         trust: TrustSet,
         ack: oneshot::Sender<Result<()>>,
@@ -202,7 +213,6 @@ pub(crate) struct PeerSession {
 pub(crate) struct EngineState {
     pub trust: TrustSet,
     pub registry: SubscriptionRegistry,
-    #[allow(dead_code)]
     pub routes: crate::routing::Routes,
     /// Per-peer session state, keyed by `PeerId`. Each entry carries
     /// the sender, the connection generation, and the transport kind
@@ -413,6 +423,47 @@ where
         rx.await.map_err(|_| Error::Closed)?
     }
 
+    /// Subscribe to `filter` from one specific peer. The provider, on
+    /// receiving the resulting SubscriptionEntry, starts forwarding
+    /// matching store events to me; the existing DigestRequest/Exchange
+    /// pipeline backfills already-stored entries.
+    pub async fn subscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+        policy: crate::routing::SubscriptionPolicy,
+    ) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::SubscribeVia {
+                filter,
+                provider,
+                policy,
+                ack,
+            })
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Withdraw a `subscribe_via(filter, provider)` subscription.
+    /// Publishes `SubscriptionEntry::Withdrawn` at the same key;
+    /// idempotent (returns Ok if not currently subscribed).
+    pub async fn unsubscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+    ) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::UnsubscribeVia {
+                filter,
+                provider,
+                ack,
+            })
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
     /// Replace the trust set. Subsequent inbound events are filtered
     /// against the new set.
     pub async fn set_trust(&self, trust: TrustSet) -> Result<()> {
@@ -572,6 +623,23 @@ where
             }
             EngineCommand::PublishSubscription { filter, ttl, ack } => {
                 let r = self.do_publish_subscription(filter, ttl).await;
+                let _ = ack.send(r);
+            }
+            EngineCommand::SubscribeVia {
+                filter,
+                provider,
+                policy,
+                ack,
+            } => {
+                let r = self.do_subscribe_via(filter, provider, policy).await;
+                let _ = ack.send(r);
+            }
+            EngineCommand::UnsubscribeVia {
+                filter,
+                provider,
+                ack,
+            } => {
+                let r = self.do_unsubscribe_via(filter, provider).await;
                 let _ = ack.send(r);
             }
             EngineCommand::SetTrust { trust, ack } => {
@@ -1288,6 +1356,115 @@ where
         for peer_id in &peers {
             self.send_filter_digest(peer_id, &filter).await;
         }
+        Ok(())
+    }
+
+    /// Publish a per-pair `SubscriptionEntry::Active` for `(filter,
+    /// provider)` and record the outbound in `routes.my_subs` for
+    /// refresh.
+    async fn do_subscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+        policy: crate::routing::SubscriptionPolicy,
+    ) -> Result<()> {
+        use sunset_store::canonical::signing_payload;
+        use sunset_store::{ContentBlock, SignedKvEntry};
+
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let name = crate::routing::subscription_name(&filter, &provider);
+        let entry_value = crate::routing::SubscriptionEntry::Active {
+            filter: filter.clone(),
+            provider: provider.clone(),
+        };
+        let value = postcard::to_stdvec(&entry_value)
+            .map_err(|e| Error::Decode(format!("encode SubscriptionEntry: {e}")))?;
+        let block = ContentBlock {
+            data: Bytes::from(value),
+            references: vec![],
+        };
+        let now_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let ttl_ms = policy.freshness_threshold.as_millis() as u64;
+        let vk = self.signer.verifying_key();
+        let value_hash = block.hash();
+        let mut entry = SignedKvEntry {
+            verifying_key: vk,
+            name,
+            value_hash,
+            priority: now_ms,
+            expires_at: Some(now_ms.saturating_add(ttl_ms)),
+            signature: Bytes::new(),
+        };
+        let payload = signing_payload(&entry);
+        entry.signature = self.signer.sign(&payload);
+        self.store
+            .insert(entry, Some(block))
+            .await
+            .map_err(Error::Store)?;
+
+        let mut state = self.state.lock().await;
+        state.routes.my_subs.insert(
+            crate::routing::OutboundKey {
+                filter_hash,
+                provider: provider.clone(),
+            },
+            crate::routing::Outbound {
+                filter,
+                policy,
+                last_published_ms: now_ms,
+            },
+        );
+        Ok(())
+    }
+
+    /// Withdraw a per-pair `SubscriptionEntry`. Idempotent: returns Ok
+    /// without writing if no matching outbound is recorded.
+    async fn do_unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()> {
+        use sunset_store::canonical::signing_payload;
+        use sunset_store::{ContentBlock, SignedKvEntry};
+
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let key = crate::routing::OutboundKey {
+            filter_hash,
+            provider: provider.clone(),
+        };
+        let prev = {
+            let mut state = self.state.lock().await;
+            state.routes.my_subs.remove(&key)
+        };
+        let Some(prev) = prev else { return Ok(()) };
+        let name = crate::routing::subscription_name(&filter, &provider);
+        let entry_value = crate::routing::SubscriptionEntry::Withdrawn;
+        let value = postcard::to_stdvec(&entry_value)
+            .map_err(|e| Error::Decode(format!("encode SubscriptionEntry: {e}")))?;
+        let block = ContentBlock {
+            data: Bytes::from(value),
+            references: vec![],
+        };
+        let now_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let ttl_ms = prev.policy.freshness_threshold.as_millis() as u64;
+        let vk = self.signer.verifying_key();
+        let value_hash = block.hash();
+        let mut entry = SignedKvEntry {
+            verifying_key: vk,
+            name,
+            value_hash,
+            priority: now_ms,
+            expires_at: Some(now_ms.saturating_add(ttl_ms)),
+            signature: Bytes::new(),
+        };
+        let payload = signing_payload(&entry);
+        entry.signature = self.signer.sign(&payload);
+        self.store
+            .insert(entry, Some(block))
+            .await
+            .map_err(Error::Store)?;
         Ok(())
     }
 
