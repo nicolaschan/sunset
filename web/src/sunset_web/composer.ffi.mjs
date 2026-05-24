@@ -31,6 +31,48 @@ export function resetTextarea(elementId) {
   el.style.overflowY = "hidden";
 }
 
+// Insert `text` into the textarea at its current selection. Replaces
+// any non-empty selection; collapses the caret to the position after
+// the inserted text. Same FFI shape as applyTemplate — returns the
+// resulting textarea value so the caller can sync it into model state
+// in a single update step (no synthetic input event, no double-render).
+//
+// Used by the composer emoji picker: opening the picker takes focus
+// out of the textarea, but the browser preserves the textarea's last
+// selectionStart/End, so a pick after opening lands at the user's
+// last cursor position rather than the end.
+export function insertAtCursor(elementId, text) {
+  const el = document.getElementById(elementId);
+  if (!el || el.tagName !== "TEXTAREA") return el ? el.value : "";
+  const start = el.selectionStart;
+  const end = el.selectionEnd;
+  el.value = el.value.slice(0, start) + text + el.value.slice(end);
+  const caret = start + text.length;
+  el.selectionStart = caret;
+  el.selectionEnd = caret;
+  autoGrow(elementId);
+  // Unlike applyTemplate (which is always invoked from a textarea
+  // keypress, so focus is already there), insertAtCursor runs from a
+  // picker click — focus is on the picker button. Defer the focus +
+  // caret-restore to the next frame so Lustre's pending re-render of
+  // the composer (triggered by the InsertEmojiAtCursor message that
+  // called us) has already committed; otherwise picking emoji #N+1
+  // can land focus on a node Lustre is about to replace, dropping the
+  // selection. Mirrors `focusTextarea` below.
+  requestAnimationFrame(() => {
+    const live = document.getElementById(elementId);
+    if (!live || live.tagName !== "TEXTAREA") return;
+    try {
+      live.focus({ preventScroll: true });
+      live.selectionStart = caret;
+      live.selectionEnd = caret;
+    } catch {
+      // ignored: focus is best-effort.
+    }
+  });
+  return el.value;
+}
+
 export function applyTemplate(elementId, before, between, after, caretAtBetween) {
   const el = document.getElementById(elementId);
   if (!el || el.tagName !== "TEXTAREA") return el ? el.value : "";
