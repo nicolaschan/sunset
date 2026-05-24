@@ -405,10 +405,17 @@ where
             datagram: datagram.clone(),
         };
         let state = self.state.lock().await;
-        for peer in state
+        let mut targets: std::collections::HashSet<PeerId> = state
             .registry
             .peers_matching(&datagram.verifying_key, &datagram.name)
-        {
+            .collect();
+        targets.extend(crate::routing::forward_targets(
+            &state.peer_sessions,
+            |s| &s.interests,
+            &datagram.verifying_key,
+            &datagram.name,
+        ));
+        for peer in targets {
             if let Some(po) = state.peer_sessions.get(&peer) {
                 let _ = po.tx.send(msg.clone());
             }
@@ -1312,10 +1319,17 @@ where
                 let _ = po.tx.send(msg.clone());
             }
         } else {
-            for peer in state
+            let mut targets: std::collections::HashSet<PeerId> = state
                 .registry
                 .peers_matching(&entry.verifying_key, &entry.name)
-            {
+                .collect();
+            targets.extend(crate::routing::forward_targets(
+                &state.peer_sessions,
+                |s| &s.interests,
+                &entry.verifying_key,
+                &entry.name,
+            ));
+            for peer in targets {
                 if let Some(po) = state.peer_sessions.get(&peer) {
                     let _ = po.tx.send(msg.clone());
                 }
