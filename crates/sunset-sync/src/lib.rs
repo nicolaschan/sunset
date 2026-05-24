@@ -15,6 +15,7 @@ pub mod multi_transport;
 pub mod native_stub;
 pub mod peer;
 pub mod reserved;
+pub mod routing;
 pub mod signaler;
 pub mod signer;
 pub mod spawn;
