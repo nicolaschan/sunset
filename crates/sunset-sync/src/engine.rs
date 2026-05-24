@@ -153,10 +153,13 @@ pub enum EngineEvent {
     },
 }
 
-/// Sender + connection identity for one peer's currently-active connection.
+/// Per-peer connection state. Bundles outbound channel, transport identity,
+/// the per-peer task shutdown handle, and the inbound interests (what this
+/// peer currently wants from me).
+///
 /// `conn_id` is checked when handling `InboundEvent::Disconnected` so a
 /// stale event from a defunct connection can't tear down a fresh one.
-pub(crate) struct PeerOutbound {
+pub(crate) struct PeerSession {
     /// Identifies the connection generation that owns this outbound channel.
     /// Compared against `InboundEvent::Disconnected.conn_id` to filter stale
     /// disconnects from defunct generations (see `handle_inbound_event`).
@@ -166,7 +169,7 @@ pub(crate) struct PeerOutbound {
     pub(crate) kind: crate::transport::TransportKind,
     pub(crate) tx: mpsc::UnboundedSender<SyncMessage>,
     /// Structural shutdown handle for the per-peer task that owns this
-    /// connection. When `PeerOutbound` is dropped (entry removed via
+    /// connection. When `PeerSession` is dropped (entry removed via
     /// `remove_peer` or replaced by a fresher conn's `PeerHello`), this
     /// `watch::Sender` drops, which makes
     /// `watch::Receiver::changed().await` in the per-peer task's
@@ -184,6 +187,14 @@ pub(crate) struct PeerOutbound {
     /// cycles the relay would run out of file descriptors and stop
     /// accepting new WebSocket upgrades.
     pub(crate) _shutdown: tokio::sync::watch::Sender<()>,
+    /// What this peer currently wants from me, keyed by `FilterHash` for
+    /// O(1) Withdrawn lookups (the entry name carries the hash, not the
+    /// filter). Populated by the SUBSCRIBE_PREFIX branch in
+    /// handle_local_store_event (added in a later task); cleared with the
+    /// session on peer drop.
+    #[allow(dead_code)]
+    pub(crate) interests:
+        std::collections::HashMap<crate::routing::FilterHash, sunset_store::Filter>,
 }
 
 /// Mutable state inside the engine. Held under a `tokio::sync::Mutex` so
@@ -191,11 +202,11 @@ pub(crate) struct PeerOutbound {
 pub(crate) struct EngineState {
     pub trust: TrustSet,
     pub registry: SubscriptionRegistry,
-    /// Per-peer outbound state, keyed by `PeerId`. Each entry carries
+    /// Per-peer session state, keyed by `PeerId`. Each entry carries
     /// the sender, the connection generation, and the transport kind
     /// — kept together so a late `current_peers()` snapshot can't see
     /// a peer in one map but not the other.
-    pub peer_outbound: HashMap<PeerId, PeerOutbound>,
+    pub peer_sessions: HashMap<PeerId, PeerSession>,
     /// Live `EngineEvent` subscribers. Dead senders (closed by the
     /// receiver being dropped) are evicted lazily on the next emit.
     pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
@@ -257,7 +268,7 @@ where
             state: Arc::new(Mutex::new(EngineState {
                 trust: TrustSet::default(),
                 registry: SubscriptionRegistry::new(),
-                peer_outbound: HashMap::new(),
+                peer_sessions: HashMap::new(),
                 event_subs: Vec::new(),
                 ephemeral_subs: Vec::new(),
             })),
@@ -363,7 +374,7 @@ where
             .registry
             .peers_matching(&datagram.verifying_key, &datagram.name)
         {
-            if let Some(po) = state.peer_outbound.get(&peer) {
+            if let Some(po) = state.peer_sessions.get(&peer) {
                 let _ = po.tx.send(msg.clone());
             }
         }
@@ -377,7 +388,7 @@ where
     pub async fn current_peers(&self) -> Vec<(PeerId, crate::transport::TransportKind)> {
         let state = self.state.lock().await;
         state
-            .peer_outbound
+            .peer_sessions
             .iter()
             .map(|(pk, po)| (pk.clone(), po.kind))
             .collect()
@@ -508,7 +519,7 @@ where
         // the lock and skips peers that disconnected mid-tick.
         let peers: Vec<PeerId> = {
             let state = self.state.lock().await;
-            state.peer_outbound.keys().cloned().collect()
+            state.peer_sessions.keys().cloned().collect()
         };
         if peers.is_empty() {
             return;
@@ -567,7 +578,7 @@ where
             EngineCommand::RemovePeer { peer_id, ack } => {
                 let removed = {
                     let mut state = self.state.lock().await;
-                    state.peer_outbound.remove(&peer_id).is_some()
+                    state.peer_sessions.remove(&peer_id).is_some()
                 };
                 if removed {
                     self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
@@ -590,20 +601,21 @@ where
             } => {
                 // Register the outbound state under the Hello-declared
                 // peer_id. The insert here implicitly drops any previous
-                // PeerOutbound for the same peer_id (e.g. a stale
+                // PeerSession for the same peer_id (e.g. a stale
                 // generation from before a reconnect). That drop fires
                 // the OLD `_shutdown` watch::Sender, telling the OLD
                 // run_peer's tasks to wind down — see the field doc on
-                // `PeerOutbound::_shutdown`.
+                // `PeerSession::_shutdown`.
                 {
                     let mut state = self.state.lock().await;
-                    state.peer_outbound.insert(
+                    state.peer_sessions.insert(
                         peer_id.clone(),
-                        PeerOutbound {
+                        PeerSession {
                             conn_id,
                             kind,
                             tx: out_tx,
                             _shutdown: shutdown,
+                            interests: std::collections::HashMap::new(),
                         },
                     );
                 }
@@ -613,7 +625,7 @@ where
                 })
                 .await;
                 // Wake the `add_peer().await` caller now that
-                // `peer_outbound` is populated, so an immediately-
+                // `peer_sessions` is populated, so an immediately-
                 // following `publish_subscription` / `insert` lands a
                 // peer to push to. We also pass `kind` through the
                 // oneshot so the supervisor can write
@@ -644,9 +656,9 @@ where
                 );
                 let removed = {
                     let mut state = self.state.lock().await;
-                    match state.peer_outbound.get(&peer_id) {
+                    match state.peer_sessions.get(&peer_id) {
                         Some(po) if po.conn_id == conn_id => {
-                            state.peer_outbound.remove(&peer_id);
+                            state.peer_sessions.remove(&peer_id);
                             true
                         }
                         _ => false,
@@ -804,7 +816,7 @@ where
             bloom: bloom.to_bytes(),
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(to) {
+        if let Some(po) = state.peer_sessions.get(to) {
             let _ = po.tx.send(msg);
         }
     }
@@ -878,7 +890,7 @@ where
             blobs,
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(&from) {
+        if let Some(po) = state.peer_sessions.get(&from) {
             let _ = po.tx.send(msg);
         }
     }
@@ -890,7 +902,7 @@ where
             _ => return,
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(&from) {
+        if let Some(po) = state.peer_sessions.get(&from) {
             let _ = po.tx.send(SyncMessage::BlobResponse { block });
         }
     }
@@ -955,7 +967,7 @@ where
                     .is_some();
                 if !have {
                     let state = self.state.lock().await;
-                    if let Some(po) = state.peer_outbound.get(&from) {
+                    if let Some(po) = state.peer_sessions.get(&from) {
                         let _ = po.tx.send(SyncMessage::BlobRequest {
                             hash: entry.value_hash,
                         });
@@ -1009,7 +1021,7 @@ where
                             range: DigestRange::All,
                         };
                         let state = self.state.lock().await;
-                        if let Some(po) = state.peer_outbound.get(&peer_id) {
+                        if let Some(po) = state.peer_sessions.get(&peer_id) {
                             let _ = po.tx.send(msg);
                         }
                     }
@@ -1045,7 +1057,7 @@ where
         };
         let state = self.state.lock().await;
         if entry.verifying_key == self.local_peer.0 {
-            for po in state.peer_outbound.values() {
+            for po in state.peer_sessions.values() {
                 let _ = po.tx.send(msg.clone());
             }
         } else {
@@ -1053,7 +1065,7 @@ where
                 .registry
                 .peers_matching(&entry.verifying_key, &entry.name)
             {
-                if let Some(po) = state.peer_outbound.get(&peer) {
+                if let Some(po) = state.peer_sessions.get(&peer) {
                     let _ = po.tx.send(msg.clone());
                 }
             }
@@ -1067,7 +1079,7 @@ where
         self.state
             .lock()
             .await
-            .peer_outbound
+            .peer_sessions
             .keys()
             .cloned()
             .collect()
@@ -1266,7 +1278,7 @@ where
             .state
             .lock()
             .await
-            .peer_outbound
+            .peer_sessions
             .keys()
             .cloned()
             .collect();
@@ -1348,13 +1360,14 @@ mod tests {
     ) -> (PeerId, mpsc::UnboundedReceiver<SyncMessage>) {
         let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
         let peer = PeerId(vk(label));
-        engine.state.lock().await.peer_outbound.insert(
+        engine.state.lock().await.peer_sessions.insert(
             peer.clone(),
-            PeerOutbound {
+            PeerSession {
                 conn_id,
                 kind: TransportKind::Unknown,
                 tx,
                 _shutdown: tokio::sync::watch::channel(()).0,
+                interests: std::collections::HashMap::new(),
             },
         );
         (peer, rx)
@@ -1473,13 +1486,14 @@ mod tests {
 
                 // Pre-register a fake outbound channel so handle_blob_request has somewhere to send.
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     PeerId(vk(b"requester")),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: ConnectionId::for_test(99),
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1544,13 +1558,14 @@ mod tests {
                     .unwrap();
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     PeerId(vk(b"remote")),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: ConnectionId::for_test(99),
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1809,26 +1824,28 @@ mod tests {
                 // Generation 1.
                 let (tx1, _rx1) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn1 = ConnectionId::for_test(1);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn1,
                         kind: TransportKind::Unknown,
                         tx: tx1,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
                 // Replace with generation 2 (simulating a fresh PeerHello).
                 let (tx2, mut rx2) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn2 = ConnectionId::for_test(2);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn2,
                         kind: TransportKind::Unknown,
                         tx: tx2,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1855,7 +1872,7 @@ mod tests {
                 // The fresh sender (gen 2) must still be live: a manual
                 // send through it should succeed.
                 let state = engine.state.lock().await;
-                let po = state.peer_outbound.get(&peer).expect("gen2 still present");
+                let po = state.peer_sessions.get(&peer).expect("gen2 still present");
                 assert_eq!(po.conn_id, conn2);
                 let _ = po.tx.send(SyncMessage::Goodbye {});
                 drop(state);
@@ -1875,13 +1892,14 @@ mod tests {
 
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(7);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn,
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1904,7 +1922,7 @@ mod tests {
                     other => panic!("expected PeerRemoved, got {other:?}"),
                 }
 
-                assert!(!engine.state.lock().await.peer_outbound.contains_key(&peer));
+                assert!(!engine.state.lock().await.peer_sessions.contains_key(&peer));
             })
             .await;
     }
@@ -1919,13 +1937,14 @@ mod tests {
 
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(7);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn,
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1974,13 +1993,14 @@ mod tests {
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(1);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn,
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -2123,13 +2143,14 @@ mod tests {
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
                 {
                     let mut state = engine.state.lock().await;
-                    state.peer_outbound.insert(
+                    state.peer_sessions.insert(
                         relay.clone(),
-                        PeerOutbound {
+                        PeerSession {
                             conn_id: ConnectionId::for_test(0),
                             kind: TransportKind::Unknown,
                             tx,
                             _shutdown: tokio::sync::watch::channel(()).0,
+                            interests: std::collections::HashMap::new(),
                         },
                     );
                 }
