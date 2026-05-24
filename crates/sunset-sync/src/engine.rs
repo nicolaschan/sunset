@@ -741,6 +741,23 @@ where
                         },
                     );
                 }
+                // Auto-resubscriber: replay every current BroadcastIntent
+                // for this newly-connected peer. Errors are logged-and-
+                // continued; failing AddPeer because a broadcast intent
+                // couldn't bind would be worse than the inconsistency
+                // (the next refresh tick will surface persistent failures).
+                let intents: Vec<crate::routing::BroadcastIntent> = {
+                    let state = self.state.lock().await;
+                    state.routes.broadcast_intents.values().cloned().collect()
+                };
+                for intent in intents {
+                    if let Err(e) = self
+                        .do_subscribe_via(intent.filter, peer_id.clone(), intent.policy)
+                        .await
+                    {
+                        tracing::warn!(?e, ?peer_id, "auto-resubscribe failed on new peer");
+                    }
+                }
                 self.emit_engine_event(EngineEvent::PeerAdded {
                     peer_id: peer_id.clone(),
                     kind,
