@@ -19,6 +19,28 @@ pub enum SubscriptionEntry {
     Withdrawn,
 }
 
+/// Self-published gossip of the publisher's direct neighbors.
+///
+/// Stored at `(self_pubkey, naming::LINKS_NAME)`. Receivers read this
+/// from any peer they care about as input to the candidate ranking.
+/// The publisher reports its own heartbeat measurements; no other field
+/// (broad-subscriber flag, load hint) is carried because both are
+/// derivable from data already replicated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkState {
+    pub neighbors: Vec<Neighbor>,
+}
+
+/// One row of `LinkState`: a peer the publisher is directly connected to,
+/// with the publisher's most recent heartbeat-measured RTT and the
+/// timestamp of the last successful exchange.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Neighbor {
+    pub peer: PeerId,
+    pub rtt_ms: u16,
+    pub last_success_ts: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,4 +87,33 @@ mod tests {
     // Computed from the input above; regenerate intentionally on a real wire
     // change with `cargo test ... -- --nocapture` then update.
     const EXPECTED_HEX: &str = "00020c726f6f6d2f67656e6572616c0150";
+
+    #[test]
+    fn link_state_postcard_roundtrip() {
+        let ls = LinkState {
+            neighbors: vec![
+                Neighbor {
+                    peer: PeerId(vk(b"n1")),
+                    rtt_ms: 12,
+                    last_success_ts: 1_700_000_000,
+                },
+                Neighbor {
+                    peer: PeerId(vk(b"n2")),
+                    rtt_ms: 280,
+                    last_success_ts: 1_700_000_005,
+                },
+            ],
+        };
+        let bytes = postcard::to_stdvec(&ls).unwrap();
+        let back: LinkState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(ls, back);
+    }
+
+    #[test]
+    fn link_state_empty_roundtrip() {
+        let ls = LinkState { neighbors: vec![] };
+        let bytes = postcard::to_stdvec(&ls).unwrap();
+        let back: LinkState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(ls, back);
+    }
 }
