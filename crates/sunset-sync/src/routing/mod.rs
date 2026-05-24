@@ -6,10 +6,12 @@
 //! predicates). The receiver loop, provider loop, liveness, and
 //! integration into the engine ship in follow-up plans.
 
+pub mod coverage;
 pub mod naming;
 pub mod policy;
 pub mod types;
 
+pub use coverage::covers;
 pub use naming::{LINKS_NAME, PROVIDER_TICK_NAME, SUBSCRIBE_PREFIX, subscription_name};
 pub use policy::SubscriptionPolicy;
 pub use types::{LinkState, Neighbor, ProviderTick, SubscriptionEntry};

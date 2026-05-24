@@ -1,0 +1,88 @@
+//! Pure predicate: does one filter cover (is a superset of) another?
+//!
+//! Used by the receiver ranking to ask "if a candidate already
+//! subscribes to filter S, will my filter F be satisfied for free?"
+//! Answer: yes iff every `(vk, name)` matching F also matches S, i.e.
+//! `covers(S, F) == true`.
+
+use bytes::Bytes;
+use sunset_store::{Filter, VerifyingKey};
+
+/// True iff every `(vk, name)` matching `subset` also matches `superset`.
+///
+/// Equivalent to "subscribing to `superset` would deliver everything
+/// `subset` asks for." The relation is reflexive, transitive, and
+/// not symmetric.
+pub fn covers(superset: &Filter, subset: &Filter) -> bool {
+    match superset {
+        Filter::Specific(super_vk, super_name) => {
+            covers_specific(super_vk, super_name, subset)
+        }
+        // Other superset variants implemented in subsequent tasks.
+        _ => unimplemented!("covers: superset variant not yet implemented"),
+    }
+}
+
+/// `Specific(super_vk, super_name)` covers `subset` iff `subset` matches
+/// exactly that one key — i.e. `subset` is itself `Specific(super_vk,
+/// super_name)`, or a `Union` whose every alternative is covered by it.
+fn covers_specific(super_vk: &VerifyingKey, super_name: &Bytes, subset: &Filter) -> bool {
+    match subset {
+        Filter::Specific(sub_vk, sub_name) => super_vk == sub_vk && super_name == sub_name,
+        Filter::Union(alts) => alts.iter().all(|alt| {
+            covers(&Filter::Specific(super_vk.clone(), super_name.clone()), alt)
+        }),
+        Filter::Keyspace(_) | Filter::Namespace(_) | Filter::NamePrefix(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vk(seed: &[u8]) -> VerifyingKey {
+        VerifyingKey::new(Bytes::copy_from_slice(seed))
+    }
+
+    fn n(b: &'static [u8]) -> Bytes {
+        Bytes::from_static(b)
+    }
+
+    #[test]
+    fn specific_covers_itself() {
+        let f = Filter::Specific(vk(b"a"), n(b"k"));
+        assert!(covers(&f, &f));
+    }
+
+    #[test]
+    fn specific_does_not_cover_different_specific() {
+        let s = Filter::Specific(vk(b"a"), n(b"k"));
+        assert!(!covers(&s, &Filter::Specific(vk(b"b"), n(b"k"))));
+        assert!(!covers(&s, &Filter::Specific(vk(b"a"), n(b"other"))));
+    }
+
+    #[test]
+    fn specific_does_not_cover_broader_filters() {
+        let s = Filter::Specific(vk(b"a"), n(b"k"));
+        assert!(!covers(&s, &Filter::Keyspace(vk(b"a"))));
+        assert!(!covers(&s, &Filter::Namespace(n(b"k"))));
+        assert!(!covers(&s, &Filter::NamePrefix(n(b""))));
+    }
+
+    #[test]
+    fn specific_covers_union_of_only_itself() {
+        let s = Filter::Specific(vk(b"a"), n(b"k"));
+        let single = Filter::Union(vec![Filter::Specific(vk(b"a"), n(b"k"))]);
+        let two_same = Filter::Union(vec![
+            Filter::Specific(vk(b"a"), n(b"k")),
+            Filter::Specific(vk(b"a"), n(b"k")),
+        ]);
+        let mixed = Filter::Union(vec![
+            Filter::Specific(vk(b"a"), n(b"k")),
+            Filter::Specific(vk(b"b"), n(b"k")),
+        ]);
+        assert!(covers(&s, &single));
+        assert!(covers(&s, &two_same));
+        assert!(!covers(&s, &mixed));
+    }
+}
