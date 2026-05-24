@@ -67,6 +67,9 @@ mod tests {
 
     #[test]
     fn default_matches_store_data() {
-        assert_eq!(SubscriptionPolicy::default(), SubscriptionPolicy::store_data());
+        assert_eq!(
+            SubscriptionPolicy::default(),
+            SubscriptionPolicy::store_data()
+        );
     }
 }

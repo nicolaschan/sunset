@@ -15,9 +15,7 @@ use sunset_store::{Filter, VerifyingKey};
 /// not symmetric.
 pub fn covers(superset: &Filter, subset: &Filter) -> bool {
     match superset {
-        Filter::Specific(super_vk, super_name) => {
-            covers_specific(super_vk, super_name, subset)
-        }
+        Filter::Specific(super_vk, super_name) => covers_specific(super_vk, super_name, subset),
         Filter::Keyspace(super_vk) => covers_keyspace(super_vk, subset),
         Filter::Namespace(super_name) => covers_namespace(super_name, subset),
         Filter::NamePrefix(super_prefix) => covers_name_prefix(super_prefix, subset),
@@ -31,9 +29,9 @@ pub fn covers(superset: &Filter, subset: &Filter) -> bool {
 fn covers_specific(super_vk: &VerifyingKey, super_name: &Bytes, subset: &Filter) -> bool {
     match subset {
         Filter::Specific(sub_vk, sub_name) => super_vk == sub_vk && super_name == sub_name,
-        Filter::Union(alts) => alts.iter().all(|alt| {
-            covers(&Filter::Specific(super_vk.clone(), super_name.clone()), alt)
-        }),
+        Filter::Union(alts) => alts
+            .iter()
+            .all(|alt| covers(&Filter::Specific(super_vk.clone(), super_name.clone()), alt)),
         Filter::Keyspace(_) | Filter::Namespace(_) | Filter::NamePrefix(_) => false,
     }
 }
@@ -44,9 +42,9 @@ fn covers_keyspace(super_vk: &VerifyingKey, subset: &Filter) -> bool {
     match subset {
         Filter::Specific(sub_vk, _) => super_vk == sub_vk,
         Filter::Keyspace(sub_vk) => super_vk == sub_vk,
-        Filter::Union(alts) => alts.iter().all(|alt| {
-            covers(&Filter::Keyspace(super_vk.clone()), alt)
-        }),
+        Filter::Union(alts) => alts
+            .iter()
+            .all(|alt| covers(&Filter::Keyspace(super_vk.clone()), alt)),
         Filter::Namespace(_) | Filter::NamePrefix(_) => false,
     }
 }
@@ -57,9 +55,9 @@ fn covers_namespace(super_name: &Bytes, subset: &Filter) -> bool {
     match subset {
         Filter::Specific(_, sub_name) => super_name == sub_name,
         Filter::Namespace(sub_name) => super_name == sub_name,
-        Filter::Union(alts) => alts.iter().all(|alt| {
-            covers(&Filter::Namespace(super_name.clone()), alt)
-        }),
+        Filter::Union(alts) => alts
+            .iter()
+            .all(|alt| covers(&Filter::Namespace(super_name.clone()), alt)),
         Filter::Keyspace(_) | Filter::NamePrefix(_) => false,
     }
 }
@@ -71,9 +69,9 @@ fn covers_name_prefix(super_prefix: &Bytes, subset: &Filter) -> bool {
         Filter::Specific(_, sub_name) => sub_name.starts_with(super_prefix.as_ref()),
         Filter::Namespace(sub_name) => sub_name.starts_with(super_prefix.as_ref()),
         Filter::NamePrefix(sub_prefix) => sub_prefix.starts_with(super_prefix.as_ref()),
-        Filter::Union(alts) => alts.iter().all(|alt| {
-            covers(&Filter::NamePrefix(super_prefix.clone()), alt)
-        }),
+        Filter::Union(alts) => alts
+            .iter()
+            .all(|alt| covers(&Filter::NamePrefix(super_prefix.clone()), alt)),
         Filter::Keyspace(_) => false,
     }
 }
@@ -166,14 +164,20 @@ mod tests {
     #[test]
     fn keyspace_covers_union_iff_all_alts_under_it() {
         let s = Filter::Keyspace(vk(b"a"));
-        assert!(covers(&s, &Filter::Union(vec![
-            Filter::Specific(vk(b"a"), n(b"k1")),
-            Filter::Specific(vk(b"a"), n(b"k2")),
-        ])));
-        assert!(!covers(&s, &Filter::Union(vec![
-            Filter::Specific(vk(b"a"), n(b"k1")),
-            Filter::Specific(vk(b"b"), n(b"k1")),
-        ])));
+        assert!(covers(
+            &s,
+            &Filter::Union(vec![
+                Filter::Specific(vk(b"a"), n(b"k1")),
+                Filter::Specific(vk(b"a"), n(b"k2")),
+            ])
+        ));
+        assert!(!covers(
+            &s,
+            &Filter::Union(vec![
+                Filter::Specific(vk(b"a"), n(b"k1")),
+                Filter::Specific(vk(b"b"), n(b"k1")),
+            ])
+        ));
     }
 
     #[test]
@@ -281,7 +285,10 @@ mod tests {
             Filter::Keyspace(vk(b"a")),
             Filter::Namespace(n(b"k")),
             Filter::NamePrefix(n(b"k")),
-            Filter::Union(vec![Filter::Keyspace(vk(b"a")), Filter::NamePrefix(n(b"r/"))]),
+            Filter::Union(vec![
+                Filter::Keyspace(vk(b"a")),
+                Filter::NamePrefix(n(b"r/")),
+            ]),
         ];
         for f in &filters {
             assert!(covers(f, f), "covers({f:?}, {f:?}) should be true");
