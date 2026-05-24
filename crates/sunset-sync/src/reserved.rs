@@ -8,10 +8,6 @@
 //! an entry under any name. Defense against deliberately hostile values is
 //! a separate concern handled by the trust filter.
 
-/// Subscription filter entries — `(local_pubkey, "_sunset-sync/subscribe")`
-/// stores a postcard-encoded `Filter` describing what events the peer wants.
-pub const SUBSCRIBE_NAME: &[u8] = b"_sunset-sync/subscribe";
-
 /// Optional liveness/health summaries (not used in v1).
 #[allow(dead_code)]
 pub const PEER_HEALTH_NAME: &[u8] = b"_sunset-sync/peer-health";
@@ -26,8 +22,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscribe_name_is_reserved() {
-        assert!(is_reserved(SUBSCRIBE_NAME));
+    fn subscribe_prefix_entry_name_is_reserved() {
+        // Representative `_sunset-sync/subscribe/<filter-hash>/<provider-id>`
+        // entry name (see `crate::routing::SUBSCRIBE_PREFIX` and
+        // `crate::routing::subscription_name`). Reserving the whole
+        // `_sunset-sync/` namespace covers every well-formed shape of
+        // these names without the constant having to enumerate them.
+        assert!(is_reserved(b"_sunset-sync/subscribe/abc123/def456"));
     }
 
     #[test]
