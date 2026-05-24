@@ -459,10 +459,7 @@ impl RelayHandle {
         self.engine
             .subscribe(
                 self.subscription_filter.clone(),
-                sunset_sync::routing::SubscriptionPolicy {
-                    target_n: 0,
-                    freshness_threshold: Duration::from_secs(30),
-                },
+                sunset_sync::routing::SubscriptionPolicy::relay_broad(),
             )
             .await?;
         tracing::info!("published broad subscription");
@@ -513,10 +510,7 @@ impl RelayHandle {
         self.engine
             .subscribe(
                 self.subscription_filter.clone(),
-                sunset_sync::routing::SubscriptionPolicy {
-                    target_n: 0,
-                    freshness_threshold: Duration::from_secs(30),
-                },
+                sunset_sync::routing::SubscriptionPolicy::relay_broad(),
             )
             .await?;
         self.dial_configured_peers().await;

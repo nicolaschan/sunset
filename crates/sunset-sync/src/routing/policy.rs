@@ -38,6 +38,19 @@ impl SubscriptionPolicy {
             freshness_threshold: Duration::from_millis(200),
         }
     }
+
+    /// Broadcast-style relay subscription: target_n=0 (the broadcast
+    /// intent doesn't map to a per-provider count yet; Phase 3 will
+    /// give this meaning), 30s freshness threshold. A relay maintains
+    /// many concurrent subscriptions; a slower refresh (vs.
+    /// store_data's 5s) keeps the routing-tick churn manageable at
+    /// relay scale.
+    pub const fn relay_broad() -> Self {
+        Self {
+            target_n: 0,
+            freshness_threshold: Duration::from_secs(30),
+        }
+    }
 }
 
 impl Default for SubscriptionPolicy {
@@ -63,6 +76,13 @@ mod tests {
         let p = SubscriptionPolicy::voice_active_call();
         assert_eq!(p.target_n, 2);
         assert_eq!(p.freshness_threshold, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn relay_broad_uses_slower_refresh() {
+        let p = SubscriptionPolicy::relay_broad();
+        assert_eq!(p.target_n, 0);
+        assert_eq!(p.freshness_threshold, Duration::from_secs(30));
     }
 
     #[test]
