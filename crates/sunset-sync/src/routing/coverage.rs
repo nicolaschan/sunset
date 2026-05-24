@@ -19,6 +19,7 @@ pub fn covers(superset: &Filter, subset: &Filter) -> bool {
             covers_specific(super_vk, super_name, subset)
         }
         Filter::Keyspace(super_vk) => covers_keyspace(super_vk, subset),
+        Filter::Namespace(super_name) => covers_namespace(super_name, subset),
         // Other superset variants implemented in subsequent tasks.
         _ => unimplemented!("covers: superset variant not yet implemented"),
     }
@@ -47,6 +48,19 @@ fn covers_keyspace(super_vk: &VerifyingKey, subset: &Filter) -> bool {
             covers(&Filter::Keyspace(super_vk.clone()), alt)
         }),
         Filter::Namespace(_) | Filter::NamePrefix(_) => false,
+    }
+}
+
+/// `Namespace(super_name)` covers `subset` iff every match of `subset` has
+/// `name == super_name`.
+fn covers_namespace(super_name: &Bytes, subset: &Filter) -> bool {
+    match subset {
+        Filter::Specific(_, sub_name) => super_name == sub_name,
+        Filter::Namespace(sub_name) => super_name == sub_name,
+        Filter::Union(alts) => alts.iter().all(|alt| {
+            covers(&Filter::Namespace(super_name.clone()), alt)
+        }),
+        Filter::Keyspace(_) | Filter::NamePrefix(_) => false,
     }
 }
 
@@ -133,5 +147,29 @@ mod tests {
             Filter::Specific(vk(b"a"), n(b"k1")),
             Filter::Specific(vk(b"b"), n(b"k1")),
         ])));
+    }
+
+    #[test]
+    fn namespace_covers_itself_and_specifics_with_same_name() {
+        let s = Filter::Namespace(n(b"room/x"));
+        assert!(covers(&s, &s));
+        assert!(covers(&s, &Filter::Specific(vk(b"a"), n(b"room/x"))));
+        assert!(covers(&s, &Filter::Specific(vk(b"b"), n(b"room/x"))));
+    }
+
+    #[test]
+    fn namespace_does_not_cover_other_name() {
+        let s = Filter::Namespace(n(b"room/x"));
+        assert!(!covers(&s, &Filter::Namespace(n(b"room/y"))));
+        assert!(!covers(&s, &Filter::Specific(vk(b"a"), n(b"room/y"))));
+    }
+
+    #[test]
+    fn namespace_does_not_cover_writer_or_prefix_filters() {
+        let s = Filter::Namespace(n(b"room/x"));
+        assert!(!covers(&s, &Filter::Keyspace(vk(b"a"))));
+        // Even NamePrefix matching only the same name string isn't covered —
+        // a prefix matches anything-with-that-prefix, not the exact name.
+        assert!(!covers(&s, &Filter::NamePrefix(n(b"room/x"))));
     }
 }
