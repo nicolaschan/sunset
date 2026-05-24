@@ -221,6 +221,49 @@ InboundEvent::PeerHello { peer_id, conn_id, kind, out_tx } => {
 }
 ```
 
+> **Revision (2026-05-19, PR #99): multiple conns per `PeerId`.**
+>
+> The "replace on Hello" rule above assumed that a given `PeerId`
+> always maps to at most one live connection — i.e. that the second
+> `PeerHello` is a *fresh generation* of the same logical peer, and
+> the old one is stale. That assumption breaks when a single
+> identity dials the relay from multiple processes at once: two
+> browser tabs of the same origin share `localStorage` (the identity
+> store), each runs its own engine, and each dials the relay
+> independently. Treating the second tab's Hello as a "replacement"
+> meant the relay sent `Goodbye` over the first tab's socket, the
+> first tab redialed (~1 s backoff), replaced the second, etc.
+> forever — a tight Goodbye/redial loop that left both tabs
+> intermittently unreachable.
+>
+> `peer_outbound` is now `HashMap<PeerId, Vec<PeerOutbound>>`. The
+> rules become:
+>
+> - `PeerHello` **appends** a `PeerOutbound` to the peer's `Vec`.
+> - `PeerAdded` fires on the **0→1** transition (the first conn for
+>   this peer); subsequent additions are silent.
+> - A matching `InboundEvent::Disconnected { conn_id }` removes
+>   *just* that conn from the `Vec`. `PeerRemoved` fires only on
+>   the **N→0** transition.
+> - `RemovePeer` (engine API) kicks every conn for the peer.
+> - Engine send paths fan out across every conn for the destination
+>   peer. The sync protocol is content-addressed and idempotent —
+>   duplicate inserts return `Stale` — so each tab receiving its own
+>   copy is correct, not wasteful.
+>
+> The "stale-generation Disconnected" guard in the previous section
+> remains intact under the new shape; it now reads as "the
+> `Disconnected` removes the conn matching its `conn_id`, or no-ops
+> if that conn is already gone."
+>
+> The shutdown wiring on `PeerOutbound::_shutdown` is also unchanged
+> at the per-conn level: when a specific `PeerOutbound` is removed
+> from its `Vec`, its `_shutdown` watch::Sender drops and the
+> corresponding `run_peer` tasks wind down. The behavioural
+> difference is that a second Hello no longer triggers this drop on
+> the older conn — only that conn's own `Disconnected` (or a
+> deliberate `RemovePeer`) does.
+
 The public `EngineEvent` API does **not** expose `ConnectionId`. Subscribers (membership tracker, supervisor) continue to work in terms of `peer_id`. The conn_id is purely an internal correlation token; it never escapes `sunset-sync`'s private event plumbing.
 
 ### Engine handling
