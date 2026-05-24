@@ -22,16 +22,14 @@ import sunset_web/theme.{type Palette}
 @external(javascript, "./markdown.ffi.mjs", "parseMarkdown")
 fn parse_markdown_ffi(body: String) -> Dynamic
 
-/// Parse a body string to its block-level AST. Calls the Rust parser
-/// over FFI; on any decode failure returns a single Paragraph wrapping
-/// the body as literal text.
-///
-/// Exposed so tests can assert against parsed AST without re-rendering.
-pub fn parse(body: String) -> List(Block) {
+/// Parse a body string to its AST. Calls the Rust parser over FFI; on any
+/// decode failure returns a single Paragraph wrapping the body as literal
+/// text.
+pub fn parse(body: String) -> Document {
   let ast = parse_markdown_ffi(body)
-  case decode.run(ast, decode.list(block_decoder())) {
-    Ok(bs) -> bs
-    Error(_) -> [Paragraph([Text(body)])]
+  case decode.run(ast, document_decoder()) {
+    Ok(doc) -> doc
+    Error(_) -> Blocks([Paragraph([Text(body)])])
   }
 }
 
@@ -62,7 +60,7 @@ pub fn render(
   on_toggle_spoiler: fn(SpoilerKey) -> msg,
   p: Palette,
 ) -> Element(msg) {
-  render_blocks(
+  render_document(
     parse(body),
     message_id,
     is_spoiler_revealed,
@@ -71,32 +69,39 @@ pub fn render(
   )
 }
 
-/// Render a pre-parsed AST to a Lustre element. Used by `render` and
-/// directly by tests that build AST values by hand to avoid the FFI
-/// dependency in unit-test environments.
-pub fn render_blocks(
-  blocks: List(Block),
+/// Render a pre-parsed `Document`. Used by `render` and directly by tests
+/// that build AST values by hand to avoid the FFI dependency in unit-test
+/// environments.
+pub fn render_document(
+  doc: Document,
   message_id: String,
   is_spoiler_revealed: fn(SpoilerKey) -> Bool,
   on_toggle_spoiler: fn(SpoilerKey) -> msg,
   p: Palette,
 ) -> Element(msg) {
-  let ctx =
-    Ctx(
-      palette: p,
-      message_id: message_id,
-      is_revealed: is_spoiler_revealed,
-      on_toggle: on_toggle_spoiler,
-    )
-  html.div(
-    [
-      attribute.attribute(
-        "style",
-        "display: flex; flex-direction: column; gap: 4px;",
-      ),
-    ],
-    list.index_map(blocks, fn(b, i) { render_block(b, ctx, int.to_string(i)) }),
-  )
+  case doc {
+    Jumbo(emojis) -> render_jumbo(emojis)
+    Blocks(blocks) -> {
+      let ctx =
+        Ctx(
+          palette: p,
+          message_id: message_id,
+          is_revealed: is_spoiler_revealed,
+          on_toggle: on_toggle_spoiler,
+        )
+      html.div(
+        [
+          attribute.attribute(
+            "style",
+            "display: flex; flex-direction: column; gap: 4px;",
+          ),
+        ],
+        list.index_map(blocks, fn(b, i) {
+          render_block(b, ctx, int.to_string(i))
+        }),
+      )
+    }
+  }
 }
 
 /// Strip all formatting and return concatenated text. Useful for
@@ -107,6 +112,11 @@ pub fn to_plain(body: String) -> String
 
 // ----- AST types -----
 // Pub so tests can construct AST values directly without going through FFI.
+
+pub type Document {
+  Blocks(content: List(Block))
+  Jumbo(emojis: List(String))
+}
 
 pub type Block {
   Paragraph(content: List(Inline))
@@ -156,6 +166,20 @@ fn lazy_block_list() -> decode.Decoder(List(Block)) {
 //   - "VariantName"               (unit variants like LineBreak)
 //
 // `decode.one_of` tries each branch in order.
+
+fn document_decoder() -> decode.Decoder(Document) {
+  decode.one_of(document_blocks_decoder(), [document_jumbo_decoder()])
+}
+
+fn document_blocks_decoder() -> decode.Decoder(Document) {
+  use blocks <- decode.field("Blocks", decode.list(block_decoder()))
+  decode.success(Blocks(blocks))
+}
+
+fn document_jumbo_decoder() -> decode.Decoder(Document) {
+  use emojis <- decode.field("Jumbo", decode.list(decode.string))
+  decode.success(Jumbo(emojis))
+}
 
 fn block_decoder() -> decode.Decoder(Block) {
   decode.one_of(paragraph_decoder(), [
@@ -333,6 +357,31 @@ fn render_block(b: Block, ctx: Ctx(msg), path: String) -> Element(msg) {
 
     CodeBlock(language, source) ->
       render_code_block(language, source, ctx.palette)
+  }
+}
+
+fn render_jumbo(emojis: List(String)) -> Element(msg) {
+  let count = list.length(emojis)
+  html.div(
+    [
+      attribute.attribute("data-testid", "emoji-jumbo"),
+      attribute.attribute("data-emoji-count", int.to_string(count)),
+      attribute.attribute(
+        "style",
+        "font-size: "
+          <> jumbo_font_size(count)
+          <> "; line-height: 1.15; margin-top: 2px;",
+      ),
+    ],
+    [html.text(string.concat(emojis))],
+  )
+}
+
+fn jumbo_font_size(count: Int) -> String {
+  case count {
+    1 -> "54px"
+    2 -> "44px"
+    _ -> "36px"
   }
 }
 
