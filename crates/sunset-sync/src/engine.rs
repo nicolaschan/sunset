@@ -13,9 +13,7 @@ use crate::digest::{BloomFilter, build_digest, entries_missing_from_remote};
 use crate::error::{Error, Result};
 use crate::message::{DigestRange, SyncMessage};
 use crate::peer::{InboundEvent, run_peer};
-use crate::reserved;
 use crate::signer::Signer;
-use crate::subscription_registry::{SubscriptionRegistry, parse_subscription_entry};
 use crate::transport::Transport;
 use crate::types::{PeerAddr, PeerId, SyncConfig, TrustSet};
 
@@ -229,7 +227,6 @@ pub(crate) struct PeerSession {
 /// command processing and per-peer task callbacks can both update it.
 pub(crate) struct EngineState {
     pub trust: TrustSet,
-    pub registry: SubscriptionRegistry,
     pub routes: crate::routing::Routes,
     /// Per-peer session state, keyed by `PeerId`. Each entry carries
     /// the sender, the connection generation, and the transport kind
@@ -286,7 +283,6 @@ where
             signer,
             state: Arc::new(Mutex::new(EngineState {
                 trust: TrustSet::default(),
-                registry: SubscriptionRegistry::new(),
                 routes: crate::routing::Routes::new(local_peer),
                 peer_sessions: HashMap::new(),
                 event_subs: Vec::new(),
@@ -389,16 +385,14 @@ where
             datagram: datagram.clone(),
         };
         let state = self.state.lock().await;
-        let mut targets: std::collections::HashSet<PeerId> = state
-            .registry
-            .peers_matching(&datagram.verifying_key, &datagram.name)
-            .collect();
-        targets.extend(crate::routing::forward_targets(
+        let targets: Vec<PeerId> = crate::routing::forward_targets(
             &state.peer_sessions,
             |s| &s.interests,
             &datagram.verifying_key,
             &datagram.name,
-        ));
+        )
+        .into_iter()
+        .collect();
         for peer in targets {
             if let Some(po) = state.peer_sessions.get(&peer) {
                 let _ = po.tx.send(msg.clone());
@@ -837,40 +831,11 @@ where
         }
     }
 
-    /// Walk the local store for existing `_sunset-sync/subscribe` entries
-    /// and seed the in-memory `subscription_registry`. Called once at the
-    /// top of `run()` so that persistent backends survive process restart
-    /// without losing their routing state. Pure "read existing entries
-    /// and update local in-memory state" — does NOT push events to peers
-    /// (that's the live `local_sub` path's job, only for *new* inserts).
+    /// Stub: with the legacy `SubscriptionRegistry` removed, there is
+    /// no in-memory routing table to rehydrate at startup. Renamed to
+    /// `bootstrap_routes` in the next commit; for now this preserves
+    /// `run()`'s call site so the diff stays minimal.
     async fn replay_existing_subscriptions(&self) -> Result<()> {
-        let filter = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
-        let mut entries = self.store.iter(filter).await.map_err(Error::Store)?;
-        while let Some(item) = entries.next().await {
-            let entry = match item {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %e, "replay_existing_subscriptions: store iteration");
-                    continue;
-                }
-            };
-            let block = match self.store.get_content(&entry.value_hash).await {
-                Ok(Some(b)) => b,
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!(error = %e, "replay_existing_subscriptions: get_content");
-                    continue;
-                }
-            };
-            if let Ok(parsed_filter) = parse_subscription_entry(&entry, &block) {
-                let _ = self
-                    .state
-                    .lock()
-                    .await
-                    .registry
-                    .insert(entry.verifying_key, parsed_filter);
-            }
-        }
         Ok(())
     }
 
@@ -1089,49 +1054,12 @@ where
             _ => return,
         };
 
-        // If this is a subscription announcement, update the registry so
-        // future push routing knows about the peer's interests.
-        //
-        // On a new or changed filter, also backfill the peer with already-
-        // stored entries that match the filter. This closes the receiver-side
-        // race where third-party-authored entries arrive in our local store
-        // *before* the recipient's SUBSCRIBE_NAME is parsed; without the
-        // backfill, those entries sit in our store with no forwarding trigger
-        // until anti-entropy fires (well past the latency budget for, e.g.,
-        // WebRTC SDP signaling).
-        if entry.name.as_ref() == reserved::SUBSCRIBE_NAME {
-            if let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await {
-                if let Ok(filter) = parse_subscription_entry(&entry, &block) {
-                    let peer_vk = entry.verifying_key.clone();
-                    let peer_id = PeerId(peer_vk.clone());
-                    let prev = self
-                        .state
-                        .lock()
-                        .await
-                        .registry
-                        .insert(peer_vk.clone(), filter.clone());
-                    let filter_changed = prev.as_ref() != Some(&filter);
-                    let is_self = peer_vk == self.local_peer.0;
-                    if filter_changed && !is_self {
-                        // Send a DigestRequest to the peer so they respond
-                        // with a DigestExchange (their bloom over `filter`).
-                        // The existing handle_digest_exchange path then
-                        // computes the diff and pushes only the entries the
-                        // peer is missing — bandwidth-efficient via bloom
-                        // dedup, safe when the peer already has overlapping
-                        // state (browser persistence, federated relays).
-                        let msg = SyncMessage::DigestRequest {
-                            filter: filter.clone(),
-                            range: DigestRange::All,
-                        };
-                        let state = self.state.lock().await;
-                        if let Some(po) = state.peer_sessions.get(&peer_id) {
-                            let _ = po.tx.send(msg);
-                        }
-                    }
-                }
-            }
-        } else if entry
+        // If this entry is a per-(filter, provider) `SubscriptionEntry`
+        // naming us as the provider, mirror the receiver's interest into
+        // their `PeerSession`. Forwarding consults `peer_sessions[*].interests`
+        // (via `routing::forward_targets`); without this mirror, the
+        // receiver would never see matching application entries.
+        if entry
             .name
             .as_ref()
             .starts_with(crate::routing::SUBSCRIBE_PREFIX)
@@ -1232,16 +1160,14 @@ where
                 let _ = po.tx.send(msg.clone());
             }
         } else {
-            let mut targets: std::collections::HashSet<PeerId> = state
-                .registry
-                .peers_matching(&entry.verifying_key, &entry.name)
-                .collect();
-            targets.extend(crate::routing::forward_targets(
+            let targets: Vec<PeerId> = crate::routing::forward_targets(
                 &state.peer_sessions,
                 |s| &s.interests,
                 &entry.verifying_key,
                 &entry.name,
-            ));
+            )
+            .into_iter()
+            .collect();
             for peer in targets {
                 if let Some(po) = state.peer_sessions.get(&peer) {
                     let _ = po.tx.send(msg.clone());
@@ -1263,16 +1189,21 @@ where
             .collect()
     }
 
-    /// Snapshot of `(PeerId, Filter)` for every peer whose
-    /// `_sunset-sync/subscribe` entry is currently in the registry.
+    /// Snapshot of `(PeerId, Filter)` for every interest a currently-
+    /// connected peer has registered with us via a
+    /// `_sunset-sync/subscribe/<hash>/<provider>` entry naming this
+    /// engine as the provider. One row per (peer, filter); a peer
+    /// subscribing to multiple disjoint namespaces produces multiple
+    /// rows. Used by the relay dashboard.
     pub async fn subscriptions_snapshot(&self) -> Vec<(PeerId, Filter)> {
-        self.state
-            .lock()
-            .await
-            .registry
-            .iter()
-            .map(|(vk, f)| (PeerId(vk.clone()), f.clone()))
-            .collect()
+        let state = self.state.lock().await;
+        let mut out = Vec::new();
+        for (peer_id, session) in &state.peer_sessions {
+            for filter in session.interests.values() {
+                out.push((peer_id.clone(), filter.clone()));
+            }
+        }
+        out
     }
 
     /// Test-only helper: bypass the command channel and update trust
@@ -1280,19 +1211,6 @@ where
     #[cfg(test)]
     pub(crate) async fn set_trust_direct(&self, trust: TrustSet) {
         self.state.lock().await.trust = trust;
-    }
-
-    /// Test-only: true if this engine has learned the given peer's
-    /// subscription filter via the bootstrap digest exchange. Available
-    /// only with the `test-helpers` feature.
-    #[cfg(feature = "test-helpers")]
-    pub async fn knows_peer_subscription(&self, vk: &sunset_store::VerifyingKey) -> bool {
-        self.state
-            .lock()
-            .await
-            .registry
-            .iter()
-            .any(|(k, _)| k == vk)
     }
 
     /// Fan-out an event to every live subscriber. Drops senders whose
@@ -1579,42 +1497,6 @@ mod tests {
             vk: local_peer.0.clone(),
         });
         SyncEngine::new(store, transport, SyncConfig::default(), local_peer, signer)
-    }
-
-    /// Register a fake connected peer on the engine and return the
-    /// receiver end of its outbound channel.
-    async fn add_test_peer(
-        engine: &SyncEngine<MemoryStore, TestTransport>,
-        label: &[u8],
-        conn_id: ConnectionId,
-    ) -> (PeerId, mpsc::UnboundedReceiver<SyncMessage>) {
-        let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
-        let peer = PeerId(vk(label));
-        engine.state.lock().await.peer_sessions.insert(
-            peer.clone(),
-            PeerSession {
-                conn_id,
-                kind: TransportKind::Unknown,
-                tx,
-                _shutdown: tokio::sync::watch::channel(()).0,
-                interests: std::collections::HashMap::new(),
-            },
-        );
-        (peer, rx)
-    }
-
-    /// Drain `rx` (non-blocking), collecting `DigestExchange.filter`
-    /// values. Panics on any other queued message kind.
-    fn drain_digest_filters(rx: &mut mpsc::UnboundedReceiver<SyncMessage>) -> Vec<Filter> {
-        let mut out = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(SyncMessage::DigestExchange { filter, .. }) => out.push(filter),
-                Ok(other) => panic!("expected DigestExchange, got {other:?}"),
-                Err(_) => break,
-            }
-        }
-        out
     }
 
     #[tokio::test(flavor = "current_thread")]

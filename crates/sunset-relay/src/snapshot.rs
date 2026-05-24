@@ -91,7 +91,11 @@ async fn collect_store_stats<S: Store>(store: &S) -> StoreStats {
             Err(_) => continue,
         };
         stats.entry_count += 1;
-        if entry.name.as_ref() == sunset_sync::reserved::SUBSCRIBE_NAME {
+        if entry
+            .name
+            .as_ref()
+            .starts_with(sunset_sync::routing::SUBSCRIBE_PREFIX)
+        {
             stats.subscription_entries += 1;
         }
         match entry.expires_at {
