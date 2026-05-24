@@ -30,9 +30,7 @@ pub const SUBSCRIBE_PREFIX: &[u8] = b"_sunset-sync/subscribe/";
 /// human-debuggable. The 2× size cost is negligible at the wire level
 /// and pays for cheap grepping of live entries during incident response.
 pub fn subscription_name(filter: &Filter, provider: &PeerId) -> Bytes {
-    let filter_bytes = postcard::to_stdvec(filter).expect("postcard filter encode is infallible");
-    let filter_hash = blake3::hash(&filter_bytes);
-    let filter_hex = hex::encode(filter_hash.as_bytes());
+    let filter_hex = hex::encode(crate::routing::filter_hash(filter));
     let provider_hex = hex::encode(provider.0.as_bytes());
     Bytes::from(format!(
         "_sunset-sync/subscribe/{filter_hex}/{provider_hex}"
