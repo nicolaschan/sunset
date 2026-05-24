@@ -190,11 +190,6 @@ impl Liveness {
         }
     }
 
-    /// Apply the observation to `peer`'s entry, returning the resulting
-    /// state change if one occurred. Out-of-order (older than stored)
-    /// observations leave state untouched and return `None`. Live→Live
-    /// is silent (`None`); None→Live and Stale→Live both emit `Live`.
-    /// Caller must hold the inner lock.
     fn record_observation(
         inner: &mut Inner,
         peer: &PeerId,
@@ -234,11 +229,6 @@ impl Liveness {
         }
     }
 
-    /// Walk every peer (optionally skipping `except`) and transition
-    /// any `Live` entry whose `last_heard_at` is older than `stale_after`
-    /// relative to `now` into `Stale`, returning the resulting change
-    /// events. Idempotent — already-`Stale` entries are untouched.
-    /// Caller must hold the inner lock.
     fn sweep_stale(
         inner: &mut Inner,
         now: SystemTime,
