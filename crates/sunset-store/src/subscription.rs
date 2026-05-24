@@ -51,25 +51,15 @@ impl SubscriptionList {
     }
 
     /// Broadcast an event to every live subscription whose filter matches.
-    /// `BlobAdded` / `BlobRemoved` have no key and are delivered to all
-    /// subscribers regardless of filter.
+    /// Per-variant matching (including the "blob events go to all" rule)
+    /// lives on [`Filter::matches_event`].
     pub fn broadcast(&self, event: &Event) {
-        let (vk, name) = match event {
-            Event::Inserted(e) | Event::Expired(e) => (Some(&e.verifying_key), Some(&e.name)),
-            Event::Replaced { new, .. } => (Some(&new.verifying_key), Some(&new.name)),
-            Event::BlobAdded(_) | Event::BlobRemoved(_) => (None, None),
-        };
-
         let mut g = self.entries.lock().unwrap();
         g.retain(|w| {
             let Some(s) = w.upgrade() else {
                 return false;
             };
-            let interested = match (vk, name) {
-                (Some(v), Some(n)) => s.filter.matches(v, n.as_ref()),
-                _ => true,
-            };
-            if interested {
+            if s.filter.matches_event(event) {
                 let _ = s.tx.send(Ok(event.clone()));
             }
             true

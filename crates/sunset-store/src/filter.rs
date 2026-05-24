@@ -30,6 +30,21 @@ impl Filter {
             Filter::Union(filters) => filters.iter().any(|f| f.matches(vk, name)),
         }
     }
+
+    /// True if this filter is interested in delivery of `event`.
+    ///
+    /// Keyed events (`Inserted`, `Replaced`, `Expired`) are matched against
+    /// the filter's `(verifying_key, name)` predicate. Blob events
+    /// (`BlobAdded`, `BlobRemoved`) carry no key and are delivered to every
+    /// subscriber regardless of filter — they describe content-store state,
+    /// which is shared across the whole store.
+    pub fn matches_event(&self, event: &Event) -> bool {
+        match event {
+            Event::Inserted(e) | Event::Expired(e) => self.matches(&e.verifying_key, &e.name),
+            Event::Replaced { new, .. } => self.matches(&new.verifying_key, &new.name),
+            Event::BlobAdded(_) | Event::BlobRemoved(_) => true,
+        }
+    }
 }
 
 /// Replay mode for `Store::subscribe`.
