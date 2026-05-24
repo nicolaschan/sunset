@@ -41,6 +41,17 @@ pub struct Neighbor {
     pub last_success_ts: u64,
 }
 
+/// Monotonic liveness beacon published by a provider.
+///
+/// Stored at `(self_pubkey, naming::PROVIDER_TICK_NAME)`. Receivers
+/// observe arrival cadence on their subscribed path as the provider's
+/// liveness signal; for active data streams (e.g. voice frames) the
+/// data itself serves the same role.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTick {
+    pub seq: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +126,15 @@ mod tests {
         let bytes = postcard::to_stdvec(&ls).unwrap();
         let back: LinkState = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(ls, back);
+    }
+
+    #[test]
+    fn provider_tick_postcard_roundtrip() {
+        for seq in [0u64, 1, 42, u64::MAX] {
+            let t = ProviderTick { seq };
+            let bytes = postcard::to_stdvec(&t).unwrap();
+            let back: ProviderTick = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(t, back);
+        }
     }
 }

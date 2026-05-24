@@ -8,4 +8,4 @@
 
 pub mod types;
 
-pub use types::{LinkState, Neighbor, SubscriptionEntry};
+pub use types::{LinkState, Neighbor, ProviderTick, SubscriptionEntry};
