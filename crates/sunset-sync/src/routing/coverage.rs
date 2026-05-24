@@ -78,8 +78,17 @@ fn covers_name_prefix(super_prefix: &Bytes, subset: &Filter) -> bool {
     }
 }
 
-fn covers_union(_super_alts: &[Filter], _subset: &Filter) -> bool {
-    unimplemented!("covers: Union superset implemented in next task")
+/// `Union(super_alts)` covers `subset` iff:
+/// - `subset` is itself a `Union(sub_alts)` and every `sub_alt` is
+///   covered by at least one `super_alt`, OR
+/// - `subset` is a non-Union and some `super_alt` covers it.
+fn covers_union(super_alts: &[Filter], subset: &Filter) -> bool {
+    match subset {
+        Filter::Union(sub_alts) => sub_alts
+            .iter()
+            .all(|sub_alt| super_alts.iter().any(|sup| covers(sup, sub_alt))),
+        _ => super_alts.iter().any(|sup| covers(sup, subset)),
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +231,60 @@ mod tests {
         assert!(covers(&s, &Filter::NamePrefix(n(b"x/"))));
         // Still doesn't cover Keyspace (writer-keyed, not name-keyed).
         assert!(!covers(&s, &Filter::Keyspace(vk(b"x"))));
+    }
+
+    #[test]
+    fn union_superset_covers_when_any_alt_covers() {
+        let s = Filter::Union(vec![
+            Filter::Keyspace(vk(b"a")),
+            Filter::NamePrefix(n(b"room/")),
+        ]);
+        assert!(covers(&s, &Filter::Specific(vk(b"a"), n(b"random"))));
+        assert!(covers(&s, &Filter::Specific(vk(b"b"), n(b"room/x"))));
+        assert!(!covers(&s, &Filter::Specific(vk(b"b"), n(b"other"))));
+    }
+
+    #[test]
+    fn union_superset_covers_union_subset_pairwise() {
+        let s = Filter::Union(vec![
+            Filter::Keyspace(vk(b"a")),
+            Filter::NamePrefix(n(b"room/")),
+        ]);
+        let covered = Filter::Union(vec![
+            Filter::Specific(vk(b"a"), n(b"k")),
+            Filter::Namespace(n(b"room/x")),
+        ]);
+        let not_covered = Filter::Union(vec![
+            Filter::Specific(vk(b"a"), n(b"k")),
+            Filter::Specific(vk(b"b"), n(b"presence")),
+        ]);
+        assert!(covers(&s, &covered));
+        assert!(!covers(&s, &not_covered));
+    }
+
+    #[test]
+    fn empty_union_covers_nothing_and_is_covered_by_anything() {
+        // Empty Union as superset: no alternative can cover anything, so always false.
+        let empty_super = Filter::Union(vec![]);
+        assert!(!covers(&empty_super, &Filter::Specific(vk(b"a"), n(b"k"))));
+
+        // Empty Union as subset: vacuous "every alt covered" → true.
+        let real_super = Filter::Keyspace(vk(b"a"));
+        let empty_sub = Filter::Union(vec![]);
+        assert!(covers(&real_super, &empty_sub));
+    }
+
+    #[test]
+    fn covers_is_reflexive() {
+        let filters = [
+            Filter::Specific(vk(b"a"), n(b"k")),
+            Filter::Keyspace(vk(b"a")),
+            Filter::Namespace(n(b"k")),
+            Filter::NamePrefix(n(b"k")),
+            Filter::Union(vec![Filter::Keyspace(vk(b"a")), Filter::NamePrefix(n(b"r/"))]),
+        ];
+        for f in &filters {
+            assert!(covers(f, f), "covers({f:?}, {f:?}) should be true");
+        }
     }
 }
