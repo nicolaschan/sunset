@@ -18,6 +18,7 @@ pub fn covers(superset: &Filter, subset: &Filter) -> bool {
         Filter::Specific(super_vk, super_name) => {
             covers_specific(super_vk, super_name, subset)
         }
+        Filter::Keyspace(super_vk) => covers_keyspace(super_vk, subset),
         // Other superset variants implemented in subsequent tasks.
         _ => unimplemented!("covers: superset variant not yet implemented"),
     }
@@ -33,6 +34,19 @@ fn covers_specific(super_vk: &VerifyingKey, super_name: &Bytes, subset: &Filter)
             covers(&Filter::Specific(super_vk.clone(), super_name.clone()), alt)
         }),
         Filter::Keyspace(_) | Filter::Namespace(_) | Filter::NamePrefix(_) => false,
+    }
+}
+
+/// `Keyspace(super_vk)` covers `subset` iff every match of `subset` is
+/// written by `super_vk`.
+fn covers_keyspace(super_vk: &VerifyingKey, subset: &Filter) -> bool {
+    match subset {
+        Filter::Specific(sub_vk, _) => super_vk == sub_vk,
+        Filter::Keyspace(sub_vk) => super_vk == sub_vk,
+        Filter::Union(alts) => alts.iter().all(|alt| {
+            covers(&Filter::Keyspace(super_vk.clone()), alt)
+        }),
+        Filter::Namespace(_) | Filter::NamePrefix(_) => false,
     }
 }
 
@@ -84,5 +98,40 @@ mod tests {
         assert!(covers(&s, &single));
         assert!(covers(&s, &two_same));
         assert!(!covers(&s, &mixed));
+    }
+
+    #[test]
+    fn keyspace_covers_itself_and_specific_under_it() {
+        let s = Filter::Keyspace(vk(b"a"));
+        assert!(covers(&s, &s));
+        assert!(covers(&s, &Filter::Specific(vk(b"a"), n(b"any"))));
+        assert!(covers(&s, &Filter::Specific(vk(b"a"), n(b"other"))));
+    }
+
+    #[test]
+    fn keyspace_does_not_cover_other_writer() {
+        let s = Filter::Keyspace(vk(b"a"));
+        assert!(!covers(&s, &Filter::Keyspace(vk(b"b"))));
+        assert!(!covers(&s, &Filter::Specific(vk(b"b"), n(b"k"))));
+    }
+
+    #[test]
+    fn keyspace_does_not_cover_writer_agnostic_filters() {
+        let s = Filter::Keyspace(vk(b"a"));
+        assert!(!covers(&s, &Filter::Namespace(n(b"k"))));
+        assert!(!covers(&s, &Filter::NamePrefix(n(b""))));
+    }
+
+    #[test]
+    fn keyspace_covers_union_iff_all_alts_under_it() {
+        let s = Filter::Keyspace(vk(b"a"));
+        assert!(covers(&s, &Filter::Union(vec![
+            Filter::Specific(vk(b"a"), n(b"k1")),
+            Filter::Specific(vk(b"a"), n(b"k2")),
+        ])));
+        assert!(!covers(&s, &Filter::Union(vec![
+            Filter::Specific(vk(b"a"), n(b"k1")),
+            Filter::Specific(vk(b"b"), n(b"k1")),
+        ])));
     }
 }
