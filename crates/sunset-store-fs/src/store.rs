@@ -109,22 +109,18 @@ impl Store for FsStore {
             .await
             .map_err(unwrap_store_error)?;
 
-        // Broadcasts are sent under the writer_mutex by virtue of `_w` above —
-        // do not drop the guard before this block.
-        match outcome {
-            kv::InsertOutcome::Inserted => {
-                self.subscriptions.broadcast(&Event::Inserted(entry));
-            }
-            kv::InsertOutcome::Replaced { old, .. } => {
-                self.subscriptions
-                    .broadcast(&Event::Replaced { old, new: entry });
-            }
-        }
-        if blob_was_new {
-            if let Some(b) = blob {
-                self.subscriptions.broadcast(&Event::BlobAdded(b.hash()));
-            }
-        }
+        // Broadcasts run WHILE holding `_w` above — do not drop the guard
+        // before this block.
+        let entry_event = match outcome {
+            kv::InsertOutcome::Inserted => Event::Inserted(entry),
+            kv::InsertOutcome::Replaced { old, .. } => Event::Replaced { old, new: entry },
+        };
+        let blob_added = if blob_was_new {
+            blob.map(|b| b.hash())
+        } else {
+            None
+        };
+        self.subscriptions.publish_insert(&entry_event, blob_added);
 
         Ok(())
     }

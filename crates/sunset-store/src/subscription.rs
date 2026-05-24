@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::mpsc;
 
-use crate::{Event, Filter, Result};
+use crate::{Event, Filter, Hash, Result};
 
 /// A live subscription: the filter the subscriber asked for, and the
 /// sender half of its live-event channel.
@@ -74,5 +74,19 @@ impl SubscriptionList {
             }
             true
         });
+    }
+
+    /// Broadcast the entry event for an `insert`, then — if a new blob was
+    /// added by the same operation — broadcast `BlobAdded` for it. Both
+    /// fire inside the caller's writer-critical section (the caller still
+    /// holds the lock that synchronizes broadcasts with `subscribe`).
+    ///
+    /// The ordering "entry event first, then blob event" is a documented
+    /// store invariant; it lives here so each backend cannot forget it.
+    pub fn publish_insert(&self, entry_event: &Event, blob_added: Option<Hash>) {
+        self.broadcast(entry_event);
+        if let Some(h) = blob_added {
+            self.broadcast(&Event::BlobAdded(h));
+        }
     }
 }
