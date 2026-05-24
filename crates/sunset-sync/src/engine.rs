@@ -1387,7 +1387,12 @@ where
             state.peer_sessions.keys().cloned().collect()
         };
         for peer in peers {
-            self.do_subscribe_via(filter.clone(), peer, policy).await?;
+            if let Err(e) = self
+                .do_subscribe_via(filter.clone(), peer.clone(), policy)
+                .await
+            {
+                tracing::warn!(?e, ?peer, "subscribe per-peer fanout failed");
+            }
         }
         Ok(())
     }
@@ -1416,7 +1421,12 @@ where
                 .collect()
         };
         for provider in providers {
-            self.do_unsubscribe_via(filter.clone(), provider).await?;
+            if let Err(e) = self
+                .do_unsubscribe_via(filter.clone(), provider.clone())
+                .await
+            {
+                tracing::warn!(?e, ?provider, "unsubscribe per-provider fanout failed");
+            }
         }
         Ok(())
     }
