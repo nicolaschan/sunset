@@ -571,6 +571,27 @@ where
         // isn't duplicated immediately after PeerHello.
         anti_entropy.tick().await;
 
+        // Routing tick: refresh subscriptions whose TTL is past half-life.
+        // MissedTickBehavior::Skip avoids tick storms after a long pause
+        // (e.g. WASM tab backgrounded); a single catch-up fire is enough,
+        // since `due_for_refresh` scans the full set every tick anyway.
+        // wasmtimer ships its own MissedTickBehavior; on WASM we have to
+        // reach for that type rather than tokio's.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut routing_tick = {
+            let mut t = tokio::time::interval(std::time::Duration::from_millis(500));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        };
+        #[cfg(target_arch = "wasm32")]
+        let mut routing_tick = {
+            let mut t = wasmtimer::tokio::interval(std::time::Duration::from_millis(500));
+            t.set_missed_tick_behavior(wasmtimer::tokio::MissedTickBehavior::Skip);
+            t
+        };
+        // Burn the initial immediate-fire tick so the first real fire is one period out.
+        routing_tick.tick().await;
+
         // Spawn the accept loop in its own task so its in-flight
         // post-accept work (e.g. NoiseTransport's IK handshake on the
         // raw connection that `transport.accept().await` just returned)
@@ -615,6 +636,21 @@ where
                 }
                 _ = anti_entropy.tick() => {
                     self.tick_anti_entropy().await;
+                }
+                _ = routing_tick.tick() => {
+                    let now_ms = web_time::SystemTime::now()
+                        .duration_since(web_time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let due = {
+                        let state = self.state.lock().await;
+                        state.routes.due_for_refresh(now_ms)
+                    };
+                    for key in due {
+                        if let Err(e) = self.republish_subscription(&key).await {
+                            tracing::warn!(?e, ?key, "subscription refresh failed");
+                        }
+                    }
                 }
             }
         }
@@ -1498,6 +1534,21 @@ where
             self.send_filter_digest(peer_id, &filter).await;
         }
         Ok(())
+    }
+
+    /// Re-publish an active subscription to refresh its TTL. Called by the
+    /// routing tick for each entry returned from `routes.due_for_refresh`.
+    /// Returns Ok if the entry was already removed between scan and refresh.
+    async fn republish_subscription(
+        &self,
+        key: &crate::routing::OutboundKey,
+    ) -> Result<()> {
+        let (filter, policy) = {
+            let state = self.state.lock().await;
+            let Some(ob) = state.routes.my_subs.get(key) else { return Ok(()) };
+            (ob.filter.clone(), ob.policy)
+        };
+        self.do_subscribe_via(filter, key.provider.clone(), policy).await
     }
 
     /// Publish a per-pair `SubscriptionEntry::Active` for `(filter,
