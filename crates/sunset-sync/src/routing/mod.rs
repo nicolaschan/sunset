@@ -15,12 +15,14 @@
 //! introduced here. The two key spaces are disjoint as exact names.
 
 pub mod coverage;
+pub mod forward;
 pub mod naming;
 pub mod policy;
 pub mod routes;
 pub mod types;
 
 pub use coverage::covers;
+pub use forward::forward_targets;
 pub use naming::{LINKS_NAME, PROVIDER_TICK_NAME, SUBSCRIBE_PREFIX, subscription_name};
 pub use policy::SubscriptionPolicy;
 pub use routes::{BroadcastIntent, FilterHash, Outbound, OutboundKey, Routes, filter_hash};
