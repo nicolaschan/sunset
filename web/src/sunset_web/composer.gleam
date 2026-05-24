@@ -15,6 +15,12 @@ pub fn apply_template(
   caret_at_between: Bool,
 ) -> String
 
+/// Insert `text` into the textarea at the current cursor / selection.
+/// Returns the resulting textarea value so the caller can write it
+/// back into model state. Used by the composer emoji picker.
+@external(javascript, "./composer.ffi.mjs", "insertAtCursor")
+pub fn insert_at_cursor(element_id: String, text: String) -> String
+
 @external(javascript, "./composer.ffi.mjs", "attachShortcutPreventDefault")
 pub fn attach_shortcut_prevent_default(element_id: String) -> Nil
 

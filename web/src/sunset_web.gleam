@@ -169,6 +169,22 @@ fn initial_channels() -> List(domain.Channel) {
   ]
 }
 
+/// What the currently-open full emoji picker is for. One variant per
+/// distinct on-pick semantics. Modeled as a sum (not parallel
+/// flags) so "at most one picker open at a time" is a type invariant
+/// instead of state the call sites have to keep in sync by hand.
+pub type FullPickerTarget {
+  /// Picker opened from a message's "+" reaction button. On pick:
+  /// toggle the emoji as a reaction on `message_id` and close the
+  /// picker (single-pick UX matches Slack / Discord reaction add).
+  ReactionTarget(message_id: String)
+  /// Picker opened from the composer's emoji button. On pick: insert
+  /// the emoji into the active room's draft at the textarea cursor.
+  /// Stays open so the user can pick multiple emojis in one go;
+  /// dismissed via the backdrop or by switching rooms.
+  ComposerInsert
+}
+
 pub type Model {
   Model(
     mode: Mode,
@@ -190,10 +206,12 @@ pub type Model {
     rooms_collapsed: Bool,
     landing_input: String,
     sidebar_search: String,
-    /// Target id whose full emoji picker is currently open. Global
-    /// (not per-room) because only one picker is open at a time and it
-    /// dismisses if you switch rooms anyway.
-    full_picker_for: Option(String),
+    /// What the currently-open full emoji picker is for. Global (not
+    /// per-room) because only one picker is open at a time and it
+    /// dismisses if you switch rooms anyway. The variant decides what
+    /// `on_pick` does — toggle a reaction on a message, or insert into
+    /// the composer draft.
+    full_picker_target: Option(FullPickerTarget),
     /// Click-relative position of the trigger that opened the desktop
     /// full emoji picker, plus the viewport height at the time of the
     /// click. `None` for sheet-mode (mobile) opens; for desktop opens
@@ -318,8 +336,13 @@ pub type Msg {
   /// is captured by the trigger's click decoder on desktop so the
   /// overlay can anchor itself to the click; mobile uses a bottom
   /// sheet and passes `None`.
-  OpenFullEmojiPicker(target: String, anchor: Option(#(Float, Float)))
+  OpenFullEmojiPicker(target: FullPickerTarget, anchor: Option(#(Float, Float)))
   CloseFullEmojiPicker
+  /// Insert an emoji into the active room's composer draft at the
+  /// textarea's current cursor position. Dispatched by the composer
+  /// emoji picker on each pick; the picker stays open so multiple
+  /// emojis can be inserted in one session.
+  InsertEmojiAtCursor(emoji: String)
   OpenDetail(String)
   CloseDetail
   OpenVoicePopover(String)
@@ -470,7 +493,7 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       rooms_collapsed: False,
       landing_input: "",
       sidebar_search: "",
-      full_picker_for: None,
+      full_picker_target: None,
       full_picker_anchor: None,
       reactions: dict.new(),
       dragging_room: None,
@@ -1886,6 +1909,18 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         #(RoomState(..state, draft: new_value), effect.none())
       })
     }
+    InsertEmojiAtCursor(emoji) -> {
+      // Same shape as ApplyComposerShortcut: the FFI mutates the
+      // textarea (splice at selection + restore caret + auto-grow +
+      // re-focus) and returns the resulting value, which we mirror
+      // into model.draft so Lustre's next render is in sync. The
+      // picker stays open — close happens only via the backdrop /
+      // room switch / explicit dismiss.
+      let new_value = composer.insert_at_cursor("composer-textarea", emoji)
+      with_active_room(model, fn(state) {
+        #(RoomState(..state, draft: new_value), effect.none())
+      })
+    }
     // Master's reactions Msg variants — pre-multi-room these were
     // wired to a Client-level reactions tracker. After multi-room the
     // tracker needs to be per-OpenRoom (the per-room follow-up), so
@@ -1916,7 +1951,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Error(_) -> "add"
       }
       let next_model =
-        Model(..model, full_picker_for: None, full_picker_anchor: None)
+        Model(..model, full_picker_target: None, full_picker_anchor: None)
       let send_eff = case dict.get(model.rooms, active_name) {
         Ok(state) ->
           case state.handle {
@@ -2228,14 +2263,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Model(
           ..model,
           rooms: rooms,
-          full_picker_for: Some(target),
+          full_picker_target: Some(target),
           full_picker_anchor: anchor,
         ),
         register_eff,
       )
     }
     CloseFullEmojiPicker -> #(
-      Model(..model, full_picker_for: None, full_picker_anchor: None),
+      Model(..model, full_picker_target: None, full_picker_anchor: None),
       effect.none(),
     )
     UpdateSelfName(value) -> {
@@ -2263,6 +2298,20 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
       }
     }
+  }
+}
+
+/// Map a `FullPickerTarget` to the on-pick handler the emoji picker
+/// view should dispatch. One place to decide what "pick" means per
+/// target, so the three picker render sites (desktop anchored,
+/// desktop fallback-centered, mobile sheet) share the dispatch
+/// without each having its own copy of the branch.
+fn pick_msg_for(target: FullPickerTarget) -> fn(String) -> Msg {
+  case target {
+    ReactionTarget(message_id) -> fn(emoji) {
+      ToggleReactionEmoji(message_id, emoji)
+    }
+    ComposerInsert -> fn(emoji) { InsertEmojiAtCursor(emoji) }
   }
 }
 
@@ -2374,7 +2423,7 @@ fn room_view_with_state(
   //     "click outside to dismiss" affordance.
   //   * `full_picker_overlay_el` — the picker itself, positioned
   //     against the click anchor stored in `full_picker_anchor`.
-  let full_picker_backdrop_el = case model.viewport, model.full_picker_for {
+  let full_picker_backdrop_el = case model.viewport, model.full_picker_target {
     domain.Desktop, Some(_) ->
       html.div(
         [
@@ -2394,7 +2443,7 @@ fn room_view_with_state(
 
   let full_picker_overlay_el = case
     model.viewport,
-    model.full_picker_for,
+    model.full_picker_target,
     model.full_picker_anchor
   {
     domain.Desktop, Some(target), Some(#(anchor_y, viewport_h)) ->
@@ -2417,7 +2466,7 @@ fn room_view_with_state(
           emoji_picker.view(
             palette: palette,
             mode: model.mode,
-            on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+            on_pick: pick_msg_for(target),
           ),
         ],
       )
@@ -2444,7 +2493,7 @@ fn room_view_with_state(
           emoji_picker.view(
             palette: palette,
             mode: model.mode,
-            on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+            on_pick: pick_msg_for(target),
           ),
         ],
       )
@@ -2499,7 +2548,7 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
-  let full_picker_sheet_el = case model.full_picker_for {
+  let full_picker_sheet_el = case model.full_picker_target {
     Some(target) ->
       bottom_sheet.view(
         palette: palette,
@@ -2509,7 +2558,7 @@ fn room_view_with_state(
         content: emoji_picker.view(
           palette: palette,
           mode: model.mode,
-          on_pick: fn(emoji) { ToggleReactionEmoji(target, emoji) },
+          on_pick: pick_msg_for(target),
         ),
       )
     None -> element.fragment([])
@@ -2804,7 +2853,15 @@ fn room_view_with_state(
       },
       on_toggle_reaction_picker: ToggleReactionPicker,
       on_add_reaction: ToggleReactionEmoji,
-      on_open_full_picker: OpenFullEmojiPicker,
+      // main_panel deals in message ids (Strings); wrap into the
+      // sum-type variant here so the picker target type lives only in
+      // sunset_web and main_panel doesn't need to import it.
+      on_open_full_picker: fn(message_id, anchor) {
+        OpenFullEmojiPicker(ReactionTarget(message_id), anchor)
+      },
+      on_open_composer_emoji_picker: fn(anchor) {
+        OpenFullEmojiPicker(ComposerInsert, Some(anchor))
+      },
       on_open_detail: OpenDetail,
       on_open_image: OpenImageTheater,
       receipts: state.receipts,
@@ -3349,7 +3406,7 @@ fn phone_reaction_grid(
         attribute.attribute("data-testid", "reaction-picker-more"),
         // Mobile uses the bottom-sheet variant of the full picker; no
         // anchor is needed (the sheet is its own placement).
-        event.on_click(OpenFullEmojiPicker(message_id, None)),
+        event.on_click(OpenFullEmojiPicker(ReactionTarget(message_id), None)),
         ui.css([
           #("padding", "12px"),
           #("font-size", "26px"),

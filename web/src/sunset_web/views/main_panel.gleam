@@ -49,6 +49,10 @@ pub fn view(
   on_add_reaction on_add_reaction: fn(String, String) -> msg,
   on_open_full_picker on_open_full_picker: fn(String, Option(#(Float, Float))) ->
     msg,
+  on_open_composer_emoji_picker on_open_composer_emoji_picker: fn(
+    #(Float, Float),
+  ) ->
+    msg,
   on_open_detail on_open_detail: fn(String) -> msg,
   on_open_image on_open_image: fn(Attachment) -> msg,
   receipts receipts: Dict(String, Dict(String, Int)),
@@ -119,6 +123,7 @@ pub fn view(
         on_remove_attachment,
         noop,
         on_shortcut,
+        on_open_composer_emoji_picker,
       ),
     ],
   )
@@ -909,6 +914,7 @@ fn composer(
   on_remove_attachment: fn(Int) -> msg,
   noop: msg,
   on_shortcut: fn(String, String, String, Bool) -> msg,
+  on_open_emoji_picker: fn(#(Float, Float)) -> msg,
 ) -> Element(msg) {
   // The composer's outer height drives the column-bottom seam shared
   // with the channels-rail self-bar and the members-rail you_row (64px); the
@@ -978,6 +984,7 @@ fn composer(
             ],
             [
               attach_button(p, on_pick_images),
+              emoji_picker_button(p, viewport, on_open_emoji_picker),
               html.textarea(
                 [
                   attribute.id("composer-textarea"),
@@ -1191,6 +1198,113 @@ fn attach_button(p: Palette, on_click: msg) -> Element(msg) {
       ),
     ],
   )
+}
+
+/// Composer-side emoji picker trigger. Desktop only — phones have the
+/// native OS emoji keyboard, so the button is rendered as
+/// `element.fragment([])` (no DOM) on `domain.Phone`. The trigger
+/// captures the click's `clientY` + the live `view.innerHeight` so the
+/// overlay can anchor itself near the button and decide whether to
+/// flip above the trigger (composer sits at the bottom of the
+/// viewport, so most opens will flip-above).
+fn emoji_picker_button(
+  p: Palette,
+  viewport: domain.Viewport,
+  on_open: fn(#(Float, Float)) -> msg,
+) -> Element(msg) {
+  case viewport {
+    domain.Phone -> element.fragment([])
+    domain.Desktop ->
+      html.button(
+        [
+          attribute.title("Insert emoji"),
+          attribute.attribute("aria-label", "Insert emoji"),
+          attribute.attribute("data-testid", "composer-emoji-picker-trigger"),
+          event.on("click", {
+            use cy <- decode.subfield(["clientY"], decode.float)
+            use vh <- decode.subfield(["view", "innerHeight"], decode.float)
+            decode.success(on_open(#(cy, vh)))
+          }),
+          ui.css([
+            #("display", "inline-flex"),
+            #("align-items", "center"),
+            #("justify-content", "center"),
+            #("width", "24px"),
+            #("height", "24px"),
+            #("border", "none"),
+            #("background", "transparent"),
+            #("color", p.text_faint),
+            #("cursor", "pointer"),
+            #("padding", "0"),
+            #("border-radius", "4px"),
+            #("font-size", "16px"),
+            #("line-height", "1"),
+          ]),
+        ],
+        [
+          // Outline smiley to match the attach button's monochrome
+          // stroke style — both buttons read as a row of muted icons
+          // rather than mixing a colour emoji into the chrome.
+          element.namespaced(
+            "http://www.w3.org/2000/svg",
+            "svg",
+            [
+              attribute.attribute("width", "16"),
+              attribute.attribute("height", "16"),
+              attribute.attribute("viewBox", "0 0 16 16"),
+              attribute.attribute("fill", "none"),
+            ],
+            [
+              element.namespaced(
+                "http://www.w3.org/2000/svg",
+                "circle",
+                [
+                  attribute.attribute("cx", "8"),
+                  attribute.attribute("cy", "8"),
+                  attribute.attribute("r", "6"),
+                  attribute.attribute("stroke", "currentColor"),
+                  attribute.attribute("stroke-width", "1.3"),
+                ],
+                [],
+              ),
+              element.namespaced(
+                "http://www.w3.org/2000/svg",
+                "circle",
+                [
+                  attribute.attribute("cx", "6"),
+                  attribute.attribute("cy", "6.8"),
+                  attribute.attribute("r", "0.8"),
+                  attribute.attribute("fill", "currentColor"),
+                ],
+                [],
+              ),
+              element.namespaced(
+                "http://www.w3.org/2000/svg",
+                "circle",
+                [
+                  attribute.attribute("cx", "10"),
+                  attribute.attribute("cy", "6.8"),
+                  attribute.attribute("r", "0.8"),
+                  attribute.attribute("fill", "currentColor"),
+                ],
+                [],
+              ),
+              element.namespaced(
+                "http://www.w3.org/2000/svg",
+                "path",
+                [
+                  attribute.attribute("d", "M5.4 9.5 Q8 11.6 10.6 9.5"),
+                  attribute.attribute("stroke", "currentColor"),
+                  attribute.attribute("stroke-width", "1.3"),
+                  attribute.attribute("stroke-linecap", "round"),
+                ],
+                [],
+              ),
+            ],
+          ),
+        ],
+      )
+  }
 }
 
 fn you_tag(p: Palette) -> Element(msg) {
