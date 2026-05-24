@@ -2243,17 +2243,24 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
 
     OpenFullEmojiPicker(target, anchor) -> {
-      // Closing the per-room quick-picker prevents both pickers from
-      // rendering at once; full picker takes over.
-      let active_name = active_room_name(model)
-      let rooms = case dict.get(model.rooms, active_name) {
-        Ok(state) ->
-          dict.insert(
-            model.rooms,
-            active_name,
-            RoomState(..state, reacting_to: None),
-          )
-        Error(_) -> model.rooms
+      // The reaction quick-picker and the full reaction picker would
+      // otherwise render simultaneously on the same row. Scope the
+      // dismiss to the reaction case — the composer picker has no
+      // per-row quick-picker to displace.
+      let rooms = case target {
+        ReactionTarget(_) -> {
+          let active_name = active_room_name(model)
+          case dict.get(model.rooms, active_name) {
+            Ok(state) ->
+              dict.insert(
+                model.rooms,
+                active_name,
+                RoomState(..state, reacting_to: None),
+              )
+            Error(_) -> model.rooms
+          }
+        }
+        ComposerInsert -> model.rooms
       }
       // Trigger the lazy import so the web component is registered by
       // the time the picker mounts. Idempotent.
@@ -2548,8 +2555,15 @@ fn room_view_with_state(
     _, _ -> element.fragment([])
   }
 
+  // The mobile bottom-sheet only renders reaction picks: composer
+  // insertion is desktop-only (the trigger button isn't rendered on
+  // phone), and even if a future caller opens `ComposerInsert` from
+  // a non-trigger path, on-pick `insert_at_cursor` would target a
+  // textarea that the sheet is covering. Refuse the sheet render
+  // here so the desktop-only invariant doesn't have to be maintained
+  // by hand at the trigger.
   let full_picker_sheet_el = case model.full_picker_target {
-    Some(target) ->
+    Some(ReactionTarget(_) as target) ->
       bottom_sheet.view(
         palette: palette,
         open: True,
@@ -2561,7 +2575,7 @@ fn room_view_with_state(
           on_pick: pick_msg_for(target),
         ),
       )
-    None -> element.fragment([])
+    Some(ComposerInsert) | None -> element.fragment([])
   }
 
   // Derive voice-channel membership + muted status from real voice

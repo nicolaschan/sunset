@@ -214,3 +214,125 @@ test("desktop: emoji is inserted at the cursor, not appended", async ({
 
   await ctx.close();
 });
+
+// Picking when a non-empty selection is active replaces the selection
+// (analogous to typing a character with text selected). The FFI's
+// `insertAtCursor` documents this — `selectionStart != selectionEnd`
+// is the same code path as the "cursor in the middle" case, so the
+// selected range is overwritten.
+test("desktop: pick replaces a non-empty selection", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "desktop-only feature",
+  );
+  const { ctx, page, composer } = await openChat(browser);
+
+  await composer.fill("hello world");
+  // Select the word "world" — Home → Shift+End from the second word's
+  // start would also work, but this is direct and survives any input
+  // navigation quirks.
+  await composer.evaluate((el) => {
+    el.selectionStart = 6;
+    el.selectionEnd = 11;
+  });
+
+  await page.locator('[data-testid="composer-emoji-picker-trigger"]').click();
+  await pickEmoji(page, "🌙");
+
+  await expect(composer).toHaveValue("hello 🌙");
+
+  await ctx.close();
+});
+
+// After a pick the textarea must be focused with the caret restored to
+// the position past the inserted emoji, so subsequent typing continues
+// from there and a follow-up pick lands at the same place. A
+// re-render after the first pick must not strand focus on a stale
+// node.
+test("desktop: textarea regains focus + caret after a pick", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "desktop-only feature",
+  );
+  const { ctx, page, composer } = await openChat(browser);
+
+  await composer.fill("hi");
+  await page.locator('[data-testid="composer-emoji-picker-trigger"]').click();
+  await pickEmoji(page, "👋");
+
+  // Focus + caret should both land back on the textarea past the
+  // emoji. Poll because the focus + caret restore is deferred to the
+  // next animation frame so Lustre's pending re-render has committed.
+  await expect
+    .poll(
+      async () =>
+        composer.evaluate((el) => ({
+          focused: document.activeElement === el,
+          start: el.selectionStart,
+          end: el.selectionEnd,
+          value: el.value,
+        })),
+      { timeout: 2000 },
+    )
+    .toEqual({
+      focused: true,
+      // "hi" is 2 chars; "👋" is 2 UTF-16 code units. Caret should land
+      // at code-unit offset 4.
+      start: 4,
+      end: 4,
+      value: "hi👋",
+    });
+
+  // A user-typed character after the pick should land at the restored
+  // caret, not get dropped on the floor by a focus loss.
+  await page.keyboard.type("!");
+  await expect(composer).toHaveValue("hi👋!");
+
+  await ctx.close();
+});
+
+// Driving the picker through its actual shadow DOM proves the web
+// component lazy-loads, mounts, and dispatches `emoji-click` on a
+// real button activation — synthetic-CustomEvent tests pass even if
+// the picker fails to render at all. Kept as one canary; the other
+// tests use the synthetic dispatcher for speed + determinism.
+test("desktop: clicking a real emoji button inside the picker shadow DOM inserts it", async ({
+  browser,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === "mobile-chrome",
+    "desktop-only feature",
+  );
+  const { ctx, page, composer } = await openChat(browser);
+
+  await page.locator('[data-testid="composer-emoji-picker-trigger"]').click();
+  const pickerHost = page.locator('[data-testid="full-emoji-picker"]');
+  await expect(pickerHost).toBeVisible({ timeout: 10_000 });
+
+  // emoji-picker-element renders each grid cell as a real <button> with
+  // role="menuitem" inside its open shadow root. (Skintone selector +
+  // hidden baseline button also carry class="emoji" but are not
+  // role="menuitem", so the role filter scopes us to the actual
+  // pickable emojis.) The picker loads its data asynchronously; wait
+  // for the first cell to render before clicking.
+  const firstEmojiButton = pickerHost
+    .locator('button[role="menuitem"].emoji')
+    .first();
+  await firstEmojiButton.waitFor({ state: "visible", timeout: 10_000 });
+  const expectedEmoji = await firstEmojiButton.evaluate((b) =>
+    b.textContent.trim(),
+  );
+  await firstEmojiButton.click();
+
+  // The composer should now hold exactly the emoji that was clicked.
+  // Polling because the picker dispatches `emoji-click` asynchronously
+  // (an `await` between sync + async fireEvent calls in the picker's
+  // internal onEmojiClick).
+  await expect(composer).toHaveValue(expectedEmoji);
+
+  await ctx.close();
+});

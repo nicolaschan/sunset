@@ -51,10 +51,25 @@ export function insertAtCursor(elementId, text) {
   el.selectionStart = caret;
   el.selectionEnd = caret;
   autoGrow(elementId);
-  // Re-focus so the next pick (multi-pick flow) and any subsequent
-  // typing land on the same textarea — the picker click moved focus
-  // to the trigger button.
-  el.focus();
+  // Unlike applyTemplate (which is always invoked from a textarea
+  // keypress, so focus is already there), insertAtCursor runs from a
+  // picker click — focus is on the picker button. Defer the focus +
+  // caret-restore to the next frame so Lustre's pending re-render of
+  // the composer (triggered by the InsertEmojiAtCursor message that
+  // called us) has already committed; otherwise picking emoji #N+1
+  // can land focus on a node Lustre is about to replace, dropping the
+  // selection. Mirrors `focusTextarea` below.
+  requestAnimationFrame(() => {
+    const live = document.getElementById(elementId);
+    if (!live || live.tagName !== "TEXTAREA") return;
+    try {
+      live.focus({ preventScroll: true });
+      live.selectionStart = caret;
+      live.selectionEnd = caret;
+    } catch {
+      // ignored: focus is best-effort.
+    }
+  });
   return el.value;
 }
 
