@@ -17,6 +17,7 @@ use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret}
 use sunset_relay::{Config, Relay};
 use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
+use sunset_sync::test_helpers::wait_for;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
 use sunset_sync_ws_native::WebSocketRawTransport;
 
@@ -68,21 +69,6 @@ async fn make_client(
     engine.add_peer(addr).await.expect("client dial relay");
 
     (store, engine)
-}
-
-async fn wait_for<F, Fut>(deadline: Duration, interval: Duration, mut condition: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < deadline {
-        if condition().await {
-            return true;
-        }
-        tokio::time::sleep(interval).await;
-    }
-    false
 }
 
 fn relay_config(data_dir: &std::path::Path, listen_addr: &str, peers: &[String]) -> Config {

@@ -34,6 +34,7 @@ import {
   teardownRelay,
   freshSeedHex,
   syntheticPcm,
+  getPubkeyHex,
 } from "./helpers/voice.js";
 
 let relay;
@@ -69,15 +70,6 @@ async function openPeer(browser, relayAddr) {
     timeout: 15_000,
   });
   return { page, ctx };
-}
-
-async function getPubkeyHex(page) {
-  return page.evaluate(() => {
-    const pk = window.sunsetClient.public_key;
-    return Array.from(new Uint8Array(pk))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-  });
 }
 
 test("voice channel roster: both peers visible, waveform tracks real audio", async ({

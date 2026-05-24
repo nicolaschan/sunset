@@ -1,14 +1,21 @@
 // Shared voice test fixtures for Phase 5 Playwright specs.
 //
 // Exports:
-//   spawnRelay()          — spawn a sunset-relay subprocess and capture its
-//                           listen address from the banner; returns { proc, dir, addr }
-//   teardownRelay(state)  — SIGTERM the relay and delete the temp data dir
-//   freshSeedHex()        — 64-char hex seed from Math.random (one per peer/test)
-//   syntheticPcm(counter) — Float32Array(960) of continuous 440 Hz sine
-//                           (counter advances phase by one frame). Matches
-//                           Rust `synth_pcm_with_counter` so JS-side and
-//                           WASM-side fixtures are byte-equal pre-encode.
+//   spawnRelay()                       — spawn a sunset-relay subprocess and capture its
+//                                        listen address from the banner; returns { proc, dir, addr }
+//   teardownRelay(state)               — SIGTERM the relay and delete the temp data dir
+//   freshSeedHex()                     — 64-char hex seed from Math.random (one per peer/test)
+//   syntheticPcm(counter)              — Float32Array(960) of continuous 440 Hz sine
+//                                        (counter advances phase by one frame). Matches
+//                                        Rust `synth_pcm_with_counter` so JS-side and
+//                                        WASM-side fixtures are byte-equal pre-encode.
+//   getPubkeyHex(page)                 — 64-char hex of window.sunsetClient.public_key
+//   waitForVoiceConnected(peers)       — wait until every pair of `peers` mutually
+//                                        shows data-voice-connected="true". Resolves
+//                                        to the peers' hex pubkeys in input order.
+//   assertOpusFramesDelivered(...)     — assert recorded frames look like real
+//                                        Opus-decoded audio (non-silence count +
+//                                        no stuck-frame stutter).
 //
 // GainNode test affordance
 //   installVoiceFfi(page) — call after page.goto() to expose window.__voiceFfi
@@ -16,6 +23,7 @@
 //                           assert per-peer mute state should call this helper
 //                           in their beforeEach / test setup.
 
+import { expect } from "@playwright/test";
 import { spawn } from "child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -110,6 +118,14 @@ export function freshSeedHex() {
   return s;
 }
 
+export async function getPubkeyHex(page) {
+  return page.evaluate(() =>
+    Array.from(new Uint8Array(window.sunsetClient.public_key))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join(""),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic PCM helpers
 // ---------------------------------------------------------------------------
@@ -142,6 +158,57 @@ export function syntheticPcm(counter) {
     pcm[i * CHANNELS + 1] = s; // R
   }
   return pcm;
+}
+
+// ---------------------------------------------------------------------------
+// Voice readiness + frame-delivery assertion
+// ---------------------------------------------------------------------------
+
+export async function waitForVoiceConnected(peers, timeoutMs = 10_000) {
+  const hexes = await Promise.all(peers.map((p) => getPubkeyHex(p.page)));
+  await Promise.all(
+    peers.flatMap((self, i) =>
+      hexes
+        .filter((_, j) => i !== j)
+        .map((otherHex) =>
+          expect(
+            self.page.locator(
+              `[data-testid="voice-member"][data-peer-hex="${otherHex}"]`,
+            ),
+          ).toHaveAttribute("data-voice-connected", "true", {
+            timeout: timeoutMs,
+          }),
+        ),
+    ),
+  );
+  return hexes;
+}
+
+// Opus-decoded 0.5-amplitude sine ≈ 0.35 RMS; jitter pump's silence underrun ≈ 0.0.
+const NON_SILENCE_RMS = 0.05;
+const MAX_STUCK_RUN = 5;
+
+export function assertOpusFramesDelivered(frames, minCount, label) {
+  const real = frames.filter((f) => f.rms >= NON_SILENCE_RMS);
+  expect(
+    real.length,
+    `${label}: only ${real.length} non-silence frames; expected ≥ ${minCount}`,
+  ).toBeGreaterThanOrEqual(minCount);
+
+  let runLen = 0;
+  let runVal = null;
+  for (const f of real) {
+    if (f.checksum === runVal) {
+      runLen += 1;
+    } else {
+      runVal = f.checksum;
+      runLen = 1;
+    }
+    expect(
+      runLen,
+      `${label}: stuck-frame: ${runLen} consecutive non-silence frames with the same decoded PCM`,
+    ).toBeLessThanOrEqual(MAX_STUCK_RUN);
+  }
 }
 
 // ---------------------------------------------------------------------------
