@@ -202,6 +202,8 @@ pub(crate) struct PeerSession {
 pub(crate) struct EngineState {
     pub trust: TrustSet,
     pub registry: SubscriptionRegistry,
+    #[allow(dead_code)]
+    pub routes: crate::routing::Routes,
     /// Per-peer session state, keyed by `PeerId`. Each entry carries
     /// the sender, the connection generation, and the transport kind
     /// — kept together so a late `current_peers()` snapshot can't see
@@ -263,11 +265,12 @@ where
             store,
             transport: Arc::new(transport),
             config,
-            local_peer,
+            local_peer: local_peer.clone(),
             signer,
             state: Arc::new(Mutex::new(EngineState {
                 trust: TrustSet::default(),
                 registry: SubscriptionRegistry::new(),
+                routes: crate::routing::Routes::new(local_peer),
                 peer_sessions: HashMap::new(),
                 event_subs: Vec::new(),
                 ephemeral_subs: Vec::new(),
