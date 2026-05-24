@@ -11,6 +11,13 @@ use crate::types::PeerId;
 /// with normal LWW/TTL semantics. `Withdrawn` is published at the same
 /// key with `expires_at` ≥ the previous entry's so it propagates through
 /// the network like any other update before being garbage-collected.
+///
+/// `Active` carries `filter` and `provider` redundantly with the entry
+/// name (which is `subscription_name(filter, provider)`). Providers read
+/// the value directly rather than parsing the name, and receivers can
+/// reject any entry whose value disagrees with its key — so the
+/// "duplication" is a single-source claim verified at the consumer, not
+/// two independent writes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubscriptionEntry {
     /// The receiver wants `filter` from `provider`.
@@ -97,6 +104,14 @@ mod tests {
 
     // Computed from the input above; regenerate intentionally on a real wire
     // change with `cargo test ... -- --nocapture` then update.
+    //
+    // Decomposition (so a breaking change is easy to diagnose):
+    //   00                                  SubscriptionEntry::Active (variant 0)
+    //   02                                  Filter::Namespace         (variant 2)
+    //     0c                                length 12                 (postcard varint)
+    //     726f6f6d2f67656e6572616c          "room/general"
+    //   01                                  VerifyingKey inner Bytes len 1
+    //     50                                "P"
     const EXPECTED_HEX: &str = "00020c726f6f6d2f67656e6572616c0150";
 
     #[test]

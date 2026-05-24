@@ -25,6 +25,10 @@ pub const SUBSCRIBE_PREFIX: &[u8] = b"_sunset-sync/subscribe/";
 /// Re-publishing the same `(filter, provider)` always lands at the same
 /// key, so LWW just refreshes the TTL. Distinct pairs land at distinct
 /// keys, so multiple providers per filter (e.g. during failover) coexist.
+///
+/// Hex (not raw bytes) so the resulting name is utf-8, slash-safe, and
+/// human-debuggable. The 2× size cost is negligible at the wire level
+/// and pays for cheap grepping of live entries during incident response.
 pub fn subscription_name(filter: &Filter, provider: &PeerId) -> Bytes {
     let filter_bytes = postcard::to_stdvec(filter).expect("postcard filter encode is infallible");
     let filter_hash = blake3::hash(&filter_bytes);

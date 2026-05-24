@@ -23,9 +23,10 @@ pub fn covers(superset: &Filter, subset: &Filter) -> bool {
     }
 }
 
-/// `Specific(super_vk, super_name)` covers `subset` iff `subset` matches
-/// exactly that one key — i.e. `subset` is itself `Specific(super_vk,
-/// super_name)`, or a `Union` whose every alternative is covered by it.
+/// `Specific(super_vk, super_name)` covers `subset` iff every match of
+/// `subset` is exactly the one `(super_vk, super_name)` key — i.e. `subset`
+/// is itself `Specific(super_vk, super_name)`, or a `Union` whose every
+/// alternative is covered by it.
 fn covers_specific(super_vk: &VerifyingKey, super_name: &Bytes, subset: &Filter) -> bool {
     match subset {
         Filter::Specific(sub_vk, sub_name) => super_vk == sub_vk && super_name == sub_name,
