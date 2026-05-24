@@ -137,3 +137,108 @@ async fn subscribe_via_backfills_existing_entry() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn subscribe_before_peer_connect_then_data_flows() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let net = TestNetwork::new();
+            let alice_addr = PeerAddr::new("alice");
+            let bob_addr = PeerAddr::new("bob");
+            let alice_id = PeerId(vk(b"alice"));
+            let bob_id = PeerId(vk(b"bob"));
+
+            let alice_transport = net.transport(alice_id.clone(), alice_addr.clone());
+            let bob_transport = net.transport(bob_id.clone(), bob_addr.clone());
+
+            let alice_store = Arc::new(MemoryStore::with_accept_all());
+            let bob_store = Arc::new(MemoryStore::with_accept_all());
+
+            let alice_signer = Arc::new(StubSigner {
+                vk: alice_id.0.clone(),
+            });
+            let bob_signer = Arc::new(StubSigner {
+                vk: bob_id.0.clone(),
+            });
+
+            let alice_engine = Rc::new(SyncEngine::new(
+                alice_store.clone(),
+                alice_transport,
+                SyncConfig::default(),
+                alice_id.clone(),
+                alice_signer,
+            ));
+            let bob_engine = Rc::new(SyncEngine::new(
+                bob_store.clone(),
+                bob_transport,
+                SyncConfig::default(),
+                bob_id.clone(),
+                bob_signer,
+            ));
+
+            let alice_run = tokio::task::spawn_local({
+                let e = alice_engine.clone();
+                async move { e.run().await }
+            });
+            let bob_run = tokio::task::spawn_local({
+                let e = bob_engine.clone();
+                async move { e.run().await }
+            });
+
+            // Bob subscribes broadcast-style BEFORE connecting to anyone.
+            // This records a BroadcastIntent but my_subs stays empty
+            // (no connected peers yet).
+            bob_engine
+                .subscribe(
+                    Filter::Keyspace(vk(b"chat")),
+                    SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+
+            // Now Bob connects to Alice. The auto-resubscriber hook on
+            // PeerHello should replay Bob's BroadcastIntent as
+            // subscribe_via(filter, alice, policy).
+            bob_engine.add_peer(alice_addr).await.unwrap();
+
+            // Alice writes a matching entry AFTER Bob is connected.
+            let block = ContentBlock {
+                data: Bytes::from_static(b"hello-bob-broadcast"),
+                references: vec![],
+            };
+            let entry = SignedKvEntry {
+                verifying_key: vk(b"chat"),
+                name: Bytes::from_static(b"msg"),
+                value_hash: block.hash(),
+                priority: 1,
+                expires_at: None,
+                signature: Bytes::new(),
+            };
+            alice_store
+                .insert(entry.clone(), Some(block))
+                .await
+                .unwrap();
+
+            let received = wait_for(
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+                || async {
+                    bob_store
+                        .get_entry(&vk(b"chat"), b"msg")
+                        .await
+                        .unwrap()
+                        .is_some()
+                },
+            )
+            .await;
+            assert!(
+                received,
+                "bob did not receive alice's entry via the auto-resubscriber path"
+            );
+
+            alice_run.abort();
+            bob_run.abort();
+        })
+        .await;
+}
