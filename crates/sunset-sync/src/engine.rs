@@ -470,11 +470,7 @@ where
     /// Withdraw a `subscribe_via(filter, provider)` subscription.
     /// Publishes `SubscriptionEntry::Withdrawn` at the same key;
     /// idempotent (returns Ok if not currently subscribed).
-    pub async fn unsubscribe_via(
-        &self,
-        filter: Filter,
-        provider: PeerId,
-    ) -> Result<()> {
+    pub async fn unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()> {
         let (ack, rx) = oneshot::channel();
         self.cmd_tx
             .send(EngineCommand::UnsubscribeVia {
@@ -1215,7 +1211,11 @@ where
                     }
                 }
             }
-        } else if entry.name.as_ref().starts_with(crate::routing::SUBSCRIBE_PREFIX) {
+        } else if entry
+            .name
+            .as_ref()
+            .starts_with(crate::routing::SUBSCRIBE_PREFIX)
+        {
             let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
                 return;
             };
@@ -1245,7 +1245,10 @@ where
                     let was_new = {
                         let mut state = self.state.lock().await;
                         if let Some(session) = state.peer_sessions.get_mut(&receiver) {
-                            session.interests.insert(filter_hash, filter.clone()).is_none()
+                            session
+                                .interests
+                                .insert(filter_hash, filter.clone())
+                                .is_none()
                         } else {
                             // Receiver isn't connected right now; their entry
                             // will replay through this branch when they
@@ -1539,16 +1542,16 @@ where
     /// Re-publish an active subscription to refresh its TTL. Called by the
     /// routing tick for each entry returned from `routes.due_for_refresh`.
     /// Returns Ok if the entry was already removed between scan and refresh.
-    async fn republish_subscription(
-        &self,
-        key: &crate::routing::OutboundKey,
-    ) -> Result<()> {
+    async fn republish_subscription(&self, key: &crate::routing::OutboundKey) -> Result<()> {
         let (filter, policy) = {
             let state = self.state.lock().await;
-            let Some(ob) = state.routes.my_subs.get(key) else { return Ok(()) };
+            let Some(ob) = state.routes.my_subs.get(key) else {
+                return Ok(());
+            };
             (ob.filter.clone(), ob.policy)
         };
-        self.do_subscribe_via(filter, key.provider.clone(), policy).await
+        self.do_subscribe_via(filter, key.provider.clone(), policy)
+            .await
     }
 
     /// Publish a per-pair `SubscriptionEntry::Active` for `(filter,
@@ -1695,7 +1698,12 @@ where
         let filter_hash = crate::routing::filter_hash(&filter);
         let providers: Vec<PeerId> = {
             let mut state = self.state.lock().await;
-            if state.routes.broadcast_intents.remove(&filter_hash).is_none() {
+            if state
+                .routes
+                .broadcast_intents
+                .remove(&filter_hash)
+                .is_none()
+            {
                 return Ok(());
             }
             state
