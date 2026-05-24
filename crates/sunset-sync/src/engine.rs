@@ -505,22 +505,18 @@ where
         // Channel for per-peer tasks to talk back to us.
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
 
-        // Rebuild the in-memory subscription_registry from existing
-        // `SUBSCRIBE_NAME` entries on disk. Persistent backends (e.g.
-        // `sunset-store-fs` used by the relay) hold these across process
-        // restarts; the registry must reflect that state before we start
-        // routing chat traffic. Without this step, after a relay restart
-        // the relay would receive forwarded chat messages but find no
-        // peers to fan them out to (registry is empty), and clients would
-        // never see each other's messages until they happened to publish
-        // a fresh subscribe entry.
-        self.replay_existing_subscriptions().await?;
+        // Rehydrate any in-memory routing state from on-disk subscribe
+        // entries. Currently a no-op (see `bootstrap_routes` for why);
+        // kept as a named hook so Phase 3 can plug rehydration in
+        // without restructuring `run()`.
+        self.bootstrap_routes().await?;
 
         // Local store subscription. Match every entry (an empty NamePrefix
         // matches all names): the engine needs to see both subscribe-
-        // namespace entries (to maintain the registry) and any application
-        // entry that might match a peer's filter (for push routing). Per-
-        // peer fanout is filtered downstream in `handle_local_store_event`.
+        // namespace entries (to update per-peer interests) and any
+        // application entry that might match a peer's filter (for push
+        // routing). Per-peer fanout is filtered downstream in
+        // `handle_local_store_event`.
         let mut local_sub = self
             .store
             .subscribe(Filter::NamePrefix(Bytes::new()), Replay::None)
@@ -831,11 +827,14 @@ where
         }
     }
 
-    /// Stub: with the legacy `SubscriptionRegistry` removed, there is
-    /// no in-memory routing table to rehydrate at startup. Renamed to
-    /// `bootstrap_routes` in the next commit; for now this preserves
-    /// `run()`'s call site so the diff stays minimal.
-    async fn replay_existing_subscriptions(&self) -> Result<()> {
+    /// Walk the local store for `_sunset-sync/subscribe/*` entries at
+    /// startup. Currently a no-op: per-peer `interests` populates on
+    /// demand via `handle_local_store_event`'s SUBSCRIBE_PREFIX branch
+    /// as peers connect, and `my_subs`/`broadcast_intents` are not
+    /// rehydrated from disk in Phase 2 (subsystems re-call subscribe on
+    /// startup). Phase 3+ may rehydrate if a real subsystem demands
+    /// survive-restart semantics.
+    async fn bootstrap_routes(&self) -> Result<()> {
         Ok(())
     }
 
