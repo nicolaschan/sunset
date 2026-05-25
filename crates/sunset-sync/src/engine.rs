@@ -516,10 +516,12 @@ where
         // Channel for per-peer tasks to talk back to us.
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
 
-        // Rehydrate any in-memory routing state from on-disk subscribe
-        // entries. Currently a no-op (see `bootstrap_routes` for why);
-        // kept as a named hook so Phase 3 can plug rehydration in
-        // without restructuring `run()`.
+        // Walk the local store for `_sunset-sync/subscribe/*` entries
+        // and populate `peer_sessions[*].interests` for any already-
+        // connected peers. In practice `peer_sessions` is empty here
+        // (the inbound loop hasn't started) so this is a no-op, but
+        // see `bootstrap_routes` for the defensive rationale and the
+        // spec link.
         self.bootstrap_routes().await?;
 
         // Local store subscription. Match every entry (an empty NamePrefix
@@ -839,13 +841,62 @@ where
     }
 
     /// Walk the local store for `_sunset-sync/subscribe/*` entries at
-    /// startup. Currently a no-op: per-peer `interests` populates on
-    /// demand via `handle_local_store_event`'s SUBSCRIBE_PREFIX branch
-    /// as peers connect, and `my_subs`/`broadcast_intents` are not
-    /// rehydrated from disk in Phase 2 (subsystems re-call subscribe on
-    /// startup). Phase 3+ may rehydrate if a real subsystem demands
-    /// survive-restart semantics.
+    /// startup and, for each `Active { provider == me }`, populate the
+    /// matching peer's `interests` *if that peer is already in
+    /// `peer_sessions`*. Otherwise skip — `handle_local_store_event`'s
+    /// SUBSCRIBE_PREFIX branch will re-fire for that entry when the
+    /// receiver connects and the PeerHello bootstrap digest exchange
+    /// replicates it back to us.
+    ///
+    /// In current Phase 2 code `peer_sessions` is always empty when
+    /// `run()` first invokes this, so the scan is unconditionally a
+    /// no-op in practice — but the function matches the spec's
+    /// described behaviour (see
+    /// `docs/superpowers/specs/2026-05-24-cooperative-relay-phase2-design.md`,
+    /// "Bootstrap") for defensive hygiene against future code paths
+    /// that pre-populate `peer_sessions`, and because reading
+    /// SUBSCRIBE_PREFIX entries on startup is the right thing to do
+    /// regardless.
+    ///
+    /// `my_subs` and `broadcast_intents` are NOT rehydrated from disk
+    /// in Phase 2 (subsystems re-call subscribe on startup).
     async fn bootstrap_routes(&self) -> Result<()> {
+        let mut iter = self
+            .store
+            .iter(Filter::NamePrefix(Bytes::from_static(
+                crate::routing::SUBSCRIBE_PREFIX,
+            )))
+            .await?;
+        while let Some(entry_result) = iter.next().await {
+            let Ok(entry) = entry_result else {
+                continue;
+            };
+            // Reuse the same parsing path as handle_local_store_event.
+            let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
+                continue;
+            };
+            let Ok(sub_entry) =
+                postcard::from_bytes::<crate::routing::SubscriptionEntry>(&block.data)
+            else {
+                continue;
+            };
+            let Some(filter_hash) = crate::routing::decode_filter_hash_from_name(&entry.name)
+            else {
+                continue;
+            };
+            let receiver = PeerId(entry.verifying_key.clone());
+            if let crate::routing::SubscriptionEntry::Active { filter, provider } = sub_entry
+                && provider == self.local_peer
+            {
+                let mut state = self.state.lock().await;
+                if let Some(session) = state.peer_sessions.get_mut(&receiver) {
+                    session.interests.insert(filter_hash, filter);
+                }
+                // Else: receiver not connected yet; their entry will
+                // re-fire through handle_local_store_event when they
+                // connect and bootstrap digest exchange delivers it.
+            }
+        }
         Ok(())
     }
 
