@@ -27,8 +27,8 @@ use sunset_noise::{
 use sunset_store::{Filter, VerifyingKey};
 use sunset_store_fs::FsStore;
 use sunset_sync::{
-    DualInboundTransport, PeerAddr, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine,
-    routing,
+    DualInboundTransport, PeerAddr, PeerId, RawConnection, Signer, SpawningAcceptor, SyncConfig,
+    SyncEngine, routing,
 };
 use sunset_sync_webtransport_native::{
     WebTransportRawConnection, WebTransportRawTransport, build_server_endpoint,
@@ -47,45 +47,33 @@ use crate::snapshot::{build_dashboard_snapshot, build_identity_snapshot};
 /// callers interact with `RelayHandle`, not this type.
 type InboundTransport = DualInboundTransport<WsAcceptor, WtAcceptor>;
 
+/// Future returned by the SpawningAcceptor "promote" closure for raw
+/// connection `R`: runs the Noise IK responder and yields a
+/// `NoiseConnection<R>`.
+type NoiseHandshakeFuture<R> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = sunset_sync::Result<NoiseConnection<R>>> + 'static>,
+>;
+
+/// SpawningAcceptor "promote" closure for raw connection `R`. Both the
+/// WS and WT acceptors use this same shape.
+type NoisePromote<R> = Box<dyn Fn(R) -> NoiseHandshakeFuture<R> + 'static>;
+
 /// WebSocket half. Same shape as before WT was added.
 type WsAcceptor = SpawningAcceptor<
     WebSocketRawTransport,
     NoiseTransport<WebSocketRawTransport>,
-    WsPromote,
-    WsHandshakeFuture,
+    NoisePromote<sunset_sync_ws_native::WebSocketRawConnection>,
+    NoiseHandshakeFuture<sunset_sync_ws_native::WebSocketRawConnection>,
     NoiseConnection<sunset_sync_ws_native::WebSocketRawConnection>,
->;
-
-type WsPromote =
-    Box<dyn Fn(sunset_sync_ws_native::WebSocketRawConnection) -> WsHandshakeFuture + 'static>;
-
-type WsHandshakeFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = sunset_sync::Result<
-                    NoiseConnection<sunset_sync_ws_native::WebSocketRawConnection>,
-                >,
-            > + 'static,
-    >,
 >;
 
 /// WebTransport half. Mirrors the WS shape.
 type WtAcceptor = SpawningAcceptor<
     WebTransportRawTransport,
     NoiseTransport<WebTransportRawTransport>,
-    WtPromote,
-    WtHandshakeFuture,
+    NoisePromote<WebTransportRawConnection>,
+    NoiseHandshakeFuture<WebTransportRawConnection>,
     NoiseConnection<WebTransportRawConnection>,
->;
-
-type WtPromote = Box<dyn Fn(WebTransportRawConnection) -> WtHandshakeFuture + 'static>;
-
-type WtHandshakeFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = sunset_sync::Result<NoiseConnection<WebTransportRawConnection>>,
-            > + 'static,
-    >,
 >;
 
 type Engine = SyncEngine<FsStore, InboundTransport>;
@@ -184,17 +172,7 @@ impl Relay {
 
         // 5. WebSocket SpawningAcceptor — Noise IK on its own task.
         let handshake_timeout = Duration::from_secs(config.accept_handshake_timeout_secs);
-        let ws_promote: WsPromote = {
-            let identity = noise_id.clone();
-            Box::new(move |raw_conn| {
-                let identity = identity.clone();
-                Box::pin(async move {
-                    do_handshake_responder(raw_conn, identity)
-                        .await
-                        .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
-                })
-            })
-        };
+        let ws_promote: NoisePromote<_> = make_noise_promote(noise_id.clone());
         let ws_transport =
             SpawningAcceptor::new(ws_raw_inbound, ws_connector, ws_promote, handshake_timeout);
 
@@ -208,17 +186,7 @@ impl Relay {
         let (wt_raw_inbound, wt_accept_tx) = WebTransportRawTransport::serving();
         let wt_raw_outbound = WebTransportRawTransport::dial_only();
         let wt_connector = NoiseTransport::new(wt_raw_outbound, noise_id.clone());
-        let wt_promote: WtPromote = {
-            let identity = noise_id.clone();
-            Box::new(move |raw_conn| {
-                let identity = identity.clone();
-                Box::pin(async move {
-                    do_handshake_responder(raw_conn, identity)
-                        .await
-                        .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
-                })
-            })
-        };
+        let wt_promote: NoisePromote<_> = make_noise_promote(noise_id.clone());
         let wt_transport =
             SpawningAcceptor::new(wt_raw_inbound, wt_connector, wt_promote, handshake_timeout);
 
@@ -308,6 +276,24 @@ impl Relay {
             cmd_ctx,
         })
     }
+}
+
+/// Build the SpawningAcceptor "promote" closure that runs the Noise IK
+/// responder handshake on an inbound raw connection. The WS and WT
+/// acceptors are the same closure modulo the captured raw-connection
+/// type; this generic helper produces both from the same Noise identity.
+fn make_noise_promote<R>(identity: Arc<dyn NoiseIdentity>) -> NoisePromote<R>
+where
+    R: RawConnection + 'static,
+{
+    Box::new(move |raw_conn| {
+        let identity = identity.clone();
+        Box::pin(async move {
+            do_handshake_responder(raw_conn, identity)
+                .await
+                .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
+        })
+    })
 }
 
 /// Try to bring up the WebTransport listener. Returns `Some(cert_hex)`
