@@ -207,9 +207,12 @@ pub enum EngineEvent {
 /// drop sites to remember a second cleanup call — exactly the
 /// `update_a(); update_b();` smell the V2 design audit (during the
 /// cooperative-relay phase-2 design pass) explicitly chose to prevent.
-/// The routing module reaches into `interests` via the closure shape
-/// of `forward_targets`; cluster #8 (`forward_targets` API redesign)
-/// addresses that abstraction-leak concern without unbundling.
+/// The routing module reaches into `interests` via the
+/// [`crate::routing::PeerInterests`] trait (implemented on
+/// `PeerSession` below); `forward_targets` then yields
+/// `(&PeerId, &PeerSession)` pairs so callers can use `session.tx`
+/// directly instead of doing a second `peer_sessions.get(&peer)`
+/// lookup.
 pub(crate) struct PeerSession {
     /// Identifies the connection generation that owns this outbound channel.
     /// Compared against `InboundEvent::Disconnected.conn_id` to filter stale
@@ -244,6 +247,14 @@ pub(crate) struct PeerSession {
     /// handle_local_store_event; cleared with the session on peer drop.
     pub(crate) interests:
         std::collections::HashMap<crate::routing::FilterHash, sunset_store::Filter>,
+}
+
+impl crate::routing::PeerInterests for PeerSession {
+    fn interests(
+        &self,
+    ) -> &std::collections::HashMap<crate::routing::FilterHash, sunset_store::Filter> {
+        &self.interests
+    }
 }
 
 /// Mutable state inside the engine. Held under a `tokio::sync::Mutex` so
@@ -409,18 +420,12 @@ where
             datagram: datagram.clone(),
         };
         let state = self.state.lock().await;
-        let targets: Vec<PeerId> = crate::routing::forward_targets(
+        for (_peer, session) in crate::routing::forward_targets(
             &state.peer_sessions,
-            |s| &s.interests,
             &datagram.verifying_key,
             &datagram.name,
-        )
-        .into_iter()
-        .collect();
-        for peer in targets {
-            if let Some(po) = state.peer_sessions.get(&peer) {
-                let _ = po.tx.send(msg.clone());
-            }
+        ) {
+            let _ = session.tx.send(msg.clone());
         }
         Ok(())
     }
@@ -1331,21 +1336,17 @@ where
             blobs: blob.into_iter().collect(),
         };
         let state = self.state.lock().await;
-        let targets: Vec<PeerId> = if entry.verifying_key == self.local_peer.0 {
-            state.peer_sessions.keys().cloned().collect()
+        if entry.verifying_key == self.local_peer.0 {
+            for session in state.peer_sessions.values() {
+                let _ = session.tx.send(msg.clone());
+            }
         } else {
-            crate::routing::forward_targets(
+            for (_peer, session) in crate::routing::forward_targets(
                 &state.peer_sessions,
-                |s| &s.interests,
                 &entry.verifying_key,
                 &entry.name,
-            )
-            .into_iter()
-            .collect()
-        };
-        for peer in targets {
-            if let Some(po) = state.peer_sessions.get(&peer) {
-                let _ = po.tx.send(msg.clone());
+            ) {
+                let _ = session.tx.send(msg.clone());
             }
         }
     }

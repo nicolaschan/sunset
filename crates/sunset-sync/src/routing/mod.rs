@@ -20,7 +20,7 @@ pub mod routes;
 pub mod types;
 
 pub use coverage::covers;
-pub use forward::forward_targets;
+pub use forward::{PeerInterests, forward_targets};
 pub use naming::{
     LINKS_NAME, PROVIDER_TICK_NAME, SUBSCRIBE_PREFIX, decode_filter_hash_from_name,
     is_subscription_name, subscription_name,
