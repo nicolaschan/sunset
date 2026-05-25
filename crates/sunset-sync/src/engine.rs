@@ -2067,6 +2067,260 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn tick_routing_with_no_outbound_subscriptions_is_noop() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                engine.tick_routing().await;
+                // Nothing to assert beyond "must not panic / hang": there
+                // are no subscriptions to refresh, no peers to talk to.
+                assert!(
+                    engine
+                        .state
+                        .lock()
+                        .await
+                        .routes
+                        .due_for_refresh(u64::MAX)
+                        .is_empty()
+                );
+            })
+            .await;
+    }
+
+    /// `tick_routing` re-publishes any outbound whose `last_published_ms`
+    /// is past `policy.refresh_interval()`. Setup: stage an outbound with
+    /// `last_published_ms = 0` so it's immediately due, then call
+    /// `tick_routing` and assert `last_published_ms` was bumped to a real
+    /// wall-clock timestamp. The contract is: a single tick refreshes the
+    /// entry; no manual re-call needed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_routing_republishes_due_outbound() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let provider = PeerId(vk(b"bob"));
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let key = crate::routing::OutboundKey {
+                    filter_hash: crate::routing::filter_hash(&filter),
+                    provider: provider.clone(),
+                };
+                // Stage an outbound that's already past half-life
+                // (last_published_ms = 0 vs. wall-clock now in millions).
+                let ob = crate::routing::Outbound {
+                    filter,
+                    policy: crate::routing::SubscriptionPolicy::store_data(),
+                    last_published_ms: 0,
+                };
+                engine
+                    .state
+                    .lock()
+                    .await
+                    .routes
+                    .insert_outbound(key.clone(), ob);
+
+                engine.tick_routing().await;
+
+                let bumped = engine
+                    .state
+                    .lock()
+                    .await
+                    .routes
+                    .outbound_last_published(&key)
+                    .expect("outbound still present after refresh");
+                assert!(
+                    bumped > 0,
+                    "tick_routing must bump last_published_ms (got {bumped})",
+                );
+            })
+            .await;
+    }
+
+    /// `tick_routing` survives a refresh failure on one outbound and
+    /// proceeds to the others. We can't easily force `republish_subscription`
+    /// to fail (the in-memory store accepts everything), but we *can*
+    /// verify the iteration-not-aborted contract structurally: insert two
+    /// due outbounds; after one tick, both must have been refreshed.
+    /// A regression that aborts the loop on first error would leave the
+    /// second `last_published_ms` at 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_routing_refreshes_all_due_outbounds() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let provider_a = PeerId(vk(b"bob"));
+                let provider_b = PeerId(vk(b"carol"));
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let fh = crate::routing::filter_hash(&filter);
+                let key_a = crate::routing::OutboundKey {
+                    filter_hash: fh,
+                    provider: provider_a,
+                };
+                let key_b = crate::routing::OutboundKey {
+                    filter_hash: fh,
+                    provider: provider_b,
+                };
+                let mk_ob = || crate::routing::Outbound {
+                    filter: filter.clone(),
+                    policy: crate::routing::SubscriptionPolicy::store_data(),
+                    last_published_ms: 0,
+                };
+                {
+                    let mut state = engine.state.lock().await;
+                    state.routes.insert_outbound(key_a.clone(), mk_ob());
+                    state.routes.insert_outbound(key_b.clone(), mk_ob());
+                }
+
+                engine.tick_routing().await;
+
+                let state = engine.state.lock().await;
+                assert!(
+                    state.routes.outbound_last_published(&key_a).expect("a") > 0,
+                    "first outbound was not refreshed",
+                );
+                assert!(
+                    state.routes.outbound_last_published(&key_b).expect("b") > 0,
+                    "second outbound was not refreshed (loop aborted early?)",
+                );
+            })
+            .await;
+    }
+
+    /// `current_peers` returns one row per currently-connected peer with
+    /// the transport kind observed on PeerHello. Empty before any
+    /// connection; populated after `add_peer` completes; emptied again
+    /// after `remove_peer`. Drives the relay dashboard and the room-state
+    /// snapshot in sunset-core.
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_peers_reflects_connect_then_disconnect() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice_peer, bob_peer) = spawn_pair().await;
+
+                // After spawn_pair: bob has dialed alice. From alice's
+                // perspective, bob should appear in current_peers; from
+                // bob's, alice should.
+                let alice_view = alice_peer.engine.current_peers().await;
+                assert_eq!(alice_view.len(), 1, "alice sees exactly bob");
+                assert_eq!(alice_view[0].0, bob_peer.id);
+
+                let bob_view = bob_peer.engine.current_peers().await;
+                assert_eq!(bob_view.len(), 1, "bob sees exactly alice");
+                assert_eq!(bob_view[0].0, alice_peer.id);
+
+                // Tear bob's side down. alice should observe it.
+                bob_peer
+                    .engine
+                    .remove_peer(alice_peer.id.clone())
+                    .await
+                    .unwrap();
+
+                // remove_peer is fire-and-forget at the transport layer;
+                // poll alice for the resulting Disconnected to land.
+                let cleared = crate::test_helpers::wait_for(
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_millis(20),
+                    || async { alice_peer.engine.current_peers().await.is_empty() },
+                )
+                .await;
+                assert!(
+                    cleared,
+                    "alice's current_peers did not clear after bob remove_peer"
+                );
+            })
+            .await;
+    }
+
+    /// `subscriptions_snapshot` returns one `(peer, filter)` row for
+    /// every interest a currently-connected peer has armed against us.
+    /// Two filters from the same peer produce two rows; an unsubscribe
+    /// drops the row. Drives the relay dashboard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscriptions_snapshot_lists_armed_interests() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+
+                // Empty before any subscription.
+                assert!(
+                    alice.subscriptions_snapshot().await.is_empty(),
+                    "alice has no peer interests yet"
+                );
+
+                let f1 = Filter::Keyspace(vk(b"writer1"));
+                let f2 = Filter::Keyspace(vk(b"writer2"));
+                bob.subscribe_via(
+                    f1.clone(),
+                    alice_peer.id.clone(),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+                bob.subscribe_via(
+                    f2.clone(),
+                    alice_peer.id.clone(),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+
+                // Use the public completion gate so the snapshot is
+                // taken after both interests are armed end-to-end.
+                assert!(
+                    alice
+                        .wait_for_peer_interest(
+                            &bob_peer.id,
+                            &f1,
+                            std::time::Duration::from_secs(2)
+                        )
+                        .await
+                );
+                assert!(
+                    alice
+                        .wait_for_peer_interest(
+                            &bob_peer.id,
+                            &f2,
+                            std::time::Duration::from_secs(2)
+                        )
+                        .await
+                );
+
+                let mut snap = alice.subscriptions_snapshot().await;
+                // HashMap iteration order: normalize for the assertion.
+                snap.sort_by_key(|(_, f)| crate::routing::filter_hash(f));
+                let mut want = vec![
+                    (bob_peer.id.clone(), f1.clone()),
+                    (bob_peer.id.clone(), f2.clone()),
+                ];
+                want.sort_by_key(|(_, f)| crate::routing::filter_hash(f));
+                assert_eq!(snap, want);
+
+                // Unsubscribing one filter removes exactly one row.
+                bob.unsubscribe_via(f1.clone(), alice_peer.id.clone())
+                    .await
+                    .unwrap();
+                assert!(
+                    alice
+                        .wait_for_peer_interest_withdrawn(
+                            &bob_peer.id,
+                            &f1,
+                            std::time::Duration::from_secs(2),
+                        )
+                        .await
+                );
+                let after = alice.subscriptions_snapshot().await;
+                assert_eq!(after, vec![(bob_peer.id.clone(), f2)]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn engine_event_fan_out_to_multiple_subscribers() {
         use crate::engine::EngineEvent;
         use crate::transport::TransportKind;
