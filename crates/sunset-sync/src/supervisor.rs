@@ -884,26 +884,12 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::sync::Arc;
-    use sunset_store::VerifyingKey;
     use sunset_store_memory::MemoryStore;
 
     use crate::engine::SyncEngine;
+    use crate::test_helpers::{StubSigner, vk};
     use crate::test_transport::{TestNetwork, TestTransport};
     use crate::types::SyncConfig;
-
-    fn vk(b: &[u8]) -> VerifyingKey {
-        VerifyingKey::new(Bytes::copy_from_slice(b))
-    }
-
-    struct StubSigner(VerifyingKey);
-    impl crate::Signer for StubSigner {
-        fn verifying_key(&self) -> VerifyingKey {
-            self.0.clone()
-        }
-        fn sign(&self, _: &[u8]) -> Bytes {
-            Bytes::from_static(&[0u8; 64])
-        }
-    }
 
     fn engine_with_addr(
         net: &TestNetwork,
@@ -916,7 +902,7 @@ mod tests {
             local_peer.clone(),
             PeerAddr::new(Bytes::copy_from_slice(addr.as_bytes())),
         );
-        let signer = Arc::new(StubSigner(local_peer.0.clone()));
+        let signer: Arc<dyn crate::Signer> = Arc::new(StubSigner::new(local_peer.0.clone()));
         Rc::new(SyncEngine::new(
             store,
             transport,

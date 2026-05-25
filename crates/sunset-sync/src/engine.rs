@@ -1825,28 +1825,9 @@ mod tests {
     use sunset_store_memory::MemoryStore;
 
     use crate::Signer;
+    use crate::test_helpers::{StubSigner, vk};
     use crate::test_transport::{TestNetwork, TestTransport};
     use crate::transport::TransportKind;
-
-    fn vk(b: &[u8]) -> VerifyingKey {
-        VerifyingKey::new(Bytes::copy_from_slice(b))
-    }
-
-    /// Test-only signer that returns a non-empty stub signature. Adequate when
-    /// the receiving store uses `AcceptAllVerifier`.
-    struct StubSigner {
-        vk: VerifyingKey,
-    }
-
-    impl Signer for StubSigner {
-        fn verifying_key(&self) -> VerifyingKey {
-            self.vk.clone()
-        }
-
-        fn sign(&self, _payload: &[u8]) -> Bytes {
-            Bytes::from_static(&[0u8; 64])
-        }
-    }
 
     fn make_engine(addr: &str, peer_label: &[u8]) -> SyncEngine<MemoryStore, TestTransport> {
         make_engine_with_store(addr, peer_label, Arc::new(MemoryStore::with_accept_all()))
@@ -1863,9 +1844,7 @@ mod tests {
             local_peer.clone(),
             PeerAddr::new(Bytes::copy_from_slice(addr.as_bytes())),
         );
-        let signer = Arc::new(StubSigner {
-            vk: local_peer.0.clone(),
-        });
+        let signer: Arc<dyn Signer> = Arc::new(StubSigner::new(local_peer.0.clone()));
         SyncEngine::new(store, transport, SyncConfig::default(), local_peer, signer)
     }
 
@@ -2568,63 +2547,14 @@ mod tests {
     // sleeps.
 
     /// Spin up alice + bob over `TestNetwork`, run both engines, and
-    /// dial bob → alice. Returns the engines, their peer ids, and the
-    /// join handles so the caller can `.abort()` on exit.
-    async fn spawn_pair() -> (
-        Rc<SyncEngine<MemoryStore, TestTransport>>,
-        Rc<SyncEngine<MemoryStore, TestTransport>>,
-        PeerId,
-        PeerId,
-        tokio::task::JoinHandle<Result<()>>,
-        tokio::task::JoinHandle<Result<()>>,
-    ) {
-        use crate::types::PeerAddr;
+    /// dial bob → alice. Returns the two `TestPeer`s; the engine run
+    /// loops are aborted automatically when the `TestPeer`s drop.
+    async fn spawn_pair() -> (crate::test_helpers::TestPeer, crate::test_helpers::TestPeer) {
         let net = TestNetwork::new();
-        let alice_addr = PeerAddr::new("alice");
-        let bob_addr = PeerAddr::new("bob");
-        let alice_id = PeerId(vk(b"alice"));
-        let bob_id = PeerId(vk(b"bob"));
-
-        let alice_transport = net.transport(alice_id.clone(), alice_addr.clone());
-        let bob_transport = net.transport(bob_id.clone(), bob_addr);
-
-        let alice_store = Arc::new(MemoryStore::with_accept_all());
-        let bob_store = Arc::new(MemoryStore::with_accept_all());
-
-        let alice_signer = Arc::new(StubSigner {
-            vk: alice_id.0.clone(),
-        });
-        let bob_signer = Arc::new(StubSigner {
-            vk: bob_id.0.clone(),
-        });
-
-        let alice = Rc::new(SyncEngine::new(
-            alice_store,
-            alice_transport,
-            SyncConfig::default(),
-            alice_id.clone(),
-            alice_signer,
-        ));
-        let bob = Rc::new(SyncEngine::new(
-            bob_store,
-            bob_transport,
-            SyncConfig::default(),
-            bob_id.clone(),
-            bob_signer,
-        ));
-
-        let alice_run = crate::spawn::spawn_local({
-            let e = alice.clone();
-            async move { e.run().await }
-        });
-        let bob_run = crate::spawn::spawn_local({
-            let e = bob.clone();
-            async move { e.run().await }
-        });
-
-        bob.add_peer(alice_addr).await.unwrap();
-
-        (alice, bob, alice_id, bob_id, alice_run, bob_run)
+        let alice = crate::test_helpers::TestPeer::spawn(&net, b"alice");
+        let bob = crate::test_helpers::TestPeer::spawn(&net, b"bob");
+        bob.engine.add_peer(alice.addr.clone()).await.unwrap();
+        (alice, bob)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2632,13 +2562,16 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (alice, bob, _alice_id, bob_id, alice_run, bob_run) = spawn_pair().await;
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+                let bob_id = bob_peer.id.clone();
                 let mut events = alice.subscribe_engine_events().await;
                 let filter = Filter::Keyspace(vk(b"chat"));
 
                 bob.subscribe_via(
                     filter.clone(),
-                    PeerId(vk(b"alice")),
+                    alice_peer.id.clone(),
                     crate::routing::SubscriptionPolicy::store_data(),
                 )
                 .await
@@ -2669,9 +2602,6 @@ mod tests {
                 })
                 .await;
                 assert_eq!(armed_count, 1, "PeerInterestArmed must fire exactly once");
-
-                alice_run.abort();
-                bob_run.abort();
             })
             .await;
     }
@@ -2681,12 +2611,15 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (alice, bob, _alice_id, bob_id, alice_run, bob_run) = spawn_pair().await;
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+                let bob_id = bob_peer.id.clone();
                 let filter = Filter::Keyspace(vk(b"chat"));
 
                 bob.subscribe_via(
                     filter.clone(),
-                    PeerId(vk(b"alice")),
+                    alice_peer.id.clone(),
                     crate::routing::SubscriptionPolicy::store_data(),
                 )
                 .await
@@ -2700,7 +2633,7 @@ mod tests {
 
                 let mut events = alice.subscribe_engine_events().await;
 
-                bob.unsubscribe_via(filter.clone(), PeerId(vk(b"alice")))
+                bob.unsubscribe_via(filter.clone(), alice_peer.id.clone())
                     .await
                     .unwrap();
 
@@ -2726,9 +2659,6 @@ mod tests {
                     withdrawn_count, 1,
                     "PeerInterestWithdrawn must fire exactly once"
                 );
-
-                alice_run.abort();
-                bob_run.abort();
             })
             .await;
     }
@@ -2738,12 +2668,15 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (alice, bob, _alice_id, bob_id, alice_run, bob_run) = spawn_pair().await;
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+                let bob_id = bob_peer.id.clone();
                 let filter = Filter::Keyspace(vk(b"chat"));
 
                 bob.subscribe_via(
                     filter.clone(),
-                    PeerId(vk(b"alice")),
+                    alice_peer.id.clone(),
                     crate::routing::SubscriptionPolicy::store_data(),
                 )
                 .await
@@ -2766,9 +2699,6 @@ mod tests {
                     start.elapsed() < std::time::Duration::from_millis(100),
                     "wait_for_peer_interest must return immediately when already armed"
                 );
-
-                alice_run.abort();
-                bob_run.abort();
             })
             .await;
     }
@@ -2778,7 +2708,10 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (alice, bob, _alice_id, bob_id, alice_run, bob_run) = spawn_pair().await;
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+                let bob_id = bob_peer.id.clone();
                 let filter = Filter::Keyspace(vk(b"chat"));
 
                 // Start waiting BEFORE bob subscribes — exercises the
@@ -2798,7 +2731,7 @@ mod tests {
 
                 bob.subscribe_via(
                     filter,
-                    PeerId(vk(b"alice")),
+                    alice_peer.id.clone(),
                     crate::routing::SubscriptionPolicy::store_data(),
                 )
                 .await
@@ -2806,9 +2739,6 @@ mod tests {
 
                 let armed = waiter.await.expect("waiter task joined");
                 assert!(armed, "waiter must resolve true on later emit");
-
-                alice_run.abort();
-                bob_run.abort();
             })
             .await;
     }
