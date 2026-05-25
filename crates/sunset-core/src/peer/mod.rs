@@ -109,16 +109,14 @@ where
             .await
             .map_err(|e| crate::Error::Other(format!("subscribe: {e}")))?;
 
-        // Build cancel signal up front so we can hand it to background tasks.
-        let cancel = Rc::new(std::cell::Cell::new(false));
-
         // The per-room signaler doesn't need a strong ref on RoomState:
         // RelaySignaler::new spawned its dispatcher task with its own
         // strong Rc, and dispatcher.register stored another in the
         // dispatcher's HashMap. RoomState::drop's `unregister` call
         // drops the latter; the dispatcher task keeps the signaler
-        // alive until its store-subscribe stream ends.
-        let _ = signaler;
+        // alive until its store-subscribe stream ends. The local
+        // `signaler` binding falls out of scope here without any
+        // further wiring.
 
         // Spawn the per-room reaction tracker. It subscribes to
         // <room_fp>/msg/, decodes Reaction entries, applies LWW per
@@ -141,6 +139,9 @@ where
         chans.insert(crate::ChannelLabel::default_general());
         let observed_channels = Rc::new(std::cell::RefCell::new(chans));
 
+        // `cancel_decode` is consumed by the decode loop spawned in
+        // `OpenRoom::spawn_decode_loop`; `RoomState::drop` flips it to
+        // signal shutdown.
         let state = Rc::new(open_room::RoomState {
             room,
             peer_weak: Rc::downgrade(self),
@@ -148,7 +149,7 @@ where
             publisher: std::cell::RefCell::new(None),
             tracker_handles: Rc::new(crate::membership::TrackerHandles::new()),
             reaction_handles,
-            cancel_decode: cancel,
+            cancel_decode: Rc::new(std::cell::Cell::new(false)),
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
             observed_channels,
             decoded_text_messages: Rc::new(std::cell::RefCell::new(
@@ -1328,7 +1329,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn renewal_loop_exits_when_cancel_set() {
+    async fn decode_loop_cancels_on_open_room_drop() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1338,10 +1339,10 @@ mod tests {
                 // Drop the OpenRoom handle; verify cancel was set.
                 let cancel = room.inner.cancel_decode.clone();
                 drop(room);
-                // The Drop impl on RoomState (Phase 4) fires cancel_decode = true.
-                // Yield so the renewal-loop / decode-loop tasks notice (we don't
-                // actually assert their termination here — just that the cancel
-                // signal is set, which structurally guarantees their exit).
+                // The Drop impl on RoomState fires cancel_decode = true.
+                // Yield so the decode loop notices (we don't actually assert
+                // its termination here — just that the cancel signal is set,
+                // which structurally guarantees its exit).
                 tokio::task::yield_now().await;
                 assert!(
                     cancel.get(),
