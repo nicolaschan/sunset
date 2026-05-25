@@ -159,7 +159,7 @@ impl SyncEngine {
 }
 ```
 
-For Phase 2, `policy.target_n` is recorded but not interpreted (no failover yet; `subscribe` is unconditionally "all connected"). Phase 3+ will give `target_n` operational meaning.
+**Revision (2026-05-24):** `policy.target_n` has been removed from `SubscriptionPolicy` in Phase 2. The original Phase 2 design recorded `target_n` without interpreting it (`subscribe` is unconditionally "all connected"), but in practice no caller branched on it and the `relay_broad()` constructor was shipping `target_n: 0` as an undefined sentinel. Per the module's anti-pattern doc, adding knobs without consumers re-introduces the enumerated-cases-as-algorithm smell. The slot-maintenance knob will be re-introduced in Phase 3 when a real caller anchors the choice between per-policy slot count vs. a per-`subscribe_via` argument. Phase 2's `SubscriptionPolicy` is exactly `freshness_threshold` plus the `entry_ttl()` / `refresh_interval()` derivations.
 
 Backed by four new `EngineCommand` variants (`Subscribe`, `Unsubscribe`, `SubscribeVia`, `UnsubscribeVia`).
 
@@ -307,7 +307,7 @@ The following call sites change. All are mechanical renames; semantics preserved
 
 | File | Today | After |
 |---|---|---|
-| `crates/sunset-relay/src/relay.rs:460` | `publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))` | `subscribe(self.subscription_filter.clone(), SubscriptionPolicy { target_n: 0, freshness_threshold: Duration::from_secs(30) })` |
+| `crates/sunset-relay/src/relay.rs:460` | `publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))` | `subscribe(self.subscription_filter.clone(), SubscriptionPolicy::relay_broad())` |
 | `crates/sunset-relay/src/relay.rs:508` | same | same |
 | `crates/sunset-core/src/bus.rs:127` | `publish_subscription(filter.clone(), Duration::from_secs(3600))` | `subscribe(filter.clone(), SubscriptionPolicy::store_data())` |
 | `crates/sunset-core/src/peer/mod.rs:103` | `publish_subscription(filter, Duration::from_secs(3600))` | `subscribe(filter, SubscriptionPolicy::store_data())` |

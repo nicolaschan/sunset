@@ -172,7 +172,6 @@ mod tests {
         Outbound {
             filter: Filter::NamePrefix(Bytes::from_static(b"x/")),
             policy: SubscriptionPolicy {
-                target_n: 1,
                 freshness_threshold: Duration::from_millis(threshold_ms),
             },
             last_published_ms: last_ms,
@@ -200,6 +199,31 @@ mod tests {
         };
         routes.insert_outbound(key, outbound(1000, 800));
         assert!(routes.due_for_refresh(1000).is_empty());
+    }
+
+    #[test]
+    fn due_for_refresh_honors_relay_broad_policy_cadence() {
+        let mut routes = Routes::new(pid(b"me"));
+        let key = OutboundKey {
+            filter_hash: [0u8; 32],
+            provider: pid(b"p"),
+        };
+        let ob = Outbound {
+            filter: Filter::NamePrefix(Bytes::from_static(b"x/")),
+            policy: SubscriptionPolicy::relay_broad(),
+            last_published_ms: 0,
+        };
+        routes.insert_outbound(key.clone(), ob);
+        // relay_broad: freshness_threshold = 30s, refresh_interval = 15s
+        assert!(
+            routes.due_for_refresh(14_999).is_empty(),
+            "should not be due before 15s"
+        );
+        assert_eq!(
+            routes.due_for_refresh(15_000),
+            vec![key],
+            "should be due at 15s"
+        );
     }
 
     #[test]
