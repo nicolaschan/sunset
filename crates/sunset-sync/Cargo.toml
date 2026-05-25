@@ -21,6 +21,7 @@ rand_core.workspace = true
 serde.workspace = true
 sunset-relay-resolver.workspace = true
 sunset-store.workspace = true
+sunset-store-memory = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tokio-stream.workspace = true
@@ -38,4 +39,4 @@ sunset-store-memory.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "test-util"] }
 
 [features]
-test-helpers = []
+test-helpers = ["dep:sunset-store-memory"]
