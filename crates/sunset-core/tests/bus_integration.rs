@@ -23,9 +23,8 @@ use futures::StreamExt as _;
 use rand_core::OsRng;
 
 use sunset_core::{Bus, BusEvent, BusImpl, Identity};
-use sunset_store::{AcceptAllVerifier, Filter, Store};
+use sunset_store::{AcceptAllVerifier, Filter};
 use sunset_store_memory::MemoryStore;
-use sunset_sync::routing::subscription_name;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine, TrustSet};
 
@@ -77,7 +76,7 @@ async fn ephemeral_publish_arrives_at_remote_subscriber() {
     local
         .run_until(async {
             let net = TestNetwork::new();
-            let (alice_bus, alice_engine, alice_store, alice_run, alice_identity) =
+            let (alice_bus, alice_engine, _alice_store, alice_run, _alice_identity) =
                 build(&net, "alice");
             let (bob_bus, alice_view_of_bob, _bob_store, bob_run, bob_identity) =
                 build(&net, "bob");
@@ -104,35 +103,19 @@ async fn ephemeral_publish_arrives_at_remote_subscriber() {
                 .await
                 .unwrap();
 
-            // Wait for Bob's SubscriptionEntry::Active to land in
-            // Alice's store: Bob's `engine.subscribe` writes a
-            // per-(filter, provider=alice) entry to Bob's store, which
-            // sync replicates to Alice, which then populates Alice's
-            // `peer_sessions[bob].interests`. Poll the store directly
-            // rather than depending on internal engine state.
-            let bob_vk = bob_identity.store_verifying_key();
-            let alice_pid = PeerId(alice_identity.store_verifying_key());
-            let expected_name = subscription_name(
-                &Filter::NamePrefix(Bytes::from_static(b"voice/")),
-                &alice_pid,
+            // Public completion signal: alice has accepted bob's
+            // SubscriptionEntry::Active(provider=alice) and the
+            // forwarding gate is armed. From this point an ephemeral
+            // datagram alice publishes that matches `voice/` will be
+            // routed to bob.
+            let bob_pid = PeerId(bob_identity.store_verifying_key());
+            let voice_filter = Filter::NamePrefix(Bytes::from_static(b"voice/"));
+            assert!(
+                alice_engine
+                    .wait_for_peer_interest(&bob_pid, &voice_filter, Duration::from_secs(2))
+                    .await,
+                "alice did not arm bob's voice/ subscription"
             );
-            let propagated = async {
-                loop {
-                    if alice_store
-                        .get_entry(&bob_vk, &expected_name)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            };
-            tokio::time::timeout(Duration::from_secs(2), propagated)
-                .await
-                .expect("alice learned bob's subscription");
 
             // Alice publishes an ephemeral via the Bus. The Bus signs
             // the canonical payload with Alice's identity and hands it

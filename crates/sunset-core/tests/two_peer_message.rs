@@ -29,7 +29,7 @@ use sunset_core::{
 };
 use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
-use sunset_sync::routing::{SubscriptionPolicy, subscription_name};
+use sunset_sync::routing::SubscriptionPolicy;
 use sunset_sync::test_helpers::wait_for;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
@@ -117,24 +117,17 @@ async fn alice_encrypts_bob_decrypts() {
             // ---- alice connects to bob ----
             alice_engine.add_peer(bob_addr).await.unwrap();
 
-            // Wait for Bob's SubscriptionEntry::Active(provider=alice)
-            // to land in alice's store; equivalent under the new path
-            // to "alice has learned bob's interest".
-            let expected_name = subscription_name(&bob_filter, &alice_peer);
-            let registered = wait_for(
-                Duration::from_secs(2),
-                Duration::from_millis(20),
-                || async {
-                    alice_store
-                        .get_entry(&bob.store_verifying_key(), &expected_name)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some()
-                },
-            )
-            .await;
-            assert!(registered, "alice did not learn bob's subscription");
+            // Public completion signal: alice has accepted bob's
+            // SubscriptionEntry::Active(provider=alice) and the
+            // forwarding gate for bob's filter is armed. From this
+            // point a write that matches `bob_filter` on alice's
+            // store will be routed to bob.
+            assert!(
+                alice_engine
+                    .wait_for_peer_interest(&bob_peer, &bob_filter, Duration::from_secs(2))
+                    .await,
+                "alice did not arm bob's subscription"
+            );
 
             // ---- alice composes + inserts a real encrypted+signed message ----
             let body = "hello bob, this is encrypted";

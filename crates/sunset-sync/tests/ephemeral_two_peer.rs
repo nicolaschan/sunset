@@ -14,11 +14,10 @@ use bytes::Bytes;
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use sunset_store::{
-    AcceptAllVerifier, Filter, SignedDatagram, Store as _, VerifyingKey,
-    canonical::datagram_signing_payload,
+    AcceptAllVerifier, Filter, SignedDatagram, VerifyingKey, canonical::datagram_signing_payload,
 };
 use sunset_store_memory::MemoryStore;
-use sunset_sync::routing::{SubscriptionPolicy, subscription_name};
+use sunset_sync::routing::SubscriptionPolicy;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine, TrustSet};
 
@@ -84,8 +83,8 @@ async fn ephemeral_routes_subscriber_match() {
     local
         .run_until(async {
             let net = TestNetwork::new();
-            let (alice, alice_store, alice_signer) = build_engine(&net, [1u8; 32], "alice");
-            let (bob, _bob_store, _bob_signer) = build_engine(&net, [2u8; 32], "bob");
+            let (alice, _alice_store, alice_signer) = build_engine(&net, [1u8; 32], "alice");
+            let (bob, _bob_store, bob_signer) = build_engine(&net, [2u8; 32], "bob");
 
             // Run both engines first — public APIs like set_trust /
             // add_peer go through the engine's command channel and won't
@@ -106,8 +105,8 @@ async fn ephemeral_routes_subscriber_match() {
             // Bob subscribes to voice/ FIRST so the per-(filter,
             // provider=alice) SubscriptionEntry is in Bob's store before
             // alice connects. After PeerHello, sync replicates that
-            // entry to alice; alice's engine processes it and populates
-            // `peer_sessions[bob].interests`, arming the forward path.
+            // entry to alice; alice's engine arms the forward path for
+            // (bob, voice_filter).
             let voice_filter = Filter::NamePrefix(Bytes::from_static(b"voice/"));
             bob.subscribe(voice_filter.clone(), SubscriptionPolicy::store_data())
                 .await
@@ -120,30 +119,17 @@ async fn ephemeral_routes_subscriber_match() {
                 .await
                 .unwrap();
 
-            // Wait for Bob's SubscriptionEntry::Active(provider=alice)
-            // to land in alice's store. The new path writes per-(filter,
-            // provider) entries instead of populating the legacy
-            // `state.registry`, so observe the on-the-wire artifact.
-            let bob_vk = _bob_signer.vk();
-            let alice_pid = PeerId(alice_signer.vk());
-            let expected_name = subscription_name(&voice_filter, &alice_pid);
-            let propagated = async {
-                loop {
-                    if alice_store
-                        .get_entry(&bob_vk, &expected_name)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            };
-            tokio::time::timeout(Duration::from_secs(2), propagated)
-                .await
-                .expect("alice learned bob's subscription");
+            // Public completion signal: alice has accepted bob's
+            // subscription entry naming her as the provider and the
+            // forward path is armed. From this point an ephemeral
+            // datagram alice publishes will be routed to bob.
+            let bob_pid = PeerId(bob_signer.vk());
+            assert!(
+                alice
+                    .wait_for_peer_interest(&bob_pid, &voice_filter, Duration::from_secs(2))
+                    .await,
+                "alice did not arm bob's interest"
+            );
 
             // Alice publishes a signed ephemeral datagram on voice/.
             let name = Bytes::from_static(b"voice/alice/0001");

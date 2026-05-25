@@ -17,9 +17,8 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 use sunset_core::{Bus, BusEvent, BusImpl, HasSenderTime, Identity, Liveness, LivenessState};
-use sunset_store::{AcceptAllVerifier, Filter, Store};
+use sunset_store::{AcceptAllVerifier, Filter};
 use sunset_store_memory::MemoryStore;
-use sunset_sync::routing::subscription_name;
 use sunset_sync::test_transport::TestNetwork;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine, TrustSet};
 
@@ -88,7 +87,7 @@ async fn liveness_tracks_alice_via_bob_bus_subscription() {
     local
         .run_until(async {
             let net = TestNetwork::new();
-            let (alice_bus, alice_engine, alice_store, alice_run, alice_identity) =
+            let (alice_bus, alice_engine, _alice_store, alice_run, alice_identity) =
                 build(&net, "alice");
             let (bob_bus, alice_view_of_bob, _bob_store, bob_run, bob_identity) =
                 build(&net, "bob");
@@ -109,34 +108,17 @@ async fn liveness_tracks_alice_via_bob_bus_subscription() {
                 .await
                 .unwrap();
 
-            // Wait for Bob's SubscriptionEntry::Active(provider=alice)
-            // to land in Alice's store. The new subscribe path writes
-            // per-(filter, provider) entries instead of populating the
-            // legacy `state.registry`, so we observe the on-the-wire
-            // artifact directly rather than poking engine state.
-            let bob_vk = bob_identity.store_verifying_key();
-            let alice_pid = PeerId(alice_identity.store_verifying_key());
-            let expected_name = subscription_name(
-                &Filter::NamePrefix(Bytes::from_static(b"liveness-test/")),
-                &alice_pid,
+            // Public completion signal: alice has accepted bob's
+            // SubscriptionEntry::Active(provider=alice) and the
+            // forwarding gate for `liveness-test/` is armed.
+            let bob_pid = PeerId(bob_identity.store_verifying_key());
+            let liveness_filter = Filter::NamePrefix(Bytes::from_static(b"liveness-test/"));
+            assert!(
+                alice_engine
+                    .wait_for_peer_interest(&bob_pid, &liveness_filter, Duration::from_secs(2))
+                    .await,
+                "alice did not arm bob's liveness-test subscription"
             );
-            let propagated = async {
-                loop {
-                    if alice_store
-                        .get_entry(&bob_vk, &expected_name)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            };
-            tokio::time::timeout(Duration::from_secs(2), propagated)
-                .await
-                .expect("alice learned bob's subscription");
 
             // Bob keeps a Liveness tracker (production-clock; we won't
             // exercise stale transitions here, just the Live transition).
