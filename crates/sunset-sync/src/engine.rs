@@ -761,20 +761,21 @@ where
                 }
                 // Auto-resubscriber: replay every current BroadcastIntent
                 // for this newly-connected peer. Errors are logged-and-
-                // continued; failing AddPeer because a broadcast intent
-                // couldn't bind would be worse than the inconsistency
-                // (the next refresh tick will surface persistent failures).
+                // continued by `fan_out_intent_to_peers`; failing
+                // AddPeer because a broadcast intent couldn't bind
+                // would be worse than the inconsistency (the next
+                // refresh tick will surface persistent failures).
                 let intents: Vec<crate::routing::BroadcastIntent> = {
                     let state = self.state.lock().await;
                     state.routes.broadcast_intents_snapshot()
                 };
                 for intent in intents {
-                    if let Err(e) = self
-                        .do_subscribe_via(intent.filter, peer_id.clone(), intent.policy)
-                        .await
-                    {
-                        tracing::warn!(?e, ?peer_id, "auto-resubscribe failed on new peer");
-                    }
+                    self.fan_out_intent_to_peers(
+                        &intent.filter,
+                        intent.policy,
+                        vec![peer_id.clone()],
+                    )
+                    .await;
                 }
                 self.emit_engine_event(EngineEvent::PeerAdded {
                     peer_id: peer_id.clone(),
@@ -1462,46 +1463,40 @@ where
             .await
     }
 
-    /// Publish a per-pair `SubscriptionEntry::Active` for `(filter,
-    /// provider)` and record the outbound in `routes.my_subs` for
-    /// refresh.
-    async fn do_subscribe_via(
+    /// Sign and insert a per-(filter, provider) `SubscriptionEntry` into
+    /// the local store. Owns the wire-write pipeline shared by
+    /// `do_subscribe_via` (Active) and `do_unsubscribe_via` (Withdrawn).
+    ///
+    /// `prev_published` is the previous priority at the same
+    /// `(verifying_key, name)` if any. The store enforces LWW by
+    /// priority, so this method picks `max(now_ms, prev + 1)` to
+    /// guarantee strict monotonicity even when two transitions land in
+    /// the same async tick (wall-clock millisecond resolution is not
+    /// enough). Returns the chosen priority so the caller can stamp
+    /// `Outbound::last_published_ms` consistently.
+    ///
+    /// Lock semantics: takes no state lock. The caller must already
+    /// have read `prev_published` (and, for unsubscribe, already
+    /// removed the prior `Outbound`) so this fn does not hold the
+    /// state lock across the `store.insert` await.
+    async fn publish_subscription_entry(
         &self,
-        filter: Filter,
-        provider: PeerId,
-        policy: crate::routing::SubscriptionPolicy,
-    ) -> Result<()> {
+        filter: &Filter,
+        provider: &PeerId,
+        variant: crate::routing::SubscriptionEntry,
+        ttl_ms: u64,
+        prev_published: Option<u64>,
+    ) -> Result<u64> {
         use sunset_store::canonical::signing_payload;
         use sunset_store::{ContentBlock, SignedKvEntry};
 
-        let filter_hash = crate::routing::filter_hash(&filter);
-        let name = crate::routing::subscription_name(&filter, &provider);
-        let entry_value = crate::routing::SubscriptionEntry::Active {
-            filter: filter.clone(),
-            provider: provider.clone(),
-        };
-        let value = postcard::to_stdvec(&entry_value)
+        let name = crate::routing::subscription_name(filter, provider);
+        let value = postcard::to_stdvec(&variant)
             .map_err(|e| Error::Decode(format!("encode SubscriptionEntry: {e}")))?;
         let block = ContentBlock {
             data: Bytes::from(value),
             references: vec![],
         };
-        // `priority` must be strictly greater than the previous
-        // subscription entry at the same `(verifying_key, name)` —
-        // otherwise the store rejects the write as `Stale` (LWW by
-        // priority). Wall-clock millisecond resolution isn't enough
-        // when two subscribe/unsubscribe transitions happen back to
-        // back in the same async runtime tick; force monotonicity by
-        // snapping to `prev_priority + 1` whenever wall-clock is
-        // behind. Read `prev` from the routing state (which we own as
-        // the local-author side); a fresh subscribe-after-withdraw
-        // still wins because the withdrawn `Outbound` was removed by
-        // `take_outbound` on unsubscribe.
-        let key = crate::routing::OutboundKey {
-            filter_hash,
-            provider: provider.clone(),
-        };
-        let prev_published = self.state.lock().await.routes.outbound_last_published(&key);
         let now_ms = web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1510,7 +1505,6 @@ where
             Some(prev) if prev >= now_ms => prev.saturating_add(1),
             _ => now_ms,
         };
-        let ttl_ms = policy.entry_ttl().as_millis() as u64;
         let vk = self.signer.verifying_key();
         let value_hash = block.hash();
         let mut entry = SignedKvEntry {
@@ -1527,6 +1521,61 @@ where
             .insert(entry, Some(block))
             .await
             .map_err(Error::Store)?;
+        Ok(priority)
+    }
+
+    /// Fan out a `BroadcastIntent` across a snapshot of peers by calling
+    /// `do_subscribe_via(filter, peer, policy)` for each. Errors are
+    /// logged and skipped: a single failing peer must not abort the
+    /// broadcast (callers are `do_subscribe` and the PeerHello
+    /// auto-resubscriber, both of which prefer best-effort fan-out and
+    /// rely on the refresh tick to surface persistent failures).
+    ///
+    /// Lock semantics: takes no state lock itself — the caller chose
+    /// the peer snapshot under whatever lock semantics it needed.
+    async fn fan_out_intent_to_peers(
+        &self,
+        filter: &Filter,
+        policy: crate::routing::SubscriptionPolicy,
+        peers: Vec<PeerId>,
+    ) {
+        for peer in peers {
+            if let Err(e) = self
+                .do_subscribe_via(filter.clone(), peer.clone(), policy)
+                .await
+            {
+                tracing::warn!(?e, ?peer, "subscribe per-peer fanout failed");
+            }
+        }
+    }
+
+    /// Publish a per-pair `SubscriptionEntry::Active` for `(filter,
+    /// provider)` and record the outbound in `routes.my_subs` for
+    /// refresh.
+    async fn do_subscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+        policy: crate::routing::SubscriptionPolicy,
+    ) -> Result<()> {
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let key = crate::routing::OutboundKey {
+            filter_hash,
+            provider: provider.clone(),
+        };
+        // Read `prev` from the routing state (which we own as the
+        // local-author side); a fresh subscribe-after-withdraw still
+        // wins because the withdrawn `Outbound` was removed by
+        // `take_outbound` on unsubscribe.
+        let prev_published = self.state.lock().await.routes.outbound_last_published(&key);
+        let variant = crate::routing::SubscriptionEntry::Active {
+            filter: filter.clone(),
+            provider: provider.clone(),
+        };
+        let ttl_ms = policy.entry_ttl().as_millis() as u64;
+        let priority = self
+            .publish_subscription_entry(&filter, &provider, variant, ttl_ms, prev_published)
+            .await?;
 
         let mut state = self.state.lock().await;
         state.routes.insert_outbound(
@@ -1543,9 +1592,6 @@ where
     /// Withdraw a per-pair `SubscriptionEntry`. Idempotent: returns Ok
     /// without writing if no matching outbound is recorded.
     async fn do_unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()> {
-        use sunset_store::canonical::signing_payload;
-        use sunset_store::{ContentBlock, SignedKvEntry};
-
         let filter_hash = crate::routing::filter_hash(&filter);
         let key = crate::routing::OutboundKey {
             filter_hash,
@@ -1556,53 +1602,22 @@ where
             state.routes.take_outbound(&key)
         };
         let Some(prev) = prev else { return Ok(()) };
-        let name = crate::routing::subscription_name(&filter, &provider);
-        let entry_value = crate::routing::SubscriptionEntry::Withdrawn;
-        let value = postcard::to_stdvec(&entry_value)
-            .map_err(|e| Error::Decode(format!("encode SubscriptionEntry: {e}")))?;
-        let block = ContentBlock {
-            data: Bytes::from(value),
-            references: vec![],
-        };
-        let now_ms = web_time::SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        // See `do_subscribe_via`: priority must strictly exceed the
-        // previous entry's priority at `(verifying_key, name)`, or the
-        // store rejects this as Stale. Withdraw immediately after
-        // subscribe (same async tick) collides at millisecond
-        // resolution otherwise.
-        let priority = if prev.last_published_ms >= now_ms {
-            prev.last_published_ms.saturating_add(1)
-        } else {
-            now_ms
-        };
         let ttl_ms = prev.policy.entry_ttl().as_millis() as u64;
-        let vk = self.signer.verifying_key();
-        let value_hash = block.hash();
-        let mut entry = SignedKvEntry {
-            verifying_key: vk,
-            name,
-            value_hash,
-            priority,
-            expires_at: Some(priority.saturating_add(ttl_ms)),
-            signature: Bytes::new(),
-        };
-        let payload = signing_payload(&entry);
-        entry.signature = self.signer.sign(&payload);
-        self.store
-            .insert(entry, Some(block))
-            .await
-            .map_err(Error::Store)?;
+        self.publish_subscription_entry(
+            &filter,
+            &provider,
+            crate::routing::SubscriptionEntry::Withdrawn,
+            ttl_ms,
+            Some(prev.last_published_ms),
+        )
+        .await?;
         Ok(())
     }
 
     /// Declare interest in `filter` from any directly-connected peer.
     /// Records a `BroadcastIntent` and calls `subscribe_via` for every
-    /// peer currently in `peer_sessions`. The auto-resubscriber hook on
-    /// AddPeer (added in a later task) replays for future peer
-    /// connects.
+    /// peer currently in `peer_sessions`. The PeerHello
+    /// auto-resubscriber replays the intent for future peer connects.
     async fn do_subscribe(
         &self,
         filter: Filter,
@@ -1620,14 +1635,7 @@ where
             );
             state.peer_sessions.keys().cloned().collect()
         };
-        for peer in peers {
-            if let Err(e) = self
-                .do_subscribe_via(filter.clone(), peer.clone(), policy)
-                .await
-            {
-                tracing::warn!(?e, ?peer, "subscribe per-peer fanout failed");
-            }
-        }
+        self.fan_out_intent_to_peers(&filter, policy, peers).await;
         Ok(())
     }
 
