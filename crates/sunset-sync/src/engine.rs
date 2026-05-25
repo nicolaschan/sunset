@@ -749,14 +749,7 @@ where
                 let _ = ack.send(Ok(()));
             }
             EngineCommand::RemovePeer { peer_id, ack } => {
-                let removed = {
-                    let mut state = self.state.lock().await;
-                    state.peer_sessions.remove(&peer_id).is_some()
-                };
-                if removed {
-                    self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
-                        .await;
-                }
+                self.drop_peer_session(peer_id).await;
                 let _ = ack.send(Ok(()));
             }
         }
@@ -844,19 +837,19 @@ where
                     reason = %reason,
                     "peer disconnected",
                 );
-                let removed = {
-                    let mut state = self.state.lock().await;
-                    match state.peer_sessions.get(&peer_id) {
-                        Some(po) if po.conn_id == conn_id => {
-                            state.peer_sessions.remove(&peer_id);
-                            true
-                        }
-                        _ => false,
-                    }
+                // Generation guard: only drop the session if the
+                // current entry's conn_id matches the Disconnected
+                // event. A stale Disconnected from generation N must
+                // not tear down a fresh generation N+1 session that
+                // just landed via `PeerHello` (covered by the
+                // `stale_disconnected_from_old_connection_is_filtered`
+                // regression test).
+                let conn_id_matches = {
+                    let state = self.state.lock().await;
+                    matches!(state.peer_sessions.get(&peer_id), Some(po) if po.conn_id == conn_id)
                 };
-                if removed {
-                    self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
-                        .await;
+                if conn_id_matches {
+                    self.drop_peer_session(peer_id).await;
                 }
             }
             InboundEvent::PongObserved {
@@ -1527,6 +1520,34 @@ where
     async fn emit_engine_event(&self, ev: EngineEvent) {
         let mut state = self.state.lock().await;
         state.event_subs.retain(|tx| tx.send(ev.clone()).is_ok());
+    }
+
+    /// Single source of truth for peer-session teardown. Removes the
+    /// `peer_sessions` entry for `peer_id` and, if it was present, emits
+    /// `EngineEvent::PeerRemoved`. Returns `true` when a session was
+    /// actually removed so callers can gate diagnostic logging or
+    /// follow-on cleanup on the unambiguous "we just tore this peer
+    /// down" signal.
+    ///
+    /// Both the explicit `EngineCommand::RemovePeer` flow and the
+    /// `conn_id`-filtered `InboundEvent::Disconnected` flow go through
+    /// this helper. The `Disconnected` caller does its own conn_id peek
+    /// first to enforce the generation guard (a stale Disconnected from
+    /// generation N must not tear down a fresh generation N+1 session
+    /// to the same peer); once that guard passes, the actual removal +
+    /// emit is delegated here so the two paths stay in lockstep.
+    async fn drop_peer_session(&self, peer_id: PeerId) -> bool {
+        let was_present = {
+            let mut state = self.state.lock().await;
+            state.peer_sessions.remove(&peer_id).is_some()
+        };
+        if was_present {
+            self.emit_engine_event(EngineEvent::PeerRemoved {
+                peer_id: peer_id.clone(),
+            })
+            .await;
+        }
+        was_present
     }
 
     /// Fan-out a datagram to every in-process subscriber whose filter
