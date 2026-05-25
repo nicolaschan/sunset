@@ -243,37 +243,7 @@ impl Relay {
         if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
             wt_sans.push(listen_ip);
         }
-        let wt_cert_hex_opt = match crate::wt_cert::load_or_generate(&config.data_dir, &wt_sans)
-            .await
-        {
-            Ok(wt_identity) => {
-                let cert_hash = wt_identity.certificate_chain().as_slice()[0].hash();
-                let cert_hex = sha256_digest_to_hex(&cert_hash);
-                let wt_bind: SocketAddr = bound;
-                match build_server_endpoint(wt_bind, wt_identity, Some(Duration::from_secs(15))) {
-                    Ok(endpoint) => {
-                        spawn_wt_accept_loop(endpoint, wt_accept_tx);
-                        // Ship only the cert hash to the descriptor.
-                        // The relay has no reliable way to know the
-                        // public hostname clients will reach it on
-                        // (it binds `0.0.0.0` and may sit behind any
-                        // number of proxies); the resolver builds the
-                        // actual WT URL from the user-typed authority.
-                        // Shipping a URL here was the prod-bug origin
-                        // — see PR fixing the `0.0.0.0:8443` regression.
-                        Some(cert_hex)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "wt: server endpoint bind failed; degrading to WS-only");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "wt: self-signed identity failed; degrading to WS-only");
-                None
-            }
-        };
+        let wt_cert_hex_opt = try_start_wt(&config.data_dir, &wt_sans, bound, wt_accept_tx).await;
 
         // 7. Combine WS + WT into the engine's inbound transport.
         let transport = DualInboundTransport::new(ws_transport, wt_transport);
@@ -337,6 +307,48 @@ impl Relay {
             cmd_tx,
             cmd_ctx,
         })
+    }
+}
+
+/// Try to bring up the WebTransport listener. Returns `Some(cert_hex)`
+/// (SHA-256 of the SPKI for the listener's cert) on success, or `None`
+/// when WT bringup fails — in which case the relay degrades to WS-only
+/// rather than aborting startup. Both failure paths (cert load/generate,
+/// UDP endpoint bind) emit a `warn!` and return `None`.
+///
+/// On success this also spawns the accept loop that drains incoming
+/// sessions onto `wt_accept_tx`.
+async fn try_start_wt(
+    data_dir: &std::path::Path,
+    wt_sans: &[String],
+    bound: SocketAddr,
+    wt_accept_tx: mpsc::UnboundedSender<wtransport::Connection>,
+) -> Option<String> {
+    let wt_identity = match crate::wt_cert::load_or_generate(data_dir, wt_sans).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, "wt: self-signed identity failed; degrading to WS-only");
+            return None;
+        }
+    };
+    let cert_hash = wt_identity.certificate_chain().as_slice()[0].hash();
+    let cert_hex = sha256_digest_to_hex(&cert_hash);
+    match build_server_endpoint(bound, wt_identity, Some(Duration::from_secs(15))) {
+        Ok(endpoint) => {
+            spawn_wt_accept_loop(endpoint, wt_accept_tx);
+            // Ship only the cert hash to the descriptor. The relay has
+            // no reliable way to know the public hostname clients will
+            // reach it on (it binds `0.0.0.0` and may sit behind any
+            // number of proxies); the resolver builds the actual WT URL
+            // from the user-typed authority. Shipping a URL here was
+            // the prod-bug origin — see PR fixing the `0.0.0.0:8443`
+            // regression.
+            Some(cert_hex)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "wt: server endpoint bind failed; degrading to WS-only");
+            None
+        }
     }
 }
 
