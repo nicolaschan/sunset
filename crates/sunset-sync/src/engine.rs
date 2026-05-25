@@ -1109,10 +1109,13 @@ where
                                 .insert(filter_hash, filter.clone())
                                 .is_none()
                         } else {
-                            // Receiver isn't connected right now; their entry
-                            // will replay through this branch when they
-                            // reconnect (the engine emits a per-entry replay
-                            // on AddPeer via the existing bootstrap path).
+                            // Receiver isn't connected. Their SubscriptionEntry
+                            // stays in our local store; when they reconnect, the
+                            // PeerHello bootstrap digest exchange (see
+                            // `fan_out_digests_to_peer`) replicates it to them
+                            // via EventDelivery, their store insert fires this
+                            // engine's local subscription, and this branch
+                            // re-runs with the peer session now present.
                             return;
                         }
                     };
@@ -1163,23 +1166,32 @@ where
             }
         }
 
-        // Push flow.
-        //
-        // Self-authored entries are broadcast to every currently-connected
-        // peer regardless of routes / peer_sessions interests. The
-        // routes-driven push is only safe once bootstrap-digest +
-        // SUBSCRIBE_PREFIX backfill have primed peer_sessions with the
-        // peer's interests; for an entry inserted right after `add_peer`
-        // returns (e.g., the very first `subscribe` of a freshly-
-        // connected client), interests may still be empty and a
-        // routes-filtered push would lose the entry on the floor until
-        // anti-entropy (default 30 s) caught up. My own entries going to
-        // my own peers don't need filter consent — the receiving peer is
-        // free to route or drop based on its own rules.
-        //
-        // Forwarded entries (authored by someone else) keep
-        // routes-filtered semantics: a relay MUST NOT broadcast a third
-        // party's chat traffic to peers whose subscription doesn't match.
+        self.fanout_application_entry(&entry).await;
+    }
+
+    /// Fan out a locally-inserted (or just-replicated-and-inserted)
+    /// application entry to peer outbound channels.
+    ///
+    /// Two regimes:
+    ///
+    /// - **Self-authored** (`entry.verifying_key == self.local_peer.0`)
+    ///   broadcasts to every connected peer regardless of `interests`.
+    ///   This is the documented Phase 2 invariant (see
+    ///   `docs/superpowers/specs/2026-05-24-cooperative-relay-phase2-design.md`,
+    ///   "What stays the same"). It is load-bearing for `subscribe_via`
+    ///   to take effect promptly: the `SubscriptionEntry` is itself a
+    ///   self-authored write, so without this broadcast it would only
+    ///   reach the named provider via anti-entropy (default 30 s) and
+    ///   `subscribe_via` would have multi-tens-of-seconds latency. It
+    ///   also matches the application UX: a user's own writes reach
+    ///   the peers they're connected to without those peers having to
+    ///   pre-announce interest.
+    ///
+    /// - **Foreign-authored** routes via `forward_targets`, which
+    ///   consults each peer's `interests` map. This is the
+    ///   relay-correctness branch: a relay MUST NOT broadcast a third
+    ///   party's traffic to peers whose subscription doesn't match.
+    async fn fanout_application_entry(&self, entry: &sunset_store::SignedKvEntry) {
         let blob = self
             .store
             .get_content(&entry.value_hash)
@@ -1191,23 +1203,21 @@ where
             blobs: blob.into_iter().collect(),
         };
         let state = self.state.lock().await;
-        if entry.verifying_key == self.local_peer.0 {
-            for po in state.peer_sessions.values() {
-                let _ = po.tx.send(msg.clone());
-            }
+        let targets: Vec<PeerId> = if entry.verifying_key == self.local_peer.0 {
+            state.peer_sessions.keys().cloned().collect()
         } else {
-            let targets: Vec<PeerId> = crate::routing::forward_targets(
+            crate::routing::forward_targets(
                 &state.peer_sessions,
                 |s| &s.interests,
                 &entry.verifying_key,
                 &entry.name,
             )
             .into_iter()
-            .collect();
-            for peer in targets {
-                if let Some(po) = state.peer_sessions.get(&peer) {
-                    let _ = po.tx.send(msg.clone());
-                }
+            .collect()
+        };
+        for peer in targets {
+            if let Some(po) = state.peer_sessions.get(&peer) {
+                let _ = po.tx.send(msg.clone());
             }
         }
     }
