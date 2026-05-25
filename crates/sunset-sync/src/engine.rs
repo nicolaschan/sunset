@@ -42,6 +42,24 @@ impl ConnectionId {
     }
 }
 
+/// Wall-clock milliseconds since UNIX epoch. WASM-portable via
+/// `web_time`.
+///
+/// `unwrap_or(0)` is a deliberate sentinel: a wall clock set before the
+/// UNIX epoch is impossible in practice on any machine we target
+/// (Linux/macOS/Windows host or any browser), so the only way the
+/// `duration_since` arm fails is a catastrophically misconfigured system
+/// clock. Returning 0 lets callers that use the value as a monotonic-ish
+/// priority (LWW `(verifying_key, name)` writes) still make forward
+/// progress instead of panicking the engine task. The arithmetic
+/// downstream uses `saturating_add`, so a 0 here doesn't overflow.
+pub(crate) fn now_unix_ms() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Free helper that spins up the outbound channel + spawns the per-peer
 /// task. Extracted from `SyncEngine::spawn_peer` so the AddPeer command
 /// handler can call it from a `'static` spawned task without holding
@@ -630,10 +648,7 @@ where
                     self.tick_anti_entropy().await;
                 }
                 _ = routing_tick.tick() => {
-                    let now_ms = web_time::SystemTime::now()
-                        .duration_since(web_time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                    let now_ms = now_unix_ms();
                     let due = {
                         let state = self.state.lock().await;
                         state.routes.due_for_refresh(now_ms)
@@ -1598,10 +1613,7 @@ where
             data: Bytes::from(value),
             references: vec![],
         };
-        let now_ms = web_time::SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = now_unix_ms();
         let priority = match prev_published {
             Some(prev) if prev >= now_ms => prev.saturating_add(1),
             _ => now_ms,
