@@ -155,12 +155,7 @@ impl Relay {
         let identity = identity::load_or_generate(&config.identity_secret_path).await?;
 
         let ed25519_public = identity.public().as_bytes();
-        let x25519_public = {
-            let s = ed25519_seed_to_x25519_secret(&identity.secret_bytes());
-            use curve25519_dalek::{MontgomeryPoint, scalar::Scalar};
-            let scalar = Scalar::from_bytes_mod_order(*s);
-            MontgomeryPoint::mul_base(&scalar).to_bytes()
-        };
+        let x25519_public = derive_x25519_public(&identity);
 
         // 2. Store.
         let store_root = config.data_dir.join("store");
@@ -200,27 +195,7 @@ impl Relay {
         let wt_transport =
             SpawningAcceptor::new(wt_raw_inbound, wt_connector, wt_promote, handshake_timeout);
 
-        // The dial-host SAN list determines which hostnames the
-        // browser is allowed to dial when reaching this WT listener.
-        // Despite the W3C spec saying `serverCertificateHashes`
-        // *replaces* chain validation, Chrome's implementation still
-        // enforces the dialed hostname being in the cert's SAN — so
-        // production deployments behind a public hostname must include
-        // that hostname here. Default is `["127.0.0.1", "localhost"]`
-        // (sufficient for tests and loopback dev); operators set
-        // `webtransport_san` in the relay config TOML to add their
-        // public hostname.
-        //
-        // We also append the listen address's literal IP when it's
-        // explicit and non-loopback — e.g. binding `203.0.113.1:8443`
-        // makes the cert valid for that IP automatically. When binding
-        // `0.0.0.0` (the production shape behind a proxy) the listen IP
-        // is meaningless and we don't append it.
-        let mut wt_sans: Vec<String> = config.webtransport_san.clone();
-        let listen_ip = bound.ip().to_string();
-        if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
-            wt_sans.push(listen_ip);
-        }
+        let wt_sans = compute_wt_sans(&config.webtransport_san, bound);
         let wt_cert_hex_opt = try_start_wt(&config.data_dir, &wt_sans, bound, wt_accept_tx).await;
 
         // 7. Combine WS + WT into the engine's inbound transport.
@@ -261,18 +236,7 @@ impl Relay {
         spawn_command_pump(cmd_rx, cmd_ctx.clone());
 
         // 12. Banner.
-        let mut banner = identity::format_address(&bound, &identity);
-        banner.push_str(&format!("\n  dashboard: http://{bound}/dashboard"));
-        banner.push_str(&format!("\n  identity:  http://{bound}/"));
-        if let Some(cert_hex) = &wt_cert_hex_opt {
-            banner.push_str(&format!(
-                "\n  wt:        cert-sha256={cert_hex} (clients build the URL from the hostname they reached the descriptor on)"
-            ));
-        } else {
-            banner.push_str("\n  wt:        (disabled — UDP bind failed)");
-        }
-        tracing::info!("\n{}", banner);
-        println!("{banner}");
+        emit_startup_banner(&bound, &identity, wt_cert_hex_opt.as_deref());
 
         Ok(RelayHandle {
             local_address,
@@ -288,6 +252,58 @@ impl Relay {
             cmd_ctx,
         })
     }
+}
+
+/// Derive the relay's X25519 public key from its Ed25519 identity. The
+/// X25519 half is what Noise IK uses; we publish it in the dial URL
+/// fragment so peers can pin the responder static key.
+fn derive_x25519_public(identity: &Identity) -> [u8; 32] {
+    use curve25519_dalek::{MontgomeryPoint, scalar::Scalar};
+    let s = ed25519_seed_to_x25519_secret(&identity.secret_bytes());
+    let scalar = Scalar::from_bytes_mod_order(*s);
+    MontgomeryPoint::mul_base(&scalar).to_bytes()
+}
+
+/// Compute the WebTransport SAN list: start from the operator-configured
+/// list and append the listen address's literal IP when it's explicit
+/// (binding `203.0.113.1:8443` makes the cert valid for that IP
+/// automatically). Skip the append when binding `0.0.0.0` (the
+/// production shape behind a proxy) — the listen IP is meaningless
+/// there.
+///
+/// The dial-host SAN list determines which hostnames the browser is
+/// allowed to dial when reaching this WT listener. Despite the W3C spec
+/// saying `serverCertificateHashes` *replaces* chain validation,
+/// Chrome's implementation still enforces the dialed hostname being in
+/// the cert's SAN — so production deployments behind a public hostname
+/// must include that hostname in `webtransport_san` in the relay
+/// config TOML. Default is `["127.0.0.1", "localhost"]` (sufficient for
+/// tests and loopback dev).
+fn compute_wt_sans(configured: &[String], bound: SocketAddr) -> Vec<String> {
+    let mut wt_sans: Vec<String> = configured.to_vec();
+    let listen_ip = bound.ip().to_string();
+    if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
+        wt_sans.push(listen_ip);
+    }
+    wt_sans
+}
+
+/// Format and emit (both `tracing::info!` and stdout `println!`) the
+/// startup banner showing the dial URL, dashboard URL, identity URL,
+/// and WT cert hash (or a degraded-mode note when WT bringup failed).
+fn emit_startup_banner(bound: &SocketAddr, identity: &Identity, wt_cert_hex: Option<&str>) {
+    let mut banner = identity::format_address(bound, identity);
+    banner.push_str(&format!("\n  dashboard: http://{bound}/dashboard"));
+    banner.push_str(&format!("\n  identity:  http://{bound}/"));
+    if let Some(cert_hex) = wt_cert_hex {
+        banner.push_str(&format!(
+            "\n  wt:        cert-sha256={cert_hex} (clients build the URL from the hostname they reached the descriptor on)"
+        ));
+    } else {
+        banner.push_str("\n  wt:        (disabled — UDP bind failed)");
+    }
+    tracing::info!("\n{}", banner);
+    println!("{banner}");
 }
 
 /// Build the SpawningAcceptor "promote" closure that runs the Noise IK
