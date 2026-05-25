@@ -26,9 +26,10 @@ use sunset_noise::{
 };
 use sunset_store::{Filter, VerifyingKey};
 use sunset_store_fs::FsStore;
+use sunset_sync::routing::{self, SubscriptionPolicy};
 use sunset_sync::{
     DualInboundTransport, PeerAddr, PeerId, RawConnection, Signer, SpawningAcceptor, SyncConfig,
-    SyncEngine, routing,
+    SyncEngine,
 };
 use sunset_sync_webtransport_native::{
     WebTransportRawConnection, WebTransportRawTransport, build_server_endpoint,
@@ -88,6 +89,7 @@ pub struct RelayHandle {
     engine: Rc<Engine>,
     peers: Vec<String>,
     subscription_filter: Filter,
+    subscription_policy: SubscriptionPolicy,
     listener: Option<TcpListener>,
     /// Senders the axum app uses. Built once in `new`; cloned into
     /// `AppState` in `run` / `run_for_test`.
@@ -227,10 +229,11 @@ impl Relay {
             signer,
         ));
 
-        // 9. Subscription filter for the relay's broad ingestion.
+        // 9. Subscription filter + policy for the relay's broad ingestion.
         let subscription_filter = match config.interest_filter {
             InterestFilter::All => routing::relay_broad_filter(),
         };
+        let subscription_policy = SubscriptionPolicy::relay_broad();
 
         // 10. Bridge channels.
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RelayCommand>();
@@ -270,6 +273,7 @@ impl Relay {
             engine,
             peers: config.peers,
             subscription_filter,
+            subscription_policy,
             listener: Some(listener),
             ws_tx,
             cmd_tx,
@@ -456,10 +460,7 @@ impl RelayHandle {
 
         // Subscription publish + federated dials happen on the engine side.
         self.engine
-            .subscribe(
-                self.subscription_filter.clone(),
-                sunset_sync::routing::SubscriptionPolicy::relay_broad(),
-            )
+            .subscribe(self.subscription_filter.clone(), self.subscription_policy)
             .await?;
         tracing::info!("published broad subscription");
         self.dial_configured_peers().await;
@@ -507,10 +508,7 @@ impl RelayHandle {
         let _serve_task = tokio::spawn(async move { axum::serve(listener, app).await });
 
         self.engine
-            .subscribe(
-                self.subscription_filter.clone(),
-                sunset_sync::routing::SubscriptionPolicy::relay_broad(),
-            )
+            .subscribe(self.subscription_filter.clone(), self.subscription_policy)
             .await?;
         self.dial_configured_peers().await;
 
