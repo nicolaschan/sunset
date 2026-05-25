@@ -1129,105 +1129,172 @@ where
             _ => return,
         };
 
-        // If this entry is a per-(filter, provider) `SubscriptionEntry`
-        // naming us as the provider, mirror the receiver's interest into
-        // their `PeerSession`. Forwarding consults `peer_sessions[*].interests`
-        // (via `routing::forward_targets`); without this mirror, the
-        // receiver would never see matching application entries.
+        // Two unrelated jobs: (1) if this is a per-(filter, provider)
+        // SubscriptionEntry naming us as the provider, mirror the
+        // receiver's interest into their PeerSession so the forwarding
+        // path will route matching entries to them; (2) regardless,
+        // fan the entry out to peers per the push policy. Both run on
+        // every locally-observed entry insertion.
         if crate::routing::is_subscription_name(entry.name.as_ref()) {
-            let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
-                return;
-            };
-            let Ok(sub_entry) =
-                postcard::from_bytes::<crate::routing::SubscriptionEntry>(&block.data)
-            else {
+            self.handle_subscription_entry_event(&entry).await;
+        }
+
+        self.fanout_application_entry(&entry).await;
+    }
+
+    /// Dispatch a SUBSCRIBE_PREFIX entry into the routing layer.
+    ///
+    /// Splits the work into a value-parsing step (handles the two
+    /// malformed-input warn! branches) and per-variant handlers for
+    /// `Active` (mirror into session.interests + possibly send a
+    /// backfill `DigestRequest`) and `Withdrawn` (clear the mirrored
+    /// interest). All routing-state mutation happens under a single
+    /// `state.lock()` critical section per call.
+    async fn handle_subscription_entry_event(&self, entry: &sunset_store::SignedKvEntry) {
+        let Some((filter_hash, sub_entry)) = self.parse_subscription_entry(entry).await else {
+            return;
+        };
+        let receiver = PeerId(entry.verifying_key.clone());
+        let is_self_authored = entry.verifying_key == self.local_peer.0;
+
+        match sub_entry {
+            crate::routing::SubscriptionEntry::Active { filter, provider }
+                if provider == self.local_peer =>
+            {
+                self.handle_subscription_active(filter_hash, receiver, filter, is_self_authored)
+                    .await;
+            }
+            crate::routing::SubscriptionEntry::Withdrawn => {
+                self.handle_subscription_withdrawn(filter_hash, receiver)
+                    .await;
+            }
+            // Active naming someone else: Phase 3 recursive subscription
+            // will revisit (we may want to subscribe upstream). Phase 2
+            // ignores.
+            _ => {}
+        }
+    }
+
+    /// Decode a SUBSCRIBE_PREFIX entry into `(filter_hash, SubscriptionEntry)`.
+    ///
+    /// Returns `None` (after a `warn!`) if either the blob is missing /
+    /// malformed or the name doesn't parse as `subscription_name`.
+    /// These two warn! branches are exercised by the unit tests
+    /// `handle_subscription_entry_event_ignores_malformed_*` below.
+    async fn parse_subscription_entry(
+        &self,
+        entry: &sunset_store::SignedKvEntry,
+    ) -> Option<(
+        crate::routing::FilterHash,
+        crate::routing::SubscriptionEntry,
+    )> {
+        let block = self
+            .store
+            .get_content(&entry.value_hash)
+            .await
+            .ok()
+            .flatten()?;
+        let sub_entry = match postcard::from_bytes::<crate::routing::SubscriptionEntry>(&block.data)
+        {
+            Ok(e) => e,
+            Err(_) => {
                 tracing::warn!(
                     name = %String::from_utf8_lossy(&entry.name),
                     "malformed SubscriptionEntry value; ignoring"
                 );
-                return;
-            };
-            let Some(filter_hash) = crate::routing::decode_filter_hash_from_name(&entry.name)
-            else {
+                return None;
+            }
+        };
+        let filter_hash = match crate::routing::decode_filter_hash_from_name(&entry.name) {
+            Some(h) => h,
+            None => {
                 tracing::warn!(
                     name = %String::from_utf8_lossy(&entry.name),
                     "SUBSCRIBE_PREFIX entry with malformed name; ignoring"
                 );
+                return None;
+            }
+        };
+        Some((filter_hash, sub_entry))
+    }
+
+    /// `SubscriptionEntry::Active` arm with `provider == self`. Mirrors
+    /// the interest, optionally sends a backfill DigestRequest, and
+    /// emits `PeerInterestArmed`.
+    ///
+    /// Single critical section: insert into the session's interest map
+    /// and capture the outbound channel under one `state.lock()`,
+    /// release the lock, then send the DigestRequest. Holding the lock
+    /// across the (synchronous, non-blocking) `tx.send` is fine; we
+    /// release early so the `emit_engine_event` call below (which also
+    /// takes the lock) doesn't reenter.
+    async fn handle_subscription_active(
+        &self,
+        filter_hash: crate::routing::FilterHash,
+        receiver: PeerId,
+        filter: sunset_store::Filter,
+        is_self_authored: bool,
+    ) {
+        let (was_new, tx) = {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.peer_sessions.get_mut(&receiver) else {
+                // Receiver isn't connected. Their SubscriptionEntry
+                // stays in our local store; when they reconnect, the
+                // PeerHello bootstrap digest exchange (see
+                // `fan_out_digests_to_peer`) replicates it to them
+                // via EventDelivery, their store insert fires this
+                // engine's local subscription, and this branch
+                // re-runs with the peer session now present.
                 return;
             };
-            let receiver = PeerId(entry.verifying_key.clone());
-            let is_self_authored = entry.verifying_key == self.local_peer.0;
-
-            match sub_entry {
-                crate::routing::SubscriptionEntry::Active { filter, provider }
-                    if provider == self.local_peer =>
-                {
-                    let was_new = {
-                        let mut state = self.state.lock().await;
-                        if let Some(session) = state.peer_sessions.get_mut(&receiver) {
-                            session
-                                .interests
-                                .insert(filter_hash, filter.clone())
-                                .is_none()
-                        } else {
-                            // Receiver isn't connected. Their SubscriptionEntry
-                            // stays in our local store; when they reconnect, the
-                            // PeerHello bootstrap digest exchange (see
-                            // `fan_out_digests_to_peer`) replicates it to them
-                            // via EventDelivery, their store insert fires this
-                            // engine's local subscription, and this branch
-                            // re-runs with the peer session now present.
-                            return;
-                        }
-                    };
-                    if was_new && !is_self_authored {
-                        let state = self.state.lock().await;
-                        if let Some(session) = state.peer_sessions.get(&receiver) {
-                            let _ = session.tx.send(SyncMessage::DigestRequest {
-                                filter: filter.clone(),
-                                range: DigestRange::All,
-                            });
-                        }
-                    }
-                    // Emit AFTER the DigestRequest send so a test
-                    // observer that gates on this event is guaranteed
-                    // the backfill exchange is queued or in flight.
-                    // Fired for both self-authored (loopback through
-                    // sync) and foreign-authored entries so the same
-                    // gate works whether the receiver subscribes via
-                    // us directly or through an intermediary relay.
-                    if was_new {
-                        self.emit_engine_event(EngineEvent::PeerInterestArmed {
-                            receiver: receiver.clone(),
-                            filter,
-                        })
-                        .await;
-                    }
-                }
-                crate::routing::SubscriptionEntry::Withdrawn => {
-                    let prev_filter = {
-                        let mut state = self.state.lock().await;
-                        state
-                            .peer_sessions
-                            .get_mut(&receiver)
-                            .and_then(|session| session.interests.remove(&filter_hash))
-                    };
-                    if let Some(filter) = prev_filter {
-                        self.emit_engine_event(EngineEvent::PeerInterestWithdrawn {
-                            receiver: receiver.clone(),
-                            filter,
-                        })
-                        .await;
-                    }
-                }
-                // Active naming someone else: Phase 3 recursive subscription
-                // will revisit (we may want to subscribe upstream). Phase 2
-                // ignores.
-                _ => {}
-            }
+            let was_new = session
+                .interests
+                .insert(filter_hash, filter.clone())
+                .is_none();
+            (was_new, session.tx.clone())
+        };
+        if was_new && !is_self_authored {
+            let _ = tx.send(SyncMessage::DigestRequest {
+                filter: filter.clone(),
+                range: DigestRange::All,
+            });
         }
+        // Emit AFTER the DigestRequest send so a test observer that
+        // gates on this event is guaranteed the backfill exchange is
+        // queued or in flight. Fired for both self-authored (loopback
+        // through sync) and foreign-authored entries so the same gate
+        // works whether the receiver subscribes via us directly or
+        // through an intermediary relay.
+        if was_new {
+            self.emit_engine_event(EngineEvent::PeerInterestArmed {
+                receiver: receiver.clone(),
+                filter,
+            })
+            .await;
+        }
+    }
 
-        self.fanout_application_entry(&entry).await;
+    /// `SubscriptionEntry::Withdrawn` arm. Removes the mirrored interest
+    /// (no-op if not currently armed) and emits `PeerInterestWithdrawn`.
+    async fn handle_subscription_withdrawn(
+        &self,
+        filter_hash: crate::routing::FilterHash,
+        receiver: PeerId,
+    ) {
+        let prev_filter = {
+            let mut state = self.state.lock().await;
+            state
+                .peer_sessions
+                .get_mut(&receiver)
+                .and_then(|session| session.interests.remove(&filter_hash))
+        };
+        if let Some(filter) = prev_filter {
+            self.emit_engine_event(EngineEvent::PeerInterestWithdrawn {
+                receiver: receiver.clone(),
+                filter,
+            })
+            .await;
+        }
     }
 
     /// Fan out a locally-inserted (or just-replicated-and-inserted)
@@ -2822,6 +2889,224 @@ mod tests {
                     Some(&filter),
                     "bootstrap_routes must populate interests for connected peers"
                 );
+            })
+            .await;
+    }
+
+    // -- handle_subscription_entry_event coverage --
+    //
+    // The function has three previously-untested code paths:
+    //   1. SUBSCRIBE_PREFIX-named entry whose value blob doesn't decode
+    //      as a SubscriptionEntry (warn! + ignore).
+    //   2. SUBSCRIBE_PREFIX-prefixed name that doesn't carry a valid
+    //      filter-hash suffix (warn! + ignore).
+    //   3. SubscriptionEntry::Active authored by us (the local peer)
+    //      with provider == us: the interest must be mirrored, but the
+    //      backfill DigestRequest MUST NOT be sent (otherwise we'd ask
+    //      ourselves over the network for data we already have).
+    //
+    // All three drive the path via `handle_local_store_event` /
+    // `handle_subscription_entry_event` directly — they don't need a
+    // second engine wired through TestNetwork.
+    //
+    // Fixture: a peer_session pre-installed under some `receiver` PeerId
+    // with an mpsc receiver we can drain to assert presence / absence
+    // of `SyncMessage::DigestRequest`.
+
+    fn install_peer_session(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        peer: PeerId,
+    ) -> mpsc::UnboundedReceiver<SyncMessage> {
+        let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
+        // Block on the lock acquisition synchronously from the test's
+        // current_thread runtime by routing through a `LocalSet`. The
+        // callers below are inside `local.run_until`, so we just take
+        // the lock with `try_lock` — peer_sessions isn't contended in
+        // these tests.
+        let mut state = engine
+            .state
+            .try_lock()
+            .expect("test fixture: state lock uncontended");
+        state.peer_sessions.insert(
+            peer,
+            PeerSession {
+                conn_id: ConnectionId::for_test(1),
+                kind: TransportKind::Unknown,
+                tx,
+                _shutdown: tokio::sync::watch::channel(()).0,
+                interests: std::collections::HashMap::new(),
+            },
+        );
+        rx
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_subscription_entry_event_ignores_malformed_value() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+                let bob = PeerId(vk(b"bob"));
+                let _rx = install_peer_session(&engine, bob.clone());
+
+                // Well-formed SUBSCRIBE_PREFIX name with a value blob
+                // that ISN'T a postcard-encoded SubscriptionEntry.
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"\xff\xff\xff garbage \xff\xff"),
+                    references: vec![],
+                };
+                let name = crate::routing::subscription_name(&filter, &local_peer);
+                let entry = SignedKvEntry {
+                    verifying_key: bob.0.clone(),
+                    name,
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry.clone(), Some(block)).await.unwrap();
+
+                // Drive the path directly. Must not panic.
+                engine
+                    .handle_local_store_event(sunset_store::Event::Inserted(entry))
+                    .await;
+
+                // Interests must remain empty — the warn! branch fires
+                // and the entry is ignored.
+                let state = engine.state.lock().await;
+                let session = state.peer_sessions.get(&bob).expect("bob's session");
+                assert!(
+                    session.interests.is_empty(),
+                    "malformed value must not arm any interest"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_subscription_entry_event_ignores_malformed_name() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+                let bob = PeerId(vk(b"bob"));
+                let _rx = install_peer_session(&engine, bob.clone());
+
+                // SUBSCRIBE_PREFIX'd name that DOES decode as a
+                // SubscriptionEntry value, but whose name tail isn't a
+                // valid `<filter-hash-hex>/<provider-hex>` shape, so
+                // `decode_filter_hash_from_name` returns None.
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let sub_value = crate::routing::SubscriptionEntry::Active {
+                    filter: filter.clone(),
+                    provider: local_peer.clone(),
+                };
+                let block = ContentBlock {
+                    data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
+                    references: vec![],
+                };
+                // Just the prefix + a bogus tail (no slash, wrong-length hash).
+                let bad_name =
+                    Bytes::from([crate::routing::SUBSCRIBE_PREFIX, b"not-a-valid-suffix"].concat());
+                let entry = SignedKvEntry {
+                    verifying_key: bob.0.clone(),
+                    name: bad_name,
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry.clone(), Some(block)).await.unwrap();
+
+                engine
+                    .handle_local_store_event(sunset_store::Event::Inserted(entry))
+                    .await;
+
+                let state = engine.state.lock().await;
+                let session = state.peer_sessions.get(&bob).expect("bob's session");
+                assert!(
+                    session.interests.is_empty(),
+                    "malformed name must not arm any interest"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_subscription_entry_event_self_authored_skips_digest_request() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+                // The "receiver" of this self-authored entry is the local
+                // peer itself; install a peer_session under that key so
+                // the Active arm has somewhere to mirror the interest.
+                let mut rx = install_peer_session(&engine, local_peer.clone());
+
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let sub_value = crate::routing::SubscriptionEntry::Active {
+                    filter: filter.clone(),
+                    provider: local_peer.clone(),
+                };
+                let block = ContentBlock {
+                    data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
+                    references: vec![],
+                };
+                let name = crate::routing::subscription_name(&filter, &local_peer);
+                // Authored by the local peer (verifying_key == self).
+                let entry = SignedKvEntry {
+                    verifying_key: local_peer.0.clone(),
+                    name,
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry.clone(), Some(block)).await.unwrap();
+
+                engine
+                    .handle_local_store_event(sunset_store::Event::Inserted(entry))
+                    .await;
+
+                // Interest must be mirrored.
+                {
+                    let state = engine.state.lock().await;
+                    let session = state.peer_sessions.get(&local_peer).expect("self session");
+                    let filter_hash = crate::routing::filter_hash(&filter);
+                    assert_eq!(
+                        session.interests.get(&filter_hash),
+                        Some(&filter),
+                        "self-authored Active must still mirror the interest"
+                    );
+                }
+
+                // But no DigestRequest must have been sent — we'd be
+                // asking ourselves over the network for data we already
+                // have. Drain the receiver non-blockingly and assert
+                // there's no DigestRequest among any queued messages.
+                //
+                // (fanout_application_entry runs next and may push an
+                // EventDelivery for the same self-authored entry; that's
+                // expected and unrelated to this gate.)
+                while let Ok(msg) = rx.try_recv() {
+                    assert!(
+                        !matches!(msg, SyncMessage::DigestRequest { .. }),
+                        "self-authored Active must not trigger a DigestRequest, got {msg:?}"
+                    );
+                }
             })
             .await;
     }
