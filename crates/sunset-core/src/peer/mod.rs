@@ -1352,6 +1352,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn room_drop_unsubscribes_engine_broadcast_intent() {
+        // Regression: `Peer::open_room` calls
+        // `engine.subscribe(room_filter, ...)` which records a
+        // `BroadcastIntent` in the engine's routing state. Pre-fix,
+        // `RoomState::drop` tore down only `cancel_decode` and the
+        // signaler dispatcher — it never called the matching
+        // `engine.unsubscribe(filter)`, so every open/close cycle
+        // leaked a permanent broadcast intent. The PeerHello
+        // auto-resubscriber replayed those intents on every new
+        // connection, growing SubscriptionEntry traffic linearly with
+        // session-time room reopens. After the fix, dropping the
+        // `OpenRoom` must remove the broadcast intent.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(80)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                let filter = crate::filters::room_filter(&room.inner.room);
+
+                // Pre-drop: the broadcast intent for the room filter
+                // is recorded in engine routing state.
+                let pre = peer.engine().broadcast_intent_filters_snapshot().await;
+                assert!(
+                    pre.iter().any(|f| f == &filter),
+                    "expected open_room to record a BroadcastIntent for room_filter; \
+                     snapshot pre-drop = {pre:?}",
+                );
+
+                drop(room);
+
+                // Drop kicks the unsubscribe off via spawn_local; the
+                // engine command channel round-trip then needs the
+                // engine task to pump it. Poll a few times so the
+                // chain (spawn_local task -> cmd_tx -> engine run-loop
+                // -> remove intent) can complete.
+                let mut post: Vec<sunset_store::Filter> = Vec::new();
+                for _ in 0..200 {
+                    post = peer.engine().broadcast_intent_filters_snapshot().await;
+                    if !post.iter().any(|f| f == &filter) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    !post.iter().any(|f| f == &filter),
+                    "RoomState::drop must unsubscribe the room filter; \
+                     snapshot post-drop still contains it: {post:?}",
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn peer_connection_mode_reads_from_tracker() {
         let local = tokio::task::LocalSet::new();
         local

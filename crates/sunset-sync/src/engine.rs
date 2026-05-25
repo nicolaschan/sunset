@@ -197,6 +197,19 @@ pub enum EngineEvent {
 ///
 /// `conn_id` is checked when handling `InboundEvent::Disconnected` so a
 /// stale event from a defunct connection can't tear down a fresh one.
+///
+/// `interests` lives in this struct (rather than in a parallel
+/// `HashMap<PeerId, _>` next to `Routes`) because peer disconnect tears
+/// the whole session down in one removal: every drop site (`RemovePeer`,
+/// `Disconnected`, the implicit replace-on-`PeerHello`) just removes
+/// the `peer_sessions` entry and the interests go with it. Splitting
+/// interests into a parallel map would require every one of those
+/// drop sites to remember a second cleanup call — exactly the
+/// `update_a(); update_b();` smell the V2 design audit (during the
+/// cooperative-relay phase-2 design pass) explicitly chose to prevent.
+/// The routing module reaches into `interests` via the closure shape
+/// of `forward_targets`; cluster #8 (`forward_targets` API redesign)
+/// addresses that abstraction-leak concern without unbundling.
 pub(crate) struct PeerSession {
     /// Identifies the connection generation that owns this outbound channel.
     /// Compared against `InboundEvent::Disconnected.conn_id` to filter stale
@@ -1298,6 +1311,26 @@ where
             }
         }
         out
+    }
+
+    /// Test-only snapshot of every currently-recorded outbound
+    /// `BroadcastIntent` (filter we have called `subscribe()` for, and
+    /// that the PeerHello auto-resubscriber would replay to a freshly
+    /// connecting peer). Used to assert lifecycle invariants — e.g.
+    /// that `RoomState::drop` pairs its `subscribe` with an
+    /// `unsubscribe` and doesn't leak intents across room reopens.
+    ///
+    /// Gated behind `test-helpers` so the production API stays free of
+    /// internal-routing accessors.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn broadcast_intent_filters_snapshot(&self) -> Vec<Filter> {
+        let state = self.state.lock().await;
+        state
+            .routes
+            .broadcast_intents_snapshot()
+            .into_iter()
+            .map(|bi| bi.filter)
+            .collect()
     }
 
     /// Wait until this engine has accepted a `SubscriptionEntry::Active`

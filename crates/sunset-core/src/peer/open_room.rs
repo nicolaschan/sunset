@@ -673,10 +673,27 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
 impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
     fn drop(&mut self) {
         self.cancel_decode.set(true);
-        if let Some(peer) = self.peer_weak.upgrade() {
-            peer.rtc_signaler_dispatcher
-                .unregister(&self.room.fingerprint());
-        }
+        let Some(peer) = self.peer_weak.upgrade() else {
+            return;
+        };
+        peer.rtc_signaler_dispatcher
+            .unregister(&self.room.fingerprint());
+
+        // Pair the `engine.subscribe(room_filter, ...)` call that
+        // `Peer::open_room` made on entry: without this every
+        // open/close cycle accretes a permanent `BroadcastIntent`
+        // that the PeerHello auto-resubscriber replays on every new
+        // connection, growing SubscriptionEntry traffic linearly with
+        // session-time room reopens. The engine command channel is
+        // async, so kick the unsubscribe off in a `spawn_local` task —
+        // `Drop` cannot await.
+        let engine = peer.engine().clone();
+        let filter = crate::filters::room_filter(&self.room);
+        sunset_sync::spawn::spawn_local(async move {
+            if let Err(e) = engine.unsubscribe(filter).await {
+                tracing::warn!(?e, "RoomState::drop unsubscribe failed");
+            }
+        });
     }
 }
 
