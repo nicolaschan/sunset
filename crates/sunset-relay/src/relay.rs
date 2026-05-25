@@ -59,7 +59,7 @@ type NoiseHandshakeFuture<R> = std::pin::Pin<
 /// WS and WT acceptors use this same shape.
 type NoisePromote<R> = Box<dyn Fn(R) -> NoiseHandshakeFuture<R> + 'static>;
 
-/// WebSocket half. Same shape as before WT was added.
+/// WebSocket half.
 type WsAcceptor = SpawningAcceptor<
     WebSocketRawTransport,
     NoiseTransport<WebSocketRawTransport>,
@@ -350,13 +350,10 @@ async fn try_start_wt(
     match build_server_endpoint(bound, wt_identity, Some(Duration::from_secs(15))) {
         Ok(endpoint) => {
             spawn_wt_accept_loop(endpoint, wt_accept_tx);
-            // Ship only the cert hash to the descriptor. The relay has
-            // no reliable way to know the public hostname clients will
-            // reach it on (it binds `0.0.0.0` and may sit behind any
-            // number of proxies); the resolver builds the actual WT URL
-            // from the user-typed authority. Shipping a URL here was
-            // the prod-bug origin — see PR fixing the `0.0.0.0:8443`
-            // regression.
+            // Cert hash only — the relay binds `0.0.0.0` by default and
+            // may sit behind any number of proxies, so it can't reliably
+            // know the public hostname clients reach it on. The resolver
+            // builds the actual WT URL from the user-typed authority.
             Some(cert_hex)
         }
         Err(e) => {
@@ -565,8 +562,7 @@ impl RelayHandle {
 //   • `cmd_ctx` (this clone) drops → refcount drops by 1.
 //   • The pump task's own `cmd_ctx` clone drops when the task ends →
 //     refcount → 0 → CommandContext drops, releasing Rc<Engine> and Arc<FsStore>.
-// The empty Drop body marks this as a deliberate ownership shape, not an
-// oversight. tracing::trace! could go here in the future.
+// The empty Drop body marks this as a deliberate ownership shape.
 impl Drop for RelayHandle {
     fn drop(&mut self) {}
 }

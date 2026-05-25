@@ -119,10 +119,6 @@ async fn ephemeral_routes_subscriber_match() {
                 .await
                 .unwrap();
 
-            // Public completion signal: alice has accepted bob's
-            // subscription entry naming her as the provider and the
-            // forward path is armed. From this point an ephemeral
-            // datagram alice publishes will be routed to bob.
             let bob_pid = PeerId(bob_signer.vk());
             assert!(
                 alice

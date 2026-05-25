@@ -3,8 +3,7 @@
 //! See `docs/superpowers/specs/2026-05-23-cooperative-relay-design.md`
 //! and `docs/superpowers/specs/2026-05-24-cooperative-relay-phase2-design.md`.
 //!
-//! This module owns the routing-layer types and helpers that the
-//! engine drives:
+//! Engine-facing layout:
 //!
 //! - **Wire types** (`types`): `SubscriptionEntry`, `LinkState`,
 //!   `Neighbor`, `ProviderTick`.
@@ -22,18 +21,14 @@
 //! - **Forwarding decision** (`forward`): `forward_targets` and the
 //!   `PeerInterests` trait.
 //!
-//! Phase 2 wires this module into the engine's push/subscribe flow:
 //! `SyncEngine::subscribe` / `subscribe_via` / `unsubscribe` /
 //! `unsubscribe_via` publish per-pair `SUBSCRIBE_PREFIX` entries via
-//! the helpers above; `handle_local_store_event` dispatches inbound
-//! subscription entries through the same naming; the routing tick
-//! calls `Routes::due_for_refresh` to republish expiring subscriptions;
-//! and the `PeerHello` handler replays every live `BroadcastIntent`
-//! to the newly-connected peer so a reconnect re-establishes coverage
-//! without waiting for the next refresh.
-//!
-//! Phase 3+ will add liveness, failover, and candidate ranking on top
-//! of these primitives.
+//! these helpers; `handle_local_store_event` dispatches inbound
+//! subscription entries; the routing tick calls
+//! `Routes::due_for_refresh` to republish expiring subscriptions; and
+//! the `PeerHello` handler replays every live `BroadcastIntent` to a
+//! newly-connected peer so reconnect re-establishes coverage without
+//! waiting for the next refresh.
 
 pub mod coverage;
 pub mod forward;

@@ -91,11 +91,6 @@ pub fn build_identity_snapshot(
 }
 
 /// Tracks the soonest- and latest-expiring TTL'd entries seen so far.
-///
-/// Two destinations, one comparison key (`expires_at`), one observe-call
-/// per entry. Encapsulates the "candidate -> clone into both / update
-/// only one / drop" decision so the iteration in `collect_store_stats`
-/// reads as `range.observe(ttl)` without a duplicated `is_none_or` pair.
 #[derive(Default)]
 struct TtlRange {
     soonest: Option<EntryTtl>,
@@ -114,9 +109,6 @@ impl TtlRange {
             .is_none_or(|s| candidate.expires_at > s.expires_at);
         match (is_soonest, is_latest) {
             (true, true) => {
-                // First observation, or a new entry whose ttl beats both
-                // bounds (possible when there's exactly one prior entry).
-                // Clone once for soonest, move into latest.
                 self.soonest = Some(candidate.clone());
                 self.latest = Some(candidate);
             }
@@ -170,10 +162,8 @@ async fn collect_store_stats<S: Store>(store: &S) -> StoreStats {
 ///
 /// Returns `Ok(0)` for an empty tree, `Err` if any directory listing or
 /// metadata read fails. Callers that want best-effort reporting must
-/// translate the error explicitly (typically: log + fall back to 0) —
-/// the previous `let _ = ...` / `if let Ok(...)` pattern silently lied
-/// about disk usage when a subdirectory was unreadable, which is the
-/// opposite of what an operations dashboard wants.
+/// translate the error explicitly (typically: log + fall back to 0);
+/// the function deliberately does not swallow errors itself.
 fn dir_size(root: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
@@ -230,8 +220,6 @@ mod tests {
         MemoryStore::new(Arc::new(AcceptAllVerifier))
     }
 
-    // --- collect_store_stats ---
-
     #[tokio::test]
     async fn collect_store_stats_empty_store_is_all_zero() {
         let store = fresh_store();
@@ -242,8 +230,7 @@ mod tests {
         assert_eq!(stats.subscription_entries, 0);
         assert!(stats.soonest_expiry.is_none());
         assert!(stats.latest_expiry.is_none());
-        // Cursor exists even on an empty store; `current_cursor` returns
-        // the next-to-be-assigned sequence, which is fine to expose.
+        // Cursor on an empty store is the next-to-be-assigned sequence.
         assert!(stats.cursor.is_some());
     }
 
@@ -271,9 +258,8 @@ mod tests {
     async fn collect_store_stats_multiple_ttls_picks_min_and_max() {
         let store = fresh_store();
         let b = block(b"x");
-        // Insert out of order to ensure observe() doesn't rely on
-        // insertion order. Names are distinct per row so each insert
-        // creates a fresh (vk, name) key (LWW doesn't reject anything).
+        // Insert out of order so the test would catch an `observe()`
+        // that depended on insertion order.
         for (name, ttl) in [
             (&b"mid"[..], 500u64),
             (&b"late"[..], 1000),
@@ -320,7 +306,6 @@ mod tests {
     async fn collect_store_stats_counts_subscription_entries() {
         let store = fresh_store();
         let b = block(b"x");
-        // One regular entry, one subscription-prefixed entry.
         store
             .insert(entry_for(&b, b"a", b"regular", 1, None), Some(b.clone()))
             .await
@@ -335,8 +320,6 @@ mod tests {
         assert_eq!(stats.entry_count, 2);
         assert_eq!(stats.subscription_entries, 1);
     }
-
-    // --- TtlRange unit tests (small but worth pinning the algebra) ---
 
     #[test]
     fn ttl_range_empty_yields_none_none() {
@@ -376,8 +359,6 @@ mod tests {
         assert_eq!(l.unwrap().name.as_ref(), b"c");
     }
 
-    // --- dir_size ---
-
     #[test]
     fn dir_size_empty_dir_is_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -413,12 +394,11 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
+    /// Missing nested path: parent exists, tail does not. Exercises the
+    /// `read_dir(p)?` propagation from inside the walk loop, not just
+    /// the initial push.
     #[test]
     fn dir_size_missing_nested_dir_path_errors() {
-        // Pass a path whose parent exists but whose tail does not.
-        // Exercises the same `read_dir(p)?` propagation as the simple
-        // missing-path case but at a depth that proves the loop body
-        // (not just the initial push) is the propagation site.
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a").join("b").join("c");
         let err = dir_size(&nested).expect_err("missing nested path must error");

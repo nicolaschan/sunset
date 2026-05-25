@@ -3,14 +3,10 @@
 //! Free function because the input data — per-peer interests — lives in
 //! `engine::EngineState::peer_sessions`, not in `routing::Routes`.
 //!
-//! The function is generic over a [`PeerInterests`] trait rather than
-//! reaching into a concrete `engine::PeerSession`: routing is a lower
-//! layer than the engine, so we describe the shape we need ("a thing
-//! that has an interests map") via a trait and let the engine adapter
-//! impl it on `PeerSession`. The previous closure-generic shape
-//! achieved the same decoupling but forced callers to round-trip
-//! through `HashSet<PeerId>` + a second `peer_sessions.get(&peer)`
-//! lookup to recover the session they already had in hand.
+//! Generic over [`PeerInterests`] rather than reaching into a concrete
+//! `engine::PeerSession`: routing is a lower layer than the engine, so
+//! we describe the shape we need ("a thing with an interests map") and
+//! let the engine impl the trait on `PeerSession`.
 
 use std::collections::HashMap;
 
@@ -122,13 +118,10 @@ mod tests {
         assert!(t3.is_empty());
     }
 
-    /// Regression for the previous test name's "once" claim — make a
-    /// peer whose interests have *two* filters that both match the
-    /// same `(vk, name)`, and assert the peer is yielded once rather
-    /// than once-per-matching-filter.
+    /// A peer whose interests have *two* filters that both match the
+    /// same `(vk, name)` must be yielded once, not once-per-filter.
     #[test]
     fn peer_with_multiple_matching_filters_appears_once() {
-        // Both filters match "room/x" authored by `vk(b"writer")`.
         let f1 = Filter::NamePrefix(Bytes::from_static(b"room/"));
         let f2 = Filter::Keyspace(vk(b"writer"));
         let mut interests = HashMap::new();

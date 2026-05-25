@@ -1,6 +1,6 @@
-//! Integration tests for cooperative-relay Phase 2: subscribe / subscribe_via.
+//! Integration tests for `SyncEngine::subscribe` / `subscribe_via`.
 //!
-//! Each test sets up two SyncEngines over `TestNetwork`; the receiver calls
+//! Each test sets up two `SyncEngine`s over `TestNetwork`; the receiver calls
 //! one of the new APIs; the provider writes (before or after subscribe) and
 //! the receiver checks its local store for the data to appear.
 
@@ -22,19 +22,13 @@ async fn subscribe_via_backfills_existing_entry() {
             let alice = TestPeer::spawn(&net, b"alice");
             let bob = TestPeer::spawn(&net, b"bob");
 
-            // Alice (provider) writes an entry BEFORE Bob subscribes.
+            // Provider writes BEFORE the subscribe; this exercises the
+            // backfill DigestRequest, not the live forwarding path.
             let (entry, block) = make_entry(&vk(b"chat"), b"k", b"hello-bob", 1);
             alice.store.insert(entry, Some(block)).await.unwrap();
 
-            // Bob connects to Alice.
             bob.engine.add_peer(alice.addr.clone()).await.unwrap();
 
-            // Bob subscribes via Alice for the `chat` keyspace. After
-            // subscribe_via returns, Alice's engine should observe
-            // bob's `SubscriptionEntry::Active(provider=alice)` via
-            // sync replication and arm the forwarding path; the
-            // matching DigestRequest then backfills the pre-existing
-            // entry to Bob.
             let filter = Filter::Keyspace(vk(b"chat"));
             bob.engine
                 .subscribe_via(
@@ -45,10 +39,6 @@ async fn subscribe_via_backfills_existing_entry() {
                 .await
                 .unwrap();
 
-            // Public completion signal: alice has accepted bob's
-            // subscription and queued the backfill DigestRequest. From
-            // this point, application-data forwarding for `filter` is
-            // armed end-to-end.
             assert!(
                 alice
                     .engine
@@ -74,9 +64,9 @@ async fn subscribe_before_peer_connect_then_data_flows() {
             let alice = TestPeer::spawn(&net, b"alice");
             let bob = TestPeer::spawn(&net, b"bob");
 
-            // Bob subscribes broadcast-style BEFORE connecting to anyone.
-            // This records a BroadcastIntent but my_subs stays empty
-            // (no connected peers yet).
+            // Subscribe BEFORE any connection: this records a
+            // BroadcastIntent but `my_subs` stays empty until peers
+            // arrive and the PeerHello auto-resubscriber replays it.
             bob.engine
                 .subscribe(
                     Filter::Keyspace(vk(b"chat")),
@@ -85,12 +75,8 @@ async fn subscribe_before_peer_connect_then_data_flows() {
                 .await
                 .unwrap();
 
-            // Now Bob connects to Alice. The auto-resubscriber hook on
-            // PeerHello should replay Bob's BroadcastIntent as
-            // subscribe_via(filter, alice, policy).
             bob.engine.add_peer(alice.addr.clone()).await.unwrap();
 
-            // Alice writes a matching entry AFTER Bob is connected.
             let (entry, block) = make_entry(&vk(b"chat"), b"msg", b"hello-bob-broadcast", 1);
             alice.store.insert(entry, Some(block)).await.unwrap();
 
@@ -122,7 +108,6 @@ async fn unsubscribe_stops_forwarding() {
                 .await
                 .unwrap();
 
-            // First write — Bob should see it.
             let (entry_y, block_y) = make_entry(&vk(b"chat"), b"y", b"y", 1);
             alice.store.insert(entry_y, Some(block_y)).await.unwrap();
 
@@ -131,15 +116,11 @@ async fn unsubscribe_stops_forwarding() {
                 "bob should receive y while subscribed",
             );
 
-            // Unsubscribe.
             bob.engine
                 .unsubscribe_via(filter.clone(), alice.id.clone())
                 .await
                 .unwrap();
 
-            // Public completion signal: alice has observed bob's
-            // Withdrawn entry and cleared the forwarding gate.
-            // Forward path for `filter` is closed when this returns.
             assert!(
                 alice
                     .engine
@@ -148,14 +129,11 @@ async fn unsubscribe_stops_forwarding() {
                 "alice did not observe bob's unsubscribe",
             );
 
-            // Second write — Bob should NOT see it.
             let (entry_z, block_z) = make_entry(&vk(b"chat"), b"z", b"z", 1);
             alice.store.insert(entry_z, Some(block_z)).await.unwrap();
 
-            // Alice's forwarding gate is verified-closed before this
-            // point; the negative window only needs to be long enough
-            // to surface a spurious in-flight delivery, not to wait
-            // for the gate to close.
+            // Forwarding gate is verified-closed above; this short
+            // window only surfaces a spurious in-flight delivery.
             let leaked =
                 wait_for_entry(&bob.store, &vk(b"chat"), b"z", Duration::from_millis(200)).await;
             assert!(!leaked, "bob should NOT receive z after unsubscribing");
@@ -195,8 +173,6 @@ async fn two_receivers_one_provider_each_sees_match() {
                 .await
                 .unwrap();
 
-            // Both receivers' subscriptions reach alice — forwarding
-            // for `filter` is armed to both.
             assert!(
                 alice
                     .engine
@@ -222,11 +198,10 @@ async fn two_receivers_one_provider_each_sees_match() {
                 );
             }
 
-            // Negative fanout: a write under a *different* writer-key
-            // (so `Filter::Keyspace(vk("chat"))` does NOT match) must
-            // NOT reach either receiver. Verifies the forwarding gate
-            // really filters by the subscription's filter rather than
-            // shipping every alice-write to every connected peer.
+            // Negative: a write whose writer-key does NOT match
+            // `Filter::Keyspace(vk("chat"))` must not reach either
+            // receiver — the forwarding gate must filter by the
+            // subscription's filter, not blanket-fan-out.
             let (off_filter_entry, off_filter_block) =
                 make_entry(&vk(b"other"), b"m", b"off-filter", 1);
             alice
@@ -234,8 +209,6 @@ async fn two_receivers_one_provider_each_sees_match() {
                 .insert(off_filter_entry, Some(off_filter_block))
                 .await
                 .unwrap();
-            // Forwarding gate is verified-armed for `filter`; this
-            // window only catches a spurious off-filter delivery.
             for (name, peer) in [("bob", &bob), ("carol", &carol)] {
                 let leaked =
                     wait_for_entry(&peer.store, &vk(b"other"), b"m", Duration::from_millis(200))
@@ -279,7 +252,6 @@ async fn one_receiver_two_filters_each_delivers_independently() {
                 .await
                 .unwrap();
 
-            // Both per-filter forwarding gates open before any writes.
             assert!(
                 alice
                     .engine
@@ -308,10 +280,9 @@ async fn one_receiver_two_filters_each_delivers_independently() {
                 );
             }
 
-            // Negative: a write under a writer-key bob did NOT
-            // subscribe to must NOT reach bob. Per-filter independence
-            // means "subscribed to writer1 + writer2" doesn't
-            // accidentally fall back to "subscribed to all".
+            // Negative: per-filter independence — "subscribed to
+            // writer1 + writer2" must not collapse to "subscribed to
+            // all".
             let (writer3_entry, writer3_block) = make_entry(&vk(b"writer3"), b"k", b"writer3", 1);
             alice
                 .store
@@ -343,9 +314,9 @@ async fn unsubscribe_broadcast_intent_drops_all_per_peer_subs() {
             let bob = TestPeer::spawn(&net, b"bob");
             let carol = TestPeer::spawn(&net, b"carol");
 
-            // Topology: bob ↔ alice and bob ↔ carol. A broadcast
-            // subscribe on bob must fan out to BOTH providers; an
-            // unsubscribe must withdraw from BOTH.
+            // bob ↔ alice and bob ↔ carol; a broadcast subscribe on
+            // bob must fan out to BOTH providers; an unsubscribe must
+            // withdraw from BOTH.
             let filter = Filter::Keyspace(vk(b"chat"));
             bob.engine
                 .subscribe(filter.clone(), SubscriptionPolicy::store_data())
@@ -354,8 +325,6 @@ async fn unsubscribe_broadcast_intent_drops_all_per_peer_subs() {
             bob.engine.add_peer(alice.addr.clone()).await.unwrap();
             bob.engine.add_peer(carol.addr.clone()).await.unwrap();
 
-            // Both alice and carol observe bob's interest — broadcast
-            // intent fanned out to every connected provider.
             assert!(
                 alice
                     .engine
@@ -371,7 +340,6 @@ async fn unsubscribe_broadcast_intent_drops_all_per_peer_subs() {
                 "carol did not arm bob's broadcast interest"
             );
 
-            // Each provider can independently push matching entries to bob.
             let (entry_y, block_y) = make_entry(&vk(b"chat"), b"y", b"y", 1);
             alice.store.insert(entry_y, Some(block_y)).await.unwrap();
             assert!(
@@ -379,9 +347,8 @@ async fn unsubscribe_broadcast_intent_drops_all_per_peer_subs() {
                 "bob should receive y from alice while broadcast-subscribed",
             );
 
-            // Now bob unsubscribes the broadcast intent. Per-peer
-            // subscriptions to BOTH providers must be retracted; this
-            // is the bug-class the test guards.
+            // `unsubscribe` on the broadcast intent must retract the
+            // per-peer subscription to BOTH providers, not just one.
             bob.engine.unsubscribe(filter.clone()).await.unwrap();
 
             assert!(
@@ -399,7 +366,6 @@ async fn unsubscribe_broadcast_intent_drops_all_per_peer_subs() {
                 "carol did not observe bob's unsubscribe",
             );
 
-            // Subsequent writes from EITHER provider must NOT reach bob.
             let (entry_z_alice, block_z_alice) =
                 make_entry(&vk(b"chat"), b"z-alice", b"z-alice", 1);
             alice
@@ -430,11 +396,10 @@ async fn unsubscribe_broadcast_intent_drops_all_per_peer_subs() {
 
 /// Self-authored application entries fan out to every currently-
 /// connected peer regardless of whether that peer has installed an
-/// interest. This is the documented Phase 2 invariant and is load-
-/// bearing for `subscribe_via`: the `SubscriptionEntry` is itself a
-/// self-authored write and reaches the named provider via this same
-/// broadcast path, without which subscribe_via would only take effect
-/// after the anti-entropy interval (default 30s).
+/// interest. Load-bearing for `subscribe_via`: the `SubscriptionEntry`
+/// is itself a self-authored write and reaches the named provider via
+/// this same broadcast path; without it, subscribe_via would only take
+/// effect after the anti-entropy interval (default 30 s).
 #[tokio::test(flavor = "current_thread")]
 async fn self_authored_application_entry_reaches_connected_peer_without_subscribe() {
     let local = tokio::task::LocalSet::new();
@@ -447,8 +412,8 @@ async fn self_authored_application_entry_reaches_connected_peer_without_subscrib
             // Bob connects to Alice but does NOT subscribe to anything.
             bob.engine.add_peer(alice.addr.clone()).await.unwrap();
 
-            // Wait for the PeerHello to land on Alice's side so the
-            // outbound channel to Bob exists by the time Alice writes.
+            // Wait for PeerHello on alice's side: the outbound channel
+            // to bob must exist by the time alice writes.
             let connected = sunset_sync::test_helpers::wait_for(
                 Duration::from_secs(2),
                 Duration::from_millis(20),
@@ -457,9 +422,9 @@ async fn self_authored_application_entry_reaches_connected_peer_without_subscrib
             .await;
             assert!(connected, "alice did not see bob connect");
 
-            // Alice writes an entry under her OWN verifying_key. There's
-            // no interest from bob for this key, but the self-author
-            // broadcast invariant means bob should still receive it.
+            // Alice writes under her own verifying_key. Bob holds no
+            // interest for this key, but the self-author broadcast
+            // invariant means he should still receive it.
             let (entry, block) =
                 make_entry(&alice.id.0, b"my-status", b"self-authored-app-data", 1);
             alice.store.insert(entry, Some(block)).await.unwrap();

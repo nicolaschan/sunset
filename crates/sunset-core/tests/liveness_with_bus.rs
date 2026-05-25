@@ -108,9 +108,6 @@ async fn liveness_tracks_alice_via_bob_bus_subscription() {
                 .await
                 .unwrap();
 
-            // Public completion signal: alice has accepted bob's
-            // SubscriptionEntry::Active(provider=alice) and the
-            // forwarding gate for `liveness-test/` is armed.
             let bob_pid = PeerId(bob_identity.store_verifying_key());
             let liveness_filter = Filter::NamePrefix(Bytes::from_static(b"liveness-test/"));
             assert!(

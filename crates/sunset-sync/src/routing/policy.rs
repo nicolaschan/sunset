@@ -1,21 +1,15 @@
 //! Per-filter policy parameters for the receiver-side routing loop.
 //!
-//! Phase 2 ships a single knob:
+//! Currently one knob:
 //!
 //! - `freshness_threshold` — how long an outbound subscription survives
 //!   before the routing tick re-publishes it (`entry_ttl`), and the
 //!   cadence at which the routing tick re-publishes a still-active
 //!   subscription (`refresh_interval = freshness_threshold / 2`).
 //!
-//! Phase 3 will add slot maintenance (how many healthy providers to
-//! maintain per filter) and failover. That knob is deliberately absent
-//! here until there's a caller that branches on it; adding it
-//! speculatively re-introduces the enumerated-cases-as-algorithm
-//! anti-pattern the cooperative-relay design explicitly avoids.
-//!
 //! Constructors (`store_data`, `relay_broad`) name *intents*, not
-//! parameter tuples — Phase 3 can change the underlying tuple without
-//! disturbing the call sites.
+//! parameter tuples, so the underlying tuple can change without
+//! disturbing call sites.
 
 use std::time::Duration;
 
@@ -23,16 +17,8 @@ use bytes::Bytes;
 use sunset_store::Filter;
 
 /// The wire filter that pairs with [`SubscriptionPolicy::relay_broad`]
-/// — a `NamePrefix("")` that matches every entry. Production relays
-/// pass this to `engine.subscribe(...)` to declare "I want everything";
-/// tests use it as the expected filter when gating on a relay's
-/// broadcast subscription reaching a peer.
-///
-/// Centralised here so the relay-broad filter and the relay-broad
-/// policy are introduced and discoverable together; previously the
-/// filter was an inline literal at three call sites, which made the
-/// "policy + filter together = the relay-broad subscription" pairing
-/// invisible.
+/// — a `NamePrefix("")` matching every entry. Production relays pass
+/// this to `engine.subscribe(...)` to declare "I want everything".
 pub fn relay_broad_filter() -> Filter {
     Filter::NamePrefix(Bytes::new())
 }

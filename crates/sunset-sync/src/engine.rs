@@ -217,20 +217,11 @@ pub enum EngineEvent {
 /// stale event from a defunct connection can't tear down a fresh one.
 ///
 /// `interests` lives in this struct (rather than in a parallel
-/// `HashMap<PeerId, _>` next to `Routes`) because peer disconnect tears
-/// the whole session down in one removal: every drop site (`RemovePeer`,
+/// `HashMap<PeerId, _>` next to `Routes`) so peer disconnect tears the
+/// whole session down in one removal — every drop site (`RemovePeer`,
 /// `Disconnected`, the implicit replace-on-`PeerHello`) just removes
-/// the `peer_sessions` entry and the interests go with it. Splitting
-/// interests into a parallel map would require every one of those
-/// drop sites to remember a second cleanup call — exactly the
-/// `update_a(); update_b();` smell the V2 design audit (during the
-/// cooperative-relay phase-2 design pass) explicitly chose to prevent.
-/// The routing module reaches into `interests` via the
-/// [`crate::routing::PeerInterests`] trait (implemented on
-/// `PeerSession` below); `forward_targets` then yields
-/// `(&PeerId, &PeerSession)` pairs so callers can use `session.tx`
-/// directly instead of doing a second `peer_sessions.get(&peer)`
-/// lookup.
+/// the `peer_sessions` entry and the interests go with it. A parallel
+/// map would force every drop site to remember a second cleanup call.
 pub(crate) struct PeerSession {
     /// Identifies the connection generation that owns this outbound channel.
     /// Compared against `InboundEvent::Disconnected.conn_id` to filter stale
@@ -261,8 +252,7 @@ pub(crate) struct PeerSession {
     pub(crate) _shutdown: tokio::sync::watch::Sender<()>,
     /// What this peer currently wants from me, keyed by `FilterHash` for
     /// O(1) Withdrawn lookups (the entry name carries the hash, not the
-    /// filter). Populated by the SUBSCRIBE_PREFIX branch in
-    /// handle_local_store_event; cleared with the session on peer drop.
+    /// filter). Cleared with the session on peer drop.
     pub(crate) interests:
         std::collections::HashMap<crate::routing::FilterHash, sunset_store::Filter>,
 }
@@ -410,8 +400,7 @@ where
     /// `SignedDatagram` whose `(verifying_key, name)` matches the
     /// filter to this receiver. Subscription is in-process only; for
     /// remote peers to route ephemeral traffic to us, the caller must
-    /// also publish the filter via `subscribe` / `subscribe_via` (the
-    /// Bus layer does this transparently in `bus.subscribe`).
+    /// also publish the filter via `subscribe` / `subscribe_via`.
     pub async fn subscribe_ephemeral(
         &self,
         filter: Filter,
@@ -430,10 +419,8 @@ where
     /// persist; does NOT retry. Returns `Ok(())` even if no peers
     /// match.
     pub async fn publish_ephemeral(&self, datagram: sunset_store::SignedDatagram) -> Result<()> {
-        // Loopback: deliver to local subscribers first.
         self.dispatch_ephemeral_local(&datagram).await;
 
-        // Fan-out to remote peers whose subscription filter matches.
         let msg = SyncMessage::EphemeralDelivery {
             datagram: datagram.clone(),
         };
@@ -545,34 +532,24 @@ where
     /// Caller must invoke this inside a `LocalSet` (native) or directly on
     /// a single-threaded executor (WASM).
     pub async fn run(&self) -> Result<()> {
-        // Take ownership of the command receiver. If `run()` is called
-        // twice, the second call observes None and returns Error::Closed.
+        // If `run()` is called twice, the second call observes None and
+        // returns Error::Closed.
         let mut cmd_rx = self.cmd_rx.lock().await.take().ok_or(Error::Closed)?;
 
-        // Channel for per-peer tasks to talk back to us.
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
 
-        // Walk the local store for `_sunset-sync/subscribe/*` entries
-        // and populate `peer_sessions[*].interests` for any already-
-        // connected peers. In practice `peer_sessions` is empty here
-        // (the inbound loop hasn't started) so this is a no-op, but
-        // see `bootstrap_routes` for the defensive rationale and the
-        // spec link.
         self.bootstrap_routes().await?;
 
-        // Local store subscription. Match every entry (an empty NamePrefix
-        // matches all names): the engine needs to see both subscribe-
-        // namespace entries (to update per-peer interests) and any
-        // application entry that might match a peer's filter (for push
-        // routing). Per-peer fanout is filtered downstream in
-        // `handle_local_store_event`.
+        // Match every entry (empty NamePrefix matches all names): the engine
+        // needs both subscribe-namespace entries (to update per-peer
+        // interests) and any application entry that might match a peer's
+        // filter (for push routing). Per-peer fanout is filtered downstream
+        // in `handle_local_store_event`.
         let mut local_sub = self
             .store
             .subscribe(Filter::NamePrefix(Bytes::new()), Replay::None)
             .await?;
 
-        // Anti-entropy timer. tokio::time::interval works on native; on
-        // wasm32 we use the wasmtimer drop-in (browser timers via setTimeout).
         #[cfg(not(target_arch = "wasm32"))]
         let mut anti_entropy = tokio::time::interval(self.config.anti_entropy_interval);
         #[cfg(target_arch = "wasm32")]
@@ -581,12 +558,9 @@ where
         // isn't duplicated immediately after PeerHello.
         anti_entropy.tick().await;
 
-        // Routing tick: refresh subscriptions whose TTL is past half-life.
         // MissedTickBehavior::Skip avoids tick storms after a long pause
         // (e.g. WASM tab backgrounded); a single catch-up fire is enough,
         // since `due_for_refresh` scans the full set every tick anyway.
-        // wasmtimer ships its own MissedTickBehavior; on WASM we have to
-        // reach for that type rather than tokio's.
         #[cfg(not(target_arch = "wasm32"))]
         let mut routing_tick = {
             let mut t = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -602,27 +576,14 @@ where
         // Burn the initial immediate-fire tick so the first real fire is one period out.
         routing_tick.tick().await;
 
-        // Spawn the accept loop in its own task so its in-flight
-        // post-accept work (e.g. NoiseTransport's IK handshake on the
-        // raw connection that `transport.accept().await` just returned)
-        // is NOT a `tokio::select!` arm in the engine's main loop.
-        //
-        // Why this matters: `select!` cancels every other branch the
-        // moment any one branch returns Ready. If the accept arm sat in
-        // `select!`, then any unrelated wakeup (a peer's PeerHello
-        // landing on `inbound_rx`, an outbound command on `cmd_rx`, an
-        // anti-entropy tick) while the secondary transport's Noise
-        // responder was awaiting msg1 would cancel the accept future
-        // mid-handshake. The dequeued `WebRtcRawConnection` (already
-        // taken off the per-transport `completed_rx`) would be dropped
-        // along with it, and that connection is gone for good — the
-        // remote peer's dial sits in `Connecting` until its
-        // `engine.add_peer` await eventually times out (or, for
-        // `WebRtcRawTransport::connect`, never).
-        //
-        // Running accept in its own task isolates it from the select!:
-        // dequeue + Noise + run_peer spawn all happen without competing
-        // for poll cycles with the engine's other branches.
+        // Accept runs in its own task instead of a `select!` arm because
+        // `select!` cancels every other branch when any branch returns
+        // Ready. If a peer's PeerHello, an outbound command, or an
+        // anti-entropy tick wakes up while a secondary transport's Noise
+        // responder is mid-handshake on the just-accepted raw connection,
+        // the accept future would be dropped and the dequeued connection
+        // would be lost (already off the per-transport `completed_rx`,
+        // unreclaimable).
         spawn_accept_loop(
             self.transport.clone(),
             self.next_conn_id.clone(),
@@ -695,10 +656,10 @@ where
     ) {
         match cmd {
             EngineCommand::AddPeer { addr, ack } => {
-                // Spawn the connect+spawn_peer chain as a background task
-                // so the engine's `select!` loop stays responsive during
-                // the handshake. This is load-bearing for transports
-                // whose `connect()` depends on the engine making forward
+                // Run connect + spawn_peer in a background task so the
+                // engine's `select!` loop stays responsive during the
+                // handshake — load-bearing for transports whose
+                // `connect()` depends on the engine making forward
                 // progress (e.g. WebRTC, where SDP/ICE flows over the
                 // existing CRDT replication).
                 let transport = self.transport.clone();
@@ -713,7 +674,6 @@ where
                                 Result<(PeerId, crate::transport::TransportKind)>,
                             >();
                             spawn_run_peer(conn, env, conn_id, inbound_tx, Some(hello_tx));
-                            // Wait for the Hello exchange to complete.
                             match hello_rx.await {
                                 Ok(Ok(pair)) => Ok(pair),
                                 Ok(Err(e)) => Err(e),
@@ -775,8 +735,7 @@ where
                 shutdown,
                 registered,
             } => {
-                // Register the outbound state under the Hello-declared
-                // peer_id. The insert here implicitly drops any previous
+                // The insert here implicitly drops any previous
                 // PeerSession for the same peer_id (e.g. a stale
                 // generation from before a reconnect). That drop fires
                 // the OLD `_shutdown` watch::Sender, telling the OLD
@@ -795,12 +754,12 @@ where
                         },
                     );
                 }
-                // Auto-resubscriber: replay every current BroadcastIntent
-                // for this newly-connected peer. Errors are logged-and-
-                // continued by `fan_out_intent_to_peers`; failing
-                // AddPeer because a broadcast intent couldn't bind
-                // would be worse than the inconsistency (the next
-                // refresh tick will surface persistent failures).
+                // Replay every current BroadcastIntent against the
+                // newly-connected peer. Errors are logged-and-continued
+                // by `fan_out_intent_to_peers`; failing AddPeer because
+                // a single intent couldn't bind would be worse than
+                // the inconsistency (the next refresh tick surfaces
+                // persistent failures).
                 let intents: Vec<crate::routing::BroadcastIntent> = {
                     let state = self.state.lock().await;
                     state.routes.broadcast_intents_snapshot()
@@ -821,13 +780,10 @@ where
                 // Wake the `add_peer().await` caller now that
                 // `peer_sessions` is populated, so an immediately-
                 // following `subscribe` / `insert` lands a peer to
-                // push to. We also pass `kind` through the
-                // oneshot so the supervisor can write
-                // `(peer_id, kind)` atomically — without it, the
-                // supervisor would have to wait for the separate
-                // `EngineEvent::PeerAdded` broadcast to populate
-                // `IntentSnapshot::kind`, which races against
-                // `spawn_dial`'s post-await borrow_mut.
+                // push to. `kind` rides on the oneshot so callers can
+                // record `(peer_id, kind)` atomically without racing
+                // against the separate `EngineEvent::PeerAdded`
+                // broadcast.
                 if let Some(s) = registered {
                     let _ = s.send(Ok((peer_id.clone(), kind)));
                 }
@@ -851,9 +807,7 @@ where
                 // current entry's conn_id matches the Disconnected
                 // event. A stale Disconnected from generation N must
                 // not tear down a fresh generation N+1 session that
-                // just landed via `PeerHello` (covered by the
-                // `stale_disconnected_from_old_connection_is_filtered`
-                // regression test).
+                // just landed via `PeerHello`.
                 let conn_id_matches = {
                     let state = self.state.lock().await;
                     matches!(state.peer_sessions.get(&peer_id), Some(po) if po.conn_id == conn_id)
@@ -885,18 +839,8 @@ where
     /// receiver connects and the PeerHello bootstrap digest exchange
     /// replicates it back to us.
     ///
-    /// In current Phase 2 code `peer_sessions` is always empty when
-    /// `run()` first invokes this, so the scan is unconditionally a
-    /// no-op in practice — but the function matches the spec's
-    /// described behaviour (see
-    /// `docs/superpowers/specs/2026-05-24-cooperative-relay-phase2-design.md`,
-    /// "Bootstrap") for defensive hygiene against future code paths
-    /// that pre-populate `peer_sessions`, and because reading
-    /// SUBSCRIBE_PREFIX entries on startup is the right thing to do
-    /// regardless.
-    ///
     /// Outbound subscriptions and broadcast intents are NOT rehydrated
-    /// from disk in Phase 2 (subsystems re-call subscribe on startup).
+    /// from disk; subsystems re-call subscribe on startup.
     async fn bootstrap_routes(&self) -> Result<()> {
         let mut iter = self
             .store
@@ -908,7 +852,6 @@ where
             let Ok(entry) = entry_result else {
                 continue;
             };
-            // Reuse the same parsing path as handle_local_store_event.
             let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
                 continue;
             };
@@ -1152,12 +1095,6 @@ where
             _ => return,
         };
 
-        // Two unrelated jobs: (1) if this is a per-(filter, provider)
-        // SubscriptionEntry naming us as the provider, mirror the
-        // receiver's interest into their PeerSession so the forwarding
-        // path will route matching entries to them; (2) regardless,
-        // fan the entry out to peers per the push policy. Both run on
-        // every locally-observed entry insertion.
         if crate::routing::is_subscription_name(entry.name.as_ref()) {
             self.handle_subscription_entry_event(&entry).await;
         }
@@ -1167,12 +1104,8 @@ where
 
     /// Dispatch a SUBSCRIBE_PREFIX entry into the routing layer.
     ///
-    /// Splits the work into a value-parsing step (handles the two
-    /// malformed-input warn! branches) and per-variant handlers for
-    /// `Active` (mirror into session.interests + possibly send a
-    /// backfill `DigestRequest`) and `Withdrawn` (clear the mirrored
-    /// interest). All routing-state mutation happens under a single
-    /// `state.lock()` critical section per call.
+    /// All routing-state mutation happens under a single `state.lock()`
+    /// critical section per call.
     async fn handle_subscription_entry_event(&self, entry: &sunset_store::SignedKvEntry) {
         let Some((filter_hash, sub_entry)) = self.parse_subscription_entry(entry).await else {
             return;
@@ -1191,9 +1124,9 @@ where
                 self.handle_subscription_withdrawn(filter_hash, receiver)
                     .await;
             }
-            // Active naming someone else: Phase 3 recursive subscription
-            // will revisit (we may want to subscribe upstream). Phase 2
-            // ignores.
+            // Active naming someone else: ignored. Recursive
+            // subscription (forwarding interest upstream) is not yet
+            // implemented.
             _ => {}
         }
     }
@@ -1202,8 +1135,6 @@ where
     ///
     /// Returns `None` (after a `warn!`) if either the blob is missing /
     /// malformed or the name doesn't parse as `subscription_name`.
-    /// These two warn! branches are exercised by the unit tests
-    /// `handle_subscription_entry_event_ignores_malformed_*` below.
     async fn parse_subscription_entry(
         &self,
         entry: &sunset_store::SignedKvEntry,
@@ -1327,21 +1258,18 @@ where
     ///
     /// - **Self-authored** (`entry.verifying_key == self.local_peer.0`)
     ///   broadcasts to every connected peer regardless of `interests`.
-    ///   This is the documented Phase 2 invariant (see
-    ///   `docs/superpowers/specs/2026-05-24-cooperative-relay-phase2-design.md`,
-    ///   "What stays the same"). It is load-bearing for `subscribe_via`
-    ///   to take effect promptly: the `SubscriptionEntry` is itself a
-    ///   self-authored write, so without this broadcast it would only
-    ///   reach the named provider via anti-entropy (default 30 s) and
-    ///   `subscribe_via` would have multi-tens-of-seconds latency. It
-    ///   also matches the application UX: a user's own writes reach
-    ///   the peers they're connected to without those peers having to
-    ///   pre-announce interest.
+    ///   Load-bearing for `subscribe_via` to take effect promptly: the
+    ///   `SubscriptionEntry` is itself a self-authored write, so without
+    ///   this broadcast it would only reach the named provider via
+    ///   anti-entropy (default 30 s) and `subscribe_via` would have
+    ///   multi-tens-of-seconds latency. Also matches the application UX:
+    ///   a user's own writes reach the peers they're connected to
+    ///   without those peers having to pre-announce interest.
     ///
     /// - **Foreign-authored** routes via `forward_targets`, which
-    ///   consults each peer's `interests` map. This is the
-    ///   relay-correctness branch: a relay MUST NOT broadcast a third
-    ///   party's traffic to peers whose subscription doesn't match.
+    ///   consults each peer's `interests` map. A relay MUST NOT
+    ///   broadcast a third party's traffic to peers whose subscription
+    ///   doesn't match.
     async fn fanout_application_entry(&self, entry: &sunset_store::SignedKvEntry) {
         let blob = self
             .store
@@ -1387,7 +1315,7 @@ where
     /// `_sunset-sync/subscribe/<hash>/<provider>` entry naming this
     /// engine as the provider. One row per (peer, filter); a peer
     /// subscribing to multiple disjoint namespaces produces multiple
-    /// rows. Used by the relay dashboard.
+    /// rows.
     pub async fn subscriptions_snapshot(&self) -> Vec<(PeerId, Filter)> {
         let state = self.state.lock().await;
         let mut out = Vec::new();
@@ -1402,9 +1330,7 @@ where
     /// Test-only snapshot of every currently-recorded outbound
     /// `BroadcastIntent` (filter we have called `subscribe()` for, and
     /// that the PeerHello auto-resubscriber would replay to a freshly
-    /// connecting peer). Used to assert lifecycle invariants — e.g.
-    /// that `RoomState::drop` pairs its `subscribe` with an
-    /// `unsubscribe` and doesn't leak intents across room reopens.
+    /// connecting peer).
     ///
     /// Gated behind `test-helpers` so the production API stays free of
     /// internal-routing accessors.
@@ -1535,17 +1461,12 @@ where
     /// Single source of truth for peer-session teardown. Removes the
     /// `peer_sessions` entry for `peer_id` and, if it was present, emits
     /// `EngineEvent::PeerRemoved`. Returns `true` when a session was
-    /// actually removed so callers can gate diagnostic logging or
-    /// follow-on cleanup on the unambiguous "we just tore this peer
-    /// down" signal.
+    /// actually removed.
     ///
-    /// Both the explicit `EngineCommand::RemovePeer` flow and the
-    /// `conn_id`-filtered `InboundEvent::Disconnected` flow go through
-    /// this helper. The `Disconnected` caller does its own conn_id peek
-    /// first to enforce the generation guard (a stale Disconnected from
-    /// generation N must not tear down a fresh generation N+1 session
-    /// to the same peer); once that guard passes, the actual removal +
-    /// emit is delegated here so the two paths stay in lockstep.
+    /// The `Disconnected` caller does its own conn_id peek first to
+    /// enforce the generation guard (a stale Disconnected from generation
+    /// N must not tear down a fresh generation N+1 session); once that
+    /// guard passes, removal + emit is delegated here.
     async fn drop_peer_session(&self, peer_id: PeerId) -> bool {
         let was_present = {
             let mut state = self.state.lock().await;
@@ -1611,21 +1532,19 @@ where
     }
 
     /// Sign and insert a per-(filter, provider) `SubscriptionEntry` into
-    /// the local store. Owns the wire-write pipeline shared by
-    /// `do_subscribe_via` (Active) and `do_unsubscribe_via` (Withdrawn).
+    /// the local store. Returns the chosen priority so the caller can
+    /// stamp `Outbound::last_published_ms` consistently.
     ///
     /// `prev_published` is the previous priority at the same
     /// `(verifying_key, name)` if any. The store enforces LWW by
     /// priority, so this method picks `max(now_ms, prev + 1)` to
     /// guarantee strict monotonicity even when two transitions land in
     /// the same async tick (wall-clock millisecond resolution is not
-    /// enough). Returns the chosen priority so the caller can stamp
-    /// `Outbound::last_published_ms` consistently.
+    /// enough).
     ///
-    /// Lock semantics: takes no state lock. The caller must already
-    /// have read `prev_published` (and, for unsubscribe, already
-    /// removed the prior `Outbound`) so this fn does not hold the
-    /// state lock across the `store.insert` await.
+    /// Takes no state lock; the caller must already have read
+    /// `prev_published` so this fn does not hold the state lock across
+    /// the `store.insert` await.
     async fn publish_subscription_entry(
         &self,
         filter: &Filter,
@@ -1671,12 +1590,11 @@ where
     /// Fan out a `BroadcastIntent` across a snapshot of peers by calling
     /// `do_subscribe_via(filter, peer, policy)` for each. Errors are
     /// logged and skipped: a single failing peer must not abort the
-    /// broadcast (callers are `do_subscribe` and the PeerHello
-    /// auto-resubscriber, both of which prefer best-effort fan-out and
-    /// rely on the refresh tick to surface persistent failures).
+    /// broadcast — best-effort fan-out, with the refresh tick to
+    /// surface persistent failures.
     ///
-    /// Lock semantics: takes no state lock itself — the caller chose
-    /// the peer snapshot under whatever lock semantics it needed.
+    /// Takes no state lock itself — the caller chose the peer snapshot
+    /// under whatever lock semantics it needed.
     async fn fan_out_intent_to_peers(
         &self,
         filter: &Filter,
@@ -1707,10 +1625,9 @@ where
             filter_hash,
             provider: provider.clone(),
         };
-        // Read `prev` from the routing state (which we own as the
-        // local-author side); a fresh subscribe-after-withdraw still
-        // wins because the withdrawn `Outbound` was removed by
-        // `take_outbound` on unsubscribe.
+        // A fresh subscribe-after-withdraw still wins on priority because
+        // the withdrawn `Outbound` was removed by `take_outbound` on
+        // unsubscribe.
         let prev_published = self.state.lock().await.routes.outbound_last_published(&key);
         let variant = crate::routing::SubscriptionEntry::Active {
             filter: filter.clone(),
@@ -2073,8 +1990,6 @@ mod tests {
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
                 engine.tick_routing().await;
-                // Nothing to assert beyond "must not panic / hang": there
-                // are no subscriptions to refresh, no peers to talk to.
                 assert!(
                     engine
                         .state
@@ -2088,12 +2003,8 @@ mod tests {
             .await;
     }
 
-    /// `tick_routing` re-publishes any outbound whose `last_published_ms`
-    /// is past `policy.refresh_interval()`. Setup: stage an outbound with
-    /// `last_published_ms = 0` so it's immediately due, then call
-    /// `tick_routing` and assert `last_published_ms` was bumped to a real
-    /// wall-clock timestamp. The contract is: a single tick refreshes the
-    /// entry; no manual re-call needed.
+    /// A single `tick_routing` refreshes any outbound whose
+    /// `last_published_ms` is past `policy.refresh_interval()`.
     #[tokio::test(flavor = "current_thread")]
     async fn tick_routing_republishes_due_outbound() {
         let local = tokio::task::LocalSet::new();
@@ -2106,8 +2017,8 @@ mod tests {
                     filter_hash: crate::routing::filter_hash(&filter),
                     provider: provider.clone(),
                 };
-                // Stage an outbound that's already past half-life
-                // (last_published_ms = 0 vs. wall-clock now in millions).
+                // last_published_ms = 0 puts this outbound past half-life
+                // against any plausible wall-clock now.
                 let ob = crate::routing::Outbound {
                     filter,
                     policy: crate::routing::SubscriptionPolicy::store_data(),
@@ -2137,12 +2048,8 @@ mod tests {
             .await;
     }
 
-    /// `tick_routing` survives a refresh failure on one outbound and
-    /// proceeds to the others. We can't easily force `republish_subscription`
-    /// to fail (the in-memory store accepts everything), but we *can*
-    /// verify the iteration-not-aborted contract structurally: insert two
-    /// due outbounds; after one tick, both must have been refreshed.
-    /// A regression that aborts the loop on first error would leave the
+    /// `tick_routing` refreshes every due outbound in one tick — a
+    /// regression that aborts the loop on first error would leave the
     /// second `last_published_ms` at 0.
     #[tokio::test(flavor = "current_thread")]
     async fn tick_routing_refreshes_all_due_outbounds() {
@@ -2188,11 +2095,8 @@ mod tests {
             .await;
     }
 
-    /// `current_peers` returns one row per currently-connected peer with
-    /// the transport kind observed on PeerHello. Empty before any
-    /// connection; populated after `add_peer` completes; emptied again
-    /// after `remove_peer`. Drives the relay dashboard and the room-state
-    /// snapshot in sunset-core.
+    /// `current_peers` is empty before any connection, populated after
+    /// `add_peer` completes, and emptied again after `remove_peer`.
     #[tokio::test(flavor = "current_thread")]
     async fn current_peers_reflects_connect_then_disconnect() {
         let local = tokio::task::LocalSet::new();
@@ -2200,9 +2104,6 @@ mod tests {
             .run_until(async {
                 let (alice_peer, bob_peer) = spawn_pair().await;
 
-                // After spawn_pair: bob has dialed alice. From alice's
-                // perspective, bob should appear in current_peers; from
-                // bob's, alice should.
                 let alice_view = alice_peer.engine.current_peers().await;
                 assert_eq!(alice_view.len(), 1, "alice sees exactly bob");
                 assert_eq!(alice_view[0].0, bob_peer.id);
@@ -2211,7 +2112,6 @@ mod tests {
                 assert_eq!(bob_view.len(), 1, "bob sees exactly alice");
                 assert_eq!(bob_view[0].0, alice_peer.id);
 
-                // Tear bob's side down. alice should observe it.
                 bob_peer
                     .engine
                     .remove_peer(alice_peer.id.clone())
@@ -2234,10 +2134,9 @@ mod tests {
             .await;
     }
 
-    /// `subscriptions_snapshot` returns one `(peer, filter)` row for
-    /// every interest a currently-connected peer has armed against us.
-    /// Two filters from the same peer produce two rows; an unsubscribe
-    /// drops the row. Drives the relay dashboard.
+    /// `subscriptions_snapshot` returns one `(peer, filter)` row per
+    /// armed interest. Two filters from the same peer produce two rows;
+    /// an unsubscribe drops the row.
     #[tokio::test(flavor = "current_thread")]
     async fn subscriptions_snapshot_lists_armed_interests() {
         let local = tokio::task::LocalSet::new();
@@ -2247,7 +2146,6 @@ mod tests {
                 let alice = &alice_peer.engine;
                 let bob = &bob_peer.engine;
 
-                // Empty before any subscription.
                 assert!(
                     alice.subscriptions_snapshot().await.is_empty(),
                     "alice has no peer interests yet"
@@ -2270,8 +2168,6 @@ mod tests {
                 .await
                 .unwrap();
 
-                // Use the public completion gate so the snapshot is
-                // taken after both interests are armed end-to-end.
                 assert!(
                     alice
                         .wait_for_peer_interest(
@@ -2301,7 +2197,6 @@ mod tests {
                 want.sort_by_key(|(_, f)| crate::routing::filter_hash(f));
                 assert_eq!(snap, want);
 
-                // Unsubscribing one filter removes exactly one row.
                 bob.unsubscribe_via(f1.clone(), alice_peer.id.clone())
                     .await
                     .unwrap();
@@ -2788,18 +2683,6 @@ mod tests {
             .await;
     }
 
-    // -- PeerInterestArmed / PeerInterestWithdrawn substrate tests --
-    //
-    // These exercise the public completion-signal API
-    // (`wait_for_peer_interest{_withdrawn}` + the underlying
-    // `EngineEvent::PeerInterest…` variants) end-to-end through a
-    // realistic two-engine fixture: the engine under test observes a
-    // remote peer's `SubscriptionEntry::Active` / `Withdrawn` via
-    // sync's normal replication path. They are the contract the
-    // integration tests in `tests/phase2_subscribe.rs` (and similar)
-    // depend on; if these regress, all those gates degrade silently to
-    // sleeps.
-
     /// Spin up alice + bob over `TestNetwork`, run both engines, and
     /// dial bob → alice. Returns the two `TestPeer`s; the engine run
     /// loops are aborted automatically when the `TestPeer`s drop.
@@ -2831,10 +2714,6 @@ mod tests {
                 .await
                 .unwrap();
 
-                // Drain events until we see PeerInterestArmed for
-                // (bob, filter). It must fire exactly once for this
-                // transition; assert by counting matches inside a
-                // bounded window.
                 let mut armed_count = 0;
                 let deadline = std::time::Duration::from_secs(2);
                 let _ = tokio::time::timeout(deadline, async {
@@ -2847,8 +2726,7 @@ mod tests {
                             && f == filter
                         {
                             armed_count += 1;
-                            // Wait a bit longer to catch a second emit
-                            // if the engine ever double-fires.
+                            // Linger briefly to catch a double-fire.
                             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                             break;
                         }
@@ -2942,8 +2820,8 @@ mod tests {
                     "alice did not arm bob's interest"
                 );
 
-                // Second call must observe the snapshot path (already
-                // armed) and return immediately — never time out.
+                // Second call should hit the snapshot path and return
+                // immediately.
                 let start = tokio::time::Instant::now();
                 let result = alice
                     .wait_for_peer_interest(&bob_id, &filter, std::time::Duration::from_secs(5))
@@ -2968,7 +2846,7 @@ mod tests {
                 let bob_id = bob_peer.id.clone();
                 let filter = Filter::Keyspace(vk(b"chat"));
 
-                // Start waiting BEFORE bob subscribes — exercises the
+                // Wait BEFORE bob subscribes to exercise the
                 // event-channel path (not the snapshot path).
                 let alice_for_wait = alice.clone();
                 let filter_for_wait = filter.clone();
@@ -2997,16 +2875,6 @@ mod tests {
             .await;
     }
 
-    // -- bootstrap_routes tests --
-    //
-    // `bootstrap_routes` walks `_sunset-sync/subscribe/*` entries in the
-    // local store on startup and, for each `Active{provider == me}`,
-    // records the filter into the matching peer's `interests` if that
-    // peer is already in `peer_sessions`. In practice `peer_sessions` is
-    // empty at startup so it's a no-op, but the function is documented
-    // to populate interests when the session is present; both branches
-    // are exercised below so a regression of either is caught.
-
     #[tokio::test(flavor = "current_thread")]
     async fn bootstrap_routes_is_noop_when_no_peer_sessions() {
         use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
@@ -3018,9 +2886,8 @@ mod tests {
                 let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
                 let local_peer = PeerId(vk(b"alice"));
 
-                // Pre-insert an Active{provider=alice} SubscriptionEntry
-                // authored by some other peer (bob), but without ever
-                // adding bob to peer_sessions.
+                // bob authored Active{provider=alice}, but is not
+                // currently in peer_sessions.
                 let filter = Filter::Keyspace(vk(b"chat"));
                 let sub_value = crate::routing::SubscriptionEntry::Active {
                     filter: filter.clone(),
@@ -3041,13 +2908,10 @@ mod tests {
                 };
                 store.insert(entry, Some(block)).await.unwrap();
 
-                // Sanity: peer_sessions is empty.
                 assert!(engine.state.lock().await.peer_sessions.is_empty());
 
-                // Should return Ok and not panic.
                 engine.bootstrap_routes().await.expect("bootstrap_routes");
 
-                // And it must NOT have magicked up a peer_session.
                 assert!(
                     engine.state.lock().await.peer_sessions.is_empty(),
                     "bootstrap_routes must not create peer_sessions"
@@ -3068,8 +2932,6 @@ mod tests {
                 let local_peer = PeerId(vk(b"alice"));
                 let bob = PeerId(vk(b"bob"));
 
-                // Manually install bob's peer_session so the scan has
-                // somewhere to land.
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 engine.state.lock().await.peer_sessions.insert(
                     bob.clone(),
@@ -3082,8 +2944,6 @@ mod tests {
                     },
                 );
 
-                // Pre-insert bob's Active{provider=alice} subscription
-                // for some filter.
                 let filter = Filter::Keyspace(vk(b"chat"));
                 let sub_value = crate::routing::SubscriptionEntry::Active {
                     filter: filter.clone(),
@@ -3104,10 +2964,8 @@ mod tests {
                 };
                 store.insert(entry, Some(block)).await.unwrap();
 
-                // Run the scan.
                 engine.bootstrap_routes().await.expect("bootstrap_routes");
 
-                // bob's interests should now carry the filter.
                 let state = engine.state.lock().await;
                 let session = state.peer_sessions.get(&bob).expect("bob's session");
                 let filter_hash = crate::routing::filter_hash(&filter);
@@ -3121,36 +2979,11 @@ mod tests {
             .await;
     }
 
-    // -- handle_subscription_entry_event coverage --
-    //
-    // The function has three previously-untested code paths:
-    //   1. SUBSCRIBE_PREFIX-named entry whose value blob doesn't decode
-    //      as a SubscriptionEntry (warn! + ignore).
-    //   2. SUBSCRIBE_PREFIX-prefixed name that doesn't carry a valid
-    //      filter-hash suffix (warn! + ignore).
-    //   3. SubscriptionEntry::Active authored by us (the local peer)
-    //      with provider == us: the interest must be mirrored, but the
-    //      backfill DigestRequest MUST NOT be sent (otherwise we'd ask
-    //      ourselves over the network for data we already have).
-    //
-    // All three drive the path via `handle_local_store_event` /
-    // `handle_subscription_entry_event` directly — they don't need a
-    // second engine wired through TestNetwork.
-    //
-    // Fixture: a peer_session pre-installed under some `receiver` PeerId
-    // with an mpsc receiver we can drain to assert presence / absence
-    // of `SyncMessage::DigestRequest`.
-
     fn install_peer_session(
         engine: &SyncEngine<MemoryStore, TestTransport>,
         peer: PeerId,
     ) -> mpsc::UnboundedReceiver<SyncMessage> {
         let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
-        // Block on the lock acquisition synchronously from the test's
-        // current_thread runtime by routing through a `LocalSet`. The
-        // callers below are inside `local.run_until`, so we just take
-        // the lock with `try_lock` — peer_sessions isn't contended in
-        // these tests.
         let mut state = engine
             .state
             .try_lock()
@@ -3181,8 +3014,8 @@ mod tests {
                 let bob = PeerId(vk(b"bob"));
                 let _rx = install_peer_session(&engine, bob.clone());
 
-                // Well-formed SUBSCRIBE_PREFIX name with a value blob
-                // that ISN'T a postcard-encoded SubscriptionEntry.
+                // Well-formed SUBSCRIBE_PREFIX name; value blob is not
+                // a postcard-encoded SubscriptionEntry.
                 let filter = Filter::Keyspace(vk(b"chat"));
                 let block = ContentBlock {
                     data: Bytes::from_static(b"\xff\xff\xff garbage \xff\xff"),
@@ -3199,13 +3032,10 @@ mod tests {
                 };
                 store.insert(entry.clone(), Some(block)).await.unwrap();
 
-                // Drive the path directly. Must not panic.
                 engine
                     .handle_local_store_event(sunset_store::Event::Inserted(entry))
                     .await;
 
-                // Interests must remain empty — the warn! branch fires
-                // and the entry is ignored.
                 let state = engine.state.lock().await;
                 let session = state.peer_sessions.get(&bob).expect("bob's session");
                 assert!(
@@ -3229,9 +3059,8 @@ mod tests {
                 let bob = PeerId(vk(b"bob"));
                 let _rx = install_peer_session(&engine, bob.clone());
 
-                // SUBSCRIBE_PREFIX'd name that DOES decode as a
-                // SubscriptionEntry value, but whose name tail isn't a
-                // valid `<filter-hash-hex>/<provider-hex>` shape, so
+                // SUBSCRIBE_PREFIX'd name whose tail is not a valid
+                // `<filter-hash-hex>/<provider-hex>` shape, so
                 // `decode_filter_hash_from_name` returns None.
                 let filter = Filter::Keyspace(vk(b"chat"));
                 let sub_value = crate::routing::SubscriptionEntry::Active {
@@ -3242,7 +3071,6 @@ mod tests {
                     data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
                     references: vec![],
                 };
-                // Just the prefix + a bogus tail (no slash, wrong-length hash).
                 let bad_name =
                     Bytes::from([crate::routing::SUBSCRIBE_PREFIX, b"not-a-valid-suffix"].concat());
                 let entry = SignedKvEntry {
@@ -3279,9 +3107,8 @@ mod tests {
                 let store = Arc::new(MemoryStore::with_accept_all());
                 let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
                 let local_peer = PeerId(vk(b"alice"));
-                // The "receiver" of this self-authored entry is the local
-                // peer itself; install a peer_session under that key so
-                // the Active arm has somewhere to mirror the interest.
+                // Self-loopback: install a peer_session keyed on the
+                // local peer so the Active arm has somewhere to mirror.
                 let mut rx = install_peer_session(&engine, local_peer.clone());
 
                 let filter = Filter::Keyspace(vk(b"chat"));
@@ -3294,7 +3121,6 @@ mod tests {
                     references: vec![],
                 };
                 let name = crate::routing::subscription_name(&filter, &local_peer);
-                // Authored by the local peer (verifying_key == self).
                 let entry = SignedKvEntry {
                     verifying_key: local_peer.0.clone(),
                     name,
@@ -3309,7 +3135,6 @@ mod tests {
                     .handle_local_store_event(sunset_store::Event::Inserted(entry))
                     .await;
 
-                // Interest must be mirrored.
                 {
                     let state = engine.state.lock().await;
                     let session = state.peer_sessions.get(&local_peer).expect("self session");
@@ -3321,14 +3146,10 @@ mod tests {
                     );
                 }
 
-                // But no DigestRequest must have been sent — we'd be
-                // asking ourselves over the network for data we already
-                // have. Drain the receiver non-blockingly and assert
-                // there's no DigestRequest among any queued messages.
-                //
-                // (fanout_application_entry runs next and may push an
-                // EventDelivery for the same self-authored entry; that's
-                // expected and unrelated to this gate.)
+                // No DigestRequest must have been sent — we'd be asking
+                // ourselves over the network for data we already have.
+                // (An EventDelivery for the same self-authored entry may
+                // be queued by `fanout_application_entry`; ignore.)
                 while let Ok(msg) = rx.try_recv() {
                     assert!(
                         !matches!(msg, SyncMessage::DigestRequest { .. }),

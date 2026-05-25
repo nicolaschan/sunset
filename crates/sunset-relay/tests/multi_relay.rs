@@ -118,13 +118,8 @@ async fn alice_to_bob_via_two_relays() {
             let relay_b_addr = relay_b.dial_address();
             let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");
 
-            // Federation gate: wait until relay A has accepted relay
-            // B's broad-prefix subscription (relay B's
-            // `engine.subscribe` writes a per-(filter, provider=A)
-            // entry to its store, which sync replicates to A; A's
-            // engine arms the forwarding path). This is the public
-            // completion signal for "A↔B federation is live"; no
-            // sleep needed.
+            // A↔B federation: wait until A's engine has armed the
+            // forwarding path for B's broad-prefix subscription.
             let relay_b_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
                 &relay_b.ed25519_public,
             )));
@@ -156,13 +151,9 @@ async fn alice_to_bob_via_two_relays() {
                 .await
                 .unwrap();
 
-            // Public completion signal on alice's side: relay A's
-            // broad-prefix subscription naming alice as provider has
-            // been accepted by alice's engine, arming the forwarding
-            // path from alice → relay A for matching writes. Under the
-            // per-(filter, provider) model this is the exact analogue
-            // of "alice has learned relay A's subscription" — the
-            // event fires on the engine where `provider == self`.
+            // alice → relay A: wait until alice's engine has armed
+            // forwarding for A's broad-prefix subscription naming
+            // alice as the provider.
             let relay_a_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
                 &relay_a.ed25519_public,
             )));
@@ -276,10 +267,7 @@ async fn failover_when_relay_a_dies() {
             let relay_b_addr = relay_b.dial_address();
             let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");
 
-            // Federation pre-check: relay B's broad-prefix
-            // subscription naming relay A as provider has been
-            // accepted by A's engine; A↔B routing is live before any
-            // client traffic. No sleep.
+            // A↔B routing must be live before any client traffic.
             let relay_b_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
                 &relay_b.ed25519_public,
             )));
@@ -325,11 +313,8 @@ async fn failover_when_relay_a_dies() {
                 .await
                 .unwrap();
 
-            // Public completion signals: confirm both alice→A and
-            // alice→B paths are live before we kill A. Each relay
-            // subscribes broad-prefix with provider=alice; the event
-            // fires on alice's engine once that entry is replicated +
-            // accepted, at which point the forward path is armed.
+            // Both alice→A and alice→B forward paths must be armed
+            // before we kill A.
             assert!(
                 alice_engine
                     .wait_for_peer_interest(

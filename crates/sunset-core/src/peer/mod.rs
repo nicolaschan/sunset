@@ -1336,13 +1336,11 @@ mod tests {
                 let peer = helpers::mk_peer(ident(14)).await;
                 let room = peer.open_room("alpha").await.expect("open_room");
 
-                // Drop the OpenRoom handle; verify cancel was set.
                 let cancel = room.inner.cancel_decode.clone();
                 drop(room);
-                // The Drop impl on RoomState fires cancel_decode = true.
-                // Yield so the decode loop notices (we don't actually assert
-                // its termination here — just that the cancel signal is set,
-                // which structurally guarantees its exit).
+                // `RoomState::drop` flips cancel_decode. The decode
+                // loop's exit follows structurally from the flag; we
+                // only assert the flag here.
                 tokio::task::yield_now().await;
                 assert!(
                     cancel.get(),
@@ -1352,19 +1350,14 @@ mod tests {
             .await;
     }
 
+    /// `Peer::open_room` calls `engine.subscribe(room_filter, …)`,
+    /// which records a `BroadcastIntent`. `RoomState::drop` must pair
+    /// that with `engine.unsubscribe(filter)` — otherwise every
+    /// open/close cycle leaks an intent, and the PeerHello
+    /// auto-resubscriber replays it on every reconnect, growing
+    /// SubscriptionEntry traffic linearly with session-time reopens.
     #[tokio::test(flavor = "current_thread")]
     async fn room_drop_unsubscribes_engine_broadcast_intent() {
-        // Regression: `Peer::open_room` calls
-        // `engine.subscribe(room_filter, ...)` which records a
-        // `BroadcastIntent` in the engine's routing state. Pre-fix,
-        // `RoomState::drop` tore down only `cancel_decode` and the
-        // signaler dispatcher — it never called the matching
-        // `engine.unsubscribe(filter)`, so every open/close cycle
-        // leaked a permanent broadcast intent. The PeerHello
-        // auto-resubscriber replayed those intents on every new
-        // connection, growing SubscriptionEntry traffic linearly with
-        // session-time room reopens. After the fix, dropping the
-        // `OpenRoom` must remove the broadcast intent.
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1372,22 +1365,19 @@ mod tests {
                 let room = peer.open_room("alpha").await.expect("open_room");
                 let filter = crate::filters::room_filter(&room.inner.room);
 
-                // Pre-drop: the broadcast intent for the room filter
-                // is recorded in engine routing state.
                 let pre = peer.engine().broadcast_intent_filters_snapshot().await;
                 assert!(
                     pre.iter().any(|f| f == &filter),
                     "expected open_room to record a BroadcastIntent for room_filter; \
-                     snapshot pre-drop = {pre:?}",
+                     snapshot = {pre:?}",
                 );
 
                 drop(room);
 
                 // Drop kicks the unsubscribe off via spawn_local; the
                 // engine command channel round-trip then needs the
-                // engine task to pump it. Poll a few times so the
-                // chain (spawn_local task -> cmd_tx -> engine run-loop
-                // -> remove intent) can complete.
+                // engine task to pump it. Poll while the
+                // spawn_local -> cmd_tx -> engine -> remove chain runs.
                 let mut post: Vec<sunset_store::Filter> = Vec::new();
                 for _ in 0..200 {
                     post = peer.engine().broadcast_intent_filters_snapshot().await;

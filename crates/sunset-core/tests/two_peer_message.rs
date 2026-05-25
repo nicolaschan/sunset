@@ -117,11 +117,6 @@ async fn alice_encrypts_bob_decrypts() {
             // ---- alice connects to bob ----
             alice_engine.add_peer(bob_addr).await.unwrap();
 
-            // Public completion signal: alice has accepted bob's
-            // SubscriptionEntry::Active(provider=alice) and the
-            // forwarding gate for bob's filter is armed. From this
-            // point a write that matches `bob_filter` on alice's
-            // store will be routed to bob.
             assert!(
                 alice_engine
                     .wait_for_peer_interest(&bob_peer, &bob_filter, Duration::from_secs(2))

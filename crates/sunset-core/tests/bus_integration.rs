@@ -103,11 +103,6 @@ async fn ephemeral_publish_arrives_at_remote_subscriber() {
                 .await
                 .unwrap();
 
-            // Public completion signal: alice has accepted bob's
-            // SubscriptionEntry::Active(provider=alice) and the
-            // forwarding gate is armed. From this point an ephemeral
-            // datagram alice publishes that matches `voice/` will be
-            // routed to bob.
             let bob_pid = PeerId(bob_identity.store_verifying_key());
             let voice_filter = Filter::NamePrefix(Bytes::from_static(b"voice/"));
             assert!(

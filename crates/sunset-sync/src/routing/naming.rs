@@ -198,16 +198,12 @@ mod tests {
 
     #[test]
     fn decode_filter_hash_from_name_rejects_wrong_reserved_prefix() {
-        // Another `_sunset-sync/*` reserved prefix that isn't ours.
         assert_eq!(decode_filter_hash_from_name(LINKS_NAME), None);
         assert_eq!(decode_filter_hash_from_name(PROVIDER_TICK_NAME), None);
     }
 
     #[test]
     fn decode_filter_hash_from_name_rejects_short_hash() {
-        // Correct prefix + slash-terminated hash that's only 32 chars
-        // long (half the expected 64). Provider segment present and
-        // well-formed so the only thing wrong is hash length.
         let mut name = Vec::from(SUBSCRIBE_PREFIX);
         name.extend_from_slice(&b"00".repeat(16)); // 32 hex chars = 16 bytes
         name.extend_from_slice(b"/abcd");
@@ -216,7 +212,6 @@ mod tests {
 
     #[test]
     fn decode_filter_hash_from_name_rejects_long_hash() {
-        // 128 hex chars where 64 is required.
         let mut name = Vec::from(SUBSCRIBE_PREFIX);
         name.extend_from_slice(&b"00".repeat(64));
         name.extend_from_slice(b"/abcd");
@@ -225,7 +220,6 @@ mod tests {
 
     #[test]
     fn decode_filter_hash_from_name_rejects_non_hex_hash() {
-        // 64 chars, right length, but contains non-hex characters ('z').
         let mut name = Vec::from(SUBSCRIBE_PREFIX);
         name.extend_from_slice(&b"z".repeat(64));
         name.extend_from_slice(b"/abcd");
@@ -234,8 +228,6 @@ mod tests {
 
     #[test]
     fn decode_filter_hash_from_name_rejects_missing_provider_segment() {
-        // 64-char hex hash but no '/' separator — there's no provider
-        // segment at all, so split_once('/') returns None.
         let mut name = Vec::from(SUBSCRIBE_PREFIX);
         name.extend_from_slice(&b"a".repeat(64));
         assert_eq!(decode_filter_hash_from_name(&name), None);
@@ -243,7 +235,6 @@ mod tests {
 
     #[test]
     fn decode_filter_hash_from_name_rejects_non_utf8_after_prefix() {
-        // Correct prefix; tail is non-utf8 garbage.
         let mut name = Vec::from(SUBSCRIBE_PREFIX);
         name.extend_from_slice(&[0xff, 0xfe, 0xfd]);
         assert_eq!(decode_filter_hash_from_name(&name), None);

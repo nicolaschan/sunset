@@ -138,12 +138,8 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             // ---- alice connects to bob ----
             alice_engine.add_peer(bob_addr).await.unwrap();
 
-            // ---- wait for subscription propagation ----
-            // Observe Bob's SubscriptionEntry::Active(provider=alice)
-            // landing in alice's store; equivalent under the new path
-            // to "alice has learned bob's interest" (the legacy
-            // `knows_peer_subscription` no longer fires because the
-            // new entry name isn't under `_sunset-sync/subscribe`).
+            // Wait until Bob's `SubscriptionEntry::Active(provider=alice)`
+            // has replicated into alice's store.
             let expected_name = subscription_name(&bob_filter, &alice_peer);
             let registered = wait_for(
                 Duration::from_secs(5),
