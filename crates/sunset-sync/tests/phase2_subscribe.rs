@@ -939,3 +939,111 @@ async fn unsubscribe_broadcast_intent_drops_all_per_peer_subs() {
         })
         .await;
 }
+
+/// Self-authored application entries fan out to every currently-
+/// connected peer regardless of whether that peer has installed an
+/// interest. This is the documented Phase 2 invariant and is load-
+/// bearing for `subscribe_via`: the `SubscriptionEntry` is itself a
+/// self-authored write and reaches the named provider via this same
+/// broadcast path, without which subscribe_via would only take effect
+/// after the anti-entropy interval (default 30s).
+#[tokio::test(flavor = "current_thread")]
+async fn self_authored_application_entry_reaches_connected_peer_without_subscribe() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let net = TestNetwork::new();
+            let alice_addr = PeerAddr::new("alice");
+            let bob_addr = PeerAddr::new("bob");
+            let alice_id = PeerId(vk(b"alice"));
+            let bob_id = PeerId(vk(b"bob"));
+
+            let alice_transport = net.transport(alice_id.clone(), alice_addr.clone());
+            let bob_transport = net.transport(bob_id.clone(), bob_addr.clone());
+
+            let alice_store = Arc::new(MemoryStore::with_accept_all());
+            let bob_store = Arc::new(MemoryStore::with_accept_all());
+
+            let alice_signer = Arc::new(StubSigner {
+                vk: alice_id.0.clone(),
+            });
+            let bob_signer = Arc::new(StubSigner {
+                vk: bob_id.0.clone(),
+            });
+
+            let alice_engine = Rc::new(SyncEngine::new(
+                alice_store.clone(),
+                alice_transport,
+                SyncConfig::default(),
+                alice_id.clone(),
+                alice_signer,
+            ));
+            let bob_engine = Rc::new(SyncEngine::new(
+                bob_store.clone(),
+                bob_transport,
+                SyncConfig::default(),
+                bob_id.clone(),
+                bob_signer,
+            ));
+
+            let alice_run = tokio::task::spawn_local({
+                let e = alice_engine.clone();
+                async move { e.run().await }
+            });
+            let bob_run = tokio::task::spawn_local({
+                let e = bob_engine.clone();
+                async move { e.run().await }
+            });
+
+            // Bob connects to Alice but does NOT subscribe to anything.
+            bob_engine.add_peer(alice_addr).await.unwrap();
+
+            // Wait for the PeerHello to land on Alice's side so the
+            // outbound channel to Bob exists by the time Alice writes.
+            let connected = wait_for(
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+                || async { alice_engine.connected_peers().await.contains(&bob_id) },
+            )
+            .await;
+            assert!(connected, "alice did not see bob connect");
+
+            // Alice writes an entry under her OWN verifying_key. There's
+            // no interest from bob for this key, but the self-author
+            // broadcast invariant means bob should still receive it.
+            let block = ContentBlock {
+                data: Bytes::from_static(b"self-authored-app-data"),
+                references: vec![],
+            };
+            let entry = SignedKvEntry {
+                verifying_key: alice_id.0.clone(),
+                name: Bytes::from_static(b"my-status"),
+                value_hash: block.hash(),
+                priority: 1,
+                expires_at: None,
+                signature: Bytes::new(),
+            };
+            alice_store.insert(entry, Some(block)).await.unwrap();
+
+            let received = wait_for(
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+                || async {
+                    bob_store
+                        .get_entry(&alice_id.0, b"my-status")
+                        .await
+                        .unwrap()
+                        .is_some()
+                },
+            )
+            .await;
+            assert!(
+                received,
+                "bob did not receive alice's self-authored entry despite being connected"
+            );
+
+            alice_run.abort();
+            bob_run.abort();
+        })
+        .await;
+}

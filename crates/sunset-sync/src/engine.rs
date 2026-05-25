@@ -2682,4 +2682,128 @@ mod tests {
             })
             .await;
     }
+
+    // -- bootstrap_routes tests --
+    //
+    // `bootstrap_routes` walks `_sunset-sync/subscribe/*` entries in the
+    // local store on startup and, for each `Active{provider == me}`,
+    // records the filter into the matching peer's `interests` if that
+    // peer is already in `peer_sessions`. In practice `peer_sessions` is
+    // empty at startup so it's a no-op, but the function is documented
+    // to populate interests when the session is present; both branches
+    // are exercised below so a regression of either is caught.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bootstrap_routes_is_noop_when_no_peer_sessions() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+
+                // Pre-insert an Active{provider=alice} SubscriptionEntry
+                // authored by some other peer (bob), but without ever
+                // adding bob to peer_sessions.
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let sub_value = crate::routing::SubscriptionEntry::Active {
+                    filter: filter.clone(),
+                    provider: local_peer.clone(),
+                };
+                let block = ContentBlock {
+                    data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
+                    references: vec![],
+                };
+                let name = crate::routing::subscription_name(&filter, &local_peer);
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"bob"),
+                    name,
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry, Some(block)).await.unwrap();
+
+                // Sanity: peer_sessions is empty.
+                assert!(engine.state.lock().await.peer_sessions.is_empty());
+
+                // Should return Ok and not panic.
+                engine.bootstrap_routes().await.expect("bootstrap_routes");
+
+                // And it must NOT have magicked up a peer_session.
+                assert!(
+                    engine.state.lock().await.peer_sessions.is_empty(),
+                    "bootstrap_routes must not create peer_sessions"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bootstrap_routes_populates_interests_for_connected_peer() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+                let bob = PeerId(vk(b"bob"));
+
+                // Manually install bob's peer_session so the scan has
+                // somewhere to land.
+                let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
+                engine.state.lock().await.peer_sessions.insert(
+                    bob.clone(),
+                    PeerSession {
+                        conn_id: ConnectionId::for_test(1),
+                        kind: TransportKind::Unknown,
+                        tx,
+                        _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
+                    },
+                );
+
+                // Pre-insert bob's Active{provider=alice} subscription
+                // for some filter.
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let sub_value = crate::routing::SubscriptionEntry::Active {
+                    filter: filter.clone(),
+                    provider: local_peer.clone(),
+                };
+                let block = ContentBlock {
+                    data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
+                    references: vec![],
+                };
+                let name = crate::routing::subscription_name(&filter, &local_peer);
+                let entry = SignedKvEntry {
+                    verifying_key: bob.0.clone(),
+                    name: name.clone(),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry, Some(block)).await.unwrap();
+
+                // Run the scan.
+                engine.bootstrap_routes().await.expect("bootstrap_routes");
+
+                // bob's interests should now carry the filter.
+                let state = engine.state.lock().await;
+                let session = state.peer_sessions.get(&bob).expect("bob's session");
+                let filter_hash = crate::routing::filter_hash(&filter);
+                let installed = session.interests.get(&filter_hash);
+                assert_eq!(
+                    installed,
+                    Some(&filter),
+                    "bootstrap_routes must populate interests for connected peers"
+                );
+            })
+            .await;
+    }
 }
