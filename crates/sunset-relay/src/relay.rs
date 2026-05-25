@@ -79,6 +79,14 @@ type WtAcceptor = SpawningAcceptor<
 
 type Engine = SyncEngine<FsStore, InboundTransport>;
 
+/// Task handles returned by `RelayHandle::start_engine_workloads`.
+struct EngineWorkloadHandles {
+    /// Engine `run()` task. Lives on the LocalSet (engine isn't Send).
+    engine_task: tokio::task::JoinHandle<sunset_sync::Result<()>>,
+    /// axum `serve()` task. Lives on the multi-thread runtime workers.
+    serve_task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
 pub struct Relay {/* sealed; see RelayHandle */}
 
 pub struct RelayHandle {
@@ -444,12 +452,25 @@ impl RelayHandle {
         }
     }
 
-    /// Drive the engine + axum until shutdown.
-    pub async fn run(mut self) -> Result<()> {
+    /// Spawn the engine + axum tasks, publish the broad subscription, and
+    /// dial any federated peers. Both `run` (production) and
+    /// `run_for_test` (tests) share this bringup; they only differ in how
+    /// they wait for shutdown and what they do with the task handles.
+    ///
+    /// `engine_task` runs on the LocalSet (the engine isn't Send); the
+    /// axum serve task runs on the multi-thread runtime workers (the
+    /// listener+router are Send-friendly).
+    ///
+    /// Caller is responsible for aborting the returned tasks at shutdown
+    /// (or letting the runtime drop cancel them, in the test case).
+    async fn start_engine_workloads(
+        &mut self,
+        consumer_label: &'static str,
+    ) -> Result<EngineWorkloadHandles> {
         let listener = self
             .listener
             .take()
-            .expect("RelayHandle::run consumed twice");
+            .unwrap_or_else(|| panic!("RelayHandle::{consumer_label} consumed twice"));
         let app: Router = build_app(self.build_app_state());
 
         let engine_clone = self.engine.clone();
@@ -464,6 +485,19 @@ impl RelayHandle {
             .await?;
         tracing::info!("published broad subscription");
         self.dial_configured_peers().await;
+
+        Ok(EngineWorkloadHandles {
+            engine_task,
+            serve_task,
+        })
+    }
+
+    /// Drive the engine + axum until shutdown.
+    pub async fn run(mut self) -> Result<()> {
+        let EngineWorkloadHandles {
+            engine_task,
+            serve_task,
+        } = self.start_engine_workloads("run").await?;
 
         #[cfg(unix)]
         {
@@ -496,22 +530,9 @@ impl RelayHandle {
     pub async fn run_for_test(
         &mut self,
     ) -> Result<tokio::task::JoinHandle<sunset_sync::Result<()>>> {
-        let listener = self
-            .listener
-            .take()
-            .expect("RelayHandle::run_for_test consumed twice");
-        let app: Router = build_app(self.build_app_state());
-
-        let engine_clone = self.engine.clone();
-        let engine_task = tokio::task::spawn_local(async move { engine_clone.run().await });
-
-        let _serve_task = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        self.engine
-            .subscribe(self.subscription_filter.clone(), self.subscription_policy)
-            .await?;
-        self.dial_configured_peers().await;
-
+        // serve_task is detached; the test runtime drop will cancel it.
+        let EngineWorkloadHandles { engine_task, .. } =
+            self.start_engine_workloads("run_for_test").await?;
         Ok(engine_task)
     }
 
