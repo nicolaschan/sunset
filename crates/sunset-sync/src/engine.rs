@@ -648,17 +648,27 @@ where
                     self.tick_anti_entropy().await;
                 }
                 _ = routing_tick.tick() => {
-                    let now_ms = now_unix_ms();
-                    let due = {
-                        let state = self.state.lock().await;
-                        state.routes.due_for_refresh(now_ms)
-                    };
-                    for key in due {
-                        if let Err(e) = self.republish_subscription(&key).await {
-                            tracing::warn!(?e, ?key, "subscription refresh failed");
-                        }
-                    }
+                    self.tick_routing().await;
                 }
+            }
+        }
+    }
+
+    /// Refresh any subscription whose TTL has passed half-life.
+    ///
+    /// Snapshots the due-for-refresh set under the inner state lock, then
+    /// republishes each one outside the lock. `republish_subscription`
+    /// failures are logged per-key so a single bad key doesn't poison the
+    /// whole tick.
+    async fn tick_routing(&self) {
+        let now_ms = now_unix_ms();
+        let due = {
+            let state = self.state.lock().await;
+            state.routes.due_for_refresh(now_ms)
+        };
+        for key in due {
+            if let Err(e) = self.republish_subscription(&key).await {
+                tracing::warn!(?e, ?key, "subscription refresh failed");
             }
         }
     }
