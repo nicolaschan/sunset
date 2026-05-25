@@ -15,9 +15,9 @@ use sunset_core::{
 };
 use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret};
 use sunset_relay::{Config, Relay};
-use sunset_store::{ContentBlock, Filter, Hash, Store as _, VerifyingKey};
+use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
-use sunset_sync::routing::{SubscriptionPolicy, subscription_name};
+use sunset_sync::routing::{self, SubscriptionPolicy};
 use sunset_sync::test_helpers::wait_for;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
 use sunset_sync_ws_native::WebSocketRawTransport;
@@ -118,8 +118,25 @@ async fn alice_to_bob_via_two_relays() {
             let relay_b_addr = relay_b.dial_address();
             let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");
 
-            // Brief settle for federation handshake.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Federation gate: wait until relay A has accepted relay
+            // B's broad-prefix subscription (relay B's
+            // `engine.subscribe` writes a per-(filter, provider=A)
+            // entry to its store, which sync replicates to A; A's
+            // engine arms the forwarding path). This is the public
+            // completion signal for "A↔B federation is live"; no
+            // sleep needed.
+            let relay_b_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                &relay_b.ed25519_public,
+            )));
+            let federated = relay_a
+                .engine()
+                .wait_for_peer_interest(
+                    &relay_b_pid,
+                    &routing::relay_broad_filter(),
+                    Duration::from_secs(5),
+                )
+                .await;
+            assert!(federated, "A↔B federation did not complete");
 
             // Clients.
             let alice = Identity::generate(&mut OsRng);
@@ -127,7 +144,7 @@ async fn alice_to_bob_via_two_relays() {
             let alice_room = Room::open_with_params("plan-d-test", &test_fast_params()).unwrap();
             let bob_room = Room::open_with_params("plan-d-test", &test_fast_params()).unwrap();
 
-            let (alice_store, _alice_engine) = make_client(alice.clone(), &relay_a_addr).await;
+            let (alice_store, alice_engine) = make_client(alice.clone(), &relay_a_addr).await;
             let (bob_store, bob_engine) = make_client(bob.clone(), &relay_b_addr).await;
 
             // Bob declares interest.
@@ -139,46 +156,27 @@ async fn alice_to_bob_via_two_relays() {
                 .await
                 .unwrap();
 
-            // Wait for relay A's broad subscription (filter=`Filter::All`,
-            // provider=alice) to land in alice's store. The relay's
-            // `engine.subscribe(...)` writes a per-(filter, provider)
-            // SubscriptionEntry which sync replicates to the named
-            // provider; observing that entry is equivalent to "alice
-            // has learned relay A's interest" under the new path.
-            let alice_pid = PeerId(alice.store_verifying_key());
-            let relay_broad_filter = Filter::NamePrefix(Bytes::new());
-            let relay_sub_name_for_alice = subscription_name(&relay_broad_filter, &alice_pid);
-            let relay_a_vk = VerifyingKey::new(Bytes::copy_from_slice(&relay_a.ed25519_public));
-            let alice_knows_relay_a = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async {
-                    alice_store
-                        .get_entry(&relay_a_vk, &relay_sub_name_for_alice)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some()
-                },
-            )
-            .await;
+            // Public completion signal on alice's side: relay A's
+            // broad-prefix subscription naming alice as provider has
+            // been accepted by alice's engine, arming the forwarding
+            // path from alice → relay A for matching writes. Under the
+            // per-(filter, provider) model this is the exact analogue
+            // of "alice has learned relay A's subscription" — the
+            // event fires on the engine where `provider == self`.
+            let relay_a_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                &relay_a.ed25519_public,
+            )));
+            let alice_knows_relay_a = alice_engine
+                .wait_for_peer_interest(
+                    &relay_a_pid,
+                    &routing::relay_broad_filter(),
+                    Duration::from_secs(5),
+                )
+                .await;
             assert!(
                 alice_knows_relay_a,
                 "alice did not learn relay A's subscription"
             );
-
-            // Federation health: under the legacy `publish_subscription`
-            // path, alice's store would also receive a relay_b-authored
-            // broadcast subscription via gossip — observable from alice's
-            // side as proof of A↔B federation. With the new per-(filter,
-            // provider) subscription entries, relay B writes one for each
-            // of *its* direct peers (relay A), not for alice (who is on
-            // relay A only). There is no symmetric observable on alice's
-            // side. We rely on (a) the federation handshake settle delay
-            // above and (b) the primary end-to-end assertion below
-            // (bob receives alice's message via A→B) to surface any
-            // federation failure.
-            let _ = VerifyingKey::new(Bytes::copy_from_slice(&relay_b.ed25519_public));
 
             // Alice composes + inserts.
             let body = "hello bob across two relays";
@@ -276,10 +274,29 @@ async fn failover_when_relay_a_dies() {
             );
             let mut relay_b = Relay::start(config_b).await.expect("relay B new");
             let relay_b_addr = relay_b.dial_address();
-            let relay_b_vk = VerifyingKey::new(Bytes::copy_from_slice(&relay_b.ed25519_public));
             let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Federation pre-check: relay B's broad-prefix
+            // subscription naming relay A as provider has been
+            // accepted by A's engine; A↔B routing is live before any
+            // client traffic. No sleep.
+            let relay_b_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                &relay_b.ed25519_public,
+            )));
+            let relay_a_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                &relay_a.ed25519_public,
+            )));
+            assert!(
+                relay_a
+                    .engine()
+                    .wait_for_peer_interest(
+                        &relay_b_pid,
+                        &routing::relay_broad_filter(),
+                        Duration::from_secs(5)
+                    )
+                    .await,
+                "A↔B federation did not complete",
+            );
 
             // Alice connects to BOTH; bob connects to BOTH.
             let alice = Identity::generate(&mut OsRng);
@@ -308,30 +325,30 @@ async fn failover_when_relay_a_dies() {
                 .await
                 .unwrap();
 
-            // Wait for alice to learn relay B's subscription (confirms federation + alice→B path
-            // is established before we kill relay A). Observe the
-            // per-(filter, provider=alice) SubscriptionEntry that
-            // relay B writes when it auto-resubscribes after the
-            // federation handshake.
-            let alice_pid = PeerId(alice.store_verifying_key());
-            let relay_broad_filter = Filter::NamePrefix(Bytes::new());
-            let relay_sub_name_for_alice = subscription_name(&relay_broad_filter, &alice_pid);
-            let alice_knows_relay_b = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async {
-                    alice_store
-                        .get_entry(&relay_b_vk, &relay_sub_name_for_alice)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some()
-                },
-            )
-            .await;
+            // Public completion signals: confirm both alice→A and
+            // alice→B paths are live before we kill A. Each relay
+            // subscribes broad-prefix with provider=alice; the event
+            // fires on alice's engine once that entry is replicated +
+            // accepted, at which point the forward path is armed.
             assert!(
-                alice_knows_relay_b,
-                "alice did not learn relay B's subscription before starting"
+                alice_engine
+                    .wait_for_peer_interest(
+                        &relay_a_pid,
+                        &routing::relay_broad_filter(),
+                        Duration::from_secs(5)
+                    )
+                    .await,
+                "alice did not learn relay A's subscription before starting",
+            );
+            assert!(
+                alice_engine
+                    .wait_for_peer_interest(
+                        &relay_b_pid,
+                        &routing::relay_broad_filter(),
+                        Duration::from_secs(5)
+                    )
+                    .await,
+                "alice did not learn relay B's subscription before starting",
             );
 
             // Compose msg-1; expect it to arrive normally (both relays alive).
