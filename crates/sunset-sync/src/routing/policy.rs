@@ -69,6 +69,18 @@ impl SubscriptionPolicy {
             freshness_threshold: Duration::from_secs(30),
         }
     }
+
+    /// TTL set on the published `SubscriptionEntry`.
+    pub fn entry_ttl(&self) -> Duration {
+        self.freshness_threshold
+    }
+
+    /// Cadence at which the routing tick re-publishes a still-active
+    /// subscription. Half-freshness so the receiver has at least one
+    /// refresh window of slack between writes before the entry expires.
+    pub fn refresh_interval(&self) -> Duration {
+        self.freshness_threshold / 2
+    }
 }
 
 impl Default for SubscriptionPolicy {
@@ -109,5 +121,26 @@ mod tests {
             SubscriptionPolicy::default(),
             SubscriptionPolicy::store_data()
         );
+    }
+
+    #[test]
+    fn store_data_entry_ttl_and_refresh_interval() {
+        let p = SubscriptionPolicy::store_data();
+        assert_eq!(p.entry_ttl(), Duration::from_secs(5));
+        assert_eq!(p.refresh_interval(), Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn voice_active_call_entry_ttl_and_refresh_interval() {
+        let p = SubscriptionPolicy::voice_active_call();
+        assert_eq!(p.entry_ttl(), Duration::from_millis(200));
+        assert_eq!(p.refresh_interval(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn relay_broad_entry_ttl_and_refresh_interval() {
+        let p = SubscriptionPolicy::relay_broad();
+        assert_eq!(p.entry_ttl(), Duration::from_secs(30));
+        assert_eq!(p.refresh_interval(), Duration::from_secs(15));
     }
 }

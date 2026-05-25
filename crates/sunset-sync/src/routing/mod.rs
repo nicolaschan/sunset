@@ -23,8 +23,10 @@ pub use coverage::covers;
 pub use forward::forward_targets;
 pub use naming::{
     LINKS_NAME, PROVIDER_TICK_NAME, SUBSCRIBE_PREFIX, decode_filter_hash_from_name,
-    subscription_name,
+    is_subscription_name, subscription_name,
 };
 pub use policy::{SubscriptionPolicy, relay_broad_filter};
-pub use routes::{BroadcastIntent, FilterHash, Outbound, OutboundKey, Routes, filter_hash};
+pub use routes::{
+    BroadcastIntent, FILTER_HASH_HEX_LEN, FilterHash, Outbound, OutboundKey, Routes, filter_hash,
+};
 pub use types::{LinkState, Neighbor, ProviderTick, SubscriptionEntry};

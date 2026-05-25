@@ -18,6 +18,13 @@ use crate::types::PeerId;
 /// `Filter` (which the store doesn't currently provide).
 pub type FilterHash = [u8; 32];
 
+/// Length, in hex characters, of a `FilterHash` when rendered into a
+/// subscription entry name (see `routing::naming::subscription_name`).
+/// Derived from `FilterHash` so it never drifts from the underlying
+/// hash size. Used by `decode_filter_hash_from_name` for the prefix
+/// length check.
+pub const FILTER_HASH_HEX_LEN: usize = 2 * std::mem::size_of::<FilterHash>();
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct OutboundKey {
     pub filter_hash: FilterHash,

@@ -8,13 +8,21 @@
 //! an entry under any name. Defense against deliberately hostile values is
 //! a separate concern handled by the trust filter.
 
+/// Top-level reserved namespace prefix. Every sunset-sync-managed entry
+/// name starts with this; every routing-layer name constant
+/// (`LINKS_NAME`, `PROVIDER_TICK_NAME`, `SUBSCRIBE_PREFIX`, this
+/// module's `PEER_HEALTH_NAME`) is required to begin with it. Single
+/// source of truth — `is_reserved` and the reserved-prefix invariants
+/// in `routing::naming` both anchor to this constant.
+pub const RESERVED_PREFIX: &[u8] = b"_sunset-sync/";
+
 /// Optional liveness/health summaries (not used in v1).
 #[allow(dead_code)]
 pub const PEER_HEALTH_NAME: &[u8] = b"_sunset-sync/peer-health";
 
 /// True if `name` is reserved for sunset-sync internal use.
 pub fn is_reserved(name: &[u8]) -> bool {
-    name.starts_with(b"_sunset-sync/")
+    name.starts_with(RESERVED_PREFIX)
 }
 
 #[cfg(test)]
@@ -35,5 +43,10 @@ mod tests {
     fn application_names_are_not_reserved() {
         assert!(!is_reserved(b"chat/room/123"));
         assert!(!is_reserved(b"identity/alice"));
+    }
+
+    #[test]
+    fn peer_health_name_uses_reserved_prefix() {
+        assert!(PEER_HEALTH_NAME.starts_with(RESERVED_PREFIX));
     }
 }

@@ -32,9 +32,14 @@ pub const SUBSCRIBE_PREFIX: &[u8] = b"_sunset-sync/subscribe/";
 pub fn subscription_name(filter: &Filter, provider: &PeerId) -> Bytes {
     let filter_hex = hex::encode(crate::routing::filter_hash(filter));
     let provider_hex = hex::encode(provider.0.as_bytes());
-    Bytes::from(format!(
-        "_sunset-sync/subscribe/{filter_hex}/{provider_hex}"
-    ))
+    let prefix = std::str::from_utf8(SUBSCRIBE_PREFIX).expect("SUBSCRIBE_PREFIX is ASCII");
+    Bytes::from(format!("{prefix}{filter_hex}/{provider_hex}"))
+}
+
+/// True if `name` is one of the per-(filter, provider) subscription entry
+/// names produced by `subscription_name`.
+pub fn is_subscription_name(name: &[u8]) -> bool {
+    name.starts_with(SUBSCRIBE_PREFIX)
 }
 
 /// Extract the filter-hash component from a `_sunset-sync/subscribe/<hex>/<hex>`
@@ -44,10 +49,10 @@ pub fn decode_filter_hash_from_name(name: &[u8]) -> Option<crate::routing::Filte
     let rest = name.strip_prefix(SUBSCRIBE_PREFIX)?;
     let rest = std::str::from_utf8(rest).ok()?;
     let (hash_hex, _) = rest.split_once('/')?;
-    if hash_hex.len() != 64 {
+    if hash_hex.len() != crate::routing::FILTER_HASH_HEX_LEN {
         return None;
     }
-    let mut out = [0u8; 32];
+    let mut out = [0u8; std::mem::size_of::<crate::routing::FilterHash>()];
     hex::decode_to_slice(hash_hex, &mut out).ok()?;
     Some(out)
 }
@@ -101,6 +106,10 @@ mod tests {
         let filter_hex = parts.next().unwrap();
         let provider_hex = parts.next().unwrap();
         assert!(parts.next().is_none());
+        // Literal 64 (not crate::routing::FILTER_HASH_HEX_LEN): deliberate
+        // pin so a regression that changes FILTER_HASH_HEX_LEN behind our
+        // back (e.g. swapping the underlying hash to something other than
+        // blake3-256) trips this assertion instead of silently passing.
         assert_eq!(filter_hex.len(), 64); // blake3 = 32 bytes = 64 hex chars
         assert_eq!(provider_hex, hex::encode(b"provider-1"));
     }
@@ -115,9 +124,30 @@ mod tests {
     }
 
     #[test]
+    fn is_subscription_name_round_trip() {
+        let f = Filter::Namespace(Bytes::from_static(b"room/x"));
+        let p = pid(b"provider");
+        let name = subscription_name(&f, &p);
+        assert!(is_subscription_name(&name));
+    }
+
+    #[test]
+    fn is_subscription_name_rejects_other_reserved_names() {
+        assert!(!is_subscription_name(LINKS_NAME));
+        assert!(!is_subscription_name(PROVIDER_TICK_NAME));
+    }
+
+    #[test]
+    fn is_subscription_name_rejects_application_names() {
+        assert!(!is_subscription_name(b"chat/room/general"));
+        assert!(!is_subscription_name(b""));
+    }
+
+    #[test]
     fn reserved_constants_are_under_sunset_sync_prefix() {
-        assert!(LINKS_NAME.starts_with(b"_sunset-sync/"));
-        assert!(PROVIDER_TICK_NAME.starts_with(b"_sunset-sync/"));
-        assert!(SUBSCRIBE_PREFIX.starts_with(b"_sunset-sync/"));
+        use crate::reserved::RESERVED_PREFIX;
+        assert!(LINKS_NAME.starts_with(RESERVED_PREFIX));
+        assert!(PROVIDER_TICK_NAME.starts_with(RESERVED_PREFIX));
+        assert!(SUBSCRIBE_PREFIX.starts_with(RESERVED_PREFIX));
     }
 }
