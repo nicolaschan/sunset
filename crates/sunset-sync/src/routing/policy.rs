@@ -13,6 +13,24 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
+use sunset_store::Filter;
+
+/// The wire filter that pairs with [`SubscriptionPolicy::relay_broad`]
+/// — a `NamePrefix("")` that matches every entry. Production relays
+/// pass this to `engine.subscribe(...)` to declare "I want everything";
+/// tests use it as the expected filter when gating on a relay's
+/// broadcast subscription reaching a peer.
+///
+/// Centralised here so the relay-broad filter and the relay-broad
+/// policy are introduced and discoverable together; previously the
+/// filter was an inline literal at three call sites, which made the
+/// "policy + filter together = the relay-broad subscription" pairing
+/// invisible.
+pub fn relay_broad_filter() -> Filter {
+    Filter::NamePrefix(Bytes::new())
+}
+
 /// Per-filter routing policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubscriptionPolicy {

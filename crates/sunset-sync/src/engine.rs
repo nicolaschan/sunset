@@ -164,6 +164,31 @@ pub enum EngineEvent {
         rtt_ms: u64,
         observed_at_unix_ms: u64,
     },
+    /// A remote peer's `SubscriptionEntry::Active` naming us as the
+    /// provider has been replicated to us and accepted: from this point
+    /// on, application entries matching `filter` written by anyone we
+    /// trust will be forwarded to `receiver` over the routing-filtered
+    /// push path. Fired exactly once per `(receiver, filter_hash)`
+    /// transition from "not armed" to "armed", AFTER the matching
+    /// `DigestRequest` has been queued to the receiver (so an observer
+    /// who sees this event is guaranteed the backfill exchange is in
+    /// flight or has completed). Self-authored subscription entries
+    /// also fire this event so an engine can observe its own
+    /// arming for tests.
+    PeerInterestArmed {
+        receiver: PeerId,
+        filter: sunset_store::Filter,
+    },
+    /// A remote peer's `SubscriptionEntry::Withdrawn` for a previously-
+    /// armed filter has been replicated to us and accepted: from this
+    /// point on, entries matching `filter` will no longer be forwarded
+    /// to `receiver`. Fired exactly once per `(receiver, filter_hash)`
+    /// transition from "armed" to "not armed". The receiver may still
+    /// have other independent filters armed.
+    PeerInterestWithdrawn {
+        receiver: PeerId,
+        filter: sunset_store::Filter,
+    },
 }
 
 /// Per-peer connection state. Bundles outbound channel, transport identity,
@@ -1095,16 +1120,40 @@ where
                         let state = self.state.lock().await;
                         if let Some(session) = state.peer_sessions.get(&receiver) {
                             let _ = session.tx.send(SyncMessage::DigestRequest {
-                                filter,
+                                filter: filter.clone(),
                                 range: DigestRange::All,
                             });
                         }
                     }
+                    // Emit AFTER the DigestRequest send so a test
+                    // observer that gates on this event is guaranteed
+                    // the backfill exchange is queued or in flight.
+                    // Fired for both self-authored (loopback through
+                    // sync) and foreign-authored entries so the same
+                    // gate works whether the receiver subscribes via
+                    // us directly or through an intermediary relay.
+                    if was_new {
+                        self.emit_engine_event(EngineEvent::PeerInterestArmed {
+                            receiver: receiver.clone(),
+                            filter,
+                        })
+                        .await;
+                    }
                 }
                 crate::routing::SubscriptionEntry::Withdrawn => {
-                    let mut state = self.state.lock().await;
-                    if let Some(session) = state.peer_sessions.get_mut(&receiver) {
-                        session.interests.remove(&filter_hash);
+                    let prev_filter = {
+                        let mut state = self.state.lock().await;
+                        state
+                            .peer_sessions
+                            .get_mut(&receiver)
+                            .and_then(|session| session.interests.remove(&filter_hash))
+                    };
+                    if let Some(filter) = prev_filter {
+                        self.emit_engine_event(EngineEvent::PeerInterestWithdrawn {
+                            receiver: receiver.clone(),
+                            filter,
+                        })
+                        .await;
                     }
                 }
                 // Active naming someone else: Phase 3 recursive subscription
@@ -1191,6 +1240,105 @@ where
             }
         }
         out
+    }
+
+    /// Wait until this engine has accepted a `SubscriptionEntry::Active`
+    /// from `receiver` naming us as the provider for `filter` — i.e.
+    /// from this engine's perspective, `receiver` wants matching
+    /// application entries forwarded to them and the matching
+    /// `DigestRequest` has already been queued. Returns `true` on
+    /// observation, `false` on timeout.
+    ///
+    /// The snapshot of current interests and the subscription to
+    /// future events happen under the same `state` lock as the emit
+    /// site, so there is no race window between "already armed" and
+    /// "armed later"; exactly one of those two arms will resolve.
+    ///
+    /// Integration tests use this as the public completion signal for
+    /// `subscribe` / `subscribe_via` — once it returns `true`, the
+    /// forwarding gate is open and a write that matches `filter` will
+    /// be routed to `receiver` (subject to verifier / trust).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn wait_for_peer_interest(
+        &self,
+        receiver: &PeerId,
+        filter: &Filter,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let (already, mut events) = {
+            let mut state = self.state.lock().await;
+            let already = state
+                .peer_sessions
+                .get(receiver)
+                .is_some_and(|s| s.interests.values().any(|f| f == filter));
+            let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+            state.event_subs.push(tx);
+            (already, rx)
+        };
+        if already {
+            return true;
+        }
+        let fut = async {
+            while let Some(ev) = events.recv().await {
+                if let EngineEvent::PeerInterestArmed {
+                    receiver: r,
+                    filter: f,
+                } = ev
+                    && &r == receiver
+                    && &f == filter
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        tokio::time::timeout(deadline, fut).await.unwrap_or(false)
+    }
+
+    /// Mirror of [`Self::wait_for_peer_interest`] for the withdrawal
+    /// transition: wait until this engine has accepted a
+    /// `SubscriptionEntry::Withdrawn` from `receiver` that retracts a
+    /// previously-armed `filter`. Returns `true` on observation,
+    /// `false` on timeout (or if the filter was never armed in the
+    /// first place — there is no withdrawal to observe).
+    ///
+    /// Snapshot + event subscription happen under the same lock as
+    /// the emit, identical to `wait_for_peer_interest`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn wait_for_peer_interest_withdrawn(
+        &self,
+        receiver: &PeerId,
+        filter: &Filter,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let (already_withdrawn, mut events) = {
+            let mut state = self.state.lock().await;
+            let armed = state
+                .peer_sessions
+                .get(receiver)
+                .is_some_and(|s| s.interests.values().any(|f| f == filter));
+            let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+            state.event_subs.push(tx);
+            (!armed, rx)
+        };
+        if already_withdrawn {
+            return true;
+        }
+        let fut = async {
+            while let Some(ev) = events.recv().await {
+                if let EngineEvent::PeerInterestWithdrawn {
+                    receiver: r,
+                    filter: f,
+                } = ev
+                    && &r == receiver
+                    && &f == filter
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        tokio::time::timeout(deadline, fut).await.unwrap_or(false)
     }
 
     /// Test-only helper: bypass the command channel and update trust
@@ -1281,10 +1429,37 @@ where
             data: Bytes::from(value),
             references: vec![],
         };
+        // `priority` must be strictly greater than the previous
+        // subscription entry at the same `(verifying_key, name)` —
+        // otherwise the store rejects the write as `Stale` (LWW by
+        // priority). Wall-clock millisecond resolution isn't enough
+        // when two subscribe/unsubscribe transitions happen back to
+        // back in the same async runtime tick; force monotonicity by
+        // snapping to `prev_priority + 1` whenever wall-clock is
+        // behind. Read `prev` from `my_subs` (which we own as the
+        // local-author side); a fresh subscribe-after-withdraw still
+        // wins because the withdrawn `Outbound` was removed from
+        // `my_subs` on unsubscribe.
+        let key = crate::routing::OutboundKey {
+            filter_hash,
+            provider: provider.clone(),
+        };
+        let prev_published = self
+            .state
+            .lock()
+            .await
+            .routes
+            .my_subs
+            .get(&key)
+            .map(|ob| ob.last_published_ms);
         let now_ms = web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let priority = match prev_published {
+            Some(prev) if prev >= now_ms => prev.saturating_add(1),
+            _ => now_ms,
+        };
         let ttl_ms = policy.freshness_threshold.as_millis() as u64;
         let vk = self.signer.verifying_key();
         let value_hash = block.hash();
@@ -1292,8 +1467,8 @@ where
             verifying_key: vk,
             name,
             value_hash,
-            priority: now_ms,
-            expires_at: Some(now_ms.saturating_add(ttl_ms)),
+            priority,
+            expires_at: Some(priority.saturating_add(ttl_ms)),
             signature: Bytes::new(),
         };
         let payload = signing_payload(&entry);
@@ -1305,14 +1480,11 @@ where
 
         let mut state = self.state.lock().await;
         state.routes.my_subs.insert(
-            crate::routing::OutboundKey {
-                filter_hash,
-                provider: provider.clone(),
-            },
+            key,
             crate::routing::Outbound {
                 filter,
                 policy,
-                last_published_ms: now_ms,
+                last_published_ms: priority,
             },
         );
         Ok(())
@@ -1346,6 +1518,16 @@ where
             .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        // See `do_subscribe_via`: priority must strictly exceed the
+        // previous entry's priority at `(verifying_key, name)`, or the
+        // store rejects this as Stale. Withdraw immediately after
+        // subscribe (same async tick) collides at millisecond
+        // resolution otherwise.
+        let priority = if prev.last_published_ms >= now_ms {
+            prev.last_published_ms.saturating_add(1)
+        } else {
+            now_ms
+        };
         let ttl_ms = prev.policy.freshness_threshold.as_millis() as u64;
         let vk = self.signer.verifying_key();
         let value_hash = block.hash();
@@ -1353,8 +1535,8 @@ where
             verifying_key: vk,
             name,
             value_hash,
-            priority: now_ms,
-            expires_at: Some(now_ms.saturating_add(ttl_ms)),
+            priority,
+            expires_at: Some(priority.saturating_add(ttl_ms)),
             signature: Bytes::new(),
         };
         let payload = signing_payload(&entry);
@@ -2178,6 +2360,264 @@ mod tests {
                     }
                     other => panic!("unexpected event: {other:?}"),
                 }
+            })
+            .await;
+    }
+
+    // -- PeerInterestArmed / PeerInterestWithdrawn substrate tests --
+    //
+    // These exercise the public completion-signal API
+    // (`wait_for_peer_interest{_withdrawn}` + the underlying
+    // `EngineEvent::PeerInterest…` variants) end-to-end through a
+    // realistic two-engine fixture: the engine under test observes a
+    // remote peer's `SubscriptionEntry::Active` / `Withdrawn` via
+    // sync's normal replication path. They are the contract the
+    // integration tests in `tests/phase2_subscribe.rs` (and similar)
+    // depend on; if these regress, all those gates degrade silently to
+    // sleeps.
+
+    /// Spin up alice + bob over `TestNetwork`, run both engines, and
+    /// dial bob → alice. Returns the engines, their peer ids, and the
+    /// join handles so the caller can `.abort()` on exit.
+    async fn spawn_pair() -> (
+        Rc<SyncEngine<MemoryStore, TestTransport>>,
+        Rc<SyncEngine<MemoryStore, TestTransport>>,
+        PeerId,
+        PeerId,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        use crate::types::PeerAddr;
+        let net = TestNetwork::new();
+        let alice_addr = PeerAddr::new("alice");
+        let bob_addr = PeerAddr::new("bob");
+        let alice_id = PeerId(vk(b"alice"));
+        let bob_id = PeerId(vk(b"bob"));
+
+        let alice_transport = net.transport(alice_id.clone(), alice_addr.clone());
+        let bob_transport = net.transport(bob_id.clone(), bob_addr);
+
+        let alice_store = Arc::new(MemoryStore::with_accept_all());
+        let bob_store = Arc::new(MemoryStore::with_accept_all());
+
+        let alice_signer = Arc::new(StubSigner {
+            vk: alice_id.0.clone(),
+        });
+        let bob_signer = Arc::new(StubSigner {
+            vk: bob_id.0.clone(),
+        });
+
+        let alice = Rc::new(SyncEngine::new(
+            alice_store,
+            alice_transport,
+            SyncConfig::default(),
+            alice_id.clone(),
+            alice_signer,
+        ));
+        let bob = Rc::new(SyncEngine::new(
+            bob_store,
+            bob_transport,
+            SyncConfig::default(),
+            bob_id.clone(),
+            bob_signer,
+        ));
+
+        let alice_run = crate::spawn::spawn_local({
+            let e = alice.clone();
+            async move { e.run().await }
+        });
+        let bob_run = crate::spawn::spawn_local({
+            let e = bob.clone();
+            async move { e.run().await }
+        });
+
+        bob.add_peer(alice_addr).await.unwrap();
+
+        (alice, bob, alice_id, bob_id, alice_run, bob_run)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_interest_armed_fires_once_per_subscribe() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice, bob, _alice_id, bob_id, alice_run, bob_run) = spawn_pair().await;
+                let mut events = alice.subscribe_engine_events().await;
+                let filter = Filter::Keyspace(vk(b"chat"));
+
+                bob.subscribe_via(
+                    filter.clone(),
+                    PeerId(vk(b"alice")),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+
+                // Drain events until we see PeerInterestArmed for
+                // (bob, filter). It must fire exactly once for this
+                // transition; assert by counting matches inside a
+                // bounded window.
+                let mut armed_count = 0;
+                let deadline = std::time::Duration::from_secs(2);
+                let _ = tokio::time::timeout(deadline, async {
+                    while let Some(ev) = events.recv().await {
+                        if let EngineEvent::PeerInterestArmed {
+                            receiver,
+                            filter: f,
+                        } = ev
+                            && receiver == bob_id
+                            && f == filter
+                        {
+                            armed_count += 1;
+                            // Wait a bit longer to catch a second emit
+                            // if the engine ever double-fires.
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            break;
+                        }
+                    }
+                })
+                .await;
+                assert_eq!(armed_count, 1, "PeerInterestArmed must fire exactly once");
+
+                alice_run.abort();
+                bob_run.abort();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_interest_withdrawn_fires_once_per_unsubscribe() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice, bob, _alice_id, bob_id, alice_run, bob_run) = spawn_pair().await;
+                let filter = Filter::Keyspace(vk(b"chat"));
+
+                bob.subscribe_via(
+                    filter.clone(),
+                    PeerId(vk(b"alice")),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    alice
+                        .wait_for_peer_interest(&bob_id, &filter, std::time::Duration::from_secs(2))
+                        .await,
+                    "alice did not arm bob's interest"
+                );
+
+                let mut events = alice.subscribe_engine_events().await;
+
+                bob.unsubscribe_via(filter.clone(), PeerId(vk(b"alice")))
+                    .await
+                    .unwrap();
+
+                let mut withdrawn_count = 0;
+                let deadline = std::time::Duration::from_secs(2);
+                let _ = tokio::time::timeout(deadline, async {
+                    while let Some(ev) = events.recv().await {
+                        if let EngineEvent::PeerInterestWithdrawn {
+                            receiver,
+                            filter: f,
+                        } = ev
+                            && receiver == bob_id
+                            && f == filter
+                        {
+                            withdrawn_count += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            break;
+                        }
+                    }
+                })
+                .await;
+                assert_eq!(
+                    withdrawn_count, 1,
+                    "PeerInterestWithdrawn must fire exactly once"
+                );
+
+                alice_run.abort();
+                bob_run.abort();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_peer_interest_returns_immediately_when_already_armed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice, bob, _alice_id, bob_id, alice_run, bob_run) = spawn_pair().await;
+                let filter = Filter::Keyspace(vk(b"chat"));
+
+                bob.subscribe_via(
+                    filter.clone(),
+                    PeerId(vk(b"alice")),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    alice
+                        .wait_for_peer_interest(&bob_id, &filter, std::time::Duration::from_secs(2))
+                        .await,
+                    "alice did not arm bob's interest"
+                );
+
+                // Second call must observe the snapshot path (already
+                // armed) and return immediately — never time out.
+                let start = tokio::time::Instant::now();
+                let result = alice
+                    .wait_for_peer_interest(&bob_id, &filter, std::time::Duration::from_secs(5))
+                    .await;
+                assert!(result, "second wait_for_peer_interest should succeed");
+                assert!(
+                    start.elapsed() < std::time::Duration::from_millis(100),
+                    "wait_for_peer_interest must return immediately when already armed"
+                );
+
+                alice_run.abort();
+                bob_run.abort();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_peer_interest_resolves_on_later_emit() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice, bob, _alice_id, bob_id, alice_run, bob_run) = spawn_pair().await;
+                let filter = Filter::Keyspace(vk(b"chat"));
+
+                // Start waiting BEFORE bob subscribes — exercises the
+                // event-channel path (not the snapshot path).
+                let alice_for_wait = alice.clone();
+                let filter_for_wait = filter.clone();
+                let bob_id_for_wait = bob_id.clone();
+                let waiter = crate::spawn::spawn_local(async move {
+                    alice_for_wait
+                        .wait_for_peer_interest(
+                            &bob_id_for_wait,
+                            &filter_for_wait,
+                            std::time::Duration::from_secs(2),
+                        )
+                        .await
+                });
+
+                bob.subscribe_via(
+                    filter,
+                    PeerId(vk(b"alice")),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+
+                let armed = waiter.await.expect("waiter task joined");
+                assert!(armed, "waiter must resolve true on later emit");
+
+                alice_run.abort();
+                bob_run.abort();
             })
             .await;
     }

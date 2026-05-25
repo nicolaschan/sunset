@@ -441,6 +441,10 @@ where
                 }
                 Self::broadcast(&mut state, id);
             }
+            EngineEvent::PeerInterestArmed { .. } | EngineEvent::PeerInterestWithdrawn { .. } => {
+                // Routing-layer events; the supervisor only tracks
+                // identity-level connection state.
+            }
         }
     }
 

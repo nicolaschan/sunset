@@ -28,6 +28,7 @@ use sunset_store::{Filter, VerifyingKey};
 use sunset_store_fs::FsStore;
 use sunset_sync::{
     DualInboundTransport, PeerAddr, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine,
+    routing,
 };
 use sunset_sync_webtransport_native::{
     WebTransportRawConnection, WebTransportRawTransport, build_server_endpoint,
@@ -290,7 +291,7 @@ impl Relay {
 
         // 9. Subscription filter for the relay's broad ingestion.
         let subscription_filter = match config.interest_filter {
-            InterestFilter::All => Filter::NamePrefix(Bytes::new()),
+            InterestFilter::All => routing::relay_broad_filter(),
         };
 
         // 10. Bridge channels.
