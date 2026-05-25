@@ -44,10 +44,17 @@ pub struct BroadcastIntent {
     pub policy: SubscriptionPolicy,
 }
 
+/// In-engine routing state. Owns the per-(filter, provider) outbound
+/// subscriptions we have published and the per-filter broadcast intents
+/// we are tracking.
+///
+/// Both maps are private — callers go through the accessor methods so
+/// the engine doesn't reach into the routing data structures directly.
+/// This isolates "where is this data stored?" decisions to this module.
 pub struct Routes {
     me: PeerId,
-    pub my_subs: HashMap<OutboundKey, Outbound>,
-    pub broadcast_intents: HashMap<FilterHash, BroadcastIntent>,
+    my_subs: HashMap<OutboundKey, Outbound>,
+    broadcast_intents: HashMap<FilterHash, BroadcastIntent>,
 }
 
 impl Routes {
@@ -63,17 +70,78 @@ impl Routes {
         &self.me
     }
 
-    /// Keys of `my_subs` whose `last_published_ms` is at least
-    /// `policy.freshness_threshold / 2` behind `now_ms`.
+    /// Keys of outbound subscriptions whose `last_published_ms` is at
+    /// least `policy.refresh_interval()` behind `now_ms`.
     pub fn due_for_refresh(&self, now_ms: u64) -> Vec<OutboundKey> {
         self.my_subs
             .iter()
             .filter(|(_, ob)| {
-                let half = ob.policy.freshness_threshold.as_millis() as u64 / 2;
-                now_ms.saturating_sub(ob.last_published_ms) >= half
+                let refresh = ob.policy.refresh_interval().as_millis() as u64;
+                now_ms.saturating_sub(ob.last_published_ms) >= refresh
             })
             .map(|(k, _)| k.clone())
             .collect()
+    }
+
+    // ----- outbound (my_subs) -----
+
+    /// Record an outbound subscription, replacing any previous entry at
+    /// the same key. Returns the previous outbound, if any.
+    pub fn insert_outbound(&mut self, key: OutboundKey, ob: Outbound) -> Option<Outbound> {
+        self.my_subs.insert(key, ob)
+    }
+
+    /// Remove and return the outbound at `key`, if any.
+    pub fn take_outbound(&mut self, key: &OutboundKey) -> Option<Outbound> {
+        self.my_subs.remove(key)
+    }
+
+    /// `last_published_ms` for the outbound at `key`, if any.
+    pub fn outbound_last_published(&self, key: &OutboundKey) -> Option<u64> {
+        self.my_subs.get(key).map(|ob| ob.last_published_ms)
+    }
+
+    /// `(filter, policy)` for the outbound at `key`, if any.
+    pub fn outbound_filter_policy(
+        &self,
+        key: &OutboundKey,
+    ) -> Option<(Filter, SubscriptionPolicy)> {
+        self.my_subs
+            .get(key)
+            .map(|ob| (ob.filter.clone(), ob.policy))
+    }
+
+    /// Providers we currently maintain outbound subscriptions to for
+    /// the given filter hash.
+    pub fn outbound_providers_for_filter(&self, filter_hash: &FilterHash) -> Vec<PeerId> {
+        self.my_subs
+            .keys()
+            .filter(|k| &k.filter_hash == filter_hash)
+            .map(|k| k.provider.clone())
+            .collect()
+    }
+
+    // ----- broadcast intents -----
+
+    /// Record a broadcast intent for `filter_hash`. Returns the previous
+    /// intent, if any.
+    pub fn insert_broadcast_intent(
+        &mut self,
+        filter_hash: FilterHash,
+        intent: BroadcastIntent,
+    ) -> Option<BroadcastIntent> {
+        self.broadcast_intents.insert(filter_hash, intent)
+    }
+
+    /// Remove and return the broadcast intent at `filter_hash`, if any.
+    pub fn take_broadcast_intent(&mut self, filter_hash: &FilterHash) -> Option<BroadcastIntent> {
+        self.broadcast_intents.remove(filter_hash)
+    }
+
+    /// Snapshot of every current broadcast intent. Cloned so callers
+    /// can drop the routing lock before iterating.
+    pub fn broadcast_intents_snapshot(&self) -> Vec<BroadcastIntent> {
+        self.broadcast_intents.values().cloned().collect()
     }
 }
 
@@ -118,7 +186,7 @@ mod tests {
             filter_hash: [0u8; 32],
             provider: pid(b"p"),
         };
-        routes.my_subs.insert(key.clone(), outbound(1000, 0));
+        routes.insert_outbound(key.clone(), outbound(1000, 0));
         assert!(routes.due_for_refresh(499).is_empty());
         assert_eq!(routes.due_for_refresh(500), vec![key]);
     }
@@ -130,7 +198,7 @@ mod tests {
             filter_hash: [0u8; 32],
             provider: pid(b"p"),
         };
-        routes.my_subs.insert(key, outbound(1000, 800));
+        routes.insert_outbound(key, outbound(1000, 800));
         assert!(routes.due_for_refresh(1000).is_empty());
     }
 

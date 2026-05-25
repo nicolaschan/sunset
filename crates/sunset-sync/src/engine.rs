@@ -766,7 +766,7 @@ where
                 // (the next refresh tick will surface persistent failures).
                 let intents: Vec<crate::routing::BroadcastIntent> = {
                     let state = self.state.lock().await;
-                    state.routes.broadcast_intents.values().cloned().collect()
+                    state.routes.broadcast_intents_snapshot()
                 };
                 for intent in intents {
                     if let Err(e) = self
@@ -858,8 +858,8 @@ where
     /// SUBSCRIBE_PREFIX entries on startup is the right thing to do
     /// regardless.
     ///
-    /// `my_subs` and `broadcast_intents` are NOT rehydrated from disk
-    /// in Phase 2 (subsystems re-call subscribe on startup).
+    /// Outbound subscriptions and broadcast intents are NOT rehydrated
+    /// from disk in Phase 2 (subsystems re-call subscribe on startup).
     async fn bootstrap_routes(&self) -> Result<()> {
         let mut iter = self
             .store
@@ -1120,11 +1120,7 @@ where
         // their `PeerSession`. Forwarding consults `peer_sessions[*].interests`
         // (via `routing::forward_targets`); without this mirror, the
         // receiver would never see matching application entries.
-        if entry
-            .name
-            .as_ref()
-            .starts_with(crate::routing::SUBSCRIBE_PREFIX)
-        {
+        if crate::routing::is_subscription_name(entry.name.as_ref()) {
             let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
                 return;
             };
@@ -1457,10 +1453,10 @@ where
     async fn republish_subscription(&self, key: &crate::routing::OutboundKey) -> Result<()> {
         let (filter, policy) = {
             let state = self.state.lock().await;
-            let Some(ob) = state.routes.my_subs.get(key) else {
+            let Some((filter, policy)) = state.routes.outbound_filter_policy(key) else {
                 return Ok(());
             };
-            (ob.filter.clone(), ob.policy)
+            (filter, policy)
         };
         self.do_subscribe_via(filter, key.provider.clone(), policy)
             .await
@@ -1497,22 +1493,15 @@ where
         // when two subscribe/unsubscribe transitions happen back to
         // back in the same async runtime tick; force monotonicity by
         // snapping to `prev_priority + 1` whenever wall-clock is
-        // behind. Read `prev` from `my_subs` (which we own as the
-        // local-author side); a fresh subscribe-after-withdraw still
-        // wins because the withdrawn `Outbound` was removed from
-        // `my_subs` on unsubscribe.
+        // behind. Read `prev` from the routing state (which we own as
+        // the local-author side); a fresh subscribe-after-withdraw
+        // still wins because the withdrawn `Outbound` was removed by
+        // `take_outbound` on unsubscribe.
         let key = crate::routing::OutboundKey {
             filter_hash,
             provider: provider.clone(),
         };
-        let prev_published = self
-            .state
-            .lock()
-            .await
-            .routes
-            .my_subs
-            .get(&key)
-            .map(|ob| ob.last_published_ms);
+        let prev_published = self.state.lock().await.routes.outbound_last_published(&key);
         let now_ms = web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1521,7 +1510,7 @@ where
             Some(prev) if prev >= now_ms => prev.saturating_add(1),
             _ => now_ms,
         };
-        let ttl_ms = policy.freshness_threshold.as_millis() as u64;
+        let ttl_ms = policy.entry_ttl().as_millis() as u64;
         let vk = self.signer.verifying_key();
         let value_hash = block.hash();
         let mut entry = SignedKvEntry {
@@ -1540,7 +1529,7 @@ where
             .map_err(Error::Store)?;
 
         let mut state = self.state.lock().await;
-        state.routes.my_subs.insert(
+        state.routes.insert_outbound(
             key,
             crate::routing::Outbound {
                 filter,
@@ -1564,7 +1553,7 @@ where
         };
         let prev = {
             let mut state = self.state.lock().await;
-            state.routes.my_subs.remove(&key)
+            state.routes.take_outbound(&key)
         };
         let Some(prev) = prev else { return Ok(()) };
         let name = crate::routing::subscription_name(&filter, &provider);
@@ -1589,7 +1578,7 @@ where
         } else {
             now_ms
         };
-        let ttl_ms = prev.policy.freshness_threshold.as_millis() as u64;
+        let ttl_ms = prev.policy.entry_ttl().as_millis() as u64;
         let vk = self.signer.verifying_key();
         let value_hash = block.hash();
         let mut entry = SignedKvEntry {
@@ -1622,7 +1611,7 @@ where
         let filter_hash = crate::routing::filter_hash(&filter);
         let peers: Vec<PeerId> = {
             let mut state = self.state.lock().await;
-            state.routes.broadcast_intents.insert(
+            state.routes.insert_broadcast_intent(
                 filter_hash,
                 crate::routing::BroadcastIntent {
                     filter: filter.clone(),
@@ -1649,21 +1638,10 @@ where
         let filter_hash = crate::routing::filter_hash(&filter);
         let providers: Vec<PeerId> = {
             let mut state = self.state.lock().await;
-            if state
-                .routes
-                .broadcast_intents
-                .remove(&filter_hash)
-                .is_none()
-            {
+            if state.routes.take_broadcast_intent(&filter_hash).is_none() {
                 return Ok(());
             }
-            state
-                .routes
-                .my_subs
-                .keys()
-                .filter(|k| k.filter_hash == filter_hash)
-                .map(|k| k.provider.clone())
-                .collect()
+            state.routes.outbound_providers_for_filter(&filter_hash)
         };
         for provider in providers {
             if let Err(e) = self
