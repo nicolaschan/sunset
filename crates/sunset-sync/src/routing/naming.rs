@@ -150,4 +150,102 @@ mod tests {
         assert!(PROVIDER_TICK_NAME.starts_with(RESERVED_PREFIX));
         assert!(SUBSCRIBE_PREFIX.starts_with(RESERVED_PREFIX));
     }
+
+    /// Wire-format pin for `SUBSCRIBE_PREFIX`. Subscription entry names
+    /// produced by every sunset-sync deploy embed this byte string;
+    /// changing it without coordinated rollout silently splits the
+    /// network into peers whose `is_subscription_name` / `decode_*`
+    /// reject each other's entries.
+    #[test]
+    fn subscribe_prefix_wire_format_pin() {
+        assert_eq!(SUBSCRIBE_PREFIX, b"_sunset-sync/subscribe/");
+        assert_eq!(LINKS_NAME, b"_sunset-sync/links");
+        assert_eq!(PROVIDER_TICK_NAME, b"_sunset-sync/provider-tick");
+    }
+
+    /// Frozen hex vector for `filter_hash`. The wire format is
+    /// `blake3(postcard(filter))`; this test fails if either the hash
+    /// function or the postcard encoding of `Filter` changes. A wire-
+    /// format break here means any in-flight `_sunset-sync/subscribe/*`
+    /// entry from an older peer becomes un-decodable to a newer peer
+    /// (and vice-versa) — the routing tick republishes under a new
+    /// hash but the old peer's interest map still keys on the old one.
+    ///
+    /// Mirrors the `ContentBlock::hash` hex pin in
+    /// `sunset-store/src/types.rs` for the same reason.
+    #[test]
+    fn filter_hash_namespace_room_general_hex_vector() {
+        let f = Filter::Namespace(Bytes::from_static(b"room/general"));
+        let got = hex::encode(crate::routing::filter_hash(&f));
+        assert_eq!(
+            got, "dc56a60a0a4023f23916e4e5ba861f6b42152786ddab9280291b0706187843b6",
+            "filter_hash(Namespace(\"room/general\")) wire format changed — \
+             this is a breaking change to the SUBSCRIBE_PREFIX entry namespace"
+        );
+    }
+
+    // -- decode_filter_hash_from_name rejection paths --
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_empty_name() {
+        assert_eq!(decode_filter_hash_from_name(b""), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_unrelated_name() {
+        assert_eq!(decode_filter_hash_from_name(b"chat/room/general"), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_wrong_reserved_prefix() {
+        // Another `_sunset-sync/*` reserved prefix that isn't ours.
+        assert_eq!(decode_filter_hash_from_name(LINKS_NAME), None);
+        assert_eq!(decode_filter_hash_from_name(PROVIDER_TICK_NAME), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_short_hash() {
+        // Correct prefix + slash-terminated hash that's only 32 chars
+        // long (half the expected 64). Provider segment present and
+        // well-formed so the only thing wrong is hash length.
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"00".repeat(16)); // 32 hex chars = 16 bytes
+        name.extend_from_slice(b"/abcd");
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_long_hash() {
+        // 128 hex chars where 64 is required.
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"00".repeat(64));
+        name.extend_from_slice(b"/abcd");
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_non_hex_hash() {
+        // 64 chars, right length, but contains non-hex characters ('z').
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"z".repeat(64));
+        name.extend_from_slice(b"/abcd");
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_missing_provider_segment() {
+        // 64-char hex hash but no '/' separator — there's no provider
+        // segment at all, so split_once('/') returns None.
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"a".repeat(64));
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_non_utf8_after_prefix() {
+        // Correct prefix; tail is non-utf8 garbage.
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
 }

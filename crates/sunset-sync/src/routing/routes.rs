@@ -238,4 +238,164 @@ mod tests {
         let b = Filter::Namespace(Bytes::from_static(b"y"));
         assert_ne!(filter_hash(&a), filter_hash(&b));
     }
+
+    #[test]
+    fn me_returns_constructed_peer_id() {
+        let me = pid(b"alice");
+        let routes = Routes::new(me.clone());
+        assert_eq!(routes.me(), &me);
+    }
+
+    #[test]
+    fn broadcast_intents_snapshot_empty_when_none_inserted() {
+        let routes = Routes::new(pid(b"me"));
+        assert!(routes.broadcast_intents_snapshot().is_empty());
+    }
+
+    #[test]
+    fn broadcast_intents_snapshot_returns_inserted_intents() {
+        let mut routes = Routes::new(pid(b"me"));
+        let f1 = Filter::Keyspace(vk(b"writer1"));
+        let f2 = Filter::Keyspace(vk(b"writer2"));
+        let intent = |f: &Filter| BroadcastIntent {
+            filter: f.clone(),
+            policy: SubscriptionPolicy::store_data(),
+        };
+        assert!(
+            routes
+                .insert_broadcast_intent(filter_hash(&f1), intent(&f1))
+                .is_none()
+        );
+        assert!(
+            routes
+                .insert_broadcast_intent(filter_hash(&f2), intent(&f2))
+                .is_none()
+        );
+        let mut filters: Vec<Filter> = routes
+            .broadcast_intents_snapshot()
+            .into_iter()
+            .map(|bi| bi.filter)
+            .collect();
+        // Order is unspecified (HashMap), so sort by filter_hash for a
+        // stable assertion.
+        filters.sort_by_key(filter_hash);
+        let mut want = [f1, f2];
+        want.sort_by_key(filter_hash);
+        assert_eq!(filters, want);
+    }
+
+    #[test]
+    fn take_broadcast_intent_removes_and_returns_intent() {
+        let mut routes = Routes::new(pid(b"me"));
+        let f = Filter::Keyspace(vk(b"writer"));
+        let bi = BroadcastIntent {
+            filter: f.clone(),
+            policy: SubscriptionPolicy::relay_broad(),
+        };
+        routes.insert_broadcast_intent(filter_hash(&f), bi);
+        let taken = routes
+            .take_broadcast_intent(&filter_hash(&f))
+            .expect("intent");
+        assert_eq!(taken.filter, f);
+        assert!(routes.broadcast_intents_snapshot().is_empty());
+    }
+
+    #[test]
+    fn take_broadcast_intent_returns_none_when_absent() {
+        let mut routes = Routes::new(pid(b"me"));
+        assert!(routes.take_broadcast_intent(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn insert_broadcast_intent_replaces_and_returns_previous() {
+        let mut routes = Routes::new(pid(b"me"));
+        let f = Filter::Keyspace(vk(b"writer"));
+        let first = BroadcastIntent {
+            filter: f.clone(),
+            policy: SubscriptionPolicy::store_data(),
+        };
+        let second = BroadcastIntent {
+            filter: f.clone(),
+            policy: SubscriptionPolicy::relay_broad(),
+        };
+        routes.insert_broadcast_intent(filter_hash(&f), first);
+        let prev = routes
+            .insert_broadcast_intent(filter_hash(&f), second)
+            .expect("replaced");
+        assert_eq!(prev.policy, SubscriptionPolicy::store_data());
+        // The new one survives.
+        let snap = routes.broadcast_intents_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].policy, SubscriptionPolicy::relay_broad());
+    }
+
+    #[test]
+    fn outbound_providers_for_filter_only_returns_matching_filter() {
+        let mut routes = Routes::new(pid(b"me"));
+        let f1: FilterHash = [1u8; 32];
+        let f2: FilterHash = [2u8; 32];
+        let p1 = pid(b"p1");
+        let p2 = pid(b"p2");
+        let p3 = pid(b"p3");
+        // Two providers under f1, one under f2.
+        routes.insert_outbound(
+            OutboundKey {
+                filter_hash: f1,
+                provider: p1.clone(),
+            },
+            outbound(1000, 0),
+        );
+        routes.insert_outbound(
+            OutboundKey {
+                filter_hash: f1,
+                provider: p2.clone(),
+            },
+            outbound(1000, 0),
+        );
+        routes.insert_outbound(
+            OutboundKey {
+                filter_hash: f2,
+                provider: p3.clone(),
+            },
+            outbound(1000, 0),
+        );
+        let mut f1_providers = routes.outbound_providers_for_filter(&f1);
+        f1_providers.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut want = vec![p1, p2];
+        want.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        assert_eq!(f1_providers, want);
+        assert_eq!(routes.outbound_providers_for_filter(&f2), vec![p3]);
+        let absent: FilterHash = [3u8; 32];
+        assert!(routes.outbound_providers_for_filter(&absent).is_empty());
+    }
+
+    #[test]
+    fn outbound_filter_policy_returns_none_when_absent() {
+        let routes = Routes::new(pid(b"me"));
+        let key = OutboundKey {
+            filter_hash: [0u8; 32],
+            provider: pid(b"p"),
+        };
+        assert!(routes.outbound_filter_policy(&key).is_none());
+        assert!(routes.outbound_last_published(&key).is_none());
+    }
+
+    #[test]
+    fn outbound_filter_policy_returns_stored_pair() {
+        let mut routes = Routes::new(pid(b"me"));
+        let key = OutboundKey {
+            filter_hash: [7u8; 32],
+            provider: pid(b"p"),
+        };
+        let ob = Outbound {
+            filter: Filter::NamePrefix(Bytes::from_static(b"x/")),
+            policy: SubscriptionPolicy::relay_broad(),
+            last_published_ms: 42,
+        };
+        routes.insert_outbound(key.clone(), ob.clone());
+        let (filter, policy) = routes.outbound_filter_policy(&key).expect("present");
+        assert_eq!(filter, ob.filter);
+        assert_eq!(policy, ob.policy);
+        assert_eq!(routes.outbound_last_published(&key), Some(42));
+    }
 }
