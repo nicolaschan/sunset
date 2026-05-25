@@ -1,36 +1,13 @@
 //! Two-peer end-to-end integration test for sunset-sync.
 
-use std::rc::Rc;
-use std::sync::Arc;
+#![cfg(feature = "test-helpers")]
+
 use std::time::Duration;
 
-use bytes::Bytes;
-use sunset_store::{ContentBlock, Filter, SignedKvEntry, Store as _, VerifyingKey};
-use sunset_store_memory::MemoryStore;
+use sunset_store::{Filter, Store as _};
 use sunset_sync::routing::SubscriptionPolicy;
-use sunset_sync::test_helpers::wait_for;
+use sunset_sync::test_helpers::{TestPeer, make_entry, vk, wait_for_entry};
 use sunset_sync::test_transport::TestNetwork;
-use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
-
-fn vk(b: &[u8]) -> VerifyingKey {
-    VerifyingKey::new(Bytes::copy_from_slice(b))
-}
-
-/// Test-only signer that returns a non-empty stub signature. Adequate when
-/// the receiving store uses `AcceptAllVerifier`.
-struct StubSigner {
-    vk: VerifyingKey,
-}
-
-impl Signer for StubSigner {
-    fn verifying_key(&self) -> VerifyingKey {
-        self.vk.clone()
-    }
-
-    fn sign(&self, _payload: &[u8]) -> Bytes {
-        Bytes::from_static(&[0u8; 64])
-    }
-}
 
 #[tokio::test(flavor = "current_thread")]
 async fn alice_writes_bob_receives() {
@@ -38,50 +15,11 @@ async fn alice_writes_bob_receives() {
     local
         .run_until(async {
             let net = TestNetwork::new();
-            let alice_addr = PeerAddr::new("alice");
-            let bob_addr = PeerAddr::new("bob");
-            let alice_id = PeerId(vk(b"alice"));
-            let bob_id = PeerId(vk(b"bob"));
-
-            let alice_transport = net.transport(alice_id.clone(), alice_addr.clone());
-            let bob_transport = net.transport(bob_id.clone(), bob_addr.clone());
-
-            let alice_store = Arc::new(MemoryStore::with_accept_all());
-            let bob_store = Arc::new(MemoryStore::with_accept_all());
-
-            let alice_signer = Arc::new(StubSigner {
-                vk: alice_id.0.clone(),
-            });
-            let bob_signer = Arc::new(StubSigner {
-                vk: bob_id.0.clone(),
-            });
-
-            let alice_engine = Rc::new(SyncEngine::new(
-                alice_store.clone(),
-                alice_transport,
-                SyncConfig::default(),
-                alice_id.clone(),
-                alice_signer,
-            ));
-            let bob_engine = Rc::new(SyncEngine::new(
-                bob_store.clone(),
-                bob_transport,
-                SyncConfig::default(),
-                bob_id.clone(),
-                bob_signer,
-            ));
-
-            let alice_run = tokio::task::spawn_local({
-                let e = alice_engine.clone();
-                async move { e.run().await }
-            });
-            let bob_run = tokio::task::spawn_local({
-                let e = bob_engine.clone();
-                async move { e.run().await }
-            });
+            let alice = TestPeer::spawn(&net, b"alice");
+            let bob = TestPeer::spawn(&net, b"bob");
 
             // Bob declares interest in the `chat` keyspace.
-            bob_engine
+            bob.engine
                 .subscribe(
                     Filter::Keyspace(vk(b"chat")),
                     SubscriptionPolicy::store_data(),
@@ -90,50 +28,29 @@ async fn alice_writes_bob_receives() {
                 .unwrap();
 
             // Alice connects to Bob.
-            alice_engine.add_peer(bob_addr).await.unwrap();
+            alice.engine.add_peer(bob.addr.clone()).await.unwrap();
 
             // Alice writes (chat, k).
-            let block = ContentBlock {
-                data: Bytes::from_static(b"hello-bob"),
-                references: vec![],
-            };
-            let entry = SignedKvEntry {
-                verifying_key: vk(b"chat"),
-                name: Bytes::from_static(b"k"),
-                value_hash: block.hash(),
-                priority: 1,
-                expires_at: None,
-                signature: Bytes::new(),
-            };
-            alice_store
-                .insert(entry.clone(), Some(block.clone()))
+            let (entry, block) = make_entry(&vk(b"chat"), b"k", b"hello-bob", 1);
+            alice
+                .store
+                .insert(entry.clone(), Some(block))
                 .await
                 .unwrap();
 
             // Bob should receive it via push.
-            let received = wait_for(
-                Duration::from_secs(2),
-                Duration::from_millis(20),
-                || async {
-                    bob_store
-                        .get_entry(&vk(b"chat"), b"k")
-                        .await
-                        .unwrap()
-                        .is_some()
-                },
-            )
-            .await;
-            assert!(received, "bob did not receive alice's entry");
+            assert!(
+                wait_for_entry(&bob.store, &vk(b"chat"), b"k", Duration::from_secs(2)).await,
+                "bob did not receive alice's entry",
+            );
 
-            let bob_view = bob_store
+            let bob_view = bob
+                .store
                 .get_entry(&vk(b"chat"), b"k")
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(bob_view, entry);
-
-            alice_run.abort();
-            bob_run.abort();
         })
         .await;
 }
