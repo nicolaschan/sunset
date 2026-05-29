@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::LocalBoxStream;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::filter::{Event, Filter, Replay};
 use crate::types::{ContentBlock, Cursor, Hash, SignedKvEntry, VerifyingKey};
 use crate::verifier::SignatureVerifier;
@@ -31,10 +31,10 @@ pub type EventStream<'a> = LocalBoxStream<'a, Result<Event>>;
 pub trait Store {
     /// Insert an entry, optionally with its referenced blob.
     ///
-    /// Validation order:
-    /// 1. If `blob` is `Some`, `entry.value_hash` must equal `blob.hash()`.
-    /// 2. The configured `SignatureVerifier` must accept the entry.
-    /// 3. LWW: an existing entry with `priority >= entry.priority` causes `Error::Stale`.
+    /// Backends delegate to [`run_insert`], which performs the shared
+    /// validation (hash-check → signature-verify) and event ordering once;
+    /// the backend supplies only the atomic locked write via
+    /// [`InsertCommitter::commit_insert`].
     async fn insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()>;
 
     /// Insert a content block by itself; returns its hash.
@@ -76,4 +76,34 @@ pub trait Store {
     /// Engines reuse this for verifying messages outside the store
     /// itself (e.g. ephemeral datagrams in `sunset-sync`).
     fn verifier(&self) -> Arc<dyn SignatureVerifier>;
+}
+
+/// The backend-specific half of an insert: acquire the writer lock, atomically
+/// persist `(blob, entry)`, assign the monotonic sequence, and publish the
+/// resulting events.
+#[async_trait(?Send)]
+pub trait InsertCommitter {
+    /// Persist `(blob, entry)` atomically and publish the insert events.
+    ///
+    /// `publish_insert` MUST be called while the writer lock acquired here is
+    /// still held — broadcasting under the lock is what serializes the history
+    /// snapshot taken by `subscribe` against the live channel.
+    async fn commit_insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()>;
+}
+
+/// The shared insert envelope: validate hash + signature, then hand off to the
+/// backend's [`InsertCommitter::commit_insert`] for the atomic locked write.
+pub async fn run_insert<C: InsertCommitter>(
+    committer: &C,
+    verifier: &dyn SignatureVerifier,
+    entry: SignedKvEntry,
+    blob: Option<ContentBlock>,
+) -> Result<()> {
+    if let Some(b) = &blob {
+        if b.hash() != entry.value_hash {
+            return Err(Error::HashMismatch);
+        }
+    }
+    verifier.verify(&entry)?;
+    committer.commit_insert(entry, blob).await
 }
