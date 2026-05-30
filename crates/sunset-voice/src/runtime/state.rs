@@ -14,7 +14,7 @@ use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
 use crate::runtime::dyn_bus::DynBus;
-use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink};
+use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
 use crate::{Denoiser, VoiceDecoder, VoiceEncoder};
 
 pub(crate) struct RuntimeInner {
@@ -92,55 +92,63 @@ pub(crate) enum AutoConnectState {
     Dialing,
 }
 
-/// Shape of the last `VoicePeerState` we emitted for a peer (for debounce),
-/// plus the underlying liveness flags so the combiner can compute
-/// `in_call = frame_alive || membership_alive` deterministically regardless
-/// of the order frame/membership Stale events arrive in.
+/// Per-peer source facts the combiner debounces on. Holds only the
+/// independent inputs — frame/heartbeat/presence liveness plus the
+/// directly-observed talking/muted flags. The observable `VoicePeerState`
+/// (in_call, in_voice_channel, talking, is_muted) is a pure function of
+/// these, computed by `in_call()` / `in_voice_channel()` / `project()`.
 ///
-/// Without `frame_alive` / `membership_alive` the combiner can't distinguish
-/// "I never received a heartbeat from this peer" (membership has no entry,
-/// so no Stale event will ever fire) from "membership Stale already fired."
-/// In the former case, after a hard departure the frame Stale event would
-/// drop `talking` to false but leave `in_call` stuck at true forever.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The three liveness sources are tracked independently because they
+/// arrive on separate streams and in any order: a peer can register via
+/// frames before any heartbeat (membership has no entry to ever time
+/// out), or appear in durable presence before any P2P connection exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct EmittedState {
-    pub in_call: bool,
-    pub talking: bool,
-    pub is_muted: bool,
-    pub in_voice_channel: bool,
     pub frame_alive: bool,
     pub membership_alive: bool,
     pub presence_alive: bool,
+    pub talking: bool,
+    pub is_muted: bool,
+}
+
+impl EmittedState {
+    fn in_call(&self) -> bool {
+        self.frame_alive || self.membership_alive
+    }
+
+    fn in_voice_channel(&self) -> bool {
+        self.in_call() || self.presence_alive
+    }
+
+    pub(crate) fn project(&self, peer: PeerId) -> VoicePeerState {
+        VoicePeerState {
+            peer,
+            in_call: self.in_call(),
+            talking: self.talking,
+            is_muted: self.is_muted,
+            in_voice_channel: self.in_voice_channel(),
+        }
+    }
 }
 
 impl RuntimeInner {
-    /// Record the `is_muted` flag from a heartbeat.
+    /// Apply `mutate` to the debounce entry for `peer`, and emit a fresh
+    /// `VoicePeerState` iff the observable projection changed.
     ///
-    /// Returns `Some(state)` with the updated entry when `is_muted` changed
-    /// so the caller can emit it directly, or `None` when unchanged.
-    /// Returning the state avoids a second borrow of `last_emitted` at the
-    /// call site and eliminates the `unwrap()` that was previously needed
-    /// to re-fetch the just-inserted entry.
-    pub(crate) fn last_emitted_set_muted_seen(
-        &self,
-        peer: PeerId,
-        is_muted: bool,
-    ) -> Option<EmittedState> {
-        let mut map = self.last_emitted.borrow_mut();
-        let entry = map.entry(peer).or_insert(EmittedState {
-            in_call: false,
-            talking: false,
-            is_muted: false,
-            in_voice_channel: false,
-            frame_alive: false,
-            membership_alive: false,
-            presence_alive: false,
-        });
-        if entry.is_muted != is_muted {
-            entry.is_muted = is_muted;
-            Some(*entry)
-        } else {
-            None
-        }
+    /// The `last_emitted` borrow is dropped before `emit` so a sink
+    /// callback may re-enter the runtime without a BorrowMutError.
+    pub(crate) fn apply(&self, peer: PeerId, mutate: impl FnOnce(&mut EmittedState)) {
+        let state = {
+            let mut map = self.last_emitted.borrow_mut();
+            let entry = map.entry(peer.clone()).or_default();
+            let mut next = *entry;
+            mutate(&mut next);
+            if next == *entry {
+                return;
+            }
+            *entry = next;
+            next.project(peer)
+        };
+        self.peer_state_sink.emit(&state);
     }
 }

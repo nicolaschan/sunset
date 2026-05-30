@@ -1,24 +1,8 @@
 //! Combines the three `Liveness` streams (frames, ephemeral
-//! heartbeats, durable voice-presence) into `VoicePeerState`.
-//! Debounces by suppressing emissions when the four observable
-//! booleans (`in_call`, `talking`, `is_muted`, `in_voice_channel`)
-//! don't change for a peer.
-//!
-//! `in_call = frame_alive || membership_alive` — i.e. we have audio
-//! flowing or have recently heard an over-the-air heartbeat.
-//! `in_voice_channel = frame_alive || membership_alive ||
-//! presence_alive` — anything that proves the peer is in the channel,
-//! including the durable presence record (which arrives via the sync
-//! layer regardless of whether we have a P2P connection yet).
-//!
-//! Both signals must be tracked independently because a peer can
-//! register in `last_emitted` via frames before any heartbeat arrives
-//! (or vice versa). If we computed `in_call` from only the most-recent
-//! event, a hard departure that happened before the first heartbeat
-//! reached us would leave `in_call` stuck at true: frame Stale would
-//! drop `talking` but couldn't safely flip `in_call` (the peer might
-//! still be heartbeating), and no membership Stale would ever fire
-//! because membership_liveness has no entry to time out for that peer.
+//! heartbeats, durable voice-presence) into `VoicePeerState`, debounced
+//! so a peer's emission is suppressed when its observable projection
+//! doesn't change. Each arm records one source fact via
+//! `RuntimeInner::apply`, which owns the projection and debounce.
 
 use std::rc::Weak;
 
@@ -26,8 +10,7 @@ use futures::{FutureExt, StreamExt};
 
 use sunset_core::liveness::LivenessState;
 
-use super::state::{EmittedState, RuntimeInner};
-use super::traits::VoicePeerState;
+use super::state::RuntimeInner;
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
@@ -48,83 +31,17 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 Some(ev) = frame_sub.next() => {
                     let Some(inner) = weak.upgrade() else { return; };
                     let alive = ev.state == LivenessState::Live;
-                    let mut last = inner.last_emitted.borrow_mut();
-                    let entry = last.entry(ev.peer.clone()).or_insert(EmittedState {
-                        in_call: false, talking: false, is_muted: false,
-                        in_voice_channel: false,
-                        frame_alive: false, membership_alive: false, presence_alive: false,
-                    });
-                    let mut new = *entry;
-                    new.frame_alive = alive;
-                    new.talking = alive;
-                    new.in_call = new.frame_alive || new.membership_alive;
-                    new.in_voice_channel = new.in_call || new.presence_alive;
-                    if new != *entry {
-                        *entry = new;
-                        let state = VoicePeerState {
-                            peer: ev.peer.clone(),
-                            in_call: new.in_call,
-                            talking: new.talking,
-                            is_muted: new.is_muted,
-                            in_voice_channel: new.in_voice_channel,
-                        };
-                        let sink = inner.peer_state_sink.clone();
-                        drop(last);
-                        sink.emit(&state);
-                    }
+                    inner.apply(ev.peer, |s| { s.frame_alive = alive; s.talking = alive; });
                 }
                 Some(ev) = membership_sub.next() => {
                     let Some(inner) = weak.upgrade() else { return; };
                     let alive = ev.state == LivenessState::Live;
-                    let mut last = inner.last_emitted.borrow_mut();
-                    let entry = last.entry(ev.peer.clone()).or_insert(EmittedState {
-                        in_call: false, talking: false, is_muted: false,
-                        in_voice_channel: false,
-                        frame_alive: false, membership_alive: false, presence_alive: false,
-                    });
-                    let mut new = *entry;
-                    new.membership_alive = alive;
-                    new.in_call = new.frame_alive || new.membership_alive;
-                    new.in_voice_channel = new.in_call || new.presence_alive;
-                    if new != *entry {
-                        *entry = new;
-                        let state = VoicePeerState {
-                            peer: ev.peer.clone(),
-                            in_call: new.in_call,
-                            talking: new.talking,
-                            is_muted: new.is_muted,
-                            in_voice_channel: new.in_voice_channel,
-                        };
-                        let sink = inner.peer_state_sink.clone();
-                        drop(last);
-                        sink.emit(&state);
-                    }
+                    inner.apply(ev.peer, |s| s.membership_alive = alive);
                 }
                 Some(ev) = presence_sub.next() => {
                     let Some(inner) = weak.upgrade() else { return; };
                     let alive = ev.state == LivenessState::Live;
-                    let mut last = inner.last_emitted.borrow_mut();
-                    let entry = last.entry(ev.peer.clone()).or_insert(EmittedState {
-                        in_call: false, talking: false, is_muted: false,
-                        in_voice_channel: false,
-                        frame_alive: false, membership_alive: false, presence_alive: false,
-                    });
-                    let mut new = *entry;
-                    new.presence_alive = alive;
-                    new.in_voice_channel = new.in_call || new.presence_alive;
-                    if new != *entry {
-                        *entry = new;
-                        let state = VoicePeerState {
-                            peer: ev.peer.clone(),
-                            in_call: new.in_call,
-                            talking: new.talking,
-                            is_muted: new.is_muted,
-                            in_voice_channel: new.in_voice_channel,
-                        };
-                        let sink = inner.peer_state_sink.clone();
-                        drop(last);
-                        sink.emit(&state);
-                    }
+                    inner.apply(ev.peer, |s| s.presence_alive = alive);
                 }
                 else => return,
             }

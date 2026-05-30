@@ -20,7 +20,6 @@ use sunset_sync::PeerId;
 
 use super::state::RuntimeInner;
 use crate::packet::{EncryptedVoicePacket, VoicePacket, decrypt};
-use crate::runtime::traits::VoicePeerState;
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
     async move {
@@ -151,16 +150,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     inner.membership_liveness.observe(peer.clone(), st).await;
 
                     // Emit immediately on mute change.
-                    if let Some(entry) = inner.last_emitted_set_muted_seen(peer.clone(), is_muted) {
-                        let state = VoicePeerState {
-                            peer: peer.clone(),
-                            in_call: entry.in_call,
-                            talking: entry.talking,
-                            is_muted: entry.is_muted,
-                            in_voice_channel: entry.in_voice_channel,
-                        };
-                        inner.peer_state_sink.emit(&state);
-                    }
+                    inner.apply(peer.clone(), |s| s.is_muted = is_muted);
                 }
             }
         }
