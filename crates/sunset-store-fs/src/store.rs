@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sunset_store::{
     AcceptAllVerifier, ContentBlock, Cursor, EntryStream, Error, Event, EventStream, Filter, Hash,
-    Replay, Result, SignatureVerifier, SignedKvEntry, Store, Subscription, SubscriptionList,
-    VerifyingKey,
+    InsertCommitter, InsertOutcome, Replay, Result, SignatureVerifier, SignedKvEntry, Store,
+    Subscription, SubscriptionList, VerifyingKey, run_insert,
 };
 use tokio::sync::Mutex;
 use tokio_rusqlite::Connection;
@@ -72,32 +72,22 @@ fn unwrap_store_error(e: tokio_rusqlite::Error<Error>) -> Error {
 }
 
 #[async_trait(?Send)]
-impl Store for FsStore {
-    async fn insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()> {
+impl InsertCommitter for FsStore {
+    async fn commit_insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()> {
         let _w = self.writer_mutex.lock().await;
-
-        if let Some(b) = &blob {
-            if entry.value_hash != b.hash() {
-                return Err(Error::HashMismatch);
-            }
-        }
-        self.verifier
-            .verify(&entry)
-            .map_err(|_| Error::SignatureInvalid)?;
 
         // Persist the blob first (idempotent, content-addressed). Lazy refs are
         // allowed by spec, so a subsequent SQLite failure leaves at most an
         // orphaned blob, which gc_blobs reclaims later.
-        let blob_was_new = if let Some(b) = &blob {
-            blobs::write_blob_atomic(&self.root, b).await?
-        } else {
-            false
+        let blob_added = match &blob {
+            Some(b) if blobs::write_blob_atomic(&self.root, b).await? => Some(b.hash()),
+            _ => None,
         };
 
         let entry_clone = entry.clone();
-        let outcome: kv::InsertOutcome = self
+        let outcome: InsertOutcome = self
             .conn
-            .call(move |c| -> std::result::Result<kv::InsertOutcome, Error> {
+            .call(move |c| -> std::result::Result<InsertOutcome, Error> {
                 let txn = c
                     .transaction()
                     .map_err(|e| Error::Backend(format!("begin transaction: {e}")))?;
@@ -111,18 +101,17 @@ impl Store for FsStore {
 
         // Broadcasts run WHILE holding `_w` above — do not drop the guard
         // before this block.
-        let entry_event = match outcome {
-            kv::InsertOutcome::Inserted => Event::Inserted(entry),
-            kv::InsertOutcome::Replaced { old, .. } => Event::Replaced { old, new: entry },
-        };
-        let blob_added = if blob_was_new {
-            blob.map(|b| b.hash())
-        } else {
-            None
-        };
-        self.subscriptions.publish_insert(&entry_event, blob_added);
+        self.subscriptions
+            .publish_insert(outcome, entry, blob_added);
 
         Ok(())
+    }
+}
+
+#[async_trait(?Send)]
+impl Store for FsStore {
+    async fn insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()> {
+        run_insert(self, &*self.verifier, entry, blob).await
     }
 
     async fn put_content(&self, block: ContentBlock) -> Result<Hash> {

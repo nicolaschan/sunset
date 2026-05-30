@@ -1,7 +1,7 @@
 //! SQLite KV index layer.
 
 use bytes::Bytes;
-use sunset_store::{Cursor, Error, Filter, Result, SignedKvEntry, VerifyingKey};
+use sunset_store::{Cursor, Error, Filter, InsertOutcome, Result, SignedKvEntry, VerifyingKey};
 use tokio_rusqlite::rusqlite::{self, OptionalExtension, Row, params};
 
 /// Row → SignedKvEntry. The `sequence` column is also returned so callers can
@@ -47,14 +47,6 @@ pub fn get_entry(
         |row| row_to_entry(row).map(|(_, e)| e),
     )
     .optional()
-}
-
-/// Outcome of an attempted insert. The caller uses it to decide which event
-/// variant to broadcast.
-#[derive(Debug)]
-pub enum InsertOutcome {
-    Inserted,
-    Replaced { old: SignedKvEntry },
 }
 
 /// Apply LWW + insert under an open transaction. Caller is responsible for
