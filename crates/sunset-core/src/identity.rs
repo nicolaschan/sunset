@@ -8,7 +8,8 @@ use bytes::Bytes;
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey as DalekVerifyingKey};
 use rand_core::CryptoRngCore;
 
-use sunset_store::VerifyingKey as StoreVerifyingKey;
+use sunset_store::canonical::signing_payload;
+use sunset_store::{Hash, SignedKvEntry, VerifyingKey as StoreVerifyingKey};
 
 use crate::error::{Error, Result};
 
@@ -63,6 +64,40 @@ impl Identity {
     pub fn sign(&self, msg: &[u8]) -> Signature {
         self.signing.sign(msg)
     }
+
+    /// Seal an entry draft under this identity: fill `verifying_key` from this
+    /// identity, compute the entry's canonical signing payload, sign it, and
+    /// return the entry with its `signature` field filled in.
+    ///
+    /// `verifying_key` always comes from the sealing identity, so the signature
+    /// is guaranteed to match the stated key. Centralizes the "build payload,
+    /// sign, fill signature" sequence so write-side callers don't re-derive it
+    /// by hand.
+    pub fn seal_entry(&self, draft: EntryDraft) -> SignedKvEntry {
+        let mut entry = SignedKvEntry {
+            verifying_key: self.store_verifying_key(),
+            name: draft.name,
+            value_hash: draft.value_hash,
+            priority: draft.priority,
+            expires_at: draft.expires_at,
+            signature: Bytes::new(),
+        };
+        let payload = signing_payload(&entry);
+        entry.signature = Bytes::copy_from_slice(&self.sign(&payload).to_bytes());
+        entry
+    }
+}
+
+/// The signer-independent content of a store entry, before it is sealed.
+///
+/// `verifying_key` and `signature` are intentionally absent: [`Identity::seal_entry`]
+/// fills `verifying_key` from the sealing identity (so the signature always
+/// matches the stated key) and computes `signature` over the canonical payload.
+pub struct EntryDraft {
+    pub name: Bytes,
+    pub value_hash: Hash,
+    pub priority: u64,
+    pub expires_at: Option<u64>,
 }
 
 /// The public side of an `Identity`.
@@ -196,5 +231,42 @@ mod tests {
         let sig: bytes::Bytes = sunset_sync::Signer::sign(&id, b"payload");
         assert_eq!(sig.len(), 64);
         assert_eq!(id.verifying_key(), id.store_verifying_key());
+    }
+
+    #[test]
+    fn seal_entry_produces_verifiable_signature() {
+        use sunset_store::canonical::signing_payload;
+        use sunset_store::{Hash, SignatureVerifier};
+
+        let id = fresh_identity();
+        let draft = EntryDraft {
+            name: Bytes::from_static(b"room/general/msg/00"),
+            value_hash: Hash::from_bytes([1u8; 32]),
+            priority: 7,
+            expires_at: None,
+        };
+
+        let sealed = id.seal_entry(draft);
+
+        // The store's verifier signs/verifies over `signing_payload`; the
+        // sealed signature must validate through that same path.
+        assert!(crate::verifier::Ed25519Verifier.verify(&sealed).is_ok());
+
+        // The signature is over the canonical payload — re-deriving it and
+        // checking against the verifying key must also succeed, and tampering
+        // with a covered field must make it fail (so the test can fail for a
+        // real reason).
+        assert!(
+            crate::verifier::Ed25519Verifier
+                .verify_raw(
+                    &sealed.verifying_key,
+                    &signing_payload(&sealed),
+                    &sealed.signature,
+                )
+                .is_ok()
+        );
+        let mut tampered = sealed.clone();
+        tampered.priority += 1;
+        assert!(crate::verifier::Ed25519Verifier.verify(&tampered).is_err());
     }
 }

@@ -17,11 +17,9 @@ use futures::channel::{mpsc, oneshot};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-use crate::Identity;
+use crate::{EntryDraft, Identity};
 use sunset_noise::{KkInitiator, KkResponder, KkSession, ed25519_seed_to_x25519_secret};
-use sunset_store::{
-    ContentBlock, Filter, Replay, SignedKvEntry, Store, VerifyingKey, canonical::signing_payload,
-};
+use sunset_store::{ContentBlock, Filter, Replay, SignedKvEntry, Store, VerifyingKey};
 use sunset_sync::{Error as SyncError, PeerId, Result as SyncResult, SignalMessage, Signaler};
 
 pub fn signaling_filter(room_fp_hex: &str) -> Filter {
@@ -249,17 +247,12 @@ impl<S: Store + 'static> RelaySignaler<S> {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        let mut entry = SignedKvEntry {
-            verifying_key: self.local_identity.store_verifying_key(),
+        let entry = self.local_identity.seal_entry(EntryDraft {
             name: entry_name(&self.room_fp_hex, &from, to, seq),
             value_hash,
             priority,
             expires_at: Some(priority + 3_600_000),
-            signature: Bytes::new(),
-        };
-        let payload = signing_payload(&entry);
-        let sig = self.local_identity.sign(&payload);
-        entry.signature = Bytes::copy_from_slice(&sig.to_bytes());
+        });
 
         self.store
             .insert(entry, Some(block))

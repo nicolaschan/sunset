@@ -8,7 +8,6 @@ use rand_core::CryptoRngCore;
 
 use sunset_store::{ContentBlock, Hash, SignedKvEntry};
 
-use crate::canonical::signing_payload;
 use crate::crypto::aead::{aead_decrypt, aead_encrypt, build_msg_aad, derive_msg_key, fresh_nonce};
 use crate::crypto::envelope::{
     ChannelLabel, EncryptedMessage, ImageAttachment, MessageBody, ReactionAction, SignedMessage,
@@ -16,7 +15,7 @@ use crate::crypto::envelope::{
 };
 use crate::crypto::room::{Room, RoomFingerprint};
 use crate::error::{Error, Result};
-use crate::identity::{Identity, IdentityKey};
+use crate::identity::{EntryDraft, Identity, IdentityKey};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComposedMessage {
@@ -79,16 +78,12 @@ pub fn compose_message<R: CryptoRngCore + ?Sized>(
     };
     let value_hash = block.hash();
 
-    let mut entry = SignedKvEntry {
-        verifying_key: identity.store_verifying_key(),
+    let entry = identity.seal_entry(EntryDraft {
         name: message_name(&room_fp, &value_hash),
         value_hash,
         priority: sent_at_ms,
         expires_at: None,
-        signature: Bytes::new(),
-    };
-    let outer_sig = identity.sign(&signing_payload(&entry));
-    entry.signature = Bytes::copy_from_slice(&outer_sig.to_bytes());
+    });
 
     Ok(ComposedMessage { entry, block })
 }
