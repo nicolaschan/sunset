@@ -25,7 +25,7 @@ use wasmtimer::tokio::sleep;
 
 use crate::Identity;
 use crate::membership::body::PresenceBody;
-use sunset_store::{ContentBlock, SignedKvEntry, Store, canonical::signing_payload};
+use sunset_store::{ContentBlock, SignedKvEntry, Store};
 
 /// Maximum display-name length, counted in `chars()` (Unicode scalar
 /// values, NOT grapheme clusters). Defense in depth — the UI input
@@ -132,17 +132,14 @@ async fn publish_once<S: Store + 'static>(
         let last = *handle.last_priority.borrow();
         wall_ms.max(last + 1)
     };
-    let mut entry = SignedKvEntry {
+    let entry = identity.seal_entry(SignedKvEntry {
         verifying_key: identity.store_verifying_key(),
         name: Bytes::from(name_str.to_owned()),
         value_hash,
         priority: now,
         expires_at: Some(now + ttl_ms),
         signature: Bytes::new(),
-    };
-    let payload = signing_payload(&entry);
-    let sig = identity.sign(&payload);
-    entry.signature = Bytes::copy_from_slice(&sig.to_bytes());
+    });
     store
         .insert(entry, Some(block))
         .await
