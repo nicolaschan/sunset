@@ -228,6 +228,17 @@ pub type Viewport {
   Desktop
 }
 
+/// Click-anchor for a desktop floating overlay (currently the full
+/// emoji picker). Captures the click coordinates AND `view.innerHeight`
+/// — viewport height is needed in Gleam to decide whether the overlay
+/// has room below the trigger or has to flip above; viewport width
+/// isn't carried because the horizontal clamp is expressed in CSS
+/// (`100dvw`). A record (rather than a positional tuple) because
+/// `Float`s at the call site silently swap into layout bugs.
+pub type PickerAnchor {
+  PickerAnchor(client_x: Float, client_y: Float, viewport_h: Float)
+}
+
 /// Drawer that's currently open on phone. Carried as `Option(Drawer)`
 /// on the model; `None` means closed. Desktop ignores this field
 /// because drawers don't render on desktop. Channels↔rooms is modeled

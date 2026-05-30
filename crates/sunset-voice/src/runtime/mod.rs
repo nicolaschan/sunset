@@ -315,13 +315,7 @@ impl VoiceRuntime {
             .last_emitted
             .borrow()
             .iter()
-            .map(|(peer, s)| traits::VoicePeerState {
-                peer: peer.clone(),
-                in_call: s.in_call,
-                talking: s.talking,
-                is_muted: s.is_muted,
-                in_voice_channel: s.in_voice_channel,
-            })
+            .map(|(peer, s)| s.project(peer.clone()))
             .collect()
     }
 

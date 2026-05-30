@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sunset_store::{
-    ContentBlock, Cursor, Error, Event, Hash, Result, SignatureVerifier, SignedKvEntry, Store,
-    Subscription, SubscriptionList, VerifyingKey,
+    ContentBlock, Cursor, Error, Event, Hash, InsertCommitter, InsertOutcome, Result,
+    SignatureVerifier, SignedKvEntry, Store, Subscription, SubscriptionList, VerifyingKey,
+    run_insert,
 };
 use tokio::sync::Mutex;
 
@@ -31,6 +32,16 @@ impl Inner {
         let s = self.next_sequence;
         self.next_sequence += 1;
         s
+    }
+
+    /// Insert the blob if absent; return its hash iff newly stored.
+    fn put_blob(&mut self, block: ContentBlock) -> Option<Hash> {
+        let hash = block.hash();
+        if self.blobs.contains_key(&hash) {
+            return None;
+        }
+        self.blobs.insert(hash, block);
+        Some(hash)
     }
 }
 
@@ -65,16 +76,45 @@ impl MemoryStore {
 }
 
 #[async_trait(?Send)]
+impl InsertCommitter for MemoryStore {
+    async fn commit_insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let key: KvKey = (entry.verifying_key.clone(), entry.name.clone());
+        let prev = inner.entries.get(&key).map(|s| s.entry.clone());
+        if let Some(existing) = &prev {
+            if existing.priority >= entry.priority {
+                return Err(Error::Stale);
+            }
+        }
+        let blob_added = blob.and_then(|b| inner.put_blob(b));
+        let sequence = inner.assign_sequence();
+        inner.entries.insert(
+            key,
+            StoredEntry {
+                entry: entry.clone(),
+                sequence,
+            },
+        );
+        // Broadcasts run WHILE holding the inner lock to serialize with subscribe.
+        let outcome = match prev {
+            Some(old) => InsertOutcome::Replaced { old },
+            None => InsertOutcome::Inserted,
+        };
+        self.subscriptions
+            .publish_insert(outcome, entry, blob_added);
+        Ok(())
+    }
+}
+
+#[async_trait(?Send)]
 impl Store for MemoryStore {
     async fn put_content(&self, block: ContentBlock) -> Result<Hash> {
         let hash = block.hash();
         let mut inner = self.inner.lock().await;
-        let already = inner.blobs.contains_key(&hash);
-        inner.blobs.entry(hash).or_insert(block);
         // Broadcast WHILE holding the inner lock to serialize with subscribe
-        // (mirrors the pattern in `insert`; see subscription.rs invariant comment).
-        if !already {
-            self.subscriptions.broadcast(&Event::BlobAdded(hash));
+        // (mirrors the pattern in `commit_insert`; see subscription.rs invariant).
+        if let Some(h) = inner.put_blob(block) {
+            self.subscriptions.broadcast(&Event::BlobAdded(h));
         }
         Ok(hash)
     }
@@ -85,48 +125,7 @@ impl Store for MemoryStore {
     }
 
     async fn insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()> {
-        if let Some(b) = &blob {
-            if b.hash() != entry.value_hash {
-                return Err(Error::HashMismatch);
-            }
-        }
-        self.verifier.verify(&entry)?;
-        let mut inner = self.inner.lock().await;
-        let key: KvKey = (entry.verifying_key.clone(), entry.name.clone());
-        let prev = inner.entries.get(&key).map(|s| s.entry.clone());
-        if let Some(existing) = &prev {
-            if existing.priority >= entry.priority {
-                return Err(Error::Stale);
-            }
-        }
-        let blob_added_hash = if let Some(b) = blob {
-            let already = inner.blobs.contains_key(&entry.value_hash);
-            inner.blobs.entry(entry.value_hash).or_insert(b);
-            if already {
-                None
-            } else {
-                Some(entry.value_hash)
-            }
-        } else {
-            None
-        };
-        let sequence = inner.assign_sequence();
-        inner.entries.insert(
-            key,
-            StoredEntry {
-                entry: entry.clone(),
-                sequence,
-            },
-        );
-        // Broadcasts run WHILE holding the inner lock to serialize with subscribe.
-        let entry_event = if let Some(old) = prev {
-            Event::Replaced { old, new: entry }
-        } else {
-            Event::Inserted(entry)
-        };
-        self.subscriptions
-            .publish_insert(&entry_event, blob_added_hash);
-        Ok(())
+        run_insert(self, &*self.verifier, entry, blob).await
     }
 
     async fn get_entry(&self, vk: &VerifyingKey, name: &[u8]) -> Result<Option<SignedKvEntry>> {
