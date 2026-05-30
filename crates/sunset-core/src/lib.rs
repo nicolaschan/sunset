@@ -28,7 +28,7 @@ pub use crypto::envelope::{
 pub use crypto::room::{Room, RoomFingerprint, V1_EPOCH_ID};
 pub use error::{Error, Result};
 pub use filters::{room_filter, room_messages_filter};
-pub use identity::{Identity, IdentityKey};
+pub use identity::{EntryDraft, Identity, IdentityKey};
 pub use liveness::{
     Clock, HasSenderTime, Liveness, LivenessState, PeerLivenessChange, SystemClock,
 };

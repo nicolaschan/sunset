@@ -15,7 +15,7 @@ use crate::crypto::envelope::{
 };
 use crate::crypto::room::{Room, RoomFingerprint};
 use crate::error::{Error, Result};
-use crate::identity::{Identity, IdentityKey};
+use crate::identity::{EntryDraft, Identity, IdentityKey};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComposedMessage {
@@ -78,13 +78,11 @@ pub fn compose_message<R: CryptoRngCore + ?Sized>(
     };
     let value_hash = block.hash();
 
-    let entry = identity.seal_entry(SignedKvEntry {
-        verifying_key: identity.store_verifying_key(),
+    let entry = identity.seal_entry(EntryDraft {
         name: message_name(&room_fp, &value_hash),
         value_hash,
         priority: sent_at_ms,
         expires_at: None,
-        signature: Bytes::new(),
     });
 
     Ok(ComposedMessage { entry, block })
