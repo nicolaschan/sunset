@@ -100,7 +100,8 @@ impl InsertCommitter for MemoryStore {
             Some(old) => InsertOutcome::Replaced { old },
             None => InsertOutcome::Inserted,
         };
-        self.subscriptions.publish_insert(outcome, entry, blob_added);
+        self.subscriptions
+            .publish_insert(outcome, entry, blob_added);
         Ok(())
     }
 }

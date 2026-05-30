@@ -101,7 +101,8 @@ impl InsertCommitter for FsStore {
 
         // Broadcasts run WHILE holding `_w` above — do not drop the guard
         // before this block.
-        self.subscriptions.publish_insert(outcome, entry, blob_added);
+        self.subscriptions
+            .publish_insert(outcome, entry, blob_added);
 
         Ok(())
     }
