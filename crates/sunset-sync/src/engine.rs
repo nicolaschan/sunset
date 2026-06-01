@@ -886,19 +886,34 @@ where
             if let crate::routing::SubscriptionEntry::Active { filter, provider } = sub_entry
                 && provider == self.local_peer
             {
-                let mut state = self.state.lock().await;
-                let Some(session) = state.peer_sessions.get_mut(&receiver) else {
-                    // Receiver not connected: `handle_subscription_active`
-                    // arms it when their entry is (re)delivered after they
-                    // connect.
-                    continue;
+                let (was_new, tx) = {
+                    let mut state = self.state.lock().await;
+                    let Some(session) = state.peer_sessions.get_mut(&receiver) else {
+                        // Receiver not connected: `handle_subscription_active`
+                        // arms it when their entry is (re)delivered after they
+                        // connect.
+                        continue;
+                    };
+                    let was_new = session
+                        .interests
+                        .insert(filter_hash, filter.clone())
+                        .is_none();
+                    (was_new, session.tx.clone())
                 };
-                let was_new = session
-                    .interests
-                    .insert(filter_hash, filter.clone())
-                    .is_none();
-                drop(state);
                 if was_new {
+                    // These entries are authored by the receiver (a foreign
+                    // peer), so — exactly like `handle_subscription_active` —
+                    // ask them for a digest over the filter and push whatever
+                    // they are missing. This is the catch-up path: re-arming
+                    // the interest here makes the later
+                    // `handle_subscription_active` for the re-delivered entry
+                    // see it already armed and skip its own DigestRequest, so
+                    // without this a reconnecting peer would never receive the
+                    // entries written while it was gone.
+                    let _ = tx.send(SyncMessage::DigestRequest {
+                        filter: filter.clone(),
+                        range: DigestRange::All,
+                    });
                     self.emit_engine_event(EngineEvent::PeerInterestArmed {
                         receiver: receiver.clone(),
                         filter,
