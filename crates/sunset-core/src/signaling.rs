@@ -277,6 +277,15 @@ impl<S: Store + 'static> RelaySignaler<S> {
         slot.initiator = None;
         slot.responder = Some(resp);
         slot.pending.clear();
+        // Rewind the send seq so this generation's `msg2` lands at seq 0,
+        // exactly as `reset_peer` does for the dialer's `msg1`. Without
+        // this, a rejoin's `msg2` would inherit the prior call's
+        // next_send_seq (> 0), and the dialer's seq-routing would mistake a
+        // seq>=1 `msg2` for a session frame and hang. (The new msg2
+        // overwrites the dead generation's msg2 at seq 0 by LWW; its
+        // orphaned higher-seq frames are the same acceptable noise
+        // `reset_peer` already documents.)
+        slot.next_send_seq = 0;
         Ok(vec![(seq, pt)])
     }
 
@@ -926,6 +935,142 @@ mod multi_room_tests {
                         )
                         .expect("alice recv answer");
                 assert_eq!(answer.payload.as_ref(), b"answer");
+            })
+            .await;
+    }
+
+    /// On a rejoin (the dialer refreshes and re-handshakes), the responder
+    /// rebuilds its handshake against the fresh `msg1`, but its
+    /// `next_send_seq` is already past 0 from the prior call — so its new
+    /// `msg2` must still land at seq 0 (the way `reset_peer` rewinds the
+    /// dialer's `msg1`). Otherwise the dialer's seq-routing mistakes the
+    /// `msg2` for a session frame, buffers it, and the dial hangs — the
+    /// `voice_rejoin_after_refresh` / `voice_rejoin_matrix` failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejoin_dialer_completes_when_responder_resends_msg2_after_prior_call() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let alice_id = ident(1);
+                let bob_id = ident(2);
+                let alice_pk = PeerId(alice_id.store_verifying_key());
+                let bob_pk = PeerId(bob_id.store_verifying_key());
+
+                let alice1_store = store();
+                let bob_store = store();
+                let room =
+                    Room::open_with_params("alpha", &test_fast_params()).expect("Room::open");
+                let fp = room.fingerprint();
+                let fp_hex = fp.to_hex();
+
+                // First call: alice_v1 <-> bob complete a handshake, which
+                // advances bob's next_send_seq for alice past 0.
+                let alice1 = RelaySignaler::new(alice_id.clone(), fp_hex.clone(), &alice1_store);
+                let bob = RelaySignaler::new(bob_id, fp_hex.clone(), &bob_store);
+                let alice1_disp = MultiRoomSignaler::new();
+                alice1_disp.register(fp, alice1);
+                let bob_disp = MultiRoomSignaler::new();
+                bob_disp.register(fp, bob);
+
+                alice1_disp
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"offer-v1"),
+                    })
+                    .await
+                    .expect("alice1 msg1");
+                replicate_authored(
+                    &alice1_store,
+                    &bob_store,
+                    &fp_hex,
+                    alice_pk.verifying_key(),
+                    false,
+                )
+                .await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), bob_disp.recv())
+                    .await
+                    .expect("bob recv v1 offer")
+                    .expect("bob recv v1 offer err");
+                bob_disp
+                    .send(SignalMessage {
+                        from: bob_pk.clone(),
+                        to: alice_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"answer-v1"),
+                    })
+                    .await
+                    .expect("bob msg2 v1");
+                replicate_authored(
+                    &bob_store,
+                    &alice1_store,
+                    &fp_hex,
+                    bob_pk.verifying_key(),
+                    false,
+                )
+                .await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), alice1_disp.recv())
+                    .await
+                    .expect("alice1 recv answer")
+                    .expect("alice1 recv answer err");
+
+                // Rejoin: alice refreshes — a fresh signaler + store, same
+                // identity. Her new msg1 is at seq 0 (fresh slot).
+                let alice2_store = store();
+                let alice2 = RelaySignaler::new(alice_id, fp_hex.clone(), &alice2_store);
+                let alice2_disp = MultiRoomSignaler::new();
+                alice2_disp.register(fp, alice2);
+
+                alice2_disp
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"offer-v2"),
+                    })
+                    .await
+                    .expect("alice2 msg1");
+                replicate_authored(
+                    &alice2_store,
+                    &bob_store,
+                    &fp_hex,
+                    alice_pk.verifying_key(),
+                    false,
+                )
+                .await;
+                let got = tokio::time::timeout(std::time::Duration::from_secs(2), bob_disp.recv())
+                    .await
+                    .expect("bob recv v2 offer")
+                    .expect("bob recv v2 offer err");
+                assert_eq!(got.payload.as_ref(), b"offer-v2");
+
+                // Bob rebuilds his responder and answers — his next_send_seq
+                // is past 0 from the first call.
+                bob_disp
+                    .send(SignalMessage {
+                        from: bob_pk.clone(),
+                        to: alice_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"answer-v2"),
+                    })
+                    .await
+                    .expect("bob msg2 v2");
+                replicate_authored(
+                    &bob_store,
+                    &alice2_store,
+                    &fp_hex,
+                    bob_pk.verifying_key(),
+                    false,
+                )
+                .await;
+
+                let answer =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), alice2_disp.recv())
+                        .await
+                        .expect("alice2 recv timed out — responder's rejoin msg2 not at seq 0")
+                        .expect("alice2 recv answer err");
+                assert_eq!(answer.payload.as_ref(), b"answer-v2");
             })
             .await;
     }
