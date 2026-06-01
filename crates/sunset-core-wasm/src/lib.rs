@@ -13,10 +13,6 @@ use sunset_core::{
 };
 use sunset_store::{ContentBlock, SignatureVerifier, SignedKvEntry};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /// Convert a sunset-core/sunset-store error into a `JsError` with a stable
 /// `"sunset-core: <variant>: <display>"` message prefix.
 fn js_err<E: std::fmt::Display>(prefix: &str, e: E) -> JsError {
@@ -32,10 +28,6 @@ fn require_32(label: &str, slice: &[u8]) -> Result<[u8; 32], JsError> {
         ))
     })
 }
-
-// ---------------------------------------------------------------------------
-// Identity
-// ---------------------------------------------------------------------------
 
 #[wasm_bindgen]
 #[derive(Debug)]
@@ -68,10 +60,6 @@ pub fn identity_public_from_secret(secret: &[u8]) -> Result<Vec<u8>, JsError> {
         .as_bytes()
         .to_vec())
 }
-
-// ---------------------------------------------------------------------------
-// Room
-// ---------------------------------------------------------------------------
 
 #[wasm_bindgen]
 pub struct OpenedRoom {
@@ -108,10 +96,6 @@ pub fn room_messages_filter_prefix(fingerprint: &[u8]) -> Result<Vec<u8>, JsErro
     let fp = require_32("room_messages_filter_prefix fingerprint", fingerprint)?;
     Ok(format!("{}/msg/", hex::encode(fp)).into_bytes())
 }
-
-// ---------------------------------------------------------------------------
-// Compose / decode
-// ---------------------------------------------------------------------------
 
 #[wasm_bindgen]
 pub struct ComposedMessage {
