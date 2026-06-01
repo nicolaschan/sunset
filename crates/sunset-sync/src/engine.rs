@@ -754,16 +754,6 @@ where
                         },
                     );
                 }
-                // Rebuild this peer's interests from the durable
-                // SubscriptionEntries already in our store. On a reconnect
-                // those entries survive (the fresh PeerSession above does
-                // not), so this re-arms forwarding immediately instead of
-                // waiting for the peer to re-subscribe or for the next
-                // routing-tick republish — closing the dark window in which
-                // ephemeral traffic to this peer would be silently dropped.
-                if let Err(e) = self.arm_interests_from_store(Some(&peer_id)).await {
-                    tracing::warn!("re-arming interests on PeerHello failed: {e}");
-                }
                 // Replay every current BroadcastIntent against the
                 // newly-connected peer. Errors are logged-and-continued
                 // by `fan_out_intent_to_peers`; failing AddPeer because
@@ -841,22 +831,17 @@ where
         }
     }
 
-    /// Walk the local store for `_sunset-sync/subscribe/*` entries and,
-    /// for each `Active { provider == me }` whose receiver is currently
-    /// connected, (re)populate that peer's `interests`. `only` restricts
-    /// the scan to a single peer (the PeerHello (re)connect path); `None`
-    /// arms every connected peer (the one-shot startup scan).
+    /// Walk the local store for `_sunset-sync/subscribe/*` entries at
+    /// startup and, for each `Active { provider == me }`, populate the
+    /// matching peer's `interests` *if that peer is already in
+    /// `peer_sessions`*. Otherwise skip — `handle_local_store_event`'s
+    /// SUBSCRIBE_PREFIX branch will re-fire for that entry when the
+    /// receiver connects and the PeerHello bootstrap digest exchange
+    /// replicates it back to us.
     ///
-    /// This is what keeps a peer's declared interest connection-independent.
-    /// The durable `SubscriptionEntry` in our store is the source of truth;
-    /// the per-`PeerSession` `interests` map is a cache rebuilt from it
-    /// whenever a connection is (re)established. Without this rebuild a
-    /// reconnect starts the fresh `PeerSession` with an empty interest map,
-    /// and the equal-priority re-delivery of the unchanged entry is rejected
-    /// as `Stale` before it can fire a store event — so forwarding to the
-    /// peer goes dark until the next routing-tick republish, dropping any
-    /// `publish_ephemeral` traffic (e.g. voice frames) in the gap.
-    async fn arm_interests_from_store(&self, only: Option<&PeerId>) -> Result<()> {
+    /// Outbound subscriptions and broadcast intents are NOT rehydrated
+    /// from disk; subsystems re-call subscribe on startup.
+    async fn bootstrap_routes(&self) -> Result<()> {
         let mut iter = self
             .store
             .iter(Filter::NamePrefix(Bytes::from_static(
@@ -867,10 +852,6 @@ where
             let Ok(entry) = entry_result else {
                 continue;
             };
-            let receiver = PeerId(entry.verifying_key.clone());
-            if only.is_some_and(|p| p != &receiver) {
-                continue;
-            }
             let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
                 continue;
             };
@@ -883,39 +864,20 @@ where
             else {
                 continue;
             };
+            let receiver = PeerId(entry.verifying_key.clone());
             if let crate::routing::SubscriptionEntry::Active { filter, provider } = sub_entry
                 && provider == self.local_peer
             {
                 let mut state = self.state.lock().await;
-                let Some(session) = state.peer_sessions.get_mut(&receiver) else {
-                    // Receiver not connected: `handle_subscription_active`
-                    // arms it when their entry is (re)delivered after they
-                    // connect.
-                    continue;
-                };
-                let was_new = session
-                    .interests
-                    .insert(filter_hash, filter.clone())
-                    .is_none();
-                drop(state);
-                if was_new {
-                    self.emit_engine_event(EngineEvent::PeerInterestArmed {
-                        receiver: receiver.clone(),
-                        filter,
-                    })
-                    .await;
+                if let Some(session) = state.peer_sessions.get_mut(&receiver) {
+                    session.interests.insert(filter_hash, filter);
                 }
+                // Else: receiver not connected yet; their entry will
+                // re-fire through handle_local_store_event when they
+                // connect and bootstrap digest exchange delivers it.
             }
         }
         Ok(())
-    }
-
-    /// Rehydrate interests for every already-connected peer at startup.
-    /// See [`Self::arm_interests_from_store`]. Outbound subscriptions and
-    /// broadcast intents are NOT rehydrated from disk; subsystems re-call
-    /// subscribe on startup.
-    async fn bootstrap_routes(&self) -> Result<()> {
-        self.arm_interests_from_store(None).await
     }
 
     /// Send the bootstrap digest to `peer`. The bootstrap filter covers
