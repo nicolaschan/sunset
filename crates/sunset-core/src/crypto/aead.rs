@@ -15,12 +15,11 @@
 //!       pt    = postcard(SignedMessage),
 //!   )
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand_core::CryptoRngCore;
 use sha2::Sha256;
-use sha2::digest::typenum::Unsigned;
 use zeroize::Zeroizing;
 
 use sunset_store::Hash;
@@ -85,11 +84,6 @@ pub fn aead_decrypt(key: &[u8; 32], nonce: &[u8; 24], ad: &[u8], ct: &[u8]) -> R
         .map_err(|_| Error::AeadAuthFailed)
 }
 
-/// Re-exported nonce-size constant for compile-time confirmation in tests.
-pub fn nonce_size() -> usize {
-    <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,11 +97,6 @@ mod tests {
     }
     fn sample_hash() -> Hash {
         Hash::from_bytes([7u8; 32])
-    }
-
-    #[test]
-    fn nonce_size_is_24_bytes() {
-        assert_eq!(nonce_size(), 24);
     }
 
     #[test]
