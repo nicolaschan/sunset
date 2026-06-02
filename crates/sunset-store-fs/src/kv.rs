@@ -8,6 +8,18 @@ use tokio_rusqlite::rusqlite::{self, OptionalExtension, Row, params};
 /// order. Append a `WHERE …`/`ORDER BY …` clause to build a full query.
 const ENTRY_SELECT: &str = "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature FROM entries";
 
+/// Decode a `value_hash` BLOB column (exactly 32 bytes) into a `Hash`.
+pub(crate) fn hash_from_blob(bytes: &[u8]) -> rusqlite::Result<sunset_store::Hash> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            bytes.len(),
+            rusqlite::types::Type::Blob,
+            Box::<dyn std::error::Error + Send + Sync>::from("value_hash not 32 bytes"),
+        )
+    })?;
+    Ok(sunset_store::Hash::from(arr))
+}
+
 /// Row → SignedKvEntry. The `sequence` column is also returned so callers can
 /// use it for cursors / events.
 fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<(u64, SignedKvEntry)> {
@@ -18,19 +30,10 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<(u64, SignedKvEntry)> {
     let priority: i64 = row.get("priority")?;
     let expires_at: Option<i64> = row.get("expires_at")?;
     let signature: Vec<u8> = row.get("signature")?;
-    let mut hash_bytes = [0u8; 32];
-    if value_hash.len() != 32 {
-        return Err(rusqlite::Error::FromSqlConversionFailure(
-            value_hash.len(),
-            rusqlite::types::Type::Blob,
-            Box::<dyn std::error::Error + Send + Sync>::from("value_hash not 32 bytes"),
-        ));
-    }
-    hash_bytes.copy_from_slice(&value_hash);
     let entry = SignedKvEntry {
         verifying_key: VerifyingKey(Bytes::from(verifying_key)),
         name: Bytes::from(name),
-        value_hash: sunset_store::Hash::from(hash_bytes),
+        value_hash: hash_from_blob(&value_hash)?,
         priority: priority as u64,
         expires_at: expires_at.map(|x| x as u64),
         signature: Bytes::from(signature),
