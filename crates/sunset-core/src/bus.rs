@@ -101,6 +101,7 @@ where
             verifying_key: self.identity.store_verifying_key(),
             name: name.clone(),
             payload: payload.clone(),
+            seq: 0,
             signature: Bytes::new(),
         };
         let payload_bytes = datagram_signing_payload(&unsigned);
@@ -109,6 +110,7 @@ where
             verifying_key: unsigned.verifying_key,
             name: unsigned.name,
             payload: unsigned.payload,
+            seq: unsigned.seq,
             signature,
         };
         self.engine

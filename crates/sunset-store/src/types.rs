@@ -88,14 +88,19 @@ pub struct SignedKvEntry {
 /// delivery path; carried over an unreliable transport channel and
 /// never persisted.
 ///
+/// `seq` is a per-`(verifying_key, name)` monotonic stream sequence,
+/// authenticated by `signature` so a relay cannot replay or reorder a
+/// stream without detection.
+///
 /// `signature` covers the canonical postcard encoding of
-/// `(verifying_key, name, payload)` — see
+/// `(verifying_key, name, payload, seq)` — see
 /// `canonical::datagram_signing_payload`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedDatagram {
     pub verifying_key: VerifyingKey,
     pub name: bytes::Bytes,
     pub payload: bytes::Bytes,
+    pub seq: u64,
     pub signature: bytes::Bytes,
 }
 

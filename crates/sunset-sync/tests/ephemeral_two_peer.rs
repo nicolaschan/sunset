@@ -134,6 +134,7 @@ async fn ephemeral_routes_subscriber_match() {
                 verifying_key: alice_signer.vk(),
                 name: name.clone(),
                 payload: payload.clone(),
+                seq: 0,
                 signature: Bytes::new(),
             };
             let sig = alice_signer.sign_payload(&datagram_signing_payload(&unsigned));
@@ -141,6 +142,7 @@ async fn ephemeral_routes_subscriber_match() {
                 verifying_key: alice_signer.vk(),
                 name,
                 payload,
+                seq: 0,
                 signature: sig,
             };
             alice.publish_ephemeral(datagram.clone()).await.unwrap();

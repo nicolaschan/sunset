@@ -2356,6 +2356,7 @@ mod tests {
                             verifying_key: vk(b"bob"),
                             name: Bytes::from_static(b"voice/bob/0001"),
                             payload: Bytes::from_static(b"forged"),
+                            seq: 0,
                             signature: Bytes::from_static(&[0u8; 64]),
                         },
                     )
@@ -2404,6 +2405,7 @@ mod tests {
                     verifying_key: vk(b"alice"),
                     name: Bytes::from_static(b"voice/alice/0001"),
                     payload: Bytes::from_static(b"frame"),
+                    seq: 0,
                     signature: Bytes::from_static(&[0u8; 64]),
                 };
 
@@ -2430,6 +2432,7 @@ mod tests {
                     verifying_key: vk(b"alice"),
                     name: Bytes::from_static(b"chat/alice/0001"),
                     payload: Bytes::from_static(b"frame"),
+                    seq: 0,
                     signature: Bytes::from_static(&[0u8; 64]),
                 };
 

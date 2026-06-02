@@ -754,6 +754,7 @@ mod tests {
                         verifying_key: vk(b"alice"),
                         name: Bytes::from_static(b"room/voice/alice/0"),
                         payload: Bytes::from_static(b"opus-frame"),
+                        seq: 0,
                         signature: Bytes::from_static(&[0xab; 64]),
                     },
                 };

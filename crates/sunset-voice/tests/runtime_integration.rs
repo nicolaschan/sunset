@@ -89,6 +89,7 @@ impl DynBus for TestBus {
             verifying_key: self.self_pk.clone(),
             name,
             payload,
+            seq: 0,
             signature: Bytes::new(),
         };
         // Fan out to ephemeral subscribers (loopback).
@@ -530,6 +531,7 @@ async fn subscribe_decodes_frame_and_delivers_to_sink() {
                 verifying_key: alice_pk.clone(),
                 name,
                 payload: Bytes::from(payload),
+                seq: 0,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -618,6 +620,7 @@ async fn deafened_skips_decode_and_delivery() {
                 verifying_key: alice_pk.clone(),
                 name,
                 payload: Bytes::from(payload),
+                seq: 0,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -683,6 +686,7 @@ async fn combiner_emits_state_on_heartbeat() {
                 verifying_key: alice.store_verifying_key(),
                 name,
                 payload: Bytes::from(payload),
+                seq: 0,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -780,6 +784,7 @@ async fn combiner_evicts_peer_seen_only_via_frames() {
                 verifying_key: alice_pk.clone(),
                 name,
                 payload: Bytes::from(payload),
+                seq: 0,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -1275,6 +1280,7 @@ async fn dropping_runtime_terminates_all_tasks() {
                     verifying_key: dummy_peer_vk,
                     name: voice_name,
                     payload: Bytes::new(),
+                    seq: 0,
                     signature: Bytes::new(),
                 })
                 .await;
@@ -1435,6 +1441,7 @@ async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
                                 verifying_key: alice_pk.clone(),
                                 name,
                                 payload: Bytes::from(payload),
+                                seq: 0,
                                 signature: Bytes::new(),
                             })
                             .await;
@@ -1766,6 +1773,7 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
                         verifying_key: sender_pk.clone(),
                         name,
                         payload: Bytes::from(payload),
+                        seq: 0,
                         signature: Bytes::new(),
                     })
                     .await;
