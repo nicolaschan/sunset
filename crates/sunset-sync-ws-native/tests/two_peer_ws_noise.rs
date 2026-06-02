@@ -20,6 +20,7 @@ use sunset_core::{
 use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret};
 use sunset_store::{ContentBlock, Hash, Store as _};
 use sunset_store_memory::MemoryStore;
+use sunset_sync::routing::{SubscriptionPolicy, subscription_name};
 use sunset_sync::test_helpers::wait_for;
 use sunset_sync::{PeerAddr, PeerId, SyncConfig, SyncEngine};
 use sunset_sync_ws_native::{WebSocketRawTransport, axum_integration};
@@ -128,22 +129,28 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             });
 
             // ---- bob declares interest ----
+            let bob_filter = room_messages_filter(&bob_room);
             bob_engine
-                .publish_subscription(room_messages_filter(&bob_room), Duration::from_secs(60))
+                .subscribe(bob_filter.clone(), SubscriptionPolicy::store_data())
                 .await
                 .unwrap();
 
             // ---- alice connects to bob ----
             alice_engine.add_peer(bob_addr).await.unwrap();
 
-            // ---- wait for subscription propagation ----
+            // Wait until Bob's `SubscriptionEntry::Active(provider=alice)`
+            // has replicated into alice's store.
+            let expected_name = subscription_name(&bob_filter, &alice_peer);
             let registered = wait_for(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
                 || async {
-                    alice_engine
-                        .knows_peer_subscription(&bob.store_verifying_key())
+                    alice_store
+                        .get_entry(&bob.store_verifying_key(), &expected_name)
                         .await
+                        .ok()
+                        .flatten()
+                        .is_some()
                 },
             )
             .await;

@@ -97,49 +97,26 @@ where
             crate::signaling::RelaySignaler::new(self.identity.clone(), fp.to_hex(), &self.store);
         self.rtc_signaler_dispatcher.register(fp, signaler.clone());
 
-        // Publish the room subscription.
+        // Publish the room subscription via the high-level subscribe
+        // API (records a BroadcastIntent + auto-resubscribes on
+        // PeerHello, so we don't need an explicit renewal loop here).
         let filter = crate::filters::room_filter(&room);
         self.engine
-            .publish_subscription(filter, std::time::Duration::from_secs(3600))
+            .subscribe(
+                filter,
+                sunset_sync::routing::SubscriptionPolicy::store_data(),
+            )
             .await
-            .map_err(|e| crate::Error::Other(format!("publish_subscription: {e}")))?;
-
-        // Build cancel signal up front so we can hand it to background tasks.
-        let cancel = Rc::new(std::cell::Cell::new(false));
-
-        // Spawn the subscription renewal task. Re-publishes at TTL/2.
-        let engine_for_renewal = self.engine.clone();
-        let room_for_renewal = room.clone();
-        let cancel_for_renewal = cancel.clone();
-        const SUBSCRIPTION_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-        sunset_sync::spawn::spawn_local(async move {
-            #[cfg(not(target_arch = "wasm32"))]
-            use tokio::time::sleep;
-            #[cfg(target_arch = "wasm32")]
-            use wasmtimer::tokio::sleep;
-            let renewal = SUBSCRIPTION_TTL / 2;
-            loop {
-                sleep(renewal).await;
-                if cancel_for_renewal.get() {
-                    return;
-                }
-                let f = crate::filters::room_filter(&room_for_renewal);
-                if let Err(e) = engine_for_renewal
-                    .publish_subscription(f, SUBSCRIPTION_TTL)
-                    .await
-                {
-                    tracing::warn!("subscription renewal failed: {e}");
-                }
-            }
-        });
+            .map_err(|e| crate::Error::Other(format!("subscribe: {e}")))?;
 
         // The per-room signaler doesn't need a strong ref on RoomState:
         // RelaySignaler::new spawned its dispatcher task with its own
         // strong Rc, and dispatcher.register stored another in the
         // dispatcher's HashMap. RoomState::drop's `unregister` call
         // drops the latter; the dispatcher task keeps the signaler
-        // alive until its store-subscribe stream ends.
-        let _ = signaler;
+        // alive until its store-subscribe stream ends. The local
+        // `signaler` binding falls out of scope here without any
+        // further wiring.
 
         // Spawn the per-room reaction tracker. It subscribes to
         // <room_fp>/msg/, decodes Reaction entries, applies LWW per
@@ -162,6 +139,9 @@ where
         chans.insert(crate::ChannelLabel::default_general());
         let observed_channels = Rc::new(std::cell::RefCell::new(chans));
 
+        // `cancel_decode` is consumed by the decode loop spawned in
+        // `OpenRoom::spawn_decode_loop`; `RoomState::drop` flips it to
+        // signal shutdown.
         let state = Rc::new(open_room::RoomState {
             room,
             peer_weak: Rc::downgrade(self),
@@ -169,7 +149,7 @@ where
             publisher: std::cell::RefCell::new(None),
             tracker_handles: Rc::new(crate::membership::TrackerHandles::new()),
             reaction_handles,
-            cancel_decode: cancel,
+            cancel_decode: Rc::new(std::cell::Cell::new(false)),
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
             observed_channels,
             decoded_text_messages: Rc::new(std::cell::RefCell::new(
@@ -1349,24 +1329,67 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn renewal_loop_exits_when_cancel_set() {
+    async fn decode_loop_cancels_on_open_room_drop() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let peer = helpers::mk_peer(ident(14)).await;
                 let room = peer.open_room("alpha").await.expect("open_room");
 
-                // Drop the OpenRoom handle; verify cancel was set.
                 let cancel = room.inner.cancel_decode.clone();
                 drop(room);
-                // The Drop impl on RoomState (Phase 4) fires cancel_decode = true.
-                // Yield so the renewal-loop / decode-loop tasks notice (we don't
-                // actually assert their termination here — just that the cancel
-                // signal is set, which structurally guarantees their exit).
+                // `RoomState::drop` flips cancel_decode. The decode
+                // loop's exit follows structurally from the flag; we
+                // only assert the flag here.
                 tokio::task::yield_now().await;
                 assert!(
                     cancel.get(),
                     "cancel_decode should be set after OpenRoom drop"
+                );
+            })
+            .await;
+    }
+
+    /// `Peer::open_room` calls `engine.subscribe(room_filter, …)`,
+    /// which records a `BroadcastIntent`. `RoomState::drop` must pair
+    /// that with `engine.unsubscribe(filter)` — otherwise every
+    /// open/close cycle leaks an intent, and the PeerHello
+    /// auto-resubscriber replays it on every reconnect, growing
+    /// SubscriptionEntry traffic linearly with session-time reopens.
+    #[tokio::test(flavor = "current_thread")]
+    async fn room_drop_unsubscribes_engine_broadcast_intent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let peer = helpers::mk_peer(ident(80)).await;
+                let room = peer.open_room("alpha").await.expect("open_room");
+                let filter = crate::filters::room_filter(&room.inner.room);
+
+                let pre = peer.engine().broadcast_intent_filters_snapshot().await;
+                assert!(
+                    pre.iter().any(|f| f == &filter),
+                    "expected open_room to record a BroadcastIntent for room_filter; \
+                     snapshot = {pre:?}",
+                );
+
+                drop(room);
+
+                // Drop kicks the unsubscribe off via spawn_local; the
+                // engine command channel round-trip then needs the
+                // engine task to pump it. Poll while the
+                // spawn_local -> cmd_tx -> engine -> remove chain runs.
+                let mut post: Vec<sunset_store::Filter> = Vec::new();
+                for _ in 0..200 {
+                    post = peer.engine().broadcast_intent_filters_snapshot().await;
+                    if !post.iter().any(|f| f == &filter) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    !post.iter().any(|f| f == &filter),
+                    "RoomState::drop must unsubscribe the room filter; \
+                     snapshot post-drop still contains it: {post:?}",
                 );
             })
             .await;

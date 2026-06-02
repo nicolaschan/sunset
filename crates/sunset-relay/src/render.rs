@@ -79,8 +79,11 @@ pub fn render_dashboard(snap: &DashboardSnapshot) -> String {
         "  without ttl:      {}\n",
         stats.entries_without_ttl
     ));
+    let label = std::str::from_utf8(sunset_sync::routing::SUBSCRIBE_PREFIX)
+        .unwrap_or("(invalid)")
+        .trim_end_matches('/');
     out.push_str(&format!(
-        "  subscriptions:    {} (under `_sunset-sync/subscribe`)\n",
+        "  subscriptions:    {} (under `{label}`)\n",
         stats.subscription_entries
     ));
     out.push_str(&format!(
