@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use sunset_store::{Event, Filter, Replay, Store};
+use sunset_store::{Event, Filter, Replay, Store, VerifyingKey};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::digest::{BloomFilter, build_digest, entries_missing_from_remote};
@@ -284,6 +284,19 @@ pub(crate) struct EngineState {
     /// Dead senders (closed receivers) are evicted lazily on the
     /// next dispatch.
     pub ephemeral_subs: Vec<(Filter, mpsc::UnboundedSender<sunset_store::SignedDatagram>)>,
+    /// Highest ephemeral `seq` already passed through, per
+    /// `(sender verifying_key, stream name)`. The in-memory analog of
+    /// the store's idempotency for durable re-forward: an inbound
+    /// datagram at-or-below the recorded seq has already been handled,
+    /// so dropping it terminates re-forward loops. Pruned when the
+    /// sender peer drops.
+    pub ephemeral_hwm: HashMap<(VerifyingKey, Bytes), u64>,
+    /// Count of ephemeral datagrams this engine re-forwarded to at
+    /// least one peer, summed over recipients. Stays flat when an
+    /// inbound datagram matches no armed peer — the server-side ground
+    /// truth that the relay actually carried (or stopped carrying)
+    /// traffic.
+    pub ephemeral_forwarded: u64,
 }
 
 pub struct SyncEngine<S: Store, T: Transport> {
@@ -329,6 +342,8 @@ where
                 peer_sessions: HashMap::new(),
                 event_subs: Vec::new(),
                 ephemeral_subs: Vec::new(),
+                ephemeral_hwm: HashMap::new(),
+                ephemeral_forwarded: 0,
             })),
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
@@ -1523,7 +1538,14 @@ where
     async fn drop_peer_session(&self, peer_id: PeerId) -> bool {
         let was_present = {
             let mut state = self.state.lock().await;
-            state.peer_sessions.remove(&peer_id).is_some()
+            let removed = state.peer_sessions.remove(&peer_id).is_some();
+            // Drop this sender's HWM slots: a future reconnection restarts
+            // its ephemeral streams from seq 0, which a stale HWM would
+            // wrongly suppress.
+            state
+                .ephemeral_hwm
+                .retain(|(sender, _), _| *sender != peer_id.0);
+            removed
         };
         if was_present {
             self.emit_engine_event(EngineEvent::PeerRemoved {
@@ -1548,10 +1570,12 @@ where
         });
     }
 
-    /// Handle an inbound `EphemeralDelivery`: verify the datagram's
-    /// signature against the store's configured verifier and, on
-    /// success, fan it out to every in-process subscriber whose filter
-    /// matches.
+    /// Handle an inbound `EphemeralDelivery`: verify the signature, drop
+    /// already-seen seqs via the per-`(sender, name)` HWM, re-forward to
+    /// every interested peer except the source, then dispatch to local
+    /// subscribers. The re-forward mirrors `fanout_application_entry` —
+    /// `forward_targets` is interest-gated, so a leaf with no armed peer
+    /// fans out nothing by construction (no relay-role gate).
     async fn handle_ephemeral_delivery(
         &self,
         from: PeerId,
@@ -1566,7 +1590,50 @@ where
             tracing::debug!(from = ?from, "dropping ephemeral datagram — bad signature");
             return;
         }
+
+        let key = (datagram.verifying_key.clone(), datagram.name.clone());
+        {
+            let mut st = self.state.lock().await;
+            // Option gate, not `unwrap_or(0)`: seq=0 is a real first value,
+            // so "no HWM yet" must forward while "HWM == 0" must drop a replay.
+            match st.ephemeral_hwm.get(&key) {
+                Some(&h) if datagram.seq <= h => return,
+                _ => {}
+            }
+
+            let msg = SyncMessage::EphemeralDelivery {
+                datagram: datagram.clone(),
+            };
+            let mut fanned = 0u64;
+            for (peer, session) in crate::routing::forward_targets(
+                &st.peer_sessions,
+                &datagram.verifying_key,
+                &datagram.name,
+            ) {
+                if *peer == from {
+                    continue;
+                }
+                let _ = session.tx.send(msg.clone());
+                fanned += 1;
+            }
+
+            // Advance the HWM regardless (dedup), but count only real
+            // fan-out so the counter stays flat when nothing was forwarded.
+            st.ephemeral_hwm.insert(key, datagram.seq);
+            if fanned > 0 {
+                st.ephemeral_forwarded += fanned;
+            }
+        }
+
         self.dispatch_ephemeral_local(&datagram).await;
+    }
+
+    /// Count of ephemeral datagrams this engine re-forwarded, summed over
+    /// recipients. Server-side ground truth for the relay-fallback e2e:
+    /// it rises while the relay carries audio and stays flat once a direct
+    /// path supplants it.
+    pub async fn ephemeral_forwarded(&self) -> u64 {
+        self.state.lock().await.ephemeral_forwarded
     }
 
     /// Re-publish an active subscription to refresh its TTL. Called by the
@@ -1791,7 +1858,6 @@ where
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use sunset_store::VerifyingKey;
     use sunset_store_memory::MemoryStore;
 
     use crate::Signer;
@@ -2413,6 +2479,188 @@ mod tests {
 
                 let got = sub.recv().await.expect("loopback delivery");
                 assert_eq!(got, datagram);
+            })
+            .await;
+    }
+
+    /// Inject a peer session whose interests arm `filter`, with a fake
+    /// outbound channel so the test can observe what is re-forwarded to it.
+    fn arm_peer(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        peer: PeerId,
+        filter: Filter,
+    ) -> mpsc::UnboundedReceiver<SyncMessage> {
+        let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
+        let mut interests = std::collections::HashMap::new();
+        interests.insert(crate::routing::filter_hash(&filter), filter);
+        engine
+            .state
+            .try_lock()
+            .expect("uncontended in single-threaded test")
+            .peer_sessions
+            .insert(
+                peer,
+                PeerSession {
+                    conn_id: ConnectionId::for_test(1),
+                    kind: TransportKind::Unknown,
+                    tx,
+                    _shutdown: tokio::sync::watch::channel(()).0,
+                    interests,
+                },
+            );
+        rx
+    }
+
+    /// `ephemeral_forwarded` counts recipients on real fan-out and stays
+    /// FLAT when an inbound datagram matches no armed peer. The flat
+    /// property is the server-side ground truth the e2e relies on to prove
+    /// the relay stops carrying audio once a direct path forms.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_forwarded_only_when_fanned_out() {
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("relay", b"relay"));
+
+                let a = PeerId(vk(b"alice"));
+                let b = PeerId(vk(b"bob"));
+
+                // Both A and B have armed interest in alice's voice stream
+                // (A would, e.g., via a broad subscribe at the relay). A is
+                // therefore a fan-out candidate — the source-exclusion is
+                // what keeps it from being echoed its own frame.
+                let mut a_rx = arm_peer(
+                    &engine,
+                    a.clone(),
+                    Filter::NamePrefix(Bytes::from_static(b"voice/alice")),
+                );
+                let mut b_rx = arm_peer(
+                    &engine,
+                    b.clone(),
+                    Filter::NamePrefix(Bytes::from_static(b"voice/alice")),
+                );
+
+                // A delivers a datagram on its voice stream (seq=0).
+                engine
+                    .handle_ephemeral_delivery(
+                        a.clone(),
+                        SignedDatagram {
+                            verifying_key: vk(b"alice"),
+                            name: Bytes::from_static(b"voice/alice/0001"),
+                            payload: Bytes::from_static(b"frame-0"),
+                            seq: 0,
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                // Forwarded to B exactly once; never echoed to A. The send
+                // is synchronous inside handle_ephemeral_delivery, so a
+                // non-blocking try_recv is deterministic — and a regression
+                // that drops the forward fails fast instead of hanging.
+                let fwd = b_rx.try_recv().expect("forwarded to B");
+                match fwd {
+                    SyncMessage::EphemeralDelivery { datagram } => {
+                        assert_eq!(datagram.payload, Bytes::from_static(b"frame-0"));
+                    }
+                    other => panic!("expected EphemeralDelivery, got {other:?}"),
+                }
+                assert!(
+                    a_rx.try_recv().is_err(),
+                    "source A must not be echoed its own datagram"
+                );
+                // Only B counted, not the source A.
+                assert_eq!(engine.ephemeral_forwarded().await, 1);
+
+                // A second datagram with NO matching armed peer: a different
+                // sender whose stream nobody armed. Counter must stay FLAT.
+                engine
+                    .handle_ephemeral_delivery(
+                        PeerId(vk(b"carol")),
+                        SignedDatagram {
+                            verifying_key: vk(b"carol"),
+                            name: Bytes::from_static(b"voice/carol/0001"),
+                            payload: Bytes::from_static(b"frame-x"),
+                            seq: 0,
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                assert_eq!(
+                    engine.ephemeral_forwarded().await,
+                    1,
+                    "counter must stay flat when nothing was fanned out"
+                );
+            })
+            .await;
+    }
+
+    /// HWM dedup is Option-based: seq=0 is a real first value (forwarded),
+    /// replays at-or-below the HWM drop, a higher seq advances and forwards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_hwm_first_seq_0_then_dedups() {
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("relay", b"relay"));
+
+                let s = PeerId(vk(b"sender"));
+                let b = PeerId(vk(b"bob"));
+                let name = Bytes::from_static(b"voice/sender/0001");
+
+                let mut b_rx = arm_peer(
+                    &engine,
+                    b.clone(),
+                    Filter::NamePrefix(Bytes::from_static(b"voice/sender")),
+                );
+
+                let deliver = |seq: u64| {
+                    let engine = engine.clone();
+                    let s = s.clone();
+                    let name = name.clone();
+                    async move {
+                        engine
+                            .handle_ephemeral_delivery(
+                                s,
+                                SignedDatagram {
+                                    verifying_key: vk(b"sender"),
+                                    name,
+                                    payload: Bytes::from_static(b"frame"),
+                                    seq,
+                                    signature: Bytes::from_static(&[0u8; 64]),
+                                },
+                            )
+                            .await;
+                    }
+                };
+
+                // First datagram seq=0 IS forwarded (Option gate, not `<=0`).
+                deliver(0).await;
+                assert!(b_rx.try_recv().is_ok(), "seq=0 must be forwarded");
+                assert_eq!(engine.ephemeral_forwarded().await, 1);
+
+                // Same (sender,name,0) again → dropped.
+                deliver(0).await;
+                assert!(b_rx.try_recv().is_err(), "replay of seq=0 must be dropped");
+                assert_eq!(engine.ephemeral_forwarded().await, 1);
+
+                // seq=1 → forwarded.
+                deliver(1).await;
+                assert!(b_rx.try_recv().is_ok(), "seq=1 must be forwarded");
+                assert_eq!(engine.ephemeral_forwarded().await, 2);
+
+                // seq=0 after the HWM advanced → dropped.
+                deliver(0).await;
+                assert!(
+                    b_rx.try_recv().is_err(),
+                    "seq=0 after HWM=1 must be dropped"
+                );
+                assert_eq!(engine.ephemeral_forwarded().await, 2);
             })
             .await;
     }
