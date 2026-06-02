@@ -256,16 +256,6 @@ pub struct TrackerHandles {
     pub last_signature: Rc<RefCell<MemberSig>>,
 }
 
-impl TrackerHandles {
-    pub fn new() -> Self {
-        Self {
-            on_members: Rc::new(RefCell::new(None)),
-            peer_kinds: Rc::new(RefCell::new(HashMap::new())),
-            last_signature: Rc::new(RefCell::new(Vec::new())),
-        }
-    }
-}
-
 /// Per-room presence configuration consumed by `spawn_tracker`. Bundling
 /// the namespace key + the three timing knobs keeps the function signature
 /// under clippy's `too_many_arguments` threshold.
@@ -846,7 +836,7 @@ mod tests {
                 let bob = crate::Identity::generate(&mut OsRng);
 
                 let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
-                let handles = TrackerHandles::new();
+                let handles = TrackerHandles::default();
                 let cb_captured = captured.clone();
                 *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
                     *cb_captured.borrow_mut() = ms.to_vec();
@@ -926,7 +916,7 @@ mod tests {
                 let bob = crate::Identity::generate(&mut OsRng);
 
                 let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
-                let handles = TrackerHandles::new();
+                let handles = TrackerHandles::default();
                 let cb_captured = captured.clone();
                 *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
                     *cb_captured.borrow_mut() = ms.to_vec();
@@ -1009,7 +999,7 @@ mod tests {
                 let bob = crate::Identity::generate(&mut OsRng);
 
                 let captured: Rc<RefCell<Vec<Member>>> = Rc::new(RefCell::new(Vec::new()));
-                let handles = TrackerHandles::new();
+                let handles = TrackerHandles::default();
                 let cb_captured = captured.clone();
                 *handles.on_members.borrow_mut() = Some(Box::new(move |ms| {
                     *cb_captured.borrow_mut() = ms.to_vec();

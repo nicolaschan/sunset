@@ -147,7 +147,7 @@ where
             peer_weak: Rc::downgrade(self),
             presence_started: std::cell::Cell::new(false),
             publisher: std::cell::RefCell::new(None),
-            tracker_handles: Rc::new(crate::membership::TrackerHandles::new()),
+            tracker_handles: Rc::new(crate::membership::TrackerHandles::default()),
             reaction_handles,
             cancel_decode: Rc::new(std::cell::Cell::new(false)),
             callbacks: Rc::new(std::cell::RefCell::new(open_room::RoomCallbacks::default())),
