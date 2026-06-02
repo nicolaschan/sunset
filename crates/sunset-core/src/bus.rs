@@ -17,7 +17,7 @@ use crate::error::Result;
 // as `sunset_core::bus::*` without reaching into sunset-sync directly.
 pub use sunset_store::{Filter, SignedDatagram};
 pub use sunset_sync::routing::SubscriptionPolicy;
-pub use sunset_sync::{EngineEvent, PeerId, TransportKind};
+pub use sunset_sync::{EngineEvent, FrameVia, PeerId, TransportKind};
 
 use sunset_store::{ContentBlock, Replay, SignedKvEntry};
 
@@ -81,11 +81,13 @@ pub trait Bus {
     /// voice to observe local-decode/membership traffic and to receive
     /// frames whose remote forwarding is armed separately via
     /// `subscribe_via`. Delegates to `SyncEngine::subscribe_ephemeral`,
-    /// which records no intent.
+    /// which records no intent. Each item carries the `FrameVia`
+    /// provenance of the datagram (`Local` for our own loopback,
+    /// `Direct`/`Relay` for the inbound transport that carried it).
     async fn subscribe_ephemeral_local(
         &self,
         filter: Filter,
-    ) -> mpsc::UnboundedReceiver<SignedDatagram>;
+    ) -> mpsc::UnboundedReceiver<(SignedDatagram, FrameVia)>;
 }
 
 use std::rc::Rc;
@@ -217,8 +219,12 @@ where
             }
         };
 
+        // The merged `subscribe` stream is the broad, intent-arming bus
+        // view; its `BusEvent::Ephemeral` carries no provenance. Voice's
+        // per-frame `via` flows through `subscribe_ephemeral_local`
+        // instead, so here we drop the `FrameVia` tag.
         let ephemeral_mapped = tokio_stream::wrappers::UnboundedReceiverStream::new(ephemeral_rx)
-            .map(BusEvent::Ephemeral);
+            .map(|(datagram, _via)| BusEvent::Ephemeral(datagram));
 
         let merged = futures::stream::select(Box::pin(durable_mapped), ephemeral_mapped);
         Ok(Box::pin(merged))
@@ -254,7 +260,7 @@ where
     async fn subscribe_ephemeral_local(
         &self,
         filter: Filter,
-    ) -> mpsc::UnboundedReceiver<SignedDatagram> {
+    ) -> mpsc::UnboundedReceiver<(SignedDatagram, FrameVia)> {
         self.engine.subscribe_ephemeral(filter).await
     }
 }
@@ -319,12 +325,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let got = tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                let (got, via) = tokio::time::timeout(Duration::from_millis(50), sub.recv())
                     .await
                     .expect("loopback fired in time")
                     .expect("subscription open");
                 assert_eq!(&got.name, &Bytes::from_static(b"voice/me/0001"));
                 assert_eq!(&got.payload, &Bytes::from_static(b"frame"));
+                assert_eq!(via, FrameVia::Local, "loopback publish is tagged Local");
                 run_handle.abort();
             })
             .await;
@@ -351,7 +358,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let got = tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                let (got, _via) = tokio::time::timeout(Duration::from_millis(50), sub.recv())
                     .await
                     .expect("loopback fired in time")
                     .expect("subscription open");

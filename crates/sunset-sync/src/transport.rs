@@ -25,6 +25,50 @@ pub enum TransportKind {
     Unknown,
 }
 
+/// Which inbound path actually carried a received ephemeral frame.
+/// Stamped per-frame at the point of delivery (not re-derived from
+/// later connectivity), so a direct/relay switchover labels each frame
+/// by the transport it truly arrived on rather than by where the path
+/// stands now. Surfaced as a first-class readout a UI could render
+/// (e.g. a "relayed" indicator) — not a test-only probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum FrameVia {
+    /// Our own loopback publish — the frame never left this host.
+    Local,
+    /// Arrived over an inbound `Secondary` session (direct WebRTC).
+    Direct,
+    /// Arrived over an inbound `Primary` session (the relay).
+    Relay,
+}
+
+impl FrameVia {
+    /// Lowercase wire/JSON label (`"local"` / `"direct"` / `"relay"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameVia::Local => "local",
+            FrameVia::Direct => "direct",
+            FrameVia::Relay => "relay",
+        }
+    }
+}
+
+impl From<TransportKind> for FrameVia {
+    /// Map the inbound session's transport kind to the frame's
+    /// provenance. Only a `Secondary` session is a genuine direct
+    /// link; every other real inbound peer — `Primary` (the relay)
+    /// and `Unknown` (single-transport / test setups that nonetheless
+    /// reach us through a peer session) — is treated as `Relay`. A
+    /// loopback frame never goes through a session, so `Local` has no
+    /// `TransportKind` to map from and is set explicitly by the
+    /// publisher.
+    fn from(kind: TransportKind) -> Self {
+        match kind {
+            TransportKind::Secondary => FrameVia::Direct,
+            TransportKind::Primary | TransportKind::Unknown => FrameVia::Relay,
+        }
+    }
+}
+
 /// A factory for inbound and outbound peer connections.
 ///
 /// Implementations are `?Send`-compatible so they work in single-threaded

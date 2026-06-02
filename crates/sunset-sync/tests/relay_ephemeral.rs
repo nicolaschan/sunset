@@ -165,12 +165,14 @@ async fn relay_reforwards_ephemeral_to_indirect_peer() {
             };
             a.publish_ephemeral(datagram.clone()).await.unwrap();
 
-            // B receives it — only possible via R's re-forward.
-            let got = tokio::time::timeout(Duration::from_secs(2), b_sub.recv())
+            // B receives it — only possible via R's re-forward. It arrived
+            // over B's session to R, so its provenance is Relay.
+            let (got, via) = tokio::time::timeout(Duration::from_secs(2), b_sub.recv())
                 .await
                 .expect("ephemeral arrived in time")
                 .expect("subscription open");
             assert_eq!(got, datagram);
+            assert_eq!(via, sunset_sync::FrameVia::Relay);
 
             // A is not directly connected to B (R may be present).
             assert!(

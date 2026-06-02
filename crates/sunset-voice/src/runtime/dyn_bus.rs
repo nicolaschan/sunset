@@ -9,7 +9,7 @@ use futures::stream::LocalBoxStream;
 use tokio::sync::mpsc;
 
 use sunset_core::bus::{
-    EngineEvent, Filter, PeerId, SignedDatagram, SubscriptionPolicy, TransportKind,
+    EngineEvent, Filter, FrameVia, PeerId, SignedDatagram, SubscriptionPolicy, TransportKind,
 };
 use sunset_store::{ContentBlock, SignedKvEntry};
 
@@ -56,9 +56,10 @@ pub trait DynBus {
     async fn subscribe_engine_events(&self) -> mpsc::UnboundedReceiver<EngineEvent>;
 
     /// Open the in-process ephemeral channel for `filter` WITHOUT arming any
-    /// remote interest (no `BroadcastIntent`).
+    /// remote interest (no `BroadcastIntent`). Each item carries the
+    /// `FrameVia` provenance of the datagram.
     async fn subscribe_ephemeral_local(
         &self,
         filter: Filter,
-    ) -> mpsc::UnboundedReceiver<SignedDatagram>;
+    ) -> mpsc::UnboundedReceiver<(SignedDatagram, FrameVia)>;
 }

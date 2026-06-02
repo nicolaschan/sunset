@@ -178,7 +178,7 @@ impl DynBus for TestBus {
     async fn subscribe_ephemeral_local(
         &self,
         filter: sunset_store::Filter,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<SignedDatagram> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(SignedDatagram, sunset_sync::FrameVia)> {
         // Local ephemeral receive: register a sink so inject()/publish loopback
         // reaches it, filtered by name prefix, WITHOUT arming remote interest
         // (subscribe_via above is the separate remote-arming path).
@@ -188,12 +188,16 @@ impl DynBus for TestBus {
         };
         let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
         self.ephemeral_sinks.lock().await.push(sink_tx);
-        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
+        let (out_tx, out_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(SignedDatagram, sunset_sync::FrameVia)>();
         // Forward only prefix-matching datagrams to the caller's receiver.
+        // This loopback fixture has no transport substrate, so injected
+        // datagrams are tagged `Local`; real inbound-session provenance is
+        // covered by the engine's own tests.
         tokio::task::spawn_local(async move {
             while let Some(d) = sink_rx.recv().await {
                 if d.name.starts_with(&prefix) {
-                    let _ = out_tx.send(d);
+                    let _ = out_tx.send((d, sunset_sync::FrameVia::Local));
                 }
             }
         });
@@ -234,7 +238,7 @@ struct RecordingFrameSink {
     dropped: DroppedSink,
 }
 impl FrameSink for RecordingFrameSink {
-    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]) {
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32], _via: sunset_sync::FrameVia) {
         self.delivered
             .borrow_mut()
             .push((peer.clone(), seq, pcm.to_vec()));
@@ -1412,7 +1416,13 @@ async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
                         count: Rc<RefCell<usize>>,
                     }
                     impl FrameSink for RmsSink {
-                        fn deliver(&self, _peer: &PeerId, _seq: u32, pcm: &[f32]) {
+                        fn deliver(
+                            &self,
+                            _peer: &PeerId,
+                            _seq: u32,
+                            pcm: &[f32],
+                            _via: sunset_sync::FrameVia,
+                        ) {
                             let s: f32 = pcm.iter().map(|s| s * s).sum();
                             let rms = (s / pcm.len() as f32).sqrt();
                             *self.sum.borrow_mut() += rms;
@@ -1725,7 +1735,13 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
                 rms: PerPeerRms,
             }
             impl FrameSink for PerPeerRmsSink {
-                fn deliver(&self, peer: &PeerId, _seq: u32, pcm: &[f32]) {
+                fn deliver(
+                    &self,
+                    peer: &PeerId,
+                    _seq: u32,
+                    pcm: &[f32],
+                    _via: sunset_sync::FrameVia,
+                ) {
                     let s: f32 = pcm.iter().map(|s| s * s).sum();
                     let rms = (s / pcm.len() as f32).sqrt();
                     let mut map = self.rms.borrow_mut();

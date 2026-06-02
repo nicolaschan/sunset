@@ -279,11 +279,15 @@ pub(crate) struct EngineState {
     /// receiver being dropped) are evicted lazily on the next emit.
     pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
     /// Active in-process ephemeral subscribers. Each is a (filter,
-    /// sender) pair; the engine dispatches a `SignedDatagram` to
-    /// every subscriber whose filter matches the datagram's name.
-    /// Dead senders (closed receivers) are evicted lazily on the
-    /// next dispatch.
-    pub ephemeral_subs: Vec<(Filter, mpsc::UnboundedSender<sunset_store::SignedDatagram>)>,
+    /// sender) pair; the engine dispatches a `(SignedDatagram, FrameVia)`
+    /// to every subscriber whose filter matches the datagram's name.
+    /// The `FrameVia` tags which inbound transport carried the frame
+    /// (or `Local` for our own loopback publish). Dead senders (closed
+    /// receivers) are evicted lazily on the next dispatch.
+    pub ephemeral_subs: Vec<(
+        Filter,
+        mpsc::UnboundedSender<(sunset_store::SignedDatagram, crate::transport::FrameVia)>,
+    )>,
     /// Highest ephemeral `seq` already passed through, per
     /// `(sender verifying_key, stream name)`. The in-memory analog of
     /// the store's idempotency for durable re-forward: an inbound
@@ -419,8 +423,9 @@ where
     pub async fn subscribe_ephemeral(
         &self,
         filter: Filter,
-    ) -> mpsc::UnboundedReceiver<sunset_store::SignedDatagram> {
-        let (tx, rx) = mpsc::unbounded_channel::<sunset_store::SignedDatagram>();
+    ) -> mpsc::UnboundedReceiver<(sunset_store::SignedDatagram, crate::transport::FrameVia)> {
+        let (tx, rx) =
+            mpsc::unbounded_channel::<(sunset_store::SignedDatagram, crate::transport::FrameVia)>();
         self.state.lock().await.ephemeral_subs.push((filter, tx));
         rx
     }
@@ -434,7 +439,10 @@ where
     /// persist; does NOT retry. Returns `Ok(())` even if no peers
     /// match.
     pub async fn publish_ephemeral(&self, datagram: sunset_store::SignedDatagram) -> Result<()> {
-        self.dispatch_ephemeral_local(&datagram).await;
+        // Our own publish never crossed a transport — the loopback copy
+        // is `Local`.
+        self.dispatch_ephemeral_local(&datagram, crate::transport::FrameVia::Local)
+            .await;
 
         let msg = SyncMessage::EphemeralDelivery {
             datagram: datagram.clone(),
@@ -1557,13 +1565,18 @@ where
     }
 
     /// Fan-out a datagram to every in-process subscriber whose filter
-    /// matches `(datagram.verifying_key, datagram.name)`. Drops dead
-    /// senders (closed receivers) lazily.
-    async fn dispatch_ephemeral_local(&self, datagram: &sunset_store::SignedDatagram) {
+    /// matches `(datagram.verifying_key, datagram.name)`, tagged with
+    /// the `via` provenance the caller resolved at delivery time. Drops
+    /// dead senders (closed receivers) lazily.
+    async fn dispatch_ephemeral_local(
+        &self,
+        datagram: &sunset_store::SignedDatagram,
+        via: crate::transport::FrameVia,
+    ) {
         let mut state = self.state.lock().await;
         state.ephemeral_subs.retain(|(filter, tx)| {
             if filter.matches(&datagram.verifying_key, &datagram.name) {
-                tx.send(datagram.clone()).is_ok()
+                tx.send((datagram.clone(), via)).is_ok()
             } else {
                 !tx.is_closed()
             }
@@ -1592,8 +1605,25 @@ where
         }
 
         let key = (datagram.verifying_key.clone(), datagram.name.clone());
+        let via;
         {
             let mut st = self.state.lock().await;
+            // Provenance is sourced from the *delivering* session's
+            // transport kind, read here at delivery time and stamped onto
+            // this frame — never re-derived later from connectivity, which
+            // would mislabel an already-delivered frame across a
+            // direct/relay switchover. A Secondary session is the only
+            // genuine direct link ⇒ Direct; every other real inbound path
+            // (Primary relay, Unknown single-transport) ⇒ Relay. If the
+            // session has vanished between recv and handling, the frame
+            // still arrived over a non-direct path, so default to Relay
+            // (never Direct, which requires a confirmed Secondary).
+            via = st
+                .peer_sessions
+                .get(&from)
+                .map(|s| crate::transport::FrameVia::from(s.kind))
+                .unwrap_or(crate::transport::FrameVia::Relay);
+
             // Option gate, not `unwrap_or(0)`: seq=0 is a real first value,
             // so "no HWM yet" must forward while "HWM == 0" must drop a replay.
             match st.ephemeral_hwm.get(&key) {
@@ -1625,7 +1655,7 @@ where
             }
         }
 
-        self.dispatch_ephemeral_local(&datagram).await;
+        self.dispatch_ephemeral_local(&datagram, via).await;
     }
 
     /// Count of ephemeral datagrams this engine re-forwarded, summed over
@@ -2477,8 +2507,142 @@ mod tests {
 
                 engine.publish_ephemeral(datagram.clone()).await.unwrap();
 
-                let got = sub.recv().await.expect("loopback delivery");
+                let (got, _via) = sub.recv().await.expect("loopback delivery");
                 assert_eq!(got, datagram);
+            })
+            .await;
+    }
+
+    /// Inject a peer session with an explicit `TransportKind` and no
+    /// armed interest. Used to set up the *delivering* peer of an
+    /// inbound `EphemeralDelivery` so the test controls which inbound
+    /// transport kind the frame's provenance is sourced from.
+    fn inject_session_kind(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        peer: PeerId,
+        kind: TransportKind,
+    ) {
+        let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
+        engine
+            .state
+            .try_lock()
+            .expect("uncontended in single-threaded test")
+            .peer_sessions
+            .insert(
+                peer,
+                PeerSession {
+                    conn_id: ConnectionId::for_test(1),
+                    kind,
+                    tx,
+                    _shutdown: tokio::sync::watch::channel(()).0,
+                    interests: std::collections::HashMap::new(),
+                },
+            );
+    }
+
+    /// A received frame is tagged with the inbound transport it arrived
+    /// on, sourced from the *delivering* session's `TransportKind` at
+    /// delivery time: an inbound `Secondary` session ⇒ `Direct`, an
+    /// inbound `Primary` session (the relay) ⇒ `Relay`. The mapping is
+    /// fixed at delivery and must NOT be re-derived from later
+    /// connectivity (a switchover-time re-derive would mislabel an
+    /// already-delivered frame), which is why each datagram is stamped
+    /// here from `peer_sessions[from].kind` rather than from
+    /// `current_peers()`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_ephemeral_delivery_tags_via_from_inbound_session_kind() {
+        use crate::transport::FrameVia;
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("relay", b"relay"));
+
+                let mut sub = engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+
+                // Datagram delivered BY a Secondary (direct WebRTC) session.
+                let direct_peer = PeerId(vk(b"direct"));
+                inject_session_kind(&engine, direct_peer.clone(), TransportKind::Secondary);
+                engine
+                    .handle_ephemeral_delivery(
+                        direct_peer.clone(),
+                        SignedDatagram {
+                            verifying_key: vk(b"alice"),
+                            name: Bytes::from_static(b"voice/alice/0001"),
+                            payload: Bytes::from_static(b"via-direct"),
+                            seq: 0,
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                let (dg, via) = sub.recv().await.expect("direct frame delivered locally");
+                assert_eq!(dg.payload, Bytes::from_static(b"via-direct"));
+                assert_eq!(
+                    via,
+                    FrameVia::Direct,
+                    "frame from an inbound Secondary session is Direct"
+                );
+
+                // Datagram delivered BY a Primary (relay) session, different
+                // sender so the per-(sender,name) HWM doesn't dedup it.
+                let relay_peer = PeerId(vk(b"relay-peer"));
+                inject_session_kind(&engine, relay_peer.clone(), TransportKind::Primary);
+                engine
+                    .handle_ephemeral_delivery(
+                        relay_peer.clone(),
+                        SignedDatagram {
+                            verifying_key: vk(b"bob"),
+                            name: Bytes::from_static(b"voice/bob/0001"),
+                            payload: Bytes::from_static(b"via-relay"),
+                            seq: 0,
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                let (dg, via) = sub.recv().await.expect("relay frame delivered locally");
+                assert_eq!(dg.payload, Bytes::from_static(b"via-relay"));
+                assert_eq!(
+                    via,
+                    FrameVia::Relay,
+                    "frame from an inbound Primary (relay) session is Relay"
+                );
+            })
+            .await;
+    }
+
+    /// A loopback `publish_ephemeral` tags the local subscriber's copy
+    /// `Local` — the frame never crossed a transport.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_ephemeral_loopback_tags_via_local() {
+        use crate::transport::FrameVia;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                let mut sub = engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+
+                engine
+                    .publish_ephemeral(sunset_store::SignedDatagram {
+                        verifying_key: vk(b"alice"),
+                        name: Bytes::from_static(b"voice/alice/0001"),
+                        payload: Bytes::from_static(b"frame"),
+                        seq: 0,
+                        signature: Bytes::from_static(&[0u8; 64]),
+                    })
+                    .await
+                    .unwrap();
+
+                let (_dg, via) = sub.recv().await.expect("loopback delivery");
+                assert_eq!(via, FrameVia::Local, "loopback publish is Local");
             })
             .await;
     }

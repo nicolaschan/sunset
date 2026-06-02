@@ -148,11 +148,15 @@ async fn ephemeral_routes_subscriber_match() {
             alice.publish_ephemeral(datagram.clone()).await.unwrap();
 
             // Bob's subscriber should receive within a reasonable window.
-            let got = tokio::time::timeout(Duration::from_millis(500), bob_sub.recv())
+            // The frame crossed the (Unknown-kind TestTransport) inbound
+            // peer session, so its provenance is Relay — only a Secondary
+            // session maps to Direct.
+            let (got, via) = tokio::time::timeout(Duration::from_millis(500), bob_sub.recv())
                 .await
                 .expect("ephemeral arrived in time")
                 .expect("subscription open");
             assert_eq!(got, datagram);
+            assert_eq!(via, sunset_sync::FrameVia::Relay);
 
             // Cleanup.
             alice_run.abort();

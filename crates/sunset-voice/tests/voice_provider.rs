@@ -165,15 +165,19 @@ impl DynBus for ProviderTestBus {
     async fn subscribe_ephemeral_local(
         &self,
         filter: Filter,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<SignedDatagram> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(SignedDatagram, sunset_sync::FrameVia)> {
         let prefix = filter_prefix(&filter);
         let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
         self.ephemeral_sinks.lock().await.push(sink_tx);
-        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
+        let (out_tx, out_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(SignedDatagram, sunset_sync::FrameVia)>();
+        // This loopback fixture has no transport substrate, so injected
+        // datagrams are tagged `Local` — provenance derivation from a real
+        // inbound session kind is covered by the engine's own tests.
         tokio::task::spawn_local(async move {
             while let Some(d) = sink_rx.recv().await {
                 if d.name.starts_with(&prefix) {
-                    let _ = out_tx.send(d);
+                    let _ = out_tx.send((d, sunset_sync::FrameVia::Local));
                 }
             }
         });
@@ -196,7 +200,7 @@ impl Dialer for NoopDialer {
 
 struct NoopFrameSink;
 impl FrameSink for NoopFrameSink {
-    fn deliver(&self, _peer: &PeerId, _seq: u32, _pcm: &[f32]) {}
+    fn deliver(&self, _peer: &PeerId, _seq: u32, _pcm: &[f32], _via: sunset_sync::FrameVia) {}
     fn drop_peer(&self, _peer: &PeerId) {}
 }
 

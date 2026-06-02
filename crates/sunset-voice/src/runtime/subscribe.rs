@@ -43,7 +43,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
             .subscribe_ephemeral_local(Filter::NamePrefix(prefix))
             .await;
 
-        while let Some(datagram) = stream.recv().await {
+        while let Some((datagram, via)) = stream.recv().await {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
@@ -150,10 +150,12 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                             // passed to the sink for sequence-indexed
                             // buffering downstream. The per-peer HWM was
                             // already advanced by the dedup gate above.
-                            inner
-                                .frame_sink
-                                .borrow()
-                                .deliver(&peer, envelope_seq as u32, &pcm);
+                            inner.frame_sink.borrow().deliver(
+                                &peer,
+                                envelope_seq as u32,
+                                &pcm,
+                                via,
+                            );
                         }
                         Err(e) => tracing::warn!(error = %e, "decode failed"),
                     }

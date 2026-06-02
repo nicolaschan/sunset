@@ -318,6 +318,12 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
             &JsValue::from_f64(frame.tone_purity_440 as f64),
         )
         .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("via"),
+            &JsValue::from_str(frame.via.as_str()),
+        )
+        .unwrap();
         arr.push(&obj);
     }
     Ok(arr.into())

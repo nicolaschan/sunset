@@ -10,7 +10,8 @@ use futures::stream::LocalBoxStream;
 use tokio::sync::mpsc;
 
 use sunset_core::bus::{
-    Bus, BusEvent, BusImpl, EngineEvent, PeerId, SignedDatagram, SubscriptionPolicy, TransportKind,
+    Bus, BusEvent, BusImpl, EngineEvent, FrameVia, PeerId, SignedDatagram, SubscriptionPolicy,
+    TransportKind,
 };
 use sunset_store::{ContentBlock, Filter, SignedKvEntry, Store};
 use sunset_sync::Transport;
@@ -86,7 +87,7 @@ where
     async fn subscribe_ephemeral_local(
         &self,
         filter: Filter,
-    ) -> mpsc::UnboundedReceiver<SignedDatagram> {
+    ) -> mpsc::UnboundedReceiver<(SignedDatagram, FrameVia)> {
         Bus::subscribe_ephemeral_local(self, filter).await
     }
 }
@@ -162,12 +163,18 @@ mod tests {
                     .await
                     .expect("publish succeeded");
 
-                // Verify the loopback datagram arrives.
-                let d = tokio::time::timeout(std::time::Duration::from_millis(200), stream.recv())
-                    .await
-                    .expect("datagram arrived within timeout")
-                    .expect("stream open");
+                // Verify the loopback datagram arrives, tagged Local.
+                let (d, via) =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), stream.recv())
+                        .await
+                        .expect("datagram arrived within timeout")
+                        .expect("stream open");
                 assert_eq!(&d.name, &Bytes::from_static(b"voice/test/peer1"));
+                assert_eq!(
+                    via,
+                    sunset_core::bus::FrameVia::Local,
+                    "loopback publish is tagged Local"
+                );
 
                 // Routing/observation seam forwards through the trait object.
                 use sunset_core::bus::{PeerId, SubscriptionPolicy, TransportKind};

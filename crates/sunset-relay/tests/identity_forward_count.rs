@@ -177,12 +177,14 @@ async fn identity_snapshot_reports_relay_forward_count() {
             a.publish_ephemeral(datagram.clone()).await.unwrap();
 
             // B receiving the datagram proves R re-forwarded it; that is
-            // the user-observable event the snapshot's counter records.
-            let got = tokio::time::timeout(Duration::from_secs(2), b_sub.recv())
+            // the user-observable event the snapshot's counter records. It
+            // arrived over B's session to R, so its provenance is Relay.
+            let (got, via) = tokio::time::timeout(Duration::from_secs(2), b_sub.recv())
                 .await
                 .expect("ephemeral arrived in time")
                 .expect("subscription open");
             assert_eq!(got, datagram);
+            assert_eq!(via, sunset_sync::FrameVia::Relay);
 
             // The snapshot must mirror the relay's live forward count, and
             // it must have actually risen off zero.

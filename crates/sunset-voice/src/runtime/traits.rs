@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use sunset_sync::PeerId;
+use sunset_sync::{FrameVia, PeerId};
 
 /// Per-peer voice state surfaced to the UI. The runtime emits a new
 /// `VoicePeerState` whenever any of the four booleans changes.
@@ -71,8 +71,14 @@ pub trait Dialer {
 /// detect gaps. The runtime itself does no buffering — frames arrive at
 /// network cadence and the host is responsible for pacing playback
 /// against its audio clock.
+///
+/// `via` tags which inbound transport carried this frame — `Local` for
+/// our own loopback, `Direct` for a direct WebRTC session, `Relay` for
+/// the relay. A first-class readout the host can surface (e.g. a
+/// "relayed" indicator), stamped at delivery so a direct/relay
+/// switchover labels each frame by the path it truly arrived on.
 pub trait FrameSink {
-    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]);
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32], via: FrameVia);
     /// Peer transitioned from in-call to gone. Host should release
     /// per-peer playback resources (worklet node, gain node, etc.).
     fn drop_peer(&self, peer: &PeerId);
