@@ -7,7 +7,6 @@
 //! for the scope of this layer.
 
 pub mod bus;
-pub mod canonical;
 pub mod crypto;
 pub mod error;
 pub mod filters;
