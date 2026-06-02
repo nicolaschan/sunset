@@ -62,6 +62,10 @@ pub struct VoiceTasks {
     pub subscribe: futures::future::LocalBoxFuture<'static, ()>,
     pub combiner: futures::future::LocalBoxFuture<'static, ()>,
     pub auto_connect: futures::future::LocalBoxFuture<'static, ()>,
+    /// Per-participant voice-provider convergence: arms `subscribe_via`
+    /// for each call participant, preferring a direct WebRTC link and
+    /// falling back to the relay, recomputed on every engine peer-event.
+    pub voice_provider: futures::future::LocalBoxFuture<'static, ()>,
     pub voice_presence_publisher: futures::future::LocalBoxFuture<'static, ()>,
     /// Subscribes to durable `voice-presence/<room_fp>/` entries and
     /// observes them into `voice_presence_liveness`. Emits the
@@ -120,6 +124,7 @@ impl VoiceRuntime {
             subscribe: subscribe::spawn(Rc::downgrade(&inner)),
             combiner: combiner::spawn(Rc::downgrade(&inner)),
             auto_connect: auto_connect::spawn(Rc::downgrade(&inner)),
+            voice_provider: voice_provider::spawn(Rc::downgrade(&inner)),
             voice_presence_publisher: voice_presence_publisher::spawn(Rc::downgrade(&inner)),
             voice_presence_membership: voice_presence_membership::spawn(Rc::downgrade(&inner)),
         };
@@ -388,3 +393,4 @@ mod heartbeat;
 mod subscribe;
 mod voice_presence_membership;
 mod voice_presence_publisher;
+mod voice_provider;

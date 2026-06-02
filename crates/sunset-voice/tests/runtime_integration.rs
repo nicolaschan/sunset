@@ -123,26 +123,6 @@ impl DynBus for TestBus {
         Ok(())
     }
 
-    async fn subscribe_voice_prefix(
-        &self,
-        prefix: Bytes,
-    ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
-        // Register sink — all subsequent inject() and publish_ephemeral() calls
-        // will fan out to this sender.
-        self.ephemeral_sinks.lock().await.push(tx);
-
-        let stream = async_stream::stream! {
-            let mut r = rx;
-            while let Some(d) = r.recv().await {
-                if d.name.starts_with(&prefix) {
-                    yield BusEvent::Ephemeral(d);
-                }
-            }
-        };
-        Ok(Box::pin(stream))
-    }
-
     async fn subscribe_prefix(
         &self,
         prefix: Bytes,

@@ -29,11 +29,6 @@ pub trait DynBus {
         block: Option<ContentBlock>,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
-    async fn subscribe_voice_prefix(
-        &self,
-        prefix: Bytes,
-    ) -> Result<LocalBoxStream<'static, sunset_core::bus::BusEvent>, Box<dyn std::error::Error>>;
-
     async fn subscribe_prefix(
         &self,
         prefix: Bytes,

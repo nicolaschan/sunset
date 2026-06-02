@@ -45,15 +45,6 @@ where
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
 
-    async fn subscribe_voice_prefix(
-        &self,
-        prefix: Bytes,
-    ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {
-        Bus::subscribe(self, Filter::NamePrefix(prefix))
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-    }
-
     async fn subscribe_prefix(
         &self,
         prefix: Bytes,
@@ -106,9 +97,8 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use futures::StreamExt;
 
-    use sunset_core::bus::{BusEvent, BusImpl};
+    use sunset_core::bus::BusImpl;
     use sunset_core::identity::Identity;
     use sunset_store::AcceptAllVerifier;
     use sunset_store_memory::MemoryStore;
@@ -153,12 +143,14 @@ mod tests {
                 // Upcast to Rc<dyn DynBus> — this is the key test.
                 let dyn_bus: Rc<dyn DynBus> = Rc::new(bus);
 
-                // subscribe_voice_prefix
+                // Intent-free local ephemeral receive (the path the voice
+                // subscribe loop uses): loopback reaches it without arming
+                // any remote BroadcastIntent.
+                use sunset_store::Filter;
                 let prefix = Bytes::from_static(b"voice/test/");
                 let mut stream = dyn_bus
-                    .subscribe_voice_prefix(prefix)
-                    .await
-                    .expect("subscribe succeeded");
+                    .subscribe_ephemeral_local(Filter::NamePrefix(prefix))
+                    .await;
 
                 // publish_ephemeral loopback
                 dyn_bus
@@ -170,22 +162,15 @@ mod tests {
                     .await
                     .expect("publish succeeded");
 
-                // Verify the loopback event arrives.
-                let ev = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                // Verify the loopback datagram arrives.
+                let d = tokio::time::timeout(std::time::Duration::from_millis(200), stream.recv())
                     .await
-                    .expect("event arrived within timeout")
+                    .expect("datagram arrived within timeout")
                     .expect("stream open");
-
-                match ev {
-                    BusEvent::Ephemeral(d) => {
-                        assert_eq!(&d.name, &Bytes::from_static(b"voice/test/peer1"));
-                    }
-                    other => panic!("expected Ephemeral, got {other:?}"),
-                }
+                assert_eq!(&d.name, &Bytes::from_static(b"voice/test/peer1"));
 
                 // Routing/observation seam forwards through the trait object.
                 use sunset_core::bus::{PeerId, SubscriptionPolicy, TransportKind};
-                use sunset_store::Filter;
 
                 let peers: Vec<(PeerId, TransportKind)> = dyn_bus.current_peers().await;
                 assert!(peers.is_empty(), "no peers in this single-engine harness");

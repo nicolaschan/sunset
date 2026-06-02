@@ -12,9 +12,9 @@ use std::rc::Weak;
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 
-use sunset_core::bus::BusEvent;
+use sunset_core::bus::Filter;
 use sunset_core::identity::IdentityKey;
 use sunset_sync::PeerId;
 
@@ -32,21 +32,20 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         let self_pk = inner.identity.store_verifying_key();
         drop(inner);
 
-        let mut stream = match bus.subscribe_voice_prefix(prefix).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "subscribe failed");
-                return;
-            }
-        };
+        // Broad LOCAL receive: decode every voice frame/heartbeat the
+        // engine delivers to us, regardless of which provider forwarded
+        // it. This arms NO remote interest — the `voice_provider`
+        // component is the sole controller of per-participant remote
+        // arming. Heartbeats (on the `voice/{room}/{sender}/hb` subtree)
+        // share this prefix, so membership still flows for relay-only
+        // peers we have no direct link to.
+        let mut stream = bus
+            .subscribe_ephemeral_local(Filter::NamePrefix(prefix))
+            .await;
 
-        while let Some(ev) = stream.next().await {
+        while let Some(datagram) = stream.recv().await {
             let Some(inner) = weak.upgrade() else {
                 return;
-            };
-            let datagram = match ev {
-                BusEvent::Ephemeral(d) => d,
-                BusEvent::Durable { .. } => continue,
             };
             if datagram.verifying_key == self_pk {
                 continue;

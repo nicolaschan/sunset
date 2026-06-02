@@ -103,6 +103,7 @@ pub(crate) fn voice_observe_start(
     wasm_bindgen_futures::spawn_local(tasks.subscribe);
     wasm_bindgen_futures::spawn_local(tasks.combiner);
     wasm_bindgen_futures::spawn_local(tasks.auto_connect);
+    wasm_bindgen_futures::spawn_local(tasks.voice_provider);
     wasm_bindgen_futures::spawn_local(tasks.voice_presence_publisher);
     wasm_bindgen_futures::spawn_local(tasks.voice_presence_membership);
 
