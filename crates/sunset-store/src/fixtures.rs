@@ -13,11 +13,7 @@
 //! There is no third place — local re-declarations in backends are
 //! duplication.
 
-use std::sync::Arc;
-
-use crate::error::Result;
 use crate::types::{ContentBlock, SignedKvEntry, VerifyingKey};
-use crate::verifier::SignatureVerifier;
 
 /// Helper: a verifying key from static bytes.
 pub fn vk(b: &'static [u8]) -> VerifyingKey {
@@ -69,19 +65,5 @@ pub fn entry_expiring_at(
         priority,
         expires_at: Some(expires_at),
         signature: bytes::Bytes::from_static(b"sig"),
-    }
-}
-
-/// A verifier that asserts entries pass through it. Useful to detect when a
-/// backend forgets to call its verifier on insert.
-pub struct CountingVerifier(pub Arc<std::sync::atomic::AtomicUsize>);
-impl SignatureVerifier for CountingVerifier {
-    fn verify(&self, _entry: &SignedKvEntry) -> Result<()> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-    fn verify_raw(&self, _vk: &VerifyingKey, _payload: &[u8], _sig: &[u8]) -> Result<()> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
     }
 }
