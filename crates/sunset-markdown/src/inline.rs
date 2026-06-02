@@ -147,32 +147,25 @@ enum Delim {
     ItalicUnder,   // _
 }
 
+/// Two-character markers, in match priority. Order matters: these are tried
+/// before the single-char `*`/`_` arms so `**` wins over `*` and `__` over `_`.
+const TWO_CHAR: [(&[u8; 2], Delim); 4] = [
+    (b"**", Delim::Bold),
+    (b"__", Delim::Underline),
+    (b"~~", Delim::Strikethrough),
+    (b"||", Delim::Spoiler),
+];
+
 fn match_delimiter(bytes: &[u8], i: usize) -> Option<(Delim, usize)> {
-    // Order matters: longer markers first so `**` wins over `*` and `__` wins over `_`.
-    if bytes.get(i..i + 2) == Some(b"**") {
-        // Reject empty pair `****` (would otherwise produce Bold(empty)).
-        if bytes.get(i + 2..i + 4) == Some(b"**") {
-            return None;
+    for (marker, delim) in TWO_CHAR {
+        if bytes.get(i..i + 2) == Some(marker.as_slice()) {
+            // Reject the empty pair (`****`, `~~~~`, …): it would open a span
+            // with no content.
+            if bytes.get(i + 2..i + 4) == Some(marker.as_slice()) {
+                return None;
+            }
+            return Some((delim, 2));
         }
-        return Some((Delim::Bold, 2));
-    }
-    if bytes.get(i..i + 2) == Some(b"__") {
-        if bytes.get(i + 2..i + 4) == Some(b"__") {
-            return None;
-        }
-        return Some((Delim::Underline, 2));
-    }
-    if bytes.get(i..i + 2) == Some(b"~~") {
-        if bytes.get(i + 2..i + 4) == Some(b"~~") {
-            return None;
-        }
-        return Some((Delim::Strikethrough, 2));
-    }
-    if bytes.get(i..i + 2) == Some(b"||") {
-        if bytes.get(i + 2..i + 4) == Some(b"||") {
-            return None;
-        }
-        return Some((Delim::Spoiler, 2));
     }
     if bytes.get(i) == Some(&b'*') {
         return Some((Delim::ItalicStar, 1));
