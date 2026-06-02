@@ -66,6 +66,11 @@ pub struct IdentitySnapshot {
     /// production), so the resolver builds the WT URL from the
     /// user-typed authority instead.
     pub webtransport_cert_sha256: Option<String>,
+    /// Running count of ephemeral datagrams this relay re-forwarded,
+    /// summed over recipients. Server-side ground truth the voice
+    /// relay-fallback e2e polls to confirm audio is crossing the relay
+    /// (rising) vs. flowing direct (flat).
+    pub ephemeral_forwarded: u64,
 }
 
 #[derive(Clone, Debug, Default)]

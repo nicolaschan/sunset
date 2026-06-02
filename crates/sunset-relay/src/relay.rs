@@ -421,11 +421,13 @@ fn spawn_command_pump(mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>, ctx: Rc
                 }
                 RelayCommand::Identity { reply } => {
                     let snap = build_identity_snapshot(
+                        &ctx.engine,
                         ctx.ed25519_public,
                         ctx.x25519_public,
                         &ctx.dial_url,
                         ctx.webtransport_cert_sha256.as_deref(),
-                    );
+                    )
+                    .await;
                     let _ = reply.send(snap);
                 }
             }

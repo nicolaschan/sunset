@@ -2452,6 +2452,7 @@ dependencies = [
  "bytes",
  "clap",
  "curve25519-dalek",
+ "ed25519-dalek",
  "filetime",
  "futures",
  "hex",

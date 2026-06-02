@@ -76,17 +76,30 @@ where
     }
 }
 
-pub fn build_identity_snapshot(
+/// Generic over the store/transport so the relay's concrete
+/// `SyncEngine<FsStore, InboundTransport>` and the test harness's
+/// `SyncEngine<MemoryStore, TestTransport>` both satisfy it. The identity
+/// snapshot only reads the engine's `ephemeral_forwarded` counter — it
+/// never touches the store — so no `FsStore` pin is needed here (unlike
+/// `build_dashboard_snapshot`).
+pub async fn build_identity_snapshot<S, T>(
+    engine: &Rc<SyncEngine<S, T>>,
     ed25519_public: [u8; 32],
     x25519_public: [u8; 32],
     dial_url: &str,
     webtransport_cert_sha256: Option<&str>,
-) -> IdentitySnapshot {
+) -> IdentitySnapshot
+where
+    S: Store + 'static,
+    T: sunset_sync::Transport + 'static,
+    T::Connection: 'static,
+{
     IdentitySnapshot {
         ed25519_public,
         x25519_public,
         dial_url: dial_url.to_owned(),
         webtransport_cert_sha256: webtransport_cert_sha256.map(str::to_owned),
+        ephemeral_forwarded: engine.ephemeral_forwarded().await,
     }
 }
 
