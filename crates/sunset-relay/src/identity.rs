@@ -56,24 +56,10 @@ async fn generate_and_persist(path: &Path) -> Result<Identity> {
 
     let tmp = path.with_extension("key.tmp");
     tokio::fs::write(&tmp, &*seed).await?;
-    set_mode_0600(&tmp).await?;
+    crate::fs_util::set_mode_0600(&tmp).await?;
     tokio::fs::rename(&tmp, path).await?;
 
     Ok(Identity::from_secret_bytes(&seed))
-}
-
-#[cfg(unix)]
-async fn set_mode_0600(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = tokio::fs::metadata(path).await?.permissions();
-    perms.set_mode(0o600);
-    tokio::fs::set_permissions(path, perms).await?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn set_mode_0600(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(unix)]

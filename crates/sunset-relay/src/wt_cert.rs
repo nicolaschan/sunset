@@ -179,27 +179,13 @@ async fn persist(
         .store_secret_pemfile(key_path)
         .await
         .map_err(|e| Error::Identity(format!("wt key write: {e}")))?;
-    set_mode_0600(key_path).await?;
+    crate::fs_util::set_mode_0600(key_path).await?;
     // SAN sidecar — one entry per line, in the same order as the
     // requested list. `try_load_fresh` reads this back to detect SAN
     // list changes between startups.
     let mut sans_text = sans.join("\n");
     sans_text.push('\n');
     tokio::fs::write(san_path, sans_text).await?;
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn set_mode_0600(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = tokio::fs::metadata(path).await?.permissions();
-    perms.set_mode(0o600);
-    tokio::fs::set_permissions(path, perms).await?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn set_mode_0600(_path: &Path) -> Result<()> {
     Ok(())
 }
 
