@@ -50,7 +50,6 @@ async fn large_payload_over_ws_noise() {
             let alice = Identity::generate(&mut OsRng);
             let bob = Identity::generate(&mut OsRng);
 
-            // ---- bob serves via axum on a random local port ----
             let (bob_raw, ws_tx) = WebSocketRawTransport::serving();
             let app = axum::Router::new().route(
                 "/",
@@ -69,7 +68,6 @@ async fn large_payload_over_ws_noise() {
             let bob_noise =
                 NoiseTransport::new(bob_raw, Arc::new(IdentityNoiseAdapter(bob.clone())));
 
-            // ---- alice dials ----
             let alice_raw = WebSocketRawTransport::dial_only();
             let alice_noise =
                 NoiseTransport::new(alice_raw, Arc::new(IdentityNoiseAdapter(alice.clone())));
@@ -88,7 +86,6 @@ async fn large_payload_over_ws_noise() {
                 hex::encode(bob_x25519_pub),
             )));
 
-            // ---- handshake (parallel: alice connects, bob accepts) ----
             let bob_accept = tokio::task::spawn_local(async move { bob_noise.accept().await });
             let alice_conn = alice_noise
                 .connect(bob_addr)
@@ -99,7 +96,6 @@ async fn large_payload_over_ws_noise() {
                 .expect("bob accept task")
                 .expect("bob handshake");
 
-            // ---- build a ~2 MiB SyncMessage::EventDelivery ----
             let n: usize = 2 * 1024 * 1024;
             let big: Vec<u8> = (0..n).map(|i| i.wrapping_mul(17) as u8).collect();
             let block = ContentBlock {
@@ -126,7 +122,6 @@ async fn large_payload_over_ws_noise() {
                 encoded.len()
             );
 
-            // ---- send + receive + decode + assert ----
             alice_conn
                 .send_reliable(encoded.clone())
                 .await

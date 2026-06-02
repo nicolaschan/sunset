@@ -16,8 +16,6 @@ use sunset_sync::{
 #[cfg(feature = "axum")]
 pub mod axum_integration;
 
-// ---- split sink type ----
-
 enum WsSink {
     Client(SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>),
     #[cfg(feature = "axum")]
@@ -65,8 +63,6 @@ impl WsSink {
         }
     }
 }
-
-// ---- split stream type ----
 
 enum WsStream {
     Client(SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
