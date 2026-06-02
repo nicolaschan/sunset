@@ -42,6 +42,11 @@ struct TestBus {
     ephemeral_sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedDatagram>>>,
     /// Sinks registered by subscribe_prefix calls (for durable entries).
     durable_sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedKvEntry>>>,
+    /// Held senders for subscribe_engine_events receivers, so the channels
+    /// stay open for the receiver's lifetime. This fixture never emits
+    /// engine events; the receivers simply idle.
+    event_sinks:
+        tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<sunset_sync::EngineEvent>>>,
     /// Broadcast channel for publish_ephemeral so tests can observe outbound traffic.
     obs_tx: tokio::sync::broadcast::Sender<SignedDatagram>,
 }
@@ -55,6 +60,7 @@ impl TestBus {
             self_pk,
             ephemeral_sinks: tokio::sync::Mutex::new(vec![]),
             durable_sinks: tokio::sync::Mutex::new(vec![]),
+            event_sinks: tokio::sync::Mutex::new(vec![]),
             obs_tx: obs_tx.clone(),
         });
         (bus, obs_tx)
@@ -155,6 +161,63 @@ impl DynBus for TestBus {
             }
         };
         Ok(Box::pin(stream))
+    }
+
+    async fn subscribe_via(
+        &self,
+        _filter: sunset_store::Filter,
+        _provider: PeerId,
+        _policy: sunset_sync::routing::SubscriptionPolicy,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // This loopback fixture has no provider-routing substrate; arming
+        // remote interest is a no-op here.
+        Ok(())
+    }
+
+    async fn unsubscribe_via(
+        &self,
+        _filter: sunset_store::Filter,
+        _provider: PeerId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    async fn current_peers(&self) -> Vec<(PeerId, sunset_sync::TransportKind)> {
+        // No real peer set in the loopback fixture.
+        vec![]
+    }
+
+    async fn subscribe_engine_events(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<sunset_sync::EngineEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.event_sinks.lock().await.push(tx);
+        rx
+    }
+
+    async fn subscribe_ephemeral_local(
+        &self,
+        filter: sunset_store::Filter,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<SignedDatagram> {
+        // Local ephemeral receive: register a sink so inject()/publish loopback
+        // reaches it, filtered by name prefix, WITHOUT arming remote interest
+        // (subscribe_via above is the separate remote-arming path).
+        let prefix = match filter {
+            sunset_store::Filter::NamePrefix(p) => p,
+            _ => Bytes::new(),
+        };
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
+        self.ephemeral_sinks.lock().await.push(sink_tx);
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
+        // Forward only prefix-matching datagrams to the caller's receiver.
+        tokio::task::spawn_local(async move {
+            while let Some(d) = sink_rx.recv().await {
+                if d.name.starts_with(&prefix) {
+                    let _ = out_tx.send(d);
+                }
+            }
+        });
+        out_rx
     }
 }
 

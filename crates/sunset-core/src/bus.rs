@@ -8,10 +8,18 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::LocalBoxStream;
-
-use sunset_store::{ContentBlock, Filter, Replay, SignedDatagram, SignedKvEntry};
+use tokio::sync::mpsc;
 
 use crate::error::Result;
+
+// Re-export the routing/observation vocabulary so downstream crates
+// (e.g. sunset-voice) can name the seam's argument and return types
+// as `sunset_core::bus::*` without reaching into sunset-sync directly.
+pub use sunset_store::{Filter, SignedDatagram};
+pub use sunset_sync::routing::SubscriptionPolicy;
+pub use sunset_sync::{EngineEvent, PeerId, TransportKind};
+
+use sunset_store::{ContentBlock, Replay, SignedKvEntry};
 
 /// A message delivered to a Bus subscriber. Tagged by delivery mode
 /// so consumers can act differently (e.g. voice consumes Ephemeral,
@@ -43,6 +51,41 @@ pub trait Bus {
     async fn publish_ephemeral(&self, name: Bytes, seq: u64, payload: Bytes) -> Result<()>;
 
     async fn subscribe(&self, filter: Filter) -> Result<LocalBoxStream<'static, BusEvent>>;
+
+    /// Declare interest in `filter` from one specific `provider`, so that
+    /// provider forwards matching traffic to us. Delegates to
+    /// `SyncEngine::subscribe_via`.
+    async fn subscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+        policy: SubscriptionPolicy,
+    ) -> Result<()>;
+
+    /// Withdraw a `subscribe_via(filter, provider)` interest. Idempotent.
+    /// Delegates to `SyncEngine::unsubscribe_via`.
+    async fn unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()>;
+
+    /// Snapshot the currently-connected peers with each peer's transport
+    /// kind. Delegates to `SyncEngine::current_peers`.
+    async fn current_peers(&self) -> Vec<(PeerId, TransportKind)>;
+
+    /// Subscribe to engine lifecycle events (peer add/remove, interest
+    /// arming, …). Each call returns a fresh receiver; no replay.
+    /// Delegates to `SyncEngine::subscribe_engine_events`.
+    async fn subscribe_engine_events(&self) -> mpsc::UnboundedReceiver<EngineEvent>;
+
+    /// Open the in-process ephemeral channel for `filter` WITHOUT arming
+    /// any remote interest — a purely local receive that does not publish
+    /// a `BroadcastIntent` (contrast with `subscribe`, which does). Used by
+    /// voice to observe local-decode/membership traffic and to receive
+    /// frames whose remote forwarding is armed separately via
+    /// `subscribe_via`. Delegates to `SyncEngine::subscribe_ephemeral`,
+    /// which records no intent.
+    async fn subscribe_ephemeral_local(
+        &self,
+        filter: Filter,
+    ) -> mpsc::UnboundedReceiver<SignedDatagram>;
 }
 
 use std::rc::Rc;
@@ -180,6 +223,40 @@ where
         let merged = futures::stream::select(Box::pin(durable_mapped), ephemeral_mapped);
         Ok(Box::pin(merged))
     }
+
+    async fn subscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+        policy: SubscriptionPolicy,
+    ) -> Result<()> {
+        self.engine
+            .subscribe_via(filter, provider, policy)
+            .await
+            .map_err(|e| crate::Error::Sync(format!("{e}")))
+    }
+
+    async fn unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()> {
+        self.engine
+            .unsubscribe_via(filter, provider)
+            .await
+            .map_err(|e| crate::Error::Sync(format!("{e}")))
+    }
+
+    async fn current_peers(&self) -> Vec<(PeerId, TransportKind)> {
+        self.engine.current_peers().await
+    }
+
+    async fn subscribe_engine_events(&self) -> mpsc::UnboundedReceiver<EngineEvent> {
+        self.engine.subscribe_engine_events().await
+    }
+
+    async fn subscribe_ephemeral_local(
+        &self,
+        filter: Filter,
+    ) -> mpsc::UnboundedReceiver<SignedDatagram> {
+        self.engine.subscribe_ephemeral(filter).await
+    }
 }
 
 #[cfg(test)]
@@ -279,6 +356,75 @@ mod tests {
                     .expect("loopback fired in time")
                     .expect("subscription open");
                 assert_eq!(got.seq, 42, "caller seq must reach the envelope");
+                run_handle.abort();
+            })
+            .await;
+    }
+
+    /// The routing/observation seam delegates to the engine: `current_peers`
+    /// returns `(PeerId, TransportKind)` pairs, `subscribe_via`/`unsubscribe_via`
+    /// are callable through the `Bus` trait, and `subscribe_ephemeral_local`
+    /// opens the in-process ephemeral channel WITHOUT arming any remote
+    /// interest. The last property is load-bearing: a local receive must not
+    /// publish a BroadcastIntent (that would arm remote forwarding), whereas
+    /// `Bus::subscribe` does. We contrast the two against the engine's
+    /// outbound-intent snapshot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn routing_observation_seam_delegates_and_local_ephemeral_arms_no_intent() {
+        use sunset_sync::TransportKind;
+        use sunset_sync::routing::SubscriptionPolicy;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (bus, _identity, run_handle) = make_bus();
+                let other = PeerId(Identity::generate(&mut OsRng).store_verifying_key());
+
+                // current_peers is callable and yields (PeerId, TransportKind).
+                let peers: Vec<(PeerId, TransportKind)> = bus.current_peers().await;
+                assert!(peers.is_empty(), "no peers connected in this harness");
+
+                // subscribe_via / unsubscribe_via are callable through the trait.
+                bus.subscribe_via(
+                    Filter::NamePrefix(Bytes::from_static(b"voice/")),
+                    other.clone(),
+                    SubscriptionPolicy::store_data(),
+                )
+                .await
+                .expect("subscribe_via callable");
+                bus.unsubscribe_via(
+                    Filter::NamePrefix(Bytes::from_static(b"voice/")),
+                    other.clone(),
+                )
+                .await
+                .expect("unsubscribe_via callable");
+
+                // subscribe_engine_events is callable and returns a receiver.
+                let _events = bus.subscribe_engine_events().await;
+
+                // Local ephemeral subscribe must NOT arm a remote interest:
+                // the engine's outbound BroadcastIntent set stays empty.
+                let _eph = bus
+                    .subscribe_ephemeral_local(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+                let intents_after_local = bus.engine.broadcast_intent_filters_snapshot().await;
+                assert!(
+                    intents_after_local.is_empty(),
+                    "subscribe_ephemeral_local must arm NO BroadcastIntent, got {intents_after_local:?}"
+                );
+
+                // Contrast: the high-level Bus::subscribe DOES arm a BroadcastIntent.
+                let _stream = bus
+                    .subscribe(Filter::NamePrefix(Bytes::from_static(b"chat/")))
+                    .await
+                    .expect("subscribe callable");
+                let intents_after_subscribe = bus.engine.broadcast_intent_filters_snapshot().await;
+                assert_eq!(
+                    intents_after_subscribe.len(),
+                    1,
+                    "Bus::subscribe arms exactly one BroadcastIntent"
+                );
+
                 run_handle.abort();
             })
             .await;
