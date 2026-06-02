@@ -27,10 +27,11 @@ pub enum BusEvent {
 
 /// Unified pub/sub interface. `publish_durable` writes a signed KV
 /// entry to the local store and lets the engine fan out via CRDT
-/// replication. `publish_ephemeral` signs the payload, hands it to
-/// the engine for unreliable fan-out, and dispatches a loopback copy
-/// to local subscribers. `subscribe` opens a single stream that
-/// merges both delivery modes.
+/// replication. `publish_ephemeral` stamps the caller's per-stream
+/// `seq` on the envelope, signs the payload, hands it to the engine
+/// for unreliable fan-out, and dispatches a loopback copy to local
+/// subscribers. `subscribe` opens a single stream that merges both
+/// delivery modes.
 #[async_trait(?Send)]
 pub trait Bus {
     async fn publish_durable(
@@ -39,7 +40,7 @@ pub trait Bus {
         block: Option<ContentBlock>,
     ) -> Result<()>;
 
-    async fn publish_ephemeral(&self, name: Bytes, payload: Bytes) -> Result<()>;
+    async fn publish_ephemeral(&self, name: Bytes, seq: u64, payload: Bytes) -> Result<()>;
 
     async fn subscribe(&self, filter: Filter) -> Result<LocalBoxStream<'static, BusEvent>>;
 }
@@ -94,14 +95,16 @@ where
             .map_err(|e| crate::Error::Store(format!("{e}")))
     }
 
-    async fn publish_ephemeral(&self, name: Bytes, payload: Bytes) -> Result<()> {
+    async fn publish_ephemeral(&self, name: Bytes, seq: u64, payload: Bytes) -> Result<()> {
         // Build the unsigned shape, sign the canonical bytes, and
-        // assemble the final SignedDatagram.
+        // assemble the final SignedDatagram. The caller-supplied per-stream
+        // `seq` is stamped on the envelope so the signature covers it and
+        // the receiver reads the authoritative seq from the envelope.
         let unsigned = SignedDatagram {
             verifying_key: self.identity.store_verifying_key(),
             name: name.clone(),
             payload: payload.clone(),
-            seq: 0,
+            seq,
             signature: Bytes::new(),
         };
         let payload_bytes = datagram_signing_payload(&unsigned);
@@ -234,6 +237,7 @@ mod tests {
                     .await;
                 bus.publish_ephemeral(
                     Bytes::from_static(b"voice/me/0001"),
+                    0,
                     Bytes::from_static(b"frame"),
                 )
                 .await
@@ -244,6 +248,37 @@ mod tests {
                     .expect("subscription open");
                 assert_eq!(&got.name, &Bytes::from_static(b"voice/me/0001"));
                 assert_eq!(&got.payload, &Bytes::from_static(b"frame"));
+                run_handle.abort();
+            })
+            .await;
+    }
+
+    /// The caller-supplied `seq` is stamped onto the assembled
+    /// `SignedDatagram` envelope (and therefore covered by the signature),
+    /// so the receiver reads the authoritative per-stream seq from the
+    /// envelope rather than the decrypted payload.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_ephemeral_stamps_seq_on_envelope() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (bus, _identity, run_handle) = make_bus();
+                let mut sub = bus
+                    .engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+                bus.publish_ephemeral(
+                    Bytes::from_static(b"voice/me/0001"),
+                    42,
+                    Bytes::from_static(b"frame"),
+                )
+                .await
+                .unwrap();
+                let got = tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                    .await
+                    .expect("loopback fired in time")
+                    .expect("subscription open");
+                assert_eq!(got.seq, 42, "caller seq must reach the envelope");
                 run_handle.abort();
             })
             .await;
@@ -288,6 +323,7 @@ mod tests {
                 // Publish an ephemeral on chat/ — should arrive as Ephemeral.
                 bus.publish_ephemeral(
                     Bytes::from_static(b"chat/me/eph"),
+                    0,
                     Bytes::from_static(b"now"),
                 )
                 .await

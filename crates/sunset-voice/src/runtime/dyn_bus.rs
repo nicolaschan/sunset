@@ -14,6 +14,7 @@ pub trait DynBus {
     async fn publish_ephemeral(
         &self,
         name: Bytes,
+        seq: u64,
         payload: Bytes,
     ) -> Result<(), Box<dyn std::error::Error>>;
 

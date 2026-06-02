@@ -18,8 +18,8 @@ const RING_PER_PEER: usize = 1024;
 
 /// A single recorded frame: length in samples, SHA-256 checksum
 /// (hex) of the raw f32 bytes, root-mean-square amplitude, the
-/// wire sequence number (low 32 bits of `VoicePacket::Frame::seq`),
-/// and a 440 Hz tone-purity ratio.
+/// wire sequence number (low 32 bits of the frame stream's
+/// `SignedDatagram.seq` envelope counter), and a 440 Hz tone-purity ratio.
 ///
 /// `checksum` is a stuck-frame tripwire — distinct decoded frames
 /// land at distinct checksums even after Opus, so consecutive

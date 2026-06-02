@@ -24,9 +24,10 @@ where
     async fn publish_ephemeral(
         &self,
         name: Bytes,
+        seq: u64,
         payload: Bytes,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        Bus::publish_ephemeral(self, name, payload)
+        Bus::publish_ephemeral(self, name, seq, payload)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
@@ -124,6 +125,7 @@ mod tests {
                 dyn_bus
                     .publish_ephemeral(
                         Bytes::from_static(b"voice/test/peer1"),
+                        0,
                         Bytes::from_static(b"payload"),
                     )
                     .await

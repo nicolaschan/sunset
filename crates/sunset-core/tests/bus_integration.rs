@@ -118,6 +118,7 @@ async fn ephemeral_publish_arrives_at_remote_subscriber() {
             alice_bus
                 .publish_ephemeral(
                     Bytes::from_static(b"voice/alice/0001"),
+                    0,
                     Bytes::from_static(b"opus-frame"),
                 )
                 .await

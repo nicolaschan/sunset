@@ -25,7 +25,6 @@ pub const VOICE_AAD_DOMAIN: &[u8] = b"sunset/voice/aad/v1";
 pub enum VoicePacket {
     Frame {
         codec_id: String,
-        seq: u64,
         sender_time_ms: u64,
         payload: Vec<u8>,
     },
@@ -127,7 +126,6 @@ mod tests {
     fn fixed_packet_frame() -> VoicePacket {
         VoicePacket::Frame {
             codec_id: "opus".to_string(),
-            seq: 42,
             sender_time_ms: 1_700_000_000_000,
             payload: (0..3840u32).map(|i| (i & 0xff) as u8).collect(),
         }
@@ -232,18 +230,18 @@ mod tests {
     /// Frozen vector for the postcard encoding of a fixed `VoicePacket::Frame`.
     /// If this fails, serde field order / postcard encoding drifted — DO NOT
     /// update without a wire-format bump.
+    // Regenerated 2026-06-01: ephemeral wire bump (Frame.seq moved to SignedDatagram envelope).
     #[test]
     fn voice_packet_frame_postcard_frozen_vector() {
         let pkt = VoicePacket::Frame {
             codec_id: "opus".to_string(),
-            seq: 7,
             sender_time_ms: 1_700_000_000_000,
             payload: vec![0xAA, 0xBB, 0xCC, 0xDD],
         };
         let bytes = postcard::to_stdvec(&pkt).unwrap();
         assert_eq!(
             hex::encode(&bytes),
-            "00046f7075730780d095ffbc3104aabbccdd",
+            "00046f70757380d095ffbc3104aabbccdd",
             "If this fails, serde field order / postcard encoding drifted — DO NOT update without a wire-format bump.",
         );
     }

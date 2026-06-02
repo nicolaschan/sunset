@@ -21,6 +21,14 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
             .unwrap_or(0);
         let mut rng = ChaCha20Rng::seed_from_u64(now_nanos ^ 0x55AA_55AA_55AA_55AA);
 
+        // Heartbeats are their own ephemeral stream with their own dense
+        // monotonic seq, kept distinct from the frame stream so neither
+        // perturbs the other's HWM/jitter accounting. The counter is owned
+        // entirely by this single loop, so a plain local (single writer,
+        // exclusive access) is the right shape — no shared interior
+        // mutability needed.
+        let mut hb_seq: u64 = 0;
+
         loop {
             let Some(inner) = weak.upgrade() else {
                 return;
@@ -50,15 +58,18 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
             let bus = inner.bus.clone();
             let room_fp = room.fingerprint().to_hex();
             let sender_pk = hex::encode(inner.identity.store_verifying_key().as_bytes());
-            let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
+            let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}/hb"));
 
             // Drop strong ref before awaiting so Drop can cancel us.
             drop(inner);
 
+            let seq = hb_seq;
+            hb_seq = hb_seq.saturating_add(1);
+
             match encrypt(&room, 0, &public, &pkt, &mut rng) {
                 Ok(ev) => match postcard::to_stdvec(&ev) {
                     Ok(payload) => {
-                        let _ = bus.publish_ephemeral(name, Bytes::from(payload)).await;
+                        let _ = bus.publish_ephemeral(name, seq, Bytes::from(payload)).await;
                     }
                     Err(e) => tracing::warn!(error = %e, "heartbeat postcard encode failed"),
                 },

@@ -52,6 +52,9 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 continue;
             }
             let peer = PeerId(datagram.verifying_key.clone());
+            // The authoritative per-stream seq lives on the envelope, not
+            // inside the encrypted packet.
+            let envelope_seq = datagram.seq;
             let sender = match IdentityKey::from_store_verifying_key(&datagram.verifying_key) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -71,12 +74,29 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 VoicePacket::Frame {
                     payload,
                     sender_time_ms,
-                    seq,
                     ..
                 } => {
                     let st =
                         SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sender_time_ms);
                     inner.frame_liveness.observe(peer.clone(), st).await;
+                    // Receiver-side dedup on the envelope seq. During a
+                    // direct/relay switchover a receiver briefly gets the
+                    // same frame both ways; deliver it once. The gate uses
+                    // an `Option` keyed on the sender — seq 0 is a real
+                    // first value, so an absent entry must NOT be treated
+                    // as seq 0 (no `unwrap_or(0)`). The decoder is
+                    // stateful (Opus predictor history), so a duplicate
+                    // must be dropped before decode, not just before the
+                    // sink.
+                    {
+                        let mut last = inner.last_delivered_seq.borrow_mut();
+                        match last.get(&peer) {
+                            Some(&h) if envelope_seq <= h => continue,
+                            _ => {
+                                last.insert(peer.clone(), envelope_seq);
+                            }
+                        }
+                    }
                     // Deafened: skip decode + delivery. We still feed
                     // `frame_liveness` above so the combiner can keep
                     // the peer's `talking`/`in_call` state honest while
@@ -127,17 +147,14 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                                     tracing::warn!(error = %e, "denoise skipped");
                                 }
                             }
-                            // Track per-peer last-delivered seq so
-                            // `talking`/`observed` queries have a peer
-                            // entry even when the host's playback path
-                            // is the only buffer. The low 32 bits of
-                            // the wire seq are passed to the sink for
-                            // sequence-indexed buffering downstream.
+                            // The low 32 bits of the envelope seq are
+                            // passed to the sink for sequence-indexed
+                            // buffering downstream. The per-peer HWM was
+                            // already advanced by the dedup gate above.
                             inner
-                                .last_delivered_seq
-                                .borrow_mut()
-                                .insert(peer.clone(), seq);
-                            inner.frame_sink.borrow().deliver(&peer, seq as u32, &pcm);
+                                .frame_sink
+                                .borrow()
+                                .deliver(&peer, envelope_seq as u32, &pcm);
                         }
                         Err(e) => tracing::warn!(error = %e, "decode failed"),
                     }

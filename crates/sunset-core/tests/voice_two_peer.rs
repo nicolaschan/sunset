@@ -105,7 +105,6 @@ async fn alice_encrypts_voice_frame_bob_decrypts_and_observes_live() {
             // Opus output. The codec_id pins the new codec name.
             let original = VoicePacket::Frame {
                 codec_id: "opus".to_string(),
-                seq: 1,
                 sender_time_ms: 1_700_000_000_000,
                 payload: vec![0xAB; 3840],
             };
@@ -119,7 +118,7 @@ async fn alice_encrypts_voice_frame_bob_decrypts_and_observes_live() {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
                 while tokio::time::Instant::now() < deadline {
                     alice_bus
-                        .publish_ephemeral(name.clone(), Bytes::from(payload_bytes.clone()))
+                        .publish_ephemeral(name.clone(), 0, Bytes::from(payload_bytes.clone()))
                         .await
                         .unwrap();
                     if let Ok(Some(ev_bus)) =

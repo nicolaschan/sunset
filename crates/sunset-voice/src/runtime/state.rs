@@ -65,11 +65,13 @@ pub(crate) struct RuntimeInner {
     /// connection yet.
     pub voice_presence_liveness: Arc<Liveness>,
 
-    /// Last per-peer wire sequence number delivered to the
-    /// `FrameSink`. The runtime keeps no audio buffer of its own —
-    /// the host's playback path absorbs jitter. This map is read by
-    /// test hooks (`observed_voice_peers`) so a peer remains "seen
-    /// via frames" even when nothing else stores their PCM.
+    /// Per-peer highest envelope `seq` accepted by the receiver dedup
+    /// gate — the high-water mark that drops a frame seen twice during a
+    /// direct/relay switchover. Advanced once per accepted frame
+    /// (before decode), so it also marks a peer as "seen via frames"
+    /// even when the receiver is deafened. The runtime keeps no audio
+    /// buffer of its own — the host's playback path absorbs jitter. Read
+    /// by test hooks (`observed_voice_peers`).
     pub last_delivered_seq: RefCell<HashMap<PeerId, u64>>,
     pub auto_connect_state: RefCell<HashMap<PeerId, AutoConnectState>>,
     pub last_emitted: RefCell<HashMap<PeerId, EmittedState>>,

@@ -82,14 +82,16 @@ impl DynBus for TestBus {
     async fn publish_ephemeral(
         &self,
         name: Bytes,
+        seq: u64,
         payload: Bytes,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Build a SignedDatagram with self as verifying_key.
+        // Build a SignedDatagram with self as verifying_key, stamping the
+        // caller's per-stream seq onto the envelope.
         let dgram = SignedDatagram {
             verifying_key: self.self_pk.clone(),
             name,
             payload,
-            seq: 0,
+            seq,
             signature: Bytes::new(),
         };
         // Fan out to ephemeral subscribers (loopback).
@@ -514,7 +516,6 @@ async fn subscribe_decodes_frame_and_delivers_to_sink() {
             let bytes = enc.encode(&pcm).unwrap();
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
-                seq: 42,
                 sender_time_ms: 1000,
                 payload: bytes,
             };
@@ -526,12 +527,13 @@ async fn subscribe_decodes_frame_and_delivers_to_sink() {
             let sender_pk = hex::encode(alice_pk.as_bytes());
             let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
 
-            // Inject as if it came through the bus from alice.
+            // Inject as if it came through the bus from alice. The
+            // authoritative seq is on the envelope (42), not in the packet.
             let dgram = SignedDatagram {
                 verifying_key: alice_pk.clone(),
                 name,
                 payload: Bytes::from(payload),
-                seq: 0,
+                seq: 42,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -555,7 +557,7 @@ async fn subscribe_decodes_frame_and_delivers_to_sink() {
             assert_eq!(snapshot.len(), 1, "exactly one frame delivered");
             let (peer, seq, pcm) = &snapshot[0];
             assert_eq!(peer, &alice_peer);
-            assert_eq!(*seq, 42, "wire seq must be propagated to sink");
+            assert_eq!(*seq, 42, "envelope seq must be propagated to sink");
             assert_eq!(
                 pcm.len(),
                 sunset_voice::FRAME_SAMPLES_PER_CHANNEL * sunset_voice::PLAYBACK_CHANNELS as usize
@@ -605,7 +607,6 @@ async fn deafened_skips_decode_and_delivery() {
             let bytes = enc.encode(&pcm).unwrap();
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
-                seq: 7,
                 sender_time_ms: 1000,
                 payload: bytes,
             };
@@ -769,7 +770,6 @@ async fn combiner_evicts_peer_seen_only_via_frames() {
                 .unwrap_or(0);
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
-                seq: 1,
                 sender_time_ms: now_ms,
                 payload: bytes,
             };
@@ -1419,7 +1419,6 @@ async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
                         let bytes = enc.encode(&pcm).unwrap();
                         let pkt = sunset_voice::packet::VoicePacket::Frame {
                             codec_id: sunset_voice::CODEC_ID.to_string(),
-                            seq,
                             sender_time_ms: 1000 + seq * 20,
                             payload: bytes,
                         };
@@ -1436,12 +1435,14 @@ async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
                         let room_fp = room.fingerprint().to_hex();
                         let sender_pk = hex::encode(alice_pk.as_bytes());
                         let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
+                        // Strictly increasing envelope seqs so the new
+                        // receiver dedup gate doesn't drop them as replays.
                         bob_bus_impl
                             .inject(SignedDatagram {
                                 verifying_key: alice_pk.clone(),
                                 name,
                                 payload: Bytes::from(payload),
-                                seq: 0,
+                                seq,
                                 signature: Bytes::new(),
                             })
                             .await;
@@ -1755,7 +1756,6 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
             ) {
                 let pkt = sunset_voice::packet::VoicePacket::Frame {
                     codec_id: sunset_voice::CODEC_ID.to_string(),
-                    seq,
                     sender_time_ms: 1000 + seq * 20,
                     payload: bytes,
                 };
@@ -1768,12 +1768,15 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
                     "voice/{room_fp}/{}",
                     hex::encode(sender_pk.as_bytes())
                 ));
+                // Envelope seq is the per-sender stream seq (strictly
+                // increasing per sender) so the receiver dedup gate keeps
+                // every frame; the gate is keyed per sender.
                 bus_impl
                     .inject(SignedDatagram {
                         verifying_key: sender_pk.clone(),
                         name,
                         payload: Bytes::from(payload),
-                        seq: 0,
+                        seq,
                         signature: Bytes::new(),
                     })
                     .await;
@@ -1833,6 +1836,231 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
             assert!(
                 carol_avg > 0.30,
                 "carol average RMS collapsed: {carol_avg} (expected ~0.35)"
+            );
+        })
+        .await;
+}
+
+/// Build a frame `SignedDatagram` from `sender` carrying the given
+/// envelope `seq`. Mirrors what the engine stamps on the wire: the seq
+/// lives on the envelope, never inside the encrypted packet.
+async fn inject_frame_at_seq(
+    bus_impl: &TestBus,
+    room: &Room,
+    sender: &Identity,
+    sender_pk: &VerifyingKey,
+    seq: u64,
+) {
+    let mut enc = sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+    let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
+    let bytes = enc.encode(&pcm).unwrap();
+    let pkt = sunset_voice::packet::VoicePacket::Frame {
+        codec_id: sunset_voice::CODEC_ID.to_string(),
+        sender_time_ms: 1000 + seq,
+        payload: bytes,
+    };
+    let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seq);
+    let ev = sunset_voice::packet::encrypt(room, 0, &sender.public(), &pkt, &mut rng).unwrap();
+    let payload = postcard::to_stdvec(&ev).unwrap();
+    let room_fp = room.fingerprint().to_hex();
+    let sender_pk_hex = hex::encode(sender_pk.as_bytes());
+    let name = Bytes::from(format!("voice/{room_fp}/{sender_pk_hex}"));
+    bus_impl
+        .inject(SignedDatagram {
+            verifying_key: sender_pk.clone(),
+            name,
+            payload: Bytes::from(payload),
+            seq,
+            signature: Bytes::new(),
+        })
+        .await;
+}
+
+/// Frames and heartbeats are two distinct ephemeral streams: frames
+/// publish under `voice/{fp}/{pk}`, heartbeats under
+/// `voice/{fp}/{pk}/hb`. A single `voice/{fp}/` prefix still covers both,
+/// but each carries its own per-stream seq counter (so the frame seq the
+/// jitter buffer consumes is not perturbed by heartbeats).
+#[tokio::test(flavor = "current_thread")]
+async fn frame_and_heartbeat_distinct_names() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(80);
+            let pk = alice.store_verifying_key();
+            let (bus_impl, tx) = TestBus::new(pk.clone());
+            let bus: Rc<dyn DynBus> = bus_impl;
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (runtime, tasks) = VoiceRuntime::new(
+                bus,
+                room.clone(),
+                alice.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            runtime.set_active(true);
+            tokio::task::spawn_local(tasks.heartbeat);
+
+            let room_fp = room.fingerprint().to_hex();
+            let sender_pk = hex::encode(pk.as_bytes());
+            let frame_name = format!("voice/{room_fp}/{sender_pk}");
+            let hb_name = format!("voice/{room_fp}/{sender_pk}/hb");
+
+            let mut rx = tx.subscribe();
+
+            // The frame send path publishes under the frame name.
+            let pcm: Vec<f32> = (0..1920).map(|i| (i as f32) / 1000.0).collect();
+            runtime.send_pcm(&pcm);
+
+            // Collect one frame publish and one heartbeat publish.
+            let mut saw_frame = false;
+            let mut saw_hb = false;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !(saw_frame && saw_hb) {
+                    let d = rx.recv().await.unwrap();
+                    let name = String::from_utf8_lossy(&d.name).into_owned();
+                    if name == frame_name {
+                        saw_frame = true;
+                    } else if name == hb_name {
+                        saw_hb = true;
+                    } else {
+                        panic!("unexpected publish name: {name}");
+                    }
+                }
+            })
+            .await
+            .expect("both frame and heartbeat published within 3s");
+
+            assert!(saw_frame, "frame published under voice/{{fp}}/{{pk}}");
+            assert!(saw_hb, "heartbeat published under voice/{{fp}}/{{pk}}/hb");
+            drop(runtime);
+        })
+        .await;
+}
+
+/// The receiver dedup gate uses an `Option` keyed on the sender, never
+/// `unwrap_or(0)`: envelope seq 0 is a real first value, so the very
+/// first frame at seq 0 must be delivered, not silently dropped.
+#[tokio::test(flavor = "current_thread")]
+async fn receiver_delivers_first_frame_seq_0_once() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(82);
+            let (bob, _) = make_identity_and_room(83);
+            let alice_pk = alice.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: delivered.clone(),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::yield_now().await;
+
+            inject_frame_at_seq(&bob_bus_impl, &room, &alice, &alice_pk, 0).await;
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !delivered.borrow().is_empty() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("first frame at envelope seq 0 must be delivered, not dropped");
+
+            let snapshot = delivered.borrow();
+            assert_eq!(snapshot.len(), 1, "exactly one delivery for seq 0");
+            assert_eq!(snapshot[0].1, 0, "delivered seq is the envelope seq 0");
+        })
+        .await;
+}
+
+/// Two datagrams carrying the same `(sender, seq)` — the duplicate a
+/// receiver briefly sees during direct/relay switchover — must produce
+/// exactly one `deliver`.
+#[tokio::test(flavor = "current_thread")]
+async fn receiver_dedups_same_sender_seq() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(84);
+            let (bob, _) = make_identity_and_room(85);
+            let alice_pk = alice.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: delivered.clone(),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::yield_now().await;
+
+            // Same sender, same envelope seq, injected twice.
+            inject_frame_at_seq(&bob_bus_impl, &room, &alice, &alice_pk, 5).await;
+            inject_frame_at_seq(&bob_bus_impl, &room, &alice, &alice_pk, 5).await;
+
+            // Wait for the first to land, then give the second a chance.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !delivered.borrow().is_empty() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("first frame delivered within 1s");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                delivered.borrow().len(),
+                1,
+                "duplicate (sender, seq) must deliver exactly once"
             );
         })
         .await;

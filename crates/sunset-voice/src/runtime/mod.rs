@@ -178,6 +178,9 @@ impl VoiceRuntime {
                 .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // The per-frame counter is stamped on the SignedDatagram
+            // envelope (below), not inside the encrypted packet — one
+            // authoritative seq per stream, routing-visible and signed.
             let seq = {
                 let mut s = inner.seq.borrow_mut();
                 let v = *s;
@@ -186,7 +189,6 @@ impl VoiceRuntime {
             };
             let pkt = crate::packet::VoicePacket::Frame {
                 codec_id: crate::CODEC_ID.to_string(),
-                seq,
                 sender_time_ms: now_ms,
                 payload: encoded,
             };
@@ -216,7 +218,7 @@ impl VoiceRuntime {
             let name = bytes::Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
             let _ = inner
                 .bus
-                .publish_ephemeral(name, bytes::Bytes::from(payload))
+                .publish_ephemeral(name, seq, bytes::Bytes::from(payload))
                 .await;
         });
     }

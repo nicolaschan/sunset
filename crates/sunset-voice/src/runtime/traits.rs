@@ -65,11 +65,12 @@ pub trait Dialer {
 /// network arrival. PCM is `FRAME_SAMPLES_PER_CHANNEL * 2` (1920) f32
 /// interleaved L/R stereo @ 48 kHz.
 ///
-/// `seq` is the low 32 bits of `VoicePacket::Frame::seq`, exposed so
-/// the host can do sequence-indexed buffering (e.g. a worklet-side
-/// jitter buffer) and detect gaps. The runtime itself does no
-/// buffering — frames arrive at network cadence and the host is
-/// responsible for pacing playback against its audio clock.
+/// `seq` is the low 32 bits of the frame stream's authoritative
+/// `SignedDatagram.seq` envelope counter, exposed so the host can do
+/// sequence-indexed buffering (e.g. a worklet-side jitter buffer) and
+/// detect gaps. The runtime itself does no buffering — frames arrive at
+/// network cadence and the host is responsible for pacing playback
+/// against its audio clock.
 pub trait FrameSink {
     fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]);
     /// Peer transitioned from in-call to gone. Host should release
