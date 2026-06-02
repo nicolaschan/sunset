@@ -6,49 +6,17 @@ use wtransport::tls::Sha256Digest;
 /// stable across the resolver / descriptor / address fragment.
 pub fn sha256_digest_to_hex(digest: &Sha256Digest) -> String {
     let bytes: &[u8; 32] = digest.as_ref();
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        s.push(hex_nibble(b >> 4));
-        s.push(hex_nibble(b & 0x0f));
-    }
-    s
-}
-
-fn hex_nibble(n: u8) -> char {
-    match n {
-        0..=9 => (b'0' + n) as char,
-        10..=15 => (b'a' + (n - 10)) as char,
-        // Callers always feed us `b >> 4` or `b & 0x0f` of a `u8`, both
-        // of which are in 0..=15 by construction. A wider value would
-        // corrupt the hex output silently, so be loud instead.
-        _ => unreachable!("hex_nibble called with {n} > 15"),
-    }
+    hex::encode(bytes)
 }
 
 /// Parse a 64-char hex digest. Accepts upper or lower case; rejects any
 /// other length.
 pub fn parse_cert_hash_hex(s: &str) -> Result<Sha256Digest, String> {
-    if s.len() != 64 {
-        return Err(format!("expected 64 hex chars, got {}", s.len()));
-    }
-    let mut bytes = [0u8; 32];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        let hi = parse_nibble(s.as_bytes()[i * 2])
-            .ok_or_else(|| format!("non-hex char at offset {}", i * 2))?;
-        let lo = parse_nibble(s.as_bytes()[i * 2 + 1])
-            .ok_or_else(|| format!("non-hex char at offset {}", i * 2 + 1))?;
-        *b = (hi << 4) | lo;
-    }
+    let bytes: [u8; 32] = hex::decode(s)
+        .map_err(|e| format!("invalid cert hash hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 64 hex chars (32 bytes), got {} bytes", v.len()))?;
     Ok(Sha256Digest::new(bytes))
-}
-
-fn parse_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(10 + c - b'a'),
-        b'A'..=b'F' => Some(10 + c - b'A'),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
