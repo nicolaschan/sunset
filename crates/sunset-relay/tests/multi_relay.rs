@@ -17,6 +17,7 @@ use sunset_noise::{NoiseIdentity, NoiseTransport, ed25519_seed_to_x25519_secret}
 use sunset_relay::{Config, Relay};
 use sunset_store::{ContentBlock, Hash, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
+use sunset_sync::routing::{self, SubscriptionPolicy};
 use sunset_sync::test_helpers::wait_for;
 use sunset_sync::{PeerAddr, PeerId, Signer, SyncConfig, SyncEngine};
 use sunset_sync_ws_native::WebSocketRawTransport;
@@ -117,8 +118,20 @@ async fn alice_to_bob_via_two_relays() {
             let relay_b_addr = relay_b.dial_address();
             let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");
 
-            // Brief settle for federation handshake.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // A↔B federation: wait until A's engine has armed the
+            // forwarding path for B's broad-prefix subscription.
+            let relay_b_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                &relay_b.ed25519_public,
+            )));
+            let federated = relay_a
+                .engine()
+                .wait_for_peer_interest(
+                    &relay_b_pid,
+                    &routing::relay_broad_filter(),
+                    Duration::from_secs(5),
+                )
+                .await;
+            assert!(federated, "A↔B federation did not complete");
 
             // Clients.
             let alice = Identity::generate(&mut OsRng);
@@ -131,37 +144,29 @@ async fn alice_to_bob_via_two_relays() {
 
             // Bob declares interest.
             bob_engine
-                .publish_subscription(room_messages_filter(&bob_room), Duration::from_secs(60))
+                .subscribe(
+                    room_messages_filter(&bob_room),
+                    SubscriptionPolicy::store_data(),
+                )
                 .await
                 .unwrap();
 
-            // Wait for alice's engine to know relay A's broad subscription so the
-            // push path alice→relay-A is armed before we insert.
-            let relay_a_vk = VerifyingKey::new(Bytes::copy_from_slice(&relay_a.ed25519_public));
-            let alice_knows_relay_a = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async { alice_engine.knows_peer_subscription(&relay_a_vk).await },
-            )
-            .await;
+            // alice → relay A: wait until alice's engine has armed
+            // forwarding for A's broad-prefix subscription naming
+            // alice as the provider.
+            let relay_a_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                &relay_a.ed25519_public,
+            )));
+            let alice_knows_relay_a = alice_engine
+                .wait_for_peer_interest(
+                    &relay_a_pid,
+                    &routing::relay_broad_filter(),
+                    Duration::from_secs(5),
+                )
+                .await;
             assert!(
                 alice_knows_relay_a,
                 "alice did not learn relay A's subscription"
-            );
-
-            // Wait for relay B's own broad subscription to be known by alice's engine
-            // (relay A should have propagated it transitively through the federation);
-            // this indirectly confirms that relay A <-> relay B federation is established.
-            let relay_b_vk = VerifyingKey::new(Bytes::copy_from_slice(&relay_b.ed25519_public));
-            let alice_knows_relay_b = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async { alice_engine.knows_peer_subscription(&relay_b_vk).await },
-            )
-            .await;
-            assert!(
-                alice_knows_relay_b,
-                "alice did not learn relay B's subscription (federation not established)"
             );
 
             // Alice composes + inserts.
@@ -260,10 +265,26 @@ async fn failover_when_relay_a_dies() {
             );
             let mut relay_b = Relay::start(config_b).await.expect("relay B new");
             let relay_b_addr = relay_b.dial_address();
-            let relay_b_vk = VerifyingKey::new(Bytes::copy_from_slice(&relay_b.ed25519_public));
             let _engine_b_task = relay_b.run_for_test().await.expect("relay B run");
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // A↔B routing must be live before any client traffic.
+            let relay_b_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                &relay_b.ed25519_public,
+            )));
+            let relay_a_pid = PeerId(VerifyingKey::new(Bytes::copy_from_slice(
+                &relay_a.ed25519_public,
+            )));
+            assert!(
+                relay_a
+                    .engine()
+                    .wait_for_peer_interest(
+                        &relay_b_pid,
+                        &routing::relay_broad_filter(),
+                        Duration::from_secs(5)
+                    )
+                    .await,
+                "A↔B federation did not complete",
+            );
 
             // Alice connects to BOTH; bob connects to BOTH.
             let alice = Identity::generate(&mut OsRng);
@@ -285,21 +306,34 @@ async fn failover_when_relay_a_dies() {
                 .expect("bob dial relay B");
 
             bob_engine
-                .publish_subscription(room_messages_filter(&bob_room), Duration::from_secs(60))
+                .subscribe(
+                    room_messages_filter(&bob_room),
+                    SubscriptionPolicy::store_data(),
+                )
                 .await
                 .unwrap();
 
-            // Wait for alice to learn relay B's subscription (confirms federation + alice→B path
-            // is established before we kill relay A).
-            let alice_knows_relay_b = wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(50),
-                || async { alice_engine.knows_peer_subscription(&relay_b_vk).await },
-            )
-            .await;
+            // Both alice→A and alice→B forward paths must be armed
+            // before we kill A.
             assert!(
-                alice_knows_relay_b,
-                "alice did not learn relay B's subscription before starting"
+                alice_engine
+                    .wait_for_peer_interest(
+                        &relay_a_pid,
+                        &routing::relay_broad_filter(),
+                        Duration::from_secs(5)
+                    )
+                    .await,
+                "alice did not learn relay A's subscription before starting",
+            );
+            assert!(
+                alice_engine
+                    .wait_for_peer_interest(
+                        &relay_b_pid,
+                        &routing::relay_broad_filter(),
+                        Duration::from_secs(5)
+                    )
+                    .await,
+                "alice did not learn relay B's subscription before starting",
             );
 
             // Compose msg-1; expect it to arrive normally (both relays alive).

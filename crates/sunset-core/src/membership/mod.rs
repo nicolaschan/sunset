@@ -450,6 +450,11 @@ fn handle_engine_event(handles: &TrackerHandles, ev: &EngineEvent) {
             // (last_pong/RTT) is consumed by the supervisor for
             // IntentSnapshot, not here.
         }
+        EngineEvent::PeerInterestArmed { .. } | EngineEvent::PeerInterestWithdrawn { .. } => {
+            // Per-peer subscription gating events are consumed by
+            // routing-layer tests via `wait_for_peer_interest{_withdrawn}`,
+            // not by membership tracking.
+        }
     }
 }
 

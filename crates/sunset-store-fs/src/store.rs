@@ -181,26 +181,10 @@ impl Store for FsStore {
                 let f = filter.clone();
                 self.conn
                     .call(move |c| -> std::result::Result<Vec<SignedKvEntry>, Error> {
-                        let mut stmt = c
-                            .prepare(
-                                "SELECT sequence, verifying_key, name, value_hash, priority, expires_at, signature
-                                 FROM entries WHERE sequence >= ?1 ORDER BY sequence ASC",
-                            )
-                            .map_err(|e| Error::Backend(format!("prep replay: {e}")))?;
-                        let rows = stmt
-                            .query_map(
-                                tokio_rusqlite::rusqlite::params![cursor.0 as i64],
-                                |r| kv::row_to_entry(r).map(|(_, e)| e),
-                            )
-                            .map_err(|e| Error::Backend(format!("query replay: {e}")))?;
-                        let mut out = Vec::new();
-                        for r in rows {
-                            let e = r.map_err(|e| Error::Backend(format!("row replay: {e}")))?;
-                            if f.matches(&e.verifying_key, &e.name) {
-                                out.push(e);
-                            }
-                        }
-                        Ok(out)
+                        Ok(kv::iter_since(c, cursor)?
+                            .into_iter()
+                            .filter(|e| f.matches(&e.verifying_key, &e.name))
+                            .collect())
                     })
                     .await
                     .map_err(unwrap_store_error)?

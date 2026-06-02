@@ -447,10 +447,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                             // last_pong_at and surface a heartbeat.
                             None => 0,
                         };
-                        let observed_at_unix_ms = web_time::SystemTime::now()
-                            .duration_since(web_time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
+                        let observed_at_unix_ms = crate::engine::now_unix_ms();
                         let _ = inbound_tx.send(InboundEvent::PongObserved {
                             peer_id: peer_id.clone(),
                             rtt_ms,

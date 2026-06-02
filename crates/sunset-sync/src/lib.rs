@@ -20,7 +20,6 @@ pub mod signaler;
 pub mod signer;
 pub mod spawn;
 pub mod spawning_acceptor;
-pub mod subscription_registry;
 pub mod supervisor;
 pub mod transport;
 pub mod types;

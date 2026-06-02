@@ -58,6 +58,13 @@ struct PeerKkSlot {
     session: Option<KkSession>,
     next_send_seq: u64,
     on_session_ready: Vec<oneshot::Sender<()>>,
+    /// Session frames (the sender's `seq >= 1`) that arrived before this
+    /// handshake's `msg2` (`seq == 0`) established the session. The CRDT
+    /// signaling channel can deliver entries out of order; a session frame
+    /// must never be fed to the handshake (`read_message_2` consumes the
+    /// initiator by value), so it waits here, keyed by seq, and is drained
+    /// in order the moment the session comes up. Cleared on reset / rejoin.
+    pending: std::collections::BTreeMap<u64, Vec<u8>>,
 }
 
 struct Inner {
@@ -160,49 +167,93 @@ impl<S: Store + 'static> RelaySignaler<S> {
             .ok_or_else(|| SyncError::Transport("missing content block".into()))?;
         let ciphertext: &[u8] = &block.data;
 
-        let plaintext = self.decrypt_inbound(&from, ciphertext).await?;
-
-        let _ = inbound_tx.unbounded_send(SignalMessage {
-            from,
-            to,
-            seq,
-            payload: Bytes::from(plaintext),
-        });
+        // Decrypting a `msg2` (seq 0) can release session frames that were
+        // buffered while it was missing, so this yields zero or more
+        // plaintexts, each tagged with its own seq.
+        let delivered = self.decrypt_inbound(&from, seq, ciphertext).await?;
+        for (out_seq, plaintext) in delivered {
+            let _ = inbound_tx.unbounded_send(SignalMessage {
+                from: from.clone(),
+                to: to.clone(),
+                seq: out_seq,
+                payload: Bytes::from(plaintext),
+            });
+        }
         Ok(())
     }
 
-    async fn decrypt_inbound(&self, from: &PeerId, ciphertext: &[u8]) -> SyncResult<Vec<u8>> {
+    /// Decrypt one inbound signaling frame and return the plaintext(s) to
+    /// surface — paired with their seq, since establishing the session here
+    /// can drain previously-buffered session frames.
+    ///
+    /// `seq` carries the protocol's own frame discriminator: a handshake
+    /// frame is *always* the sender's `seq == 0` (a fresh `msg1`, or the
+    /// responder's `msg2`; `reset_peer` rewinds to 0 so a rejoin's `msg1`
+    /// is seq 0 too), and a session/ICE frame is *always* `seq >= 1`. The
+    /// CRDT signaling channel can deliver entries out of order, so routing
+    /// by this seq is what keeps a reordered session frame from ever
+    /// reaching the handshake state (`read_message_2` consumes the
+    /// initiator by value; feeding it a session frame would destroy a live
+    /// dial — the three-way-voice flake).
+    async fn decrypt_inbound(
+        &self,
+        from: &PeerId,
+        seq: u64,
+        ciphertext: &[u8],
+    ) -> SyncResult<Vec<(u64, Vec<u8>)>> {
         let mut inner = self.inner.lock().await;
         let slot = inner.peers.entry(from.clone()).or_default();
 
-        // Try the slot's current strategy first. If a peer with the same
-        // static identity restarts (page refresh, process restart) it loses
-        // its in-memory KK state and naturally sends a fresh msg1 — which
-        // looks like a corrupted session message to whichever side held
-        // the live session, and like a corrupted msg2 to whichever side
-        // was mid-handshake. In both cases we want to fall back to
-        // "treat this as a new responder kicking off a fresh handshake"
-        // rather than dropping the message. The KK pattern's static-key
-        // authentication still constrains who can produce a valid msg1
-        // — only the peer's holder of the matching static key — so the
-        // fallback can't be exploited for impersonation. (Replay of an
-        // old valid msg1 *can* force a session reset, but that's a
-        // pre-existing DoS surface: any party who can write to the
-        // relay can already censor signaling.)
+        if seq >= 1 {
+            // Session frame. Only the live session may touch it; the
+            // handshake must never see it.
+            if let Some(session) = slot.session.as_mut() {
+                return match session.decrypt(ciphertext) {
+                    Ok(pt) => Ok(vec![(seq, pt)]),
+                    // Undecryptable session frame ⇒ stale (a superseded
+                    // generation). Drop it; never fall back to the handshake.
+                    Err(_) => Ok(vec![]),
+                };
+            }
+            // Handshake not finished yet: hold the frame until `msg2`
+            // (seq 0) brings the session up, then it drains in seq order.
+            slot.pending.insert(seq, ciphertext.to_vec());
+            return Ok(vec![]);
+        }
+
+        // seq == 0: a handshake frame. If a peer with the same static
+        // identity restarts (page refresh) it sends a fresh `msg1`, which
+        // looks like a corrupted session message to whichever side held the
+        // live session and like a corrupted `msg2` to whichever side was
+        // mid-handshake; in both cases we fall through to "treat this as a
+        // new responder kicking off a fresh handshake" rather than dropping
+        // it. KK's static-key authentication still constrains who can
+        // produce a valid `msg1`, so the fallback can't be exploited for
+        // impersonation. (Replaying an old valid `msg1` can force a session
+        // reset, but that is a pre-existing DoS surface: anyone who can
+        // write to the relay can already censor signaling.)
         if let Some(session) = slot.session.as_mut() {
             match session.decrypt(ciphertext) {
-                Ok(pt) => return Ok(pt),
+                Ok(pt) => return Ok(vec![(seq, pt)]),
                 Err(_) => { /* fall through to rehandshake attempt */ }
             }
         }
         if let Some(init) = slot.initiator.take() {
             match init.read_message_2(ciphertext) {
-                Ok((pt, session)) => {
-                    slot.session = Some(session);
+                Ok((pt, mut session)) => {
                     for waiter in slot.on_session_ready.drain(..) {
                         let _ = waiter.send(());
                     }
-                    return Ok(pt);
+                    // Session is live: drain the frames that arrived ahead
+                    // of this msg2, in ascending seq order.
+                    let mut out = vec![(seq, pt)];
+                    for (s, ct) in std::mem::take(&mut slot.pending) {
+                        if let Ok(p) = session.decrypt(&ct) {
+                            out.push((s, p));
+                        }
+                    }
+                    slot.session = Some(session);
+                    return Ok(out);
                 }
                 Err(_) => { /* fall through to rehandshake attempt */ }
             }
@@ -220,11 +271,22 @@ impl<S: Store + 'static> RelaySignaler<S> {
         // Successful re-handshake: discard whatever stale state we had
         // (it can't decrypt anything sent against the new key) and pin
         // the slot to the fresh responder so the next outbound `send`
-        // writes msg2.
+        // writes msg2. Buffered session frames belong to the dead
+        // generation and can never decrypt against the new key, so drop them.
         slot.session = None;
         slot.initiator = None;
         slot.responder = Some(resp);
-        Ok(pt)
+        slot.pending.clear();
+        // Rewind the send seq so this generation's `msg2` lands at seq 0,
+        // exactly as `reset_peer` does for the dialer's `msg1`. Without
+        // this, a rejoin's `msg2` would inherit the prior call's
+        // next_send_seq (> 0), and the dialer's seq-routing would mistake a
+        // seq>=1 `msg2` for a session frame and hang. (The new msg2
+        // overwrites the dead generation's msg2 at seq 0 by LWW; its
+        // orphaned higher-seq frames are the same acceptable noise
+        // `reset_peer` already documents.)
+        slot.next_send_seq = 0;
+        Ok(vec![(seq, pt)])
     }
 
     async fn next_send_seq(&self, to: &PeerId) -> u64 {
@@ -350,6 +412,8 @@ impl<S: Store + 'static> Signaler for RelaySignaler<S> {
             slot.initiator = None;
             slot.responder = None;
             slot.next_send_seq = 0;
+            // Session frames buffered against the old handshake are stale.
+            slot.pending.clear();
             // `on_session_ready` waiters are deliberately *not* preserved
             // here: if a concurrent `send` is parked waiting for a
             // session, the next `send` after this reset will take the
@@ -723,6 +787,290 @@ mod multi_room_tests {
                 assert_eq!(received.from, alice_pk);
                 assert_eq!(received.to, bob_pk);
                 assert_eq!(received.payload.as_ref(), b"hello-bob");
+            })
+            .await;
+    }
+
+    /// Copy the signaling entries authored by `author` from `src` into
+    /// `dst`, in ascending (or, if `reversed`, descending) `seq` order.
+    /// Stands in for relay replication so a test can choose the delivery
+    /// order — the entry name embeds `seq:016x`, so a name sort is a seq
+    /// sort.
+    async fn replicate_authored(
+        src: &Arc<MemoryStore>,
+        dst: &Arc<MemoryStore>,
+        room_fp_hex: &str,
+        author: &VerifyingKey,
+        reversed: bool,
+    ) {
+        let mut entries: Vec<(SignedKvEntry, ContentBlock)> = Vec::new();
+        let mut it = src
+            .iter(signaling_filter(room_fp_hex))
+            .await
+            .expect("iter signaling entries");
+        while let Some(e) = it.next().await {
+            let e = e.expect("entry");
+            if &e.verifying_key != author {
+                continue;
+            }
+            let block = src
+                .get_content(&e.value_hash)
+                .await
+                .expect("get_content")
+                .expect("block present");
+            entries.push((e, block));
+        }
+        entries.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        if reversed {
+            entries.reverse();
+        }
+        for (e, block) in entries {
+            // A re-inserted equal-priority entry is `Stale`; that's fine.
+            let _ = dst.insert(e, Some(block)).await;
+        }
+    }
+
+    /// A session frame (the sender's `seq >= 1`) that the relay delivers
+    /// *before* the handshake's `msg2` (the sender's `seq == 0`) must not
+    /// break the dialer.
+    ///
+    /// This reproduces the three-way-voice flake: out-of-order replication
+    /// fed the `seq >= 1` frame to the dialer's `KkInitiator::read_message_2`,
+    /// which consumes the initiator by value, so the real `msg2` could never
+    /// be read and the WebRTC dial hung in Connecting. The fix routes by the
+    /// `seq` already in the entry name — a session frame never touches the
+    /// handshake state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dialer_completes_when_session_frame_precedes_msg2() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let alice_id = ident(1);
+                let bob_id = ident(2);
+                let alice_pk = PeerId(alice_id.store_verifying_key());
+                let bob_pk = PeerId(bob_id.store_verifying_key());
+
+                // Separate stores, replicated by hand so the test owns the
+                // delivery order — exactly what a relay does, but reordered.
+                let alice_store = store();
+                let bob_store = store();
+                let room =
+                    Room::open_with_params("alpha", &test_fast_params()).expect("Room::open");
+                let fp = room.fingerprint();
+                let fp_hex = fp.to_hex();
+
+                let alice = RelaySignaler::new(alice_id, fp_hex.clone(), &alice_store);
+                let bob = RelaySignaler::new(bob_id, fp_hex.clone(), &bob_store);
+                let alice_disp = MultiRoomSignaler::new();
+                alice_disp.register(fp, alice);
+                let bob_disp = MultiRoomSignaler::new();
+                bob_disp.register(fp, bob);
+
+                // 1. Alice dials: writes msg1 (her seq 0).
+                alice_disp
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"offer"),
+                    })
+                    .await
+                    .expect("alice send msg1");
+
+                // 2. Replicate msg1 to Bob; Bob builds a responder + surfaces it.
+                replicate_authored(
+                    &alice_store,
+                    &bob_store,
+                    &fp_hex,
+                    alice_pk.verifying_key(),
+                    false,
+                )
+                .await;
+                let got = tokio::time::timeout(std::time::Duration::from_secs(2), bob_disp.recv())
+                    .await
+                    .expect("bob recv msg1 timed out")
+                    .expect("bob recv msg1");
+                assert_eq!(got.payload.as_ref(), b"offer");
+
+                // 3. Bob answers (msg2 = his seq 0), then trickles a session
+                //    frame (his seq 1).
+                bob_disp
+                    .send(SignalMessage {
+                        from: bob_pk.clone(),
+                        to: alice_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"answer"),
+                    })
+                    .await
+                    .expect("bob send msg2");
+                bob_disp
+                    .send(SignalMessage {
+                        from: bob_pk.clone(),
+                        to: alice_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"ice-1"),
+                    })
+                    .await
+                    .expect("bob send session frame");
+
+                // 4. Replicate Bob's frames to Alice OUT OF ORDER: the seq-1
+                //    session frame lands before the seq-0 msg2.
+                replicate_authored(
+                    &bob_store,
+                    &alice_store,
+                    &fp_hex,
+                    bob_pk.verifying_key(),
+                    true,
+                )
+                .await;
+
+                // 5. Alice must still complete the handshake and surface the
+                //    answer. Pre-fix the reordered seq-1 frame destroyed her
+                //    initiator and this recv timed out forever.
+                let answer =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), alice_disp.recv())
+                        .await
+                        .expect(
+                            "alice recv timed out — initiator destroyed by reordered session frame",
+                        )
+                        .expect("alice recv answer");
+                assert_eq!(answer.payload.as_ref(), b"answer");
+            })
+            .await;
+    }
+
+    /// On a rejoin (the dialer refreshes and re-handshakes), the responder
+    /// rebuilds its handshake against the fresh `msg1`, but its
+    /// `next_send_seq` is already past 0 from the prior call — so its new
+    /// `msg2` must still land at seq 0 (the way `reset_peer` rewinds the
+    /// dialer's `msg1`). Otherwise the dialer's seq-routing mistakes the
+    /// `msg2` for a session frame, buffers it, and the dial hangs — the
+    /// `voice_rejoin_after_refresh` / `voice_rejoin_matrix` failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejoin_dialer_completes_when_responder_resends_msg2_after_prior_call() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let alice_id = ident(1);
+                let bob_id = ident(2);
+                let alice_pk = PeerId(alice_id.store_verifying_key());
+                let bob_pk = PeerId(bob_id.store_verifying_key());
+
+                let alice1_store = store();
+                let bob_store = store();
+                let room =
+                    Room::open_with_params("alpha", &test_fast_params()).expect("Room::open");
+                let fp = room.fingerprint();
+                let fp_hex = fp.to_hex();
+
+                // First call: alice_v1 <-> bob complete a handshake, which
+                // advances bob's next_send_seq for alice past 0.
+                let alice1 = RelaySignaler::new(alice_id.clone(), fp_hex.clone(), &alice1_store);
+                let bob = RelaySignaler::new(bob_id, fp_hex.clone(), &bob_store);
+                let alice1_disp = MultiRoomSignaler::new();
+                alice1_disp.register(fp, alice1);
+                let bob_disp = MultiRoomSignaler::new();
+                bob_disp.register(fp, bob);
+
+                alice1_disp
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"offer-v1"),
+                    })
+                    .await
+                    .expect("alice1 msg1");
+                replicate_authored(
+                    &alice1_store,
+                    &bob_store,
+                    &fp_hex,
+                    alice_pk.verifying_key(),
+                    false,
+                )
+                .await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), bob_disp.recv())
+                    .await
+                    .expect("bob recv v1 offer")
+                    .expect("bob recv v1 offer err");
+                bob_disp
+                    .send(SignalMessage {
+                        from: bob_pk.clone(),
+                        to: alice_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"answer-v1"),
+                    })
+                    .await
+                    .expect("bob msg2 v1");
+                replicate_authored(
+                    &bob_store,
+                    &alice1_store,
+                    &fp_hex,
+                    bob_pk.verifying_key(),
+                    false,
+                )
+                .await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), alice1_disp.recv())
+                    .await
+                    .expect("alice1 recv answer")
+                    .expect("alice1 recv answer err");
+
+                // Rejoin: alice refreshes — a fresh signaler + store, same
+                // identity. Her new msg1 is at seq 0 (fresh slot).
+                let alice2_store = store();
+                let alice2 = RelaySignaler::new(alice_id, fp_hex.clone(), &alice2_store);
+                let alice2_disp = MultiRoomSignaler::new();
+                alice2_disp.register(fp, alice2);
+
+                alice2_disp
+                    .send(SignalMessage {
+                        from: alice_pk.clone(),
+                        to: bob_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"offer-v2"),
+                    })
+                    .await
+                    .expect("alice2 msg1");
+                replicate_authored(
+                    &alice2_store,
+                    &bob_store,
+                    &fp_hex,
+                    alice_pk.verifying_key(),
+                    false,
+                )
+                .await;
+                let got = tokio::time::timeout(std::time::Duration::from_secs(2), bob_disp.recv())
+                    .await
+                    .expect("bob recv v2 offer")
+                    .expect("bob recv v2 offer err");
+                assert_eq!(got.payload.as_ref(), b"offer-v2");
+
+                // Bob rebuilds his responder and answers — his next_send_seq
+                // is past 0 from the first call.
+                bob_disp
+                    .send(SignalMessage {
+                        from: bob_pk.clone(),
+                        to: alice_pk.clone(),
+                        seq: 0,
+                        payload: Bytes::from_static(b"answer-v2"),
+                    })
+                    .await
+                    .expect("bob msg2 v2");
+                replicate_authored(
+                    &bob_store,
+                    &alice2_store,
+                    &fp_hex,
+                    bob_pk.verifying_key(),
+                    false,
+                )
+                .await;
+
+                let answer =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), alice2_disp.recv())
+                        .await
+                        .expect("alice2 recv timed out — responder's rejoin msg2 not at seq 0")
+                        .expect("alice2 recv answer err");
+                assert_eq!(answer.payload.as_ref(), b"answer-v2");
             })
             .await;
     }

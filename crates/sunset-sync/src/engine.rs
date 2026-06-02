@@ -13,9 +13,7 @@ use crate::digest::{BloomFilter, build_digest, entries_missing_from_remote};
 use crate::error::{Error, Result};
 use crate::message::{DigestRange, SyncMessage};
 use crate::peer::{InboundEvent, run_peer};
-use crate::reserved;
 use crate::signer::Signer;
-use crate::subscription_registry::{SubscriptionRegistry, parse_subscription_entry};
 use crate::transport::Transport;
 use crate::types::{PeerAddr, PeerId, SyncConfig, TrustSet};
 
@@ -42,6 +40,24 @@ impl ConnectionId {
     pub(crate) fn for_test(id: u64) -> Self {
         ConnectionId(id)
     }
+}
+
+/// Wall-clock milliseconds since UNIX epoch. WASM-portable via
+/// `web_time`.
+///
+/// `unwrap_or(0)` is a deliberate sentinel: a wall clock set before the
+/// UNIX epoch is impossible in practice on any machine we target
+/// (Linux/macOS/Windows host or any browser), so the only way the
+/// `duration_since` arm fails is a catastrophically misconfigured system
+/// clock. Returning 0 lets callers that use the value as a monotonic-ish
+/// priority (LWW `(verifying_key, name)` writes) still make forward
+/// progress instead of panicking the engine task. The arithmetic
+/// downstream uses `saturating_add`, so a 0 here doesn't overflow.
+pub(crate) fn now_unix_ms() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Free helper that spins up the outbound channel + spawns the per-peer
@@ -114,9 +130,24 @@ pub(crate) enum EngineCommand {
         addr: PeerAddr,
         ack: oneshot::Sender<Result<(PeerId, crate::transport::TransportKind)>>,
     },
-    PublishSubscription {
+    SubscribeVia {
         filter: Filter,
-        ttl: std::time::Duration,
+        provider: PeerId,
+        policy: crate::routing::SubscriptionPolicy,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    UnsubscribeVia {
+        filter: Filter,
+        provider: PeerId,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    Subscribe {
+        filter: Filter,
+        policy: crate::routing::SubscriptionPolicy,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    Unsubscribe {
+        filter: Filter,
         ack: oneshot::Sender<Result<()>>,
     },
     SetTrust {
@@ -151,12 +182,47 @@ pub enum EngineEvent {
         rtt_ms: u64,
         observed_at_unix_ms: u64,
     },
+    /// A remote peer's `SubscriptionEntry::Active` naming us as the
+    /// provider has been replicated to us and accepted: from this point
+    /// on, application entries matching `filter` written by anyone we
+    /// trust will be forwarded to `receiver` over the routing-filtered
+    /// push path. Fired exactly once per `(receiver, filter_hash)`
+    /// transition from "not armed" to "armed", AFTER the matching
+    /// `DigestRequest` has been queued to the receiver (so an observer
+    /// who sees this event is guaranteed the backfill exchange is in
+    /// flight or has completed). Self-authored subscription entries
+    /// also fire this event so an engine can observe its own
+    /// arming for tests.
+    PeerInterestArmed {
+        receiver: PeerId,
+        filter: sunset_store::Filter,
+    },
+    /// A remote peer's `SubscriptionEntry::Withdrawn` for a previously-
+    /// armed filter has been replicated to us and accepted: from this
+    /// point on, entries matching `filter` will no longer be forwarded
+    /// to `receiver`. Fired exactly once per `(receiver, filter_hash)`
+    /// transition from "armed" to "not armed". The receiver may still
+    /// have other independent filters armed.
+    PeerInterestWithdrawn {
+        receiver: PeerId,
+        filter: sunset_store::Filter,
+    },
 }
 
-/// Sender + connection identity for one peer's currently-active connection.
+/// Per-peer connection state. Bundles outbound channel, transport identity,
+/// the per-peer task shutdown handle, and the inbound interests (what this
+/// peer currently wants from me).
+///
 /// `conn_id` is checked when handling `InboundEvent::Disconnected` so a
 /// stale event from a defunct connection can't tear down a fresh one.
-pub(crate) struct PeerOutbound {
+///
+/// `interests` lives in this struct (rather than in a parallel
+/// `HashMap<PeerId, _>` next to `Routes`) so peer disconnect tears the
+/// whole session down in one removal — every drop site (`RemovePeer`,
+/// `Disconnected`, the implicit replace-on-`PeerHello`) just removes
+/// the `peer_sessions` entry and the interests go with it. A parallel
+/// map would force every drop site to remember a second cleanup call.
+pub(crate) struct PeerSession {
     /// Identifies the connection generation that owns this outbound channel.
     /// Compared against `InboundEvent::Disconnected.conn_id` to filter stale
     /// disconnects from defunct generations (see `handle_inbound_event`).
@@ -166,7 +232,7 @@ pub(crate) struct PeerOutbound {
     pub(crate) kind: crate::transport::TransportKind,
     pub(crate) tx: mpsc::UnboundedSender<SyncMessage>,
     /// Structural shutdown handle for the per-peer task that owns this
-    /// connection. When `PeerOutbound` is dropped (entry removed via
+    /// connection. When `PeerSession` is dropped (entry removed via
     /// `remove_peer` or replaced by a fresher conn's `PeerHello`), this
     /// `watch::Sender` drops, which makes
     /// `watch::Receiver::changed().await` in the per-peer task's
@@ -184,18 +250,31 @@ pub(crate) struct PeerOutbound {
     /// cycles the relay would run out of file descriptors and stop
     /// accepting new WebSocket upgrades.
     pub(crate) _shutdown: tokio::sync::watch::Sender<()>,
+    /// What this peer currently wants from me, keyed by `FilterHash` for
+    /// O(1) Withdrawn lookups (the entry name carries the hash, not the
+    /// filter). Cleared with the session on peer drop.
+    pub(crate) interests:
+        std::collections::HashMap<crate::routing::FilterHash, sunset_store::Filter>,
+}
+
+impl crate::routing::PeerInterests for PeerSession {
+    fn interests(
+        &self,
+    ) -> &std::collections::HashMap<crate::routing::FilterHash, sunset_store::Filter> {
+        &self.interests
+    }
 }
 
 /// Mutable state inside the engine. Held under a `tokio::sync::Mutex` so
 /// command processing and per-peer task callbacks can both update it.
 pub(crate) struct EngineState {
     pub trust: TrustSet,
-    pub registry: SubscriptionRegistry,
-    /// Per-peer outbound state, keyed by `PeerId`. Each entry carries
+    pub routes: crate::routing::Routes,
+    /// Per-peer session state, keyed by `PeerId`. Each entry carries
     /// the sender, the connection generation, and the transport kind
     /// — kept together so a late `current_peers()` snapshot can't see
     /// a peer in one map but not the other.
-    pub peer_outbound: HashMap<PeerId, PeerOutbound>,
+    pub peer_sessions: HashMap<PeerId, PeerSession>,
     /// Live `EngineEvent` subscribers. Dead senders (closed by the
     /// receiver being dropped) are evicted lazily on the next emit.
     pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
@@ -224,16 +303,6 @@ pub struct SyncEngine<S: Store, T: Transport> {
     /// (`?Send`); a `RefCell<u64>` would also work, but `Arc<Mutex<…>>` keeps
     /// the same shape as the rest of the engine state.
     pub(crate) next_conn_id: Arc<Mutex<u64>>,
-    /// All filters that the local peer has called `publish_subscription`
-    /// with, deduped by `PartialEq`. The engine writes the **union** of
-    /// these as the single per-peer SUBSCRIBE_NAME entry, so a client
-    /// that subscribes to multiple disjoint namespaces (e.g. chat
-    /// `<fp>/`, voice frames `voice/<fp>/`, voice presence
-    /// `voice-presence/<fp>/`) gets all of them routed by the relay's
-    /// registry. Without this accumulation, each call would clobber the
-    /// previous (HashMap-per-peer in `SubscriptionRegistry`), silently
-    /// breaking sync for every prior subscription.
-    pub(crate) own_filters: Arc<Mutex<Vec<Filter>>>,
 }
 
 impl<S: Store + 'static, T: Transport + 'static> SyncEngine<S, T>
@@ -252,19 +321,18 @@ where
             store,
             transport: Arc::new(transport),
             config,
-            local_peer,
+            local_peer: local_peer.clone(),
             signer,
             state: Arc::new(Mutex::new(EngineState {
                 trust: TrustSet::default(),
-                registry: SubscriptionRegistry::new(),
-                peer_outbound: HashMap::new(),
+                routes: crate::routing::Routes::new(local_peer),
+                peer_sessions: HashMap::new(),
                 event_subs: Vec::new(),
                 ephemeral_subs: Vec::new(),
             })),
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
             next_conn_id: Arc::new(Mutex::new(0)),
-            own_filters: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -332,8 +400,7 @@ where
     /// `SignedDatagram` whose `(verifying_key, name)` matches the
     /// filter to this receiver. Subscription is in-process only; for
     /// remote peers to route ephemeral traffic to us, the caller must
-    /// also publish the filter via `publish_subscription` (the Bus
-    /// layer does this transparently in `bus.subscribe`).
+    /// also publish the filter via `subscribe` / `subscribe_via`.
     pub async fn subscribe_ephemeral(
         &self,
         filter: Filter,
@@ -343,29 +410,27 @@ where
         rx
     }
 
-    /// Publish a signed ephemeral datagram. Routes via the subscription
-    /// registry: every peer whose filter matches receives the datagram
-    /// over the unreliable channel. Locally, in-process subscribers
-    /// whose filter matches also receive a copy. Fire-and-forget — does
-    /// NOT verify the signature on send (the caller is the signer); does
-    /// NOT persist; does NOT retry. Returns `Ok(())` even if no peers
+    /// Publish a signed ephemeral datagram. Routes via the routing
+    /// substrate (peer_sessions interests / Routes): every peer whose
+    /// filter matches receives the datagram over the unreliable
+    /// channel. Locally, in-process subscribers whose filter matches
+    /// also receive a copy. Fire-and-forget — does NOT verify the
+    /// signature on send (the caller is the signer); does NOT
+    /// persist; does NOT retry. Returns `Ok(())` even if no peers
     /// match.
     pub async fn publish_ephemeral(&self, datagram: sunset_store::SignedDatagram) -> Result<()> {
-        // Loopback: deliver to local subscribers first.
         self.dispatch_ephemeral_local(&datagram).await;
 
-        // Fan-out to remote peers whose subscription filter matches.
         let msg = SyncMessage::EphemeralDelivery {
             datagram: datagram.clone(),
         };
         let state = self.state.lock().await;
-        for peer in state
-            .registry
-            .peers_matching(&datagram.verifying_key, &datagram.name)
-        {
-            if let Some(po) = state.peer_outbound.get(&peer) {
-                let _ = po.tx.send(msg.clone());
-            }
+        for (_peer, session) in crate::routing::forward_targets(
+            &state.peer_sessions,
+            &datagram.verifying_key,
+            &datagram.name,
+        ) {
+            let _ = session.tx.send(msg.clone());
         }
         Ok(())
     }
@@ -377,24 +442,75 @@ where
     pub async fn current_peers(&self) -> Vec<(PeerId, crate::transport::TransportKind)> {
         let state = self.state.lock().await;
         state
-            .peer_outbound
+            .peer_sessions
             .iter()
             .map(|(pk, po)| (pk.clone(), po.kind))
             .collect()
     }
 
-    /// Publish this peer's subscription filter. Writes a signed KV entry
-    /// under `(local_peer, "_sunset-sync/subscribe")` with `value_hash =
-    /// blake3(postcard(filter))` and priority = unix-timestamp-now,
-    /// expires_at = priority + ttl.
-    pub async fn publish_subscription(
+    /// Subscribe to `filter` from one specific peer. The provider, on
+    /// receiving the resulting SubscriptionEntry, starts forwarding
+    /// matching store events to me; the existing DigestRequest/Exchange
+    /// pipeline backfills already-stored entries.
+    pub async fn subscribe_via(
         &self,
         filter: Filter,
-        ttl: std::time::Duration,
+        provider: PeerId,
+        policy: crate::routing::SubscriptionPolicy,
     ) -> Result<()> {
         let (ack, rx) = oneshot::channel();
         self.cmd_tx
-            .send(EngineCommand::PublishSubscription { filter, ttl, ack })
+            .send(EngineCommand::SubscribeVia {
+                filter,
+                provider,
+                policy,
+                ack,
+            })
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Withdraw a `subscribe_via(filter, provider)` subscription.
+    /// Publishes `SubscriptionEntry::Withdrawn` at the same key;
+    /// idempotent (returns Ok if not currently subscribed).
+    pub async fn unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::UnsubscribeVia {
+                filter,
+                provider,
+                ack,
+            })
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Declare interest in `filter` from any directly-connected peer.
+    /// Implemented as an auto-resubscriber: for each currently-connected
+    /// peer, calls `subscribe_via`; on future peer connects, the
+    /// engine's AddPeer handler re-runs `subscribe_via` for any active
+    /// intent.
+    pub async fn subscribe(
+        &self,
+        filter: Filter,
+        policy: crate::routing::SubscriptionPolicy,
+    ) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::Subscribe {
+                filter,
+                policy,
+                ack,
+            })
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Cancel a `subscribe()`. Idempotent.
+    pub async fn unsubscribe(&self, filter: Filter) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::Unsubscribe { filter, ack })
             .map_err(|_| Error::Closed)?;
         rx.await.map_err(|_| Error::Closed)?
     }
@@ -416,36 +532,24 @@ where
     /// Caller must invoke this inside a `LocalSet` (native) or directly on
     /// a single-threaded executor (WASM).
     pub async fn run(&self) -> Result<()> {
-        // Take ownership of the command receiver. If `run()` is called
-        // twice, the second call observes None and returns Error::Closed.
+        // If `run()` is called twice, the second call observes None and
+        // returns Error::Closed.
         let mut cmd_rx = self.cmd_rx.lock().await.take().ok_or(Error::Closed)?;
 
-        // Channel for per-peer tasks to talk back to us.
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<InboundEvent>();
 
-        // Rebuild the in-memory subscription_registry from existing
-        // `SUBSCRIBE_NAME` entries on disk. Persistent backends (e.g.
-        // `sunset-store-fs` used by the relay) hold these across process
-        // restarts; the registry must reflect that state before we start
-        // routing chat traffic. Without this step, after a relay restart
-        // the relay would receive forwarded chat messages but find no
-        // peers to fan them out to (registry is empty), and clients would
-        // never see each other's messages until they happened to publish
-        // a fresh subscribe entry.
-        self.replay_existing_subscriptions().await?;
+        self.bootstrap_routes().await?;
 
-        // Local store subscription. Match every entry (an empty NamePrefix
-        // matches all names): the engine needs to see both subscribe-
-        // namespace entries (to maintain the registry) and any application
-        // entry that might match a peer's filter (for push routing). Per-
-        // peer fanout is filtered downstream in `handle_local_store_event`.
+        // Match every entry (empty NamePrefix matches all names): the engine
+        // needs both subscribe-namespace entries (to update per-peer
+        // interests) and any application entry that might match a peer's
+        // filter (for push routing). Per-peer fanout is filtered downstream
+        // in `handle_local_store_event`.
         let mut local_sub = self
             .store
             .subscribe(Filter::NamePrefix(Bytes::new()), Replay::None)
             .await?;
 
-        // Anti-entropy timer. tokio::time::interval works on native; on
-        // wasm32 we use the wasmtimer drop-in (browser timers via setTimeout).
         #[cfg(not(target_arch = "wasm32"))]
         let mut anti_entropy = tokio::time::interval(self.config.anti_entropy_interval);
         #[cfg(target_arch = "wasm32")]
@@ -454,27 +558,32 @@ where
         // isn't duplicated immediately after PeerHello.
         anti_entropy.tick().await;
 
-        // Spawn the accept loop in its own task so its in-flight
-        // post-accept work (e.g. NoiseTransport's IK handshake on the
-        // raw connection that `transport.accept().await` just returned)
-        // is NOT a `tokio::select!` arm in the engine's main loop.
-        //
-        // Why this matters: `select!` cancels every other branch the
-        // moment any one branch returns Ready. If the accept arm sat in
-        // `select!`, then any unrelated wakeup (a peer's PeerHello
-        // landing on `inbound_rx`, an outbound command on `cmd_rx`, an
-        // anti-entropy tick) while the secondary transport's Noise
-        // responder was awaiting msg1 would cancel the accept future
-        // mid-handshake. The dequeued `WebRtcRawConnection` (already
-        // taken off the per-transport `completed_rx`) would be dropped
-        // along with it, and that connection is gone for good — the
-        // remote peer's dial sits in `Connecting` until its
-        // `engine.add_peer` await eventually times out (or, for
-        // `WebRtcRawTransport::connect`, never).
-        //
-        // Running accept in its own task isolates it from the select!:
-        // dequeue + Noise + run_peer spawn all happen without competing
-        // for poll cycles with the engine's other branches.
+        // MissedTickBehavior::Skip avoids tick storms after a long pause
+        // (e.g. WASM tab backgrounded); a single catch-up fire is enough,
+        // since `due_for_refresh` scans the full set every tick anyway.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut routing_tick = {
+            let mut t = tokio::time::interval(std::time::Duration::from_millis(500));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        };
+        #[cfg(target_arch = "wasm32")]
+        let mut routing_tick = {
+            let mut t = wasmtimer::tokio::interval(std::time::Duration::from_millis(500));
+            t.set_missed_tick_behavior(wasmtimer::tokio::MissedTickBehavior::Skip);
+            t
+        };
+        // Burn the initial immediate-fire tick so the first real fire is one period out.
+        routing_tick.tick().await;
+
+        // Accept runs in its own task instead of a `select!` arm because
+        // `select!` cancels every other branch when any branch returns
+        // Ready. If a peer's PeerHello, an outbound command, or an
+        // anti-entropy tick wakes up while a secondary transport's Noise
+        // responder is mid-handshake on the just-accepted raw connection,
+        // the accept future would be dropped and the dequeued connection
+        // would be lost (already off the per-transport `completed_rx`,
+        // unreclaimable).
         spawn_accept_loop(
             self.transport.clone(),
             self.next_conn_id.clone(),
@@ -499,6 +608,28 @@ where
                 _ = anti_entropy.tick() => {
                     self.tick_anti_entropy().await;
                 }
+                _ = routing_tick.tick() => {
+                    self.tick_routing().await;
+                }
+            }
+        }
+    }
+
+    /// Refresh any subscription whose TTL has passed half-life.
+    ///
+    /// Snapshots the due-for-refresh set under the inner state lock, then
+    /// republishes each one outside the lock. `republish_subscription`
+    /// failures are logged per-key so a single bad key doesn't poison the
+    /// whole tick.
+    async fn tick_routing(&self) {
+        let now_ms = now_unix_ms();
+        let due = {
+            let state = self.state.lock().await;
+            state.routes.due_for_refresh(now_ms)
+        };
+        for key in due {
+            if let Err(e) = self.republish_subscription(&key).await {
+                tracing::warn!(?e, ?key, "subscription refresh failed");
             }
         }
     }
@@ -508,14 +639,13 @@ where
         // the lock and skips peers that disconnected mid-tick.
         let peers: Vec<PeerId> = {
             let state = self.state.lock().await;
-            state.peer_outbound.keys().cloned().collect()
+            state.peer_sessions.keys().cloned().collect()
         };
         if peers.is_empty() {
             return;
         }
-        let own_filters = self.own_published_filters().await;
         for peer in &peers {
-            self.fan_out_digests_to_peer(peer, &own_filters).await;
+            self.fan_out_digests_to_peer(peer).await;
         }
     }
 
@@ -526,10 +656,10 @@ where
     ) {
         match cmd {
             EngineCommand::AddPeer { addr, ack } => {
-                // Spawn the connect+spawn_peer chain as a background task
-                // so the engine's `select!` loop stays responsive during
-                // the handshake. This is load-bearing for transports
-                // whose `connect()` depends on the engine making forward
+                // Run connect + spawn_peer in a background task so the
+                // engine's `select!` loop stays responsive during the
+                // handshake — load-bearing for transports whose
+                // `connect()` depends on the engine making forward
                 // progress (e.g. WebRTC, where SDP/ICE flows over the
                 // existing CRDT replication).
                 let transport = self.transport.clone();
@@ -544,7 +674,6 @@ where
                                 Result<(PeerId, crate::transport::TransportKind)>,
                             >();
                             spawn_run_peer(conn, env, conn_id, inbound_tx, Some(hello_tx));
-                            // Wait for the Hello exchange to complete.
                             match hello_rx.await {
                                 Ok(Ok(pair)) => Ok(pair),
                                 Ok(Err(e)) => Err(e),
@@ -556,8 +685,33 @@ where
                     let _ = ack.send(r);
                 });
             }
-            EngineCommand::PublishSubscription { filter, ttl, ack } => {
-                let r = self.do_publish_subscription(filter, ttl).await;
+            EngineCommand::SubscribeVia {
+                filter,
+                provider,
+                policy,
+                ack,
+            } => {
+                let r = self.do_subscribe_via(filter, provider, policy).await;
+                let _ = ack.send(r);
+            }
+            EngineCommand::UnsubscribeVia {
+                filter,
+                provider,
+                ack,
+            } => {
+                let r = self.do_unsubscribe_via(filter, provider).await;
+                let _ = ack.send(r);
+            }
+            EngineCommand::Subscribe {
+                filter,
+                policy,
+                ack,
+            } => {
+                let r = self.do_subscribe(filter, policy).await;
+                let _ = ack.send(r);
+            }
+            EngineCommand::Unsubscribe { filter, ack } => {
+                let r = self.do_unsubscribe(filter).await;
                 let _ = ack.send(r);
             }
             EngineCommand::SetTrust { trust, ack } => {
@@ -565,14 +719,7 @@ where
                 let _ = ack.send(Ok(()));
             }
             EngineCommand::RemovePeer { peer_id, ack } => {
-                let removed = {
-                    let mut state = self.state.lock().await;
-                    state.peer_outbound.remove(&peer_id).is_some()
-                };
-                if removed {
-                    self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
-                        .await;
-                }
+                self.drop_peer_session(peer_id).await;
                 let _ = ack.send(Ok(()));
             }
         }
@@ -588,24 +735,52 @@ where
                 shutdown,
                 registered,
             } => {
-                // Register the outbound state under the Hello-declared
-                // peer_id. The insert here implicitly drops any previous
-                // PeerOutbound for the same peer_id (e.g. a stale
+                // The insert here implicitly drops any previous
+                // PeerSession for the same peer_id (e.g. a stale
                 // generation from before a reconnect). That drop fires
                 // the OLD `_shutdown` watch::Sender, telling the OLD
                 // run_peer's tasks to wind down — see the field doc on
-                // `PeerOutbound::_shutdown`.
+                // `PeerSession::_shutdown`.
                 {
                     let mut state = self.state.lock().await;
-                    state.peer_outbound.insert(
+                    state.peer_sessions.insert(
                         peer_id.clone(),
-                        PeerOutbound {
+                        PeerSession {
                             conn_id,
                             kind,
                             tx: out_tx,
                             _shutdown: shutdown,
+                            interests: std::collections::HashMap::new(),
                         },
                     );
+                }
+                // Rebuild this peer's interests from the durable
+                // SubscriptionEntries already in our store. On a reconnect
+                // those entries survive (the fresh PeerSession above does
+                // not), so this re-arms forwarding immediately instead of
+                // waiting for the peer to re-subscribe or for the next
+                // routing-tick republish — closing the dark window in which
+                // ephemeral traffic to this peer would be silently dropped.
+                if let Err(e) = self.arm_interests_from_store(Some(&peer_id)).await {
+                    tracing::warn!("re-arming interests on PeerHello failed: {e}");
+                }
+                // Replay every current BroadcastIntent against the
+                // newly-connected peer. Errors are logged-and-continued
+                // by `fan_out_intent_to_peers`; failing AddPeer because
+                // a single intent couldn't bind would be worse than
+                // the inconsistency (the next refresh tick surfaces
+                // persistent failures).
+                let intents: Vec<crate::routing::BroadcastIntent> = {
+                    let state = self.state.lock().await;
+                    state.routes.broadcast_intents_snapshot()
+                };
+                for intent in intents {
+                    self.fan_out_intent_to_peers(
+                        &intent.filter,
+                        intent.policy,
+                        vec![peer_id.clone()],
+                    )
+                    .await;
                 }
                 self.emit_engine_event(EngineEvent::PeerAdded {
                     peer_id: peer_id.clone(),
@@ -613,20 +788,16 @@ where
                 })
                 .await;
                 // Wake the `add_peer().await` caller now that
-                // `peer_outbound` is populated, so an immediately-
-                // following `publish_subscription` / `insert` lands a
-                // peer to push to. We also pass `kind` through the
-                // oneshot so the supervisor can write
-                // `(peer_id, kind)` atomically — without it, the
-                // supervisor would have to wait for the separate
-                // `EngineEvent::PeerAdded` broadcast to populate
-                // `IntentSnapshot::kind`, which races against
-                // `spawn_dial`'s post-await borrow_mut.
+                // `peer_sessions` is populated, so an immediately-
+                // following `subscribe` / `insert` lands a peer to
+                // push to. `kind` rides on the oneshot so callers can
+                // record `(peer_id, kind)` atomically without racing
+                // against the separate `EngineEvent::PeerAdded`
+                // broadcast.
                 if let Some(s) = registered {
                     let _ = s.send(Ok((peer_id.clone(), kind)));
                 }
-                let own_filters = self.own_published_filters().await;
-                self.fan_out_digests_to_peer(&peer_id, &own_filters).await;
+                self.fan_out_digests_to_peer(&peer_id).await;
             }
             InboundEvent::Message { from, message } => {
                 self.handle_peer_message(from, message).await;
@@ -642,19 +813,17 @@ where
                     reason = %reason,
                     "peer disconnected",
                 );
-                let removed = {
-                    let mut state = self.state.lock().await;
-                    match state.peer_outbound.get(&peer_id) {
-                        Some(po) if po.conn_id == conn_id => {
-                            state.peer_outbound.remove(&peer_id);
-                            true
-                        }
-                        _ => false,
-                    }
+                // Generation guard: only drop the session if the
+                // current entry's conn_id matches the Disconnected
+                // event. A stale Disconnected from generation N must
+                // not tear down a fresh generation N+1 session that
+                // just landed via `PeerHello`.
+                let conn_id_matches = {
+                    let state = self.state.lock().await;
+                    matches!(state.peer_sessions.get(&peer_id), Some(po) if po.conn_id == conn_id)
                 };
-                if removed {
-                    self.emit_engine_event(EngineEvent::PeerRemoved { peer_id })
-                        .await;
+                if conn_id_matches {
+                    self.drop_peer_session(peer_id).await;
                 }
             }
             InboundEvent::PongObserved {
@@ -672,101 +841,107 @@ where
         }
     }
 
-    /// Walk the local store for existing `_sunset-sync/subscribe` entries
-    /// and seed the in-memory `subscription_registry`. Called once at the
-    /// top of `run()` so that persistent backends survive process restart
-    /// without losing their routing state. Pure "read existing entries
-    /// and update local in-memory state" — does NOT push events to peers
-    /// (that's the live `local_sub` path's job, only for *new* inserts).
-    async fn replay_existing_subscriptions(&self) -> Result<()> {
-        let filter = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
-        let mut entries = self.store.iter(filter).await.map_err(Error::Store)?;
-        while let Some(item) = entries.next().await {
-            let entry = match item {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %e, "replay_existing_subscriptions: store iteration");
-                    continue;
-                }
+    /// Walk the local store for `_sunset-sync/subscribe/*` entries and,
+    /// for each `Active { provider == me }` whose receiver is currently
+    /// connected, (re)populate that peer's `interests`. `only` restricts
+    /// the scan to a single peer (the PeerHello (re)connect path); `None`
+    /// arms every connected peer (the one-shot startup scan).
+    ///
+    /// This is what keeps a peer's declared interest connection-independent.
+    /// The durable `SubscriptionEntry` in our store is the source of truth;
+    /// the per-`PeerSession` `interests` map is a cache rebuilt from it
+    /// whenever a connection is (re)established. Without this rebuild a
+    /// reconnect starts the fresh `PeerSession` with an empty interest map,
+    /// and the equal-priority re-delivery of the unchanged entry is rejected
+    /// as `Stale` before it can fire a store event — so forwarding to the
+    /// peer goes dark until the next routing-tick republish, dropping any
+    /// `publish_ephemeral` traffic (e.g. voice frames) in the gap.
+    async fn arm_interests_from_store(&self, only: Option<&PeerId>) -> Result<()> {
+        let mut iter = self
+            .store
+            .iter(Filter::NamePrefix(Bytes::from_static(
+                crate::routing::SUBSCRIBE_PREFIX,
+            )))
+            .await?;
+        while let Some(entry_result) = iter.next().await {
+            let Ok(entry) = entry_result else {
+                continue;
             };
-            let block = match self.store.get_content(&entry.value_hash).await {
-                Ok(Some(b)) => b,
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!(error = %e, "replay_existing_subscriptions: get_content");
-                    continue;
-                }
+            let receiver = PeerId(entry.verifying_key.clone());
+            if only.is_some_and(|p| p != &receiver) {
+                continue;
+            }
+            let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
+                continue;
             };
-            if let Ok(parsed_filter) = parse_subscription_entry(&entry, &block) {
-                let _ = self
-                    .state
-                    .lock()
-                    .await
-                    .registry
-                    .insert(entry.verifying_key, parsed_filter);
+            let Ok(sub_entry) =
+                postcard::from_bytes::<crate::routing::SubscriptionEntry>(&block.data)
+            else {
+                continue;
+            };
+            let Some(filter_hash) = crate::routing::decode_filter_hash_from_name(&entry.name)
+            else {
+                continue;
+            };
+            if let crate::routing::SubscriptionEntry::Active { filter, provider } = sub_entry
+                && provider == self.local_peer
+            {
+                let (was_new, tx) = {
+                    let mut state = self.state.lock().await;
+                    let Some(session) = state.peer_sessions.get_mut(&receiver) else {
+                        // Receiver not connected: `handle_subscription_active`
+                        // arms it when their entry is (re)delivered after they
+                        // connect.
+                        continue;
+                    };
+                    let was_new = session
+                        .interests
+                        .insert(filter_hash, filter.clone())
+                        .is_none();
+                    (was_new, session.tx.clone())
+                };
+                if was_new {
+                    // These entries are authored by the receiver (a foreign
+                    // peer), so — exactly like `handle_subscription_active` —
+                    // ask them for a digest over the filter and push whatever
+                    // they are missing. This is the catch-up path: re-arming
+                    // the interest here makes the later
+                    // `handle_subscription_active` for the re-delivered entry
+                    // see it already armed and skip its own DigestRequest, so
+                    // without this a reconnecting peer would never receive the
+                    // entries written while it was gone.
+                    let _ = tx.send(SyncMessage::DigestRequest {
+                        filter: filter.clone(),
+                        range: DigestRange::All,
+                    });
+                    self.emit_engine_event(EngineEvent::PeerInterestArmed {
+                        receiver: receiver.clone(),
+                        filter,
+                    })
+                    .await;
+                }
             }
         }
         Ok(())
     }
 
-    /// Walk the local store for `_sunset-sync/subscribe` entries authored
-    /// by `self.local_peer` and return their parsed filters. Used by
-    /// `PeerHello` and `tick_anti_entropy` to fire per-filter digests so
-    /// a (re)connected client catches up on whatever it missed under
-    /// each of its own published interests.
-    ///
-    /// Other peers' subscribe entries are intentionally skipped — they
-    /// own their own catch-up, and this engine has no signing key for
-    /// them. Iteration errors and parse errors are logged-and-skipped,
-    /// matching `replay_existing_subscriptions`.
-    async fn own_published_filters(&self) -> Vec<Filter> {
-        let mut out = Vec::new();
-        let filter = Filter::Specific(
-            self.local_peer.0.clone(),
-            Bytes::from_static(reserved::SUBSCRIBE_NAME),
-        );
-        let mut entries = match self.store.iter(filter).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "own_published_filters: store iteration");
-                return out;
-            }
-        };
-        while let Some(item) = entries.next().await {
-            let entry = match item {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %e, "own_published_filters: store iteration");
-                    continue;
-                }
-            };
-            let block = match self.store.get_content(&entry.value_hash).await {
-                Ok(Some(b)) => b,
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!(error = %e, "own_published_filters: get_content");
-                    continue;
-                }
-            };
-            if let Ok(parsed) = parse_subscription_entry(&entry, &block) {
-                out.push(parsed);
-            }
-        }
-        out
+    /// Rehydrate interests for every already-connected peer at startup.
+    /// See [`Self::arm_interests_from_store`]. Outbound subscriptions and
+    /// broadcast intents are NOT rehydrated from disk; subsystems re-call
+    /// subscribe on startup.
+    async fn bootstrap_routes(&self) -> Result<()> {
+        self.arm_interests_from_store(None).await
     }
 
-    /// Send the bootstrap digest plus a per-own-filter digest to `peer`,
-    /// skipping any own filter that equals `bootstrap_filter` so the
-    /// receiver doesn't see two `DigestExchange`s for the same filter.
-    async fn fan_out_digests_to_peer(&self, peer: &PeerId, own_filters: &[Filter]) {
+    /// Send the bootstrap digest to `peer`. The bootstrap filter covers
+    /// the `_sunset-sync/subscribe/` namespace so a (re)connected peer
+    /// rehydrates its view of our outstanding per-(filter, provider)
+    /// subscription entries. Application-data digests are driven on
+    /// demand by `do_subscribe_via` / `do_subscribe` and by inbound
+    /// `SubscriptionEntry` replay.
+    async fn fan_out_digests_to_peer(&self, peer: &PeerId) {
         let bootstrap = &self.config.bootstrap_filter;
         self.send_filter_digest(peer, bootstrap).await;
-        for filter in own_filters {
-            if filter == bootstrap {
-                continue;
-            }
-            self.send_filter_digest(peer, filter).await;
-        }
     }
 
     /// Handle an inbound `DigestRequest`: the peer is asking us to send
@@ -782,9 +957,9 @@ where
     /// of our entries matching `filter`; the receiver uses its own
     /// store + the bloom to compute "entries we have that the sender
     /// doesn't" and replies with those as `EventDelivery`. Reused
-    /// for both the per-peer bootstrap exchange (filter =
-    /// SUBSCRIBE_NAME) and the post-`publish_subscription` catch-up
-    /// exchange (filter = the just-published subscription's filter).
+    /// for both the per-peer bootstrap exchange (filter prefix =
+    /// SUBSCRIBE_PREFIX) and the post-`subscribe` catch-up exchange
+    /// (filter = the just-subscribed filter).
     async fn send_filter_digest(&self, to: &PeerId, filter: &Filter) {
         let bloom = match build_digest(
             &*self.store,
@@ -804,7 +979,7 @@ where
             bloom: bloom.to_bytes(),
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(to) {
+        if let Some(po) = state.peer_sessions.get(to) {
             let _ = po.tx.send(msg);
         }
     }
@@ -878,7 +1053,7 @@ where
             blobs,
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(&from) {
+        if let Some(po) = state.peer_sessions.get(&from) {
             let _ = po.tx.send(msg);
         }
     }
@@ -890,7 +1065,7 @@ where
             _ => return,
         };
         let state = self.state.lock().await;
-        if let Some(po) = state.peer_outbound.get(&from) {
+        if let Some(po) = state.peer_sessions.get(&from) {
             let _ = po.tx.send(SyncMessage::BlobResponse { block });
         }
     }
@@ -955,7 +1130,7 @@ where
                     .is_some();
                 if !have {
                     let state = self.state.lock().await;
-                    if let Some(po) = state.peer_outbound.get(&from) {
+                    if let Some(po) = state.peer_sessions.get(&from) {
                         let _ = po.tx.send(SyncMessage::BlobRequest {
                             hash: entry.value_hash,
                         });
@@ -973,66 +1148,182 @@ where
             _ => return,
         };
 
-        // If this is a subscription announcement, update the registry so
-        // future push routing knows about the peer's interests.
-        //
-        // On a new or changed filter, also backfill the peer with already-
-        // stored entries that match the filter. This closes the receiver-side
-        // race where third-party-authored entries arrive in our local store
-        // *before* the recipient's SUBSCRIBE_NAME is parsed; without the
-        // backfill, those entries sit in our store with no forwarding trigger
-        // until anti-entropy fires (well past the latency budget for, e.g.,
-        // WebRTC SDP signaling).
-        if entry.name.as_ref() == reserved::SUBSCRIBE_NAME {
-            if let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await {
-                if let Ok(filter) = parse_subscription_entry(&entry, &block) {
-                    let peer_vk = entry.verifying_key.clone();
-                    let peer_id = PeerId(peer_vk.clone());
-                    let prev = self
-                        .state
-                        .lock()
-                        .await
-                        .registry
-                        .insert(peer_vk.clone(), filter.clone());
-                    let filter_changed = prev.as_ref() != Some(&filter);
-                    let is_self = peer_vk == self.local_peer.0;
-                    if filter_changed && !is_self {
-                        // Send a DigestRequest to the peer so they respond
-                        // with a DigestExchange (their bloom over `filter`).
-                        // The existing handle_digest_exchange path then
-                        // computes the diff and pushes only the entries the
-                        // peer is missing — bandwidth-efficient via bloom
-                        // dedup, safe when the peer already has overlapping
-                        // state (browser persistence, federated relays).
-                        let msg = SyncMessage::DigestRequest {
-                            filter: filter.clone(),
-                            range: DigestRange::All,
-                        };
-                        let state = self.state.lock().await;
-                        if let Some(po) = state.peer_outbound.get(&peer_id) {
-                            let _ = po.tx.send(msg);
-                        }
-                    }
-                }
-            }
+        if crate::routing::is_subscription_name(entry.name.as_ref()) {
+            self.handle_subscription_entry_event(&entry).await;
         }
 
-        // Push flow.
-        //
-        // Self-authored entries are broadcast to every currently-connected
-        // peer regardless of registry filter. The registry-driven push is
-        // only safe once bootstrap-digest has primed the registry with the
-        // peer's filter; for an entry inserted right after `add_peer`
-        // returns (e.g., the very first `publish_subscription` of a
-        // freshly-connected client), the registry may still be empty and
-        // a registry-filtered push would lose the entry on the floor
-        // until anti-entropy (default 30 s) caught up. My own entries
-        // going to my own peers don't need filter consent — the receiving
-        // peer is free to route or drop based on its own rules.
-        //
-        // Forwarded entries (authored by someone else) keep registry-
-        // filtered semantics: a relay MUST NOT broadcast a third party's
-        // chat traffic to peers whose subscription doesn't match.
+        self.fanout_application_entry(&entry).await;
+    }
+
+    /// Dispatch a SUBSCRIBE_PREFIX entry into the routing layer.
+    ///
+    /// All routing-state mutation happens under a single `state.lock()`
+    /// critical section per call.
+    async fn handle_subscription_entry_event(&self, entry: &sunset_store::SignedKvEntry) {
+        let Some((filter_hash, sub_entry)) = self.parse_subscription_entry(entry).await else {
+            return;
+        };
+        let receiver = PeerId(entry.verifying_key.clone());
+        let is_self_authored = entry.verifying_key == self.local_peer.0;
+
+        match sub_entry {
+            crate::routing::SubscriptionEntry::Active { filter, provider }
+                if provider == self.local_peer =>
+            {
+                self.handle_subscription_active(filter_hash, receiver, filter, is_self_authored)
+                    .await;
+            }
+            crate::routing::SubscriptionEntry::Withdrawn => {
+                self.handle_subscription_withdrawn(filter_hash, receiver)
+                    .await;
+            }
+            // Active naming someone else: ignored. Recursive
+            // subscription (forwarding interest upstream) is not yet
+            // implemented.
+            _ => {}
+        }
+    }
+
+    /// Decode a SUBSCRIBE_PREFIX entry into `(filter_hash, SubscriptionEntry)`.
+    ///
+    /// Returns `None` (after a `warn!`) if either the blob is missing /
+    /// malformed or the name doesn't parse as `subscription_name`.
+    async fn parse_subscription_entry(
+        &self,
+        entry: &sunset_store::SignedKvEntry,
+    ) -> Option<(
+        crate::routing::FilterHash,
+        crate::routing::SubscriptionEntry,
+    )> {
+        let block = self
+            .store
+            .get_content(&entry.value_hash)
+            .await
+            .ok()
+            .flatten()?;
+        let sub_entry = match postcard::from_bytes::<crate::routing::SubscriptionEntry>(&block.data)
+        {
+            Ok(e) => e,
+            Err(_) => {
+                tracing::warn!(
+                    name = %String::from_utf8_lossy(&entry.name),
+                    "malformed SubscriptionEntry value; ignoring"
+                );
+                return None;
+            }
+        };
+        let filter_hash = match crate::routing::decode_filter_hash_from_name(&entry.name) {
+            Some(h) => h,
+            None => {
+                tracing::warn!(
+                    name = %String::from_utf8_lossy(&entry.name),
+                    "SUBSCRIBE_PREFIX entry with malformed name; ignoring"
+                );
+                return None;
+            }
+        };
+        Some((filter_hash, sub_entry))
+    }
+
+    /// `SubscriptionEntry::Active` arm with `provider == self`. Mirrors
+    /// the interest, optionally sends a backfill DigestRequest, and
+    /// emits `PeerInterestArmed`.
+    ///
+    /// Single critical section: insert into the session's interest map
+    /// and capture the outbound channel under one `state.lock()`,
+    /// release the lock, then send the DigestRequest. Holding the lock
+    /// across the (synchronous, non-blocking) `tx.send` is fine; we
+    /// release early so the `emit_engine_event` call below (which also
+    /// takes the lock) doesn't reenter.
+    async fn handle_subscription_active(
+        &self,
+        filter_hash: crate::routing::FilterHash,
+        receiver: PeerId,
+        filter: sunset_store::Filter,
+        is_self_authored: bool,
+    ) {
+        let (was_new, tx) = {
+            let mut state = self.state.lock().await;
+            let Some(session) = state.peer_sessions.get_mut(&receiver) else {
+                // Receiver isn't connected. Their SubscriptionEntry
+                // stays in our local store; when they reconnect, the
+                // PeerHello bootstrap digest exchange (see
+                // `fan_out_digests_to_peer`) replicates it to them
+                // via EventDelivery, their store insert fires this
+                // engine's local subscription, and this branch
+                // re-runs with the peer session now present.
+                return;
+            };
+            let was_new = session
+                .interests
+                .insert(filter_hash, filter.clone())
+                .is_none();
+            (was_new, session.tx.clone())
+        };
+        if was_new && !is_self_authored {
+            let _ = tx.send(SyncMessage::DigestRequest {
+                filter: filter.clone(),
+                range: DigestRange::All,
+            });
+        }
+        // Emit AFTER the DigestRequest send so a test observer that
+        // gates on this event is guaranteed the backfill exchange is
+        // queued or in flight. Fired for both self-authored (loopback
+        // through sync) and foreign-authored entries so the same gate
+        // works whether the receiver subscribes via us directly or
+        // through an intermediary relay.
+        if was_new {
+            self.emit_engine_event(EngineEvent::PeerInterestArmed {
+                receiver: receiver.clone(),
+                filter,
+            })
+            .await;
+        }
+    }
+
+    /// `SubscriptionEntry::Withdrawn` arm. Removes the mirrored interest
+    /// (no-op if not currently armed) and emits `PeerInterestWithdrawn`.
+    async fn handle_subscription_withdrawn(
+        &self,
+        filter_hash: crate::routing::FilterHash,
+        receiver: PeerId,
+    ) {
+        let prev_filter = {
+            let mut state = self.state.lock().await;
+            state
+                .peer_sessions
+                .get_mut(&receiver)
+                .and_then(|session| session.interests.remove(&filter_hash))
+        };
+        if let Some(filter) = prev_filter {
+            self.emit_engine_event(EngineEvent::PeerInterestWithdrawn {
+                receiver: receiver.clone(),
+                filter,
+            })
+            .await;
+        }
+    }
+
+    /// Fan out a locally-inserted (or just-replicated-and-inserted)
+    /// application entry to peer outbound channels.
+    ///
+    /// Two regimes:
+    ///
+    /// - **Self-authored** (`entry.verifying_key == self.local_peer.0`)
+    ///   broadcasts to every connected peer regardless of `interests`.
+    ///   Load-bearing for `subscribe_via` to take effect promptly: the
+    ///   `SubscriptionEntry` is itself a self-authored write, so without
+    ///   this broadcast it would only reach the named provider via
+    ///   anti-entropy (default 30 s) and `subscribe_via` would have
+    ///   multi-tens-of-seconds latency. Also matches the application UX:
+    ///   a user's own writes reach the peers they're connected to
+    ///   without those peers having to pre-announce interest.
+    ///
+    /// - **Foreign-authored** routes via `forward_targets`, which
+    ///   consults each peer's `interests` map. A relay MUST NOT
+    ///   broadcast a third party's traffic to peers whose subscription
+    ///   doesn't match.
+    async fn fanout_application_entry(&self, entry: &sunset_store::SignedKvEntry) {
         let blob = self
             .store
             .get_content(&entry.value_hash)
@@ -1045,17 +1336,16 @@ where
         };
         let state = self.state.lock().await;
         if entry.verifying_key == self.local_peer.0 {
-            for po in state.peer_outbound.values() {
-                let _ = po.tx.send(msg.clone());
+            for session in state.peer_sessions.values() {
+                let _ = session.tx.send(msg.clone());
             }
         } else {
-            for peer in state
-                .registry
-                .peers_matching(&entry.verifying_key, &entry.name)
-            {
-                if let Some(po) = state.peer_outbound.get(&peer) {
-                    let _ = po.tx.send(msg.clone());
-                }
+            for (_peer, session) in crate::routing::forward_targets(
+                &state.peer_sessions,
+                &entry.verifying_key,
+                &entry.name,
+            ) {
+                let _ = session.tx.send(msg.clone());
             }
         }
     }
@@ -1067,22 +1357,144 @@ where
         self.state
             .lock()
             .await
-            .peer_outbound
+            .peer_sessions
             .keys()
             .cloned()
             .collect()
     }
 
-    /// Snapshot of `(PeerId, Filter)` for every peer whose
-    /// `_sunset-sync/subscribe` entry is currently in the registry.
+    /// Snapshot of `(PeerId, Filter)` for every interest a currently-
+    /// connected peer has registered with us via a
+    /// `_sunset-sync/subscribe/<hash>/<provider>` entry naming this
+    /// engine as the provider. One row per (peer, filter); a peer
+    /// subscribing to multiple disjoint namespaces produces multiple
+    /// rows.
     pub async fn subscriptions_snapshot(&self) -> Vec<(PeerId, Filter)> {
-        self.state
-            .lock()
-            .await
-            .registry
-            .iter()
-            .map(|(vk, f)| (PeerId(vk.clone()), f.clone()))
+        let state = self.state.lock().await;
+        let mut out = Vec::new();
+        for (peer_id, session) in &state.peer_sessions {
+            for filter in session.interests.values() {
+                out.push((peer_id.clone(), filter.clone()));
+            }
+        }
+        out
+    }
+
+    /// Test-only snapshot of every currently-recorded outbound
+    /// `BroadcastIntent` (filter we have called `subscribe()` for, and
+    /// that the PeerHello auto-resubscriber would replay to a freshly
+    /// connecting peer).
+    ///
+    /// Gated behind `test-helpers` so the production API stays free of
+    /// internal-routing accessors.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn broadcast_intent_filters_snapshot(&self) -> Vec<Filter> {
+        let state = self.state.lock().await;
+        state
+            .routes
+            .broadcast_intents_snapshot()
+            .into_iter()
+            .map(|bi| bi.filter)
             .collect()
+    }
+
+    /// Wait until this engine has accepted a `SubscriptionEntry::Active`
+    /// from `receiver` naming us as the provider for `filter` — i.e.
+    /// from this engine's perspective, `receiver` wants matching
+    /// application entries forwarded to them and the matching
+    /// `DigestRequest` has already been queued. Returns `true` on
+    /// observation, `false` on timeout.
+    ///
+    /// The snapshot of current interests and the subscription to
+    /// future events happen under the same `state` lock as the emit
+    /// site, so there is no race window between "already armed" and
+    /// "armed later"; exactly one of those two arms will resolve.
+    ///
+    /// Integration tests use this as the public completion signal for
+    /// `subscribe` / `subscribe_via` — once it returns `true`, the
+    /// forwarding gate is open and a write that matches `filter` will
+    /// be routed to `receiver` (subject to verifier / trust).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn wait_for_peer_interest(
+        &self,
+        receiver: &PeerId,
+        filter: &Filter,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let (already, mut events) = {
+            let mut state = self.state.lock().await;
+            let already = state
+                .peer_sessions
+                .get(receiver)
+                .is_some_and(|s| s.interests.values().any(|f| f == filter));
+            let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+            state.event_subs.push(tx);
+            (already, rx)
+        };
+        if already {
+            return true;
+        }
+        let fut = async {
+            while let Some(ev) = events.recv().await {
+                if let EngineEvent::PeerInterestArmed {
+                    receiver: r,
+                    filter: f,
+                } = ev
+                    && &r == receiver
+                    && &f == filter
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        tokio::time::timeout(deadline, fut).await.unwrap_or(false)
+    }
+
+    /// Mirror of [`Self::wait_for_peer_interest`] for the withdrawal
+    /// transition: wait until this engine has accepted a
+    /// `SubscriptionEntry::Withdrawn` from `receiver` that retracts a
+    /// previously-armed `filter`. Returns `true` on observation,
+    /// `false` on timeout (or if the filter was never armed in the
+    /// first place — there is no withdrawal to observe).
+    ///
+    /// Snapshot + event subscription happen under the same lock as
+    /// the emit, identical to `wait_for_peer_interest`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn wait_for_peer_interest_withdrawn(
+        &self,
+        receiver: &PeerId,
+        filter: &Filter,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let (already_withdrawn, mut events) = {
+            let mut state = self.state.lock().await;
+            let armed = state
+                .peer_sessions
+                .get(receiver)
+                .is_some_and(|s| s.interests.values().any(|f| f == filter));
+            let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+            state.event_subs.push(tx);
+            (!armed, rx)
+        };
+        if already_withdrawn {
+            return true;
+        }
+        let fut = async {
+            while let Some(ev) = events.recv().await {
+                if let EngineEvent::PeerInterestWithdrawn {
+                    receiver: r,
+                    filter: f,
+                } = ev
+                    && &r == receiver
+                    && &f == filter
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        tokio::time::timeout(deadline, fut).await.unwrap_or(false)
     }
 
     /// Test-only helper: bypass the command channel and update trust
@@ -1092,24 +1504,34 @@ where
         self.state.lock().await.trust = trust;
     }
 
-    /// Test-only: true if this engine has learned the given peer's
-    /// subscription filter via the bootstrap digest exchange. Available
-    /// only with the `test-helpers` feature.
-    #[cfg(feature = "test-helpers")]
-    pub async fn knows_peer_subscription(&self, vk: &sunset_store::VerifyingKey) -> bool {
-        self.state
-            .lock()
-            .await
-            .registry
-            .iter()
-            .any(|(k, _)| k == vk)
-    }
-
     /// Fan-out an event to every live subscriber. Drops senders whose
     /// receivers have been dropped (lazy GC).
     async fn emit_engine_event(&self, ev: EngineEvent) {
         let mut state = self.state.lock().await;
         state.event_subs.retain(|tx| tx.send(ev.clone()).is_ok());
+    }
+
+    /// Single source of truth for peer-session teardown. Removes the
+    /// `peer_sessions` entry for `peer_id` and, if it was present, emits
+    /// `EngineEvent::PeerRemoved`. Returns `true` when a session was
+    /// actually removed.
+    ///
+    /// The `Disconnected` caller does its own conn_id peek first to
+    /// enforce the generation guard (a stale Disconnected from generation
+    /// N must not tear down a fresh generation N+1 session); once that
+    /// guard passes, removal + emit is delegated here.
+    async fn drop_peer_session(&self, peer_id: PeerId) -> bool {
+        let was_present = {
+            let mut state = self.state.lock().await;
+            state.peer_sessions.remove(&peer_id).is_some()
+        };
+        if was_present {
+            self.emit_engine_event(EngineEvent::PeerRemoved {
+                peer_id: peer_id.clone(),
+            })
+            .await;
+        }
+        was_present
     }
 
     /// Fan-out a datagram to every in-process subscriber whose filter
@@ -1147,131 +1569,209 @@ where
         self.dispatch_ephemeral_local(&datagram).await;
     }
 
-    /// Real implementation of `publish_subscription`'s server side.
+    /// Re-publish an active subscription to refresh its TTL. Called by the
+    /// routing tick for each entry returned from `routes.due_for_refresh`.
+    /// Returns Ok if the entry was already removed between scan and refresh.
+    async fn republish_subscription(&self, key: &crate::routing::OutboundKey) -> Result<()> {
+        let (filter, policy) = {
+            let state = self.state.lock().await;
+            let Some((filter, policy)) = state.routes.outbound_filter_policy(key) else {
+                return Ok(());
+            };
+            (filter, policy)
+        };
+        self.do_subscribe_via(filter, key.provider.clone(), policy)
+            .await
+    }
+
+    /// Sign and insert a per-(filter, provider) `SubscriptionEntry` into
+    /// the local store. Returns the chosen priority so the caller can
+    /// stamp `Outbound::last_published_ms` consistently.
     ///
-    /// Uses millisecond-precision priority (matching `presence_publisher`)
-    /// so two `publish_subscription` calls separated by sub-second wall
-    /// clock — most commonly a process restart sharing a `data_dir` with
-    /// the previous instance, where `Relay::new` + bind + banner takes
-    /// well under one second — produce monotonically-increasing priorities.
-    /// On the unlikely Stale (equal- or greater-priority on-disk entry,
-    /// e.g. clock-stepped backwards by NTP), retry once with
-    /// `existing.priority + 1` so the call always succeeds for our own
-    /// subscribe entry. The contract is "after Ok, the subscription is
-    /// active"; previously, restart within the same UNIX second of the
-    /// prior run silently violated that contract and caused the relay
-    /// process to exit on startup.
-    async fn do_publish_subscription(
+    /// `prev_published` is the previous priority at the same
+    /// `(verifying_key, name)` if any. The store enforces LWW by
+    /// priority, so this method picks `max(now_ms, prev + 1)` to
+    /// guarantee strict monotonicity even when two transitions land in
+    /// the same async tick (wall-clock millisecond resolution is not
+    /// enough).
+    ///
+    /// Takes no state lock; the caller must already have read
+    /// `prev_published` so this fn does not hold the state lock across
+    /// the `store.insert` await.
+    async fn publish_subscription_entry(
         &self,
-        filter: Filter,
-        ttl: std::time::Duration,
-    ) -> Result<()> {
+        filter: &Filter,
+        provider: &PeerId,
+        variant: crate::routing::SubscriptionEntry,
+        ttl_ms: u64,
+        prev_published: Option<u64>,
+    ) -> Result<u64> {
         use sunset_store::canonical::signing_payload;
         use sunset_store::{ContentBlock, SignedKvEntry};
 
-        // Accumulate this filter into the local per-engine set, then
-        // publish the union of all locally-published filters. The
-        // SUBSCRIBE_NAME entry carries one filter per peer (LWW); without
-        // accumulation, a second `publish_subscription(other_filter)`
-        // would silently clobber the first peer's prior interest at the
-        // relay, breaking every higher-layer subsystem (chat / voice /
-        // signaling) that has its own subscribe call.
-        let union_filter = {
-            let mut filters = self.own_filters.lock().await;
-            if !filters.iter().any(|f| f == &filter) {
-                filters.push(filter.clone());
-            }
-            // Single-element optimization: avoid wrapping in Union when
-            // unnecessary, so the wire format stays identical to the
-            // pre-accumulation behavior in the common one-subsystem case
-            // and the existing test vectors aren't disturbed.
-            if filters.len() == 1 {
-                filters[0].clone()
-            } else {
-                Filter::Union(filters.clone())
-            }
-        };
-
-        let value = postcard::to_stdvec(&union_filter)
-            .map_err(|e| Error::Decode(format!("encode filter: {e}")))?;
+        let name = crate::routing::subscription_name(filter, provider);
+        let value = postcard::to_stdvec(&variant)
+            .map_err(|e| Error::Decode(format!("encode SubscriptionEntry: {e}")))?;
         let block = ContentBlock {
             data: Bytes::from(value),
             references: vec![],
         };
-        let now_ms = web_time::SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let ttl_ms = ttl.as_millis() as u64;
+        let now_ms = now_unix_ms();
+        let priority = match prev_published {
+            Some(prev) if prev >= now_ms => prev.saturating_add(1),
+            _ => now_ms,
+        };
         let vk = self.signer.verifying_key();
-        let name = Bytes::from_static(reserved::SUBSCRIBE_NAME);
         let value_hash = block.hash();
+        let mut entry = SignedKvEntry {
+            verifying_key: vk,
+            name,
+            value_hash,
+            priority,
+            expires_at: Some(priority.saturating_add(ttl_ms)),
+            signature: Bytes::new(),
+        };
+        let payload = signing_payload(&entry);
+        entry.signature = self.signer.sign(&payload);
+        self.store
+            .insert(entry, Some(block))
+            .await
+            .map_err(Error::Store)?;
+        Ok(priority)
+    }
 
-        let mut priority = now_ms;
-        // At most one retry: the second iteration uses
-        // `existing.priority + 1`, which is strictly greater than any
-        // priority we've ever stored, so the third insert (if reached)
-        // would be impossible by construction.
-        let mut inserted = false;
-        for _ in 0..2 {
-            let mut entry = SignedKvEntry {
-                verifying_key: vk.clone(),
-                name: name.clone(),
-                value_hash,
-                priority,
-                expires_at: Some(priority.saturating_add(ttl_ms)),
-                signature: Bytes::new(),
-            };
-            let payload = signing_payload(&entry);
-            entry.signature = self.signer.sign(&payload);
-            match self.store.insert(entry, Some(block.clone())).await {
-                Ok(()) => {
-                    inserted = true;
-                    break;
-                }
-                Err(sunset_store::Error::Stale) => {
-                    let existing = self
-                        .store
-                        .get_entry(&vk, &name)
-                        .await
-                        .map_err(Error::Store)?;
-                    match existing {
-                        Some(e) => priority = e.priority.saturating_add(1),
-                        // Stale without an existing entry shouldn't happen
-                        // (LWW only rejects against an existing-or-equal
-                        // priority), but propagate cleanly if it does.
-                        None => return Err(Error::Store(sunset_store::Error::Stale)),
-                    }
-                }
-                Err(e) => return Err(Error::Store(e)),
+    /// Fan out a `BroadcastIntent` across a snapshot of peers by calling
+    /// `do_subscribe_via(filter, peer, policy)` for each. Errors are
+    /// logged and skipped: a single failing peer must not abort the
+    /// broadcast — best-effort fan-out, with the refresh tick to
+    /// surface persistent failures.
+    ///
+    /// Takes no state lock itself — the caller chose the peer snapshot
+    /// under whatever lock semantics it needed.
+    async fn fan_out_intent_to_peers(
+        &self,
+        filter: &Filter,
+        policy: crate::routing::SubscriptionPolicy,
+        peers: Vec<PeerId>,
+    ) {
+        for peer in peers {
+            if let Err(e) = self
+                .do_subscribe_via(filter.clone(), peer.clone(), policy)
+                .await
+            {
+                tracing::warn!(?e, ?peer, "subscribe per-peer fanout failed");
             }
         }
-        if !inserted {
-            // The retry loop is bounded by construction — see above.
-            // This branch is unreachable; we return Stale to satisfy
-            // the type system without inventing a new error variant.
-            return Err(Error::Store(sunset_store::Error::Stale));
-        }
+    }
 
-        // Fire a digest exchange to every connected peer over the
-        // newly-published filter. The peer responds with any matching
-        // entries it has that aren't in our bloom — closing the
-        // late-subscriber gap where an entry already at the peer
-        // (e.g., a relay holding A's WebRTC offer for us) wouldn't
-        // otherwise reach us until anti-entropy fires for
-        // SUBSCRIBE_NAME, which doesn't carry chat/webrtc data.
-        // Snapshotting peer ids first lets us drop the state lock
-        // before the per-peer bloom build + send work.
-        let peers: Vec<PeerId> = self
-            .state
-            .lock()
-            .await
-            .peer_outbound
-            .keys()
-            .cloned()
-            .collect();
-        for peer_id in &peers {
-            self.send_filter_digest(peer_id, &filter).await;
+    /// Publish a per-pair `SubscriptionEntry::Active` for `(filter,
+    /// provider)` and record the outbound in `routes.my_subs` for
+    /// refresh.
+    async fn do_subscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+        policy: crate::routing::SubscriptionPolicy,
+    ) -> Result<()> {
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let key = crate::routing::OutboundKey {
+            filter_hash,
+            provider: provider.clone(),
+        };
+        // A fresh subscribe-after-withdraw still wins on priority because
+        // the withdrawn `Outbound` was removed by `take_outbound` on
+        // unsubscribe.
+        let prev_published = self.state.lock().await.routes.outbound_last_published(&key);
+        let variant = crate::routing::SubscriptionEntry::Active {
+            filter: filter.clone(),
+            provider: provider.clone(),
+        };
+        let ttl_ms = policy.entry_ttl().as_millis() as u64;
+        let priority = self
+            .publish_subscription_entry(&filter, &provider, variant, ttl_ms, prev_published)
+            .await?;
+
+        let mut state = self.state.lock().await;
+        state.routes.insert_outbound(
+            key,
+            crate::routing::Outbound {
+                filter,
+                policy,
+                last_published_ms: priority,
+            },
+        );
+        Ok(())
+    }
+
+    /// Withdraw a per-pair `SubscriptionEntry`. Idempotent: returns Ok
+    /// without writing if no matching outbound is recorded.
+    async fn do_unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()> {
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let key = crate::routing::OutboundKey {
+            filter_hash,
+            provider: provider.clone(),
+        };
+        let prev = {
+            let mut state = self.state.lock().await;
+            state.routes.take_outbound(&key)
+        };
+        let Some(prev) = prev else { return Ok(()) };
+        let ttl_ms = prev.policy.entry_ttl().as_millis() as u64;
+        self.publish_subscription_entry(
+            &filter,
+            &provider,
+            crate::routing::SubscriptionEntry::Withdrawn,
+            ttl_ms,
+            Some(prev.last_published_ms),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Declare interest in `filter` from any directly-connected peer.
+    /// Records a `BroadcastIntent` and calls `subscribe_via` for every
+    /// peer currently in `peer_sessions`. The PeerHello
+    /// auto-resubscriber replays the intent for future peer connects.
+    async fn do_subscribe(
+        &self,
+        filter: Filter,
+        policy: crate::routing::SubscriptionPolicy,
+    ) -> Result<()> {
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let peers: Vec<PeerId> = {
+            let mut state = self.state.lock().await;
+            state.routes.insert_broadcast_intent(
+                filter_hash,
+                crate::routing::BroadcastIntent {
+                    filter: filter.clone(),
+                    policy,
+                },
+            );
+            state.peer_sessions.keys().cloned().collect()
+        };
+        self.fan_out_intent_to_peers(&filter, policy, peers).await;
+        Ok(())
+    }
+
+    /// Cancel a `subscribe()` — clear the broadcast intent and
+    /// `unsubscribe_via` every `(filter, provider)` pair it produced.
+    /// Idempotent.
+    async fn do_unsubscribe(&self, filter: Filter) -> Result<()> {
+        let filter_hash = crate::routing::filter_hash(&filter);
+        let providers: Vec<PeerId> = {
+            let mut state = self.state.lock().await;
+            if state.routes.take_broadcast_intent(&filter_hash).is_none() {
+                return Ok(());
+            }
+            state.routes.outbound_providers_for_filter(&filter_hash)
+        };
+        for provider in providers {
+            if let Err(e) = self
+                .do_unsubscribe_via(filter.clone(), provider.clone())
+                .await
+            {
+                tracing::warn!(?e, ?provider, "unsubscribe per-provider fanout failed");
+            }
         }
         Ok(())
     }
@@ -1295,28 +1795,9 @@ mod tests {
     use sunset_store_memory::MemoryStore;
 
     use crate::Signer;
+    use crate::test_helpers::{StubSigner, vk};
     use crate::test_transport::{TestNetwork, TestTransport};
     use crate::transport::TransportKind;
-
-    fn vk(b: &[u8]) -> VerifyingKey {
-        VerifyingKey::new(Bytes::copy_from_slice(b))
-    }
-
-    /// Test-only signer that returns a non-empty stub signature. Adequate when
-    /// the receiving store uses `AcceptAllVerifier`.
-    struct StubSigner {
-        vk: VerifyingKey,
-    }
-
-    impl Signer for StubSigner {
-        fn verifying_key(&self) -> VerifyingKey {
-            self.vk.clone()
-        }
-
-        fn sign(&self, _payload: &[u8]) -> Bytes {
-            Bytes::from_static(&[0u8; 64])
-        }
-    }
 
     fn make_engine(addr: &str, peer_label: &[u8]) -> SyncEngine<MemoryStore, TestTransport> {
         make_engine_with_store(addr, peer_label, Arc::new(MemoryStore::with_accept_all()))
@@ -1333,45 +1814,8 @@ mod tests {
             local_peer.clone(),
             PeerAddr::new(Bytes::copy_from_slice(addr.as_bytes())),
         );
-        let signer = Arc::new(StubSigner {
-            vk: local_peer.0.clone(),
-        });
+        let signer: Arc<dyn Signer> = Arc::new(StubSigner::new(local_peer.0.clone()));
         SyncEngine::new(store, transport, SyncConfig::default(), local_peer, signer)
-    }
-
-    /// Register a fake connected peer on the engine and return the
-    /// receiver end of its outbound channel.
-    async fn add_test_peer(
-        engine: &SyncEngine<MemoryStore, TestTransport>,
-        label: &[u8],
-        conn_id: ConnectionId,
-    ) -> (PeerId, mpsc::UnboundedReceiver<SyncMessage>) {
-        let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
-        let peer = PeerId(vk(label));
-        engine.state.lock().await.peer_outbound.insert(
-            peer.clone(),
-            PeerOutbound {
-                conn_id,
-                kind: TransportKind::Unknown,
-                tx,
-                _shutdown: tokio::sync::watch::channel(()).0,
-            },
-        );
-        (peer, rx)
-    }
-
-    /// Drain `rx` (non-blocking), collecting `DigestExchange.filter`
-    /// values. Panics on any other queued message kind.
-    fn drain_digest_filters(rx: &mut mpsc::UnboundedReceiver<SyncMessage>) -> Vec<Filter> {
-        let mut out = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(SyncMessage::DigestExchange { filter, .. }) => out.push(filter),
-                Ok(other) => panic!("expected DigestExchange, got {other:?}"),
-                Err(_) => break,
-            }
-        }
-        out
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1473,13 +1917,14 @@ mod tests {
 
                 // Pre-register a fake outbound channel so handle_blob_request has somewhere to send.
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     PeerId(vk(b"requester")),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: ConnectionId::for_test(99),
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1544,13 +1989,14 @@ mod tests {
                     .unwrap();
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     PeerId(vk(b"remote")),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: ConnectionId::for_test(99),
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1586,6 +2032,238 @@ mod tests {
             .run_until(async {
                 let engine = Rc::new(make_engine("alice", b"alice"));
                 engine.tick_anti_entropy().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_routing_with_no_outbound_subscriptions_is_noop() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                engine.tick_routing().await;
+                assert!(
+                    engine
+                        .state
+                        .lock()
+                        .await
+                        .routes
+                        .due_for_refresh(u64::MAX)
+                        .is_empty()
+                );
+            })
+            .await;
+    }
+
+    /// A single `tick_routing` refreshes any outbound whose
+    /// `last_published_ms` is past `policy.refresh_interval()`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_routing_republishes_due_outbound() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let provider = PeerId(vk(b"bob"));
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let key = crate::routing::OutboundKey {
+                    filter_hash: crate::routing::filter_hash(&filter),
+                    provider: provider.clone(),
+                };
+                // last_published_ms = 0 puts this outbound past half-life
+                // against any plausible wall-clock now.
+                let ob = crate::routing::Outbound {
+                    filter,
+                    policy: crate::routing::SubscriptionPolicy::store_data(),
+                    last_published_ms: 0,
+                };
+                engine
+                    .state
+                    .lock()
+                    .await
+                    .routes
+                    .insert_outbound(key.clone(), ob);
+
+                engine.tick_routing().await;
+
+                let bumped = engine
+                    .state
+                    .lock()
+                    .await
+                    .routes
+                    .outbound_last_published(&key)
+                    .expect("outbound still present after refresh");
+                assert!(
+                    bumped > 0,
+                    "tick_routing must bump last_published_ms (got {bumped})",
+                );
+            })
+            .await;
+    }
+
+    /// `tick_routing` refreshes every due outbound in one tick — a
+    /// regression that aborts the loop on first error would leave the
+    /// second `last_published_ms` at 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_routing_refreshes_all_due_outbounds() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+                let provider_a = PeerId(vk(b"bob"));
+                let provider_b = PeerId(vk(b"carol"));
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let fh = crate::routing::filter_hash(&filter);
+                let key_a = crate::routing::OutboundKey {
+                    filter_hash: fh,
+                    provider: provider_a,
+                };
+                let key_b = crate::routing::OutboundKey {
+                    filter_hash: fh,
+                    provider: provider_b,
+                };
+                let mk_ob = || crate::routing::Outbound {
+                    filter: filter.clone(),
+                    policy: crate::routing::SubscriptionPolicy::store_data(),
+                    last_published_ms: 0,
+                };
+                {
+                    let mut state = engine.state.lock().await;
+                    state.routes.insert_outbound(key_a.clone(), mk_ob());
+                    state.routes.insert_outbound(key_b.clone(), mk_ob());
+                }
+
+                engine.tick_routing().await;
+
+                let state = engine.state.lock().await;
+                assert!(
+                    state.routes.outbound_last_published(&key_a).expect("a") > 0,
+                    "first outbound was not refreshed",
+                );
+                assert!(
+                    state.routes.outbound_last_published(&key_b).expect("b") > 0,
+                    "second outbound was not refreshed (loop aborted early?)",
+                );
+            })
+            .await;
+    }
+
+    /// `current_peers` is empty before any connection, populated after
+    /// `add_peer` completes, and emptied again after `remove_peer`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_peers_reflects_connect_then_disconnect() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice_peer, bob_peer) = spawn_pair().await;
+
+                let alice_view = alice_peer.engine.current_peers().await;
+                assert_eq!(alice_view.len(), 1, "alice sees exactly bob");
+                assert_eq!(alice_view[0].0, bob_peer.id);
+
+                let bob_view = bob_peer.engine.current_peers().await;
+                assert_eq!(bob_view.len(), 1, "bob sees exactly alice");
+                assert_eq!(bob_view[0].0, alice_peer.id);
+
+                bob_peer
+                    .engine
+                    .remove_peer(alice_peer.id.clone())
+                    .await
+                    .unwrap();
+
+                // remove_peer is fire-and-forget at the transport layer;
+                // poll alice for the resulting Disconnected to land.
+                let cleared = crate::test_helpers::wait_for(
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_millis(20),
+                    || async { alice_peer.engine.current_peers().await.is_empty() },
+                )
+                .await;
+                assert!(
+                    cleared,
+                    "alice's current_peers did not clear after bob remove_peer"
+                );
+            })
+            .await;
+    }
+
+    /// `subscriptions_snapshot` returns one `(peer, filter)` row per
+    /// armed interest. Two filters from the same peer produce two rows;
+    /// an unsubscribe drops the row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscriptions_snapshot_lists_armed_interests() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+
+                assert!(
+                    alice.subscriptions_snapshot().await.is_empty(),
+                    "alice has no peer interests yet"
+                );
+
+                let f1 = Filter::Keyspace(vk(b"writer1"));
+                let f2 = Filter::Keyspace(vk(b"writer2"));
+                bob.subscribe_via(
+                    f1.clone(),
+                    alice_peer.id.clone(),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+                bob.subscribe_via(
+                    f2.clone(),
+                    alice_peer.id.clone(),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    alice
+                        .wait_for_peer_interest(
+                            &bob_peer.id,
+                            &f1,
+                            std::time::Duration::from_secs(2)
+                        )
+                        .await
+                );
+                assert!(
+                    alice
+                        .wait_for_peer_interest(
+                            &bob_peer.id,
+                            &f2,
+                            std::time::Duration::from_secs(2)
+                        )
+                        .await
+                );
+
+                let mut snap = alice.subscriptions_snapshot().await;
+                // HashMap iteration order: normalize for the assertion.
+                snap.sort_by_key(|(_, f)| crate::routing::filter_hash(f));
+                let mut want = vec![
+                    (bob_peer.id.clone(), f1.clone()),
+                    (bob_peer.id.clone(), f2.clone()),
+                ];
+                want.sort_by_key(|(_, f)| crate::routing::filter_hash(f));
+                assert_eq!(snap, want);
+
+                bob.unsubscribe_via(f1.clone(), alice_peer.id.clone())
+                    .await
+                    .unwrap();
+                assert!(
+                    alice
+                        .wait_for_peer_interest_withdrawn(
+                            &bob_peer.id,
+                            &f1,
+                            std::time::Duration::from_secs(2),
+                        )
+                        .await
+                );
+                let after = alice.subscriptions_snapshot().await;
+                assert_eq!(after, vec![(bob_peer.id.clone(), f2)]);
             })
             .await;
     }
@@ -1809,26 +2487,28 @@ mod tests {
                 // Generation 1.
                 let (tx1, _rx1) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn1 = ConnectionId::for_test(1);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn1,
                         kind: TransportKind::Unknown,
                         tx: tx1,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
                 // Replace with generation 2 (simulating a fresh PeerHello).
                 let (tx2, mut rx2) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn2 = ConnectionId::for_test(2);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn2,
                         kind: TransportKind::Unknown,
                         tx: tx2,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1855,7 +2535,7 @@ mod tests {
                 // The fresh sender (gen 2) must still be live: a manual
                 // send through it should succeed.
                 let state = engine.state.lock().await;
-                let po = state.peer_outbound.get(&peer).expect("gen2 still present");
+                let po = state.peer_sessions.get(&peer).expect("gen2 still present");
                 assert_eq!(po.conn_id, conn2);
                 let _ = po.tx.send(SyncMessage::Goodbye {});
                 drop(state);
@@ -1875,13 +2555,14 @@ mod tests {
 
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(7);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn,
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1904,7 +2585,7 @@ mod tests {
                     other => panic!("expected PeerRemoved, got {other:?}"),
                 }
 
-                assert!(!engine.state.lock().await.peer_outbound.contains_key(&peer));
+                assert!(!engine.state.lock().await.peer_sessions.contains_key(&peer));
             })
             .await;
     }
@@ -1919,13 +2600,14 @@ mod tests {
 
                 let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(7);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn,
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -1974,13 +2656,14 @@ mod tests {
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
                 let conn = ConnectionId::for_test(1);
-                engine.state.lock().await.peer_outbound.insert(
+                engine.state.lock().await.peer_sessions.insert(
                     peer.clone(),
-                    PeerOutbound {
+                    PeerSession {
                         conn_id: conn,
                         kind: TransportKind::Unknown,
                         tx,
                         _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
                     },
                 );
 
@@ -2009,448 +2692,6 @@ mod tests {
 
                 h.abort();
                 let _ = h.await;
-            })
-            .await;
-    }
-
-    /// Regression test for the Stale-on-restart bug. The relay's
-    /// `Relay::run()` calls `publish_subscription` on startup; if the
-    /// data_dir already contains a subscribe entry written by a prior
-    /// process run with priority equal to (or greater than) the current
-    /// `now_ms`, the LWW store rejects the insert as Stale. Pre-fix,
-    /// the engine surfaced that as an error → `Relay::run` returned
-    /// Err → process exited → clients saw ECONNREFUSED on every
-    /// reconnect attempt, breaking restart-based redial.
-    ///
-    /// `do_publish_subscription` must absorb the Stale and retry with
-    /// `existing.priority + 1`, so the call is always Ok for our own
-    /// subscribe entry.
-    #[tokio::test(flavor = "current_thread")]
-    async fn publish_subscription_bumps_priority_past_existing_stale_entry() {
-        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
-
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let store = Arc::new(MemoryStore::with_accept_all());
-                let engine = make_engine_with_store("alice", b"alice", store.clone());
-
-                // Pre-populate a subscribe entry under our own
-                // verifying_key with a priority well in the future,
-                // simulating a prior-process-run entry that the new
-                // call's `now_ms` cannot beat.
-                let block = ContentBlock {
-                    data: Bytes::from_static(b"prior-filter"),
-                    references: vec![],
-                };
-                let future_priority: u64 = 9_999_999_999_999; // ~year 2286 in ms
-                let prior = SignedKvEntry {
-                    verifying_key: vk(b"alice"),
-                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
-                    value_hash: block.hash(),
-                    priority: future_priority,
-                    expires_at: Some(future_priority.saturating_add(1)),
-                    signature: Bytes::from_static(&[0u8; 64]),
-                };
-                store
-                    .insert(prior.clone(), Some(block))
-                    .await
-                    .expect("prior insert");
-
-                // The freshly-issued publish_subscription would race a
-                // `now_ms` that is far below `future_priority` and
-                // therefore hit Stale on the first attempt. The retry
-                // bump must raise priority above the prior one and
-                // succeed.
-                let new_filter = Filter::NamePrefix(Bytes::from_static(b"chat/"));
-                engine
-                    .do_publish_subscription(new_filter, std::time::Duration::from_secs(60))
-                    .await
-                    .expect("publish_subscription must succeed even when an existing entry has a higher priority");
-
-                let stored = store
-                    .get_entry(&vk(b"alice"), reserved::SUBSCRIBE_NAME)
-                    .await
-                    .expect("get_entry")
-                    .expect("entry stored");
-                assert!(
-                    stored.priority > prior.priority,
-                    "new priority {} must strictly beat prior priority {}",
-                    stored.priority,
-                    prior.priority
-                );
-                assert_ne!(
-                    stored.value_hash, prior.value_hash,
-                    "new entry must replace the prior one (different filter → different value_hash)"
-                );
-            })
-            .await;
-    }
-
-    /// Regression for the late-subscriber routing race: an entry that
-    /// already lives at our peer when we publish a new subscription
-    /// wouldn't otherwise reach us. The per-event push at the peer
-    /// fired against an empty registry (we hadn't subscribed yet),
-    /// and the periodic anti-entropy / bootstrap-digest exchange
-    /// only carries SUBSCRIBE_NAME entries — chat / webrtc data
-    /// stays stranded. Pre-fix this manifested as `connect_direct`
-    /// hangs in CI: A's WebRTC offer reaches the relay, the relay
-    /// stores it, and B (who joined a moment later) never sees it.
-    ///
-    /// Fix: `do_publish_subscription` follows the local store insert
-    /// with a `DigestExchange` over the new filter, sent to every
-    /// connected peer. The peer responds with whatever matching
-    /// entries we don't already have, reusing the existing
-    /// `handle_digest_exchange` machinery.
-    ///
-    /// This test stands in for the publishing client (B): it sets
-    /// up B with one connected peer (e.g. the relay), calls
-    /// `do_publish_subscription`, and asserts that a digest
-    /// addressed to that peer hits the outbound channel with the
-    /// just-published filter.
-    #[tokio::test(flavor = "current_thread")]
-    async fn publish_subscription_sends_filter_digest_to_connected_peers() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let engine = Rc::new(make_engine("bob", b"bob"));
-
-                // Stand up "relay" as a connected peer with an
-                // outbound channel we can drain, mirroring what
-                // `handle_inbound_event(PeerHello)` does on a real
-                // connection.
-                let relay = PeerId(vk(b"relay"));
-                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                {
-                    let mut state = engine.state.lock().await;
-                    state.peer_outbound.insert(
-                        relay.clone(),
-                        PeerOutbound {
-                            conn_id: ConnectionId::for_test(0),
-                            kind: TransportKind::Unknown,
-                            tx,
-                            _shutdown: tokio::sync::watch::channel(()).0,
-                        },
-                    );
-                }
-
-                // Publish a subscription whose filter covers a
-                // chat-like namespace. After Ok we expect a
-                // DigestExchange with this exact filter on the
-                // relay's outbound channel.
-                let filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
-                engine
-                    .do_publish_subscription(filter.clone(), std::time::Duration::from_secs(60))
-                    .await
-                    .expect("publish_subscription must succeed");
-
-                // Drain everything the engine sent to the relay and
-                // assert: at least one DigestExchange whose filter
-                // matches the freshly-published one.
-                let mut saw_filter_digest = false;
-                while let Ok(msg) = rx.try_recv() {
-                    if let SyncMessage::DigestExchange { filter: f, .. } = msg {
-                        if f == filter {
-                            saw_filter_digest = true;
-                        }
-                    }
-                }
-                assert!(
-                    saw_filter_digest,
-                    "publish_subscription must send a DigestExchange over the new filter to each connected peer so the peer can backfill matching entries we're missing"
-                );
-            })
-            .await;
-    }
-
-    /// Helper: fetch the SUBSCRIBE_NAME entry written by `vk_bytes` from an
-    /// engine's store and decode its payload as a `Filter`.
-    async fn read_stored_filter(
-        engine: &SyncEngine<MemoryStore, TestTransport>,
-        vk_bytes: &[u8],
-    ) -> Filter {
-        use sunset_store::Store as _;
-
-        let verifying_key = vk(vk_bytes);
-        let entry = engine
-            .store
-            .get_entry(&verifying_key, reserved::SUBSCRIBE_NAME)
-            .await
-            .expect("get_entry")
-            .expect("SUBSCRIBE_NAME entry must exist");
-        let block = engine
-            .store
-            .get_content(&entry.value_hash)
-            .await
-            .expect("get_content")
-            .expect("blob for SUBSCRIBE_NAME entry must be present");
-        postcard::from_bytes::<Filter>(&block.data)
-            .expect("SUBSCRIBE_NAME blob must decode as Filter")
-    }
-
-    /// Calling `publish_subscription` once stores the bare filter (not
-    /// wrapped in `Filter::Union`) in the SUBSCRIBE_NAME entry. This
-    /// preserves wire-format compatibility with pre-accumulation clients
-    /// in the common single-subsystem case.
-    #[tokio::test(flavor = "current_thread")]
-    async fn publish_subscription_single_filter_writes_bare_filter() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let engine = make_engine("alice", b"alice");
-
-                let f = Filter::NamePrefix(Bytes::from_static(b"chat/"));
-                engine
-                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
-                    .await
-                    .expect("publish_subscription must succeed");
-
-                let stored = read_stored_filter(&engine, b"alice").await;
-                assert_eq!(
-                    stored, f,
-                    "single publish_subscription must store the bare filter, not Filter::Union([f])"
-                );
-            })
-            .await;
-    }
-
-    /// Calling `publish_subscription` twice with distinct filters stores a
-    /// `Filter::Union` that contains both filters. This ensures neither
-    /// subsystem's interest is silently clobbered by the other's call.
-    #[tokio::test(flavor = "current_thread")]
-    async fn publish_subscription_two_filters_writes_union() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let engine = make_engine("alice", b"alice");
-
-                let f1 = Filter::NamePrefix(Bytes::from_static(b"chat/"));
-                let f2 = Filter::NamePrefix(Bytes::from_static(b"voice/"));
-                engine
-                    .do_publish_subscription(f1.clone(), std::time::Duration::from_secs(60))
-                    .await
-                    .expect("first publish_subscription must succeed");
-                engine
-                    .do_publish_subscription(f2.clone(), std::time::Duration::from_secs(60))
-                    .await
-                    .expect("second publish_subscription must succeed");
-
-                let stored = read_stored_filter(&engine, b"alice").await;
-                match &stored {
-                    Filter::Union(filters) => {
-                        assert!(
-                            filters.contains(&f1),
-                            "union must contain first filter; got {filters:?}"
-                        );
-                        assert!(
-                            filters.contains(&f2),
-                            "union must contain second filter; got {filters:?}"
-                        );
-                    }
-                    other => panic!("expected Filter::Union, got {other:?}"),
-                }
-            })
-            .await;
-    }
-
-    /// Calling `publish_subscription` twice with the same filter must
-    /// deduplicate — the stored result must be the bare filter (not
-    /// `Filter::Union([f, f])`).
-    #[tokio::test(flavor = "current_thread")]
-    async fn publish_subscription_dedupe_same_filter() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let engine = make_engine("alice", b"alice");
-
-                let f = Filter::NamePrefix(Bytes::from_static(b"chat/"));
-                engine
-                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
-                    .await
-                    .expect("first publish_subscription must succeed");
-                engine
-                    .do_publish_subscription(f.clone(), std::time::Duration::from_secs(60))
-                    .await
-                    .expect("second publish_subscription (same filter) must succeed");
-
-                let stored = read_stored_filter(&engine, b"alice").await;
-                assert_eq!(
-                    stored, f,
-                    "duplicate publish_subscription must not wrap in Union; got {stored:?}"
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn own_published_filters_returns_self_authored_subscribe_entries_only() {
-        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
-
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let engine = Rc::new(make_engine("alice", b"alice"));
-
-                // Self-authored subscribe entry — should be returned.
-                let mine = Filter::NamePrefix(Bytes::from_static(b"room/"));
-                let mine_bytes = postcard::to_stdvec(&mine).unwrap();
-                let mine_block = ContentBlock {
-                    data: Bytes::from(mine_bytes),
-                    references: vec![],
-                };
-                let mine_entry = SignedKvEntry {
-                    verifying_key: vk(b"alice"),
-                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
-                    value_hash: mine_block.hash(),
-                    priority: 1,
-                    expires_at: None,
-                    signature: Bytes::new(),
-                };
-                engine
-                    .store
-                    .insert(mine_entry, Some(mine_block))
-                    .await
-                    .unwrap();
-
-                // Someone else's subscribe entry — must NOT be returned.
-                let theirs = Filter::NamePrefix(Bytes::from_static(b"other/"));
-                let theirs_bytes = postcard::to_stdvec(&theirs).unwrap();
-                let theirs_block = ContentBlock {
-                    data: Bytes::from(theirs_bytes),
-                    references: vec![],
-                };
-                let theirs_entry = SignedKvEntry {
-                    verifying_key: vk(b"bob"),
-                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
-                    value_hash: theirs_block.hash(),
-                    priority: 1,
-                    expires_at: None,
-                    signature: Bytes::new(),
-                };
-                engine
-                    .store
-                    .insert(theirs_entry, Some(theirs_block))
-                    .await
-                    .unwrap();
-
-                // Self-authored entry under a non-subscribe name — must NOT be returned.
-                let chat_block = ContentBlock {
-                    data: Bytes::from_static(b"hi"),
-                    references: vec![],
-                };
-                let chat_entry = SignedKvEntry {
-                    verifying_key: vk(b"alice"),
-                    name: Bytes::from_static(b"room/msg/1"),
-                    value_hash: chat_block.hash(),
-                    priority: 1,
-                    expires_at: None,
-                    signature: Bytes::new(),
-                };
-                engine
-                    .store
-                    .insert(chat_entry, Some(chat_block))
-                    .await
-                    .unwrap();
-
-                let filters = engine.own_published_filters().await;
-                assert_eq!(filters, vec![mine]);
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn peer_hello_fires_filter_digest_for_own_published_subscriptions() {
-        use crate::peer::InboundEvent;
-        use crate::transport::TransportKind;
-        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
-
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let engine = Rc::new(make_engine("alice", b"alice"));
-
-                let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
-                let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
-                let block = ContentBlock {
-                    data: Bytes::from(filter_bytes),
-                    references: vec![],
-                };
-                let entry = SignedKvEntry {
-                    verifying_key: vk(b"alice"),
-                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
-                    value_hash: block.hash(),
-                    priority: 1,
-                    expires_at: None,
-                    signature: Bytes::new(),
-                };
-                engine.store.insert(entry, Some(block)).await.unwrap();
-
-                let (tx, mut rx) = mpsc::unbounded_channel::<SyncMessage>();
-                engine
-                    .handle_inbound_event(InboundEvent::PeerHello {
-                        peer_id: PeerId(vk(b"relay")),
-                        conn_id: ConnectionId::for_test(1),
-                        kind: TransportKind::Primary,
-                        out_tx: tx,
-                        shutdown: tokio::sync::watch::channel(()).0,
-                        registered: None,
-                    })
-                    .await;
-
-                let filters = drain_digest_filters(&mut rx);
-                let bootstrap = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
-                assert!(
-                    filters.contains(&bootstrap),
-                    "bootstrap digest must still fire (got {filters:?})"
-                );
-                assert!(
-                    filters.contains(&chat_filter),
-                    "per-filter digest must fire for own published subscription (got {filters:?})"
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn anti_entropy_tick_fires_filter_digest_for_own_published_subscriptions() {
-        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
-
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let engine = Rc::new(make_engine("alice", b"alice"));
-
-                let chat_filter = Filter::NamePrefix(Bytes::from_static(b"room/"));
-                let filter_bytes = postcard::to_stdvec(&chat_filter).unwrap();
-                let block = ContentBlock {
-                    data: Bytes::from(filter_bytes),
-                    references: vec![],
-                };
-                let entry = SignedKvEntry {
-                    verifying_key: vk(b"alice"),
-                    name: Bytes::from_static(reserved::SUBSCRIBE_NAME),
-                    value_hash: block.hash(),
-                    priority: 1,
-                    expires_at: None,
-                    signature: Bytes::new(),
-                };
-                engine.store.insert(entry, Some(block)).await.unwrap();
-
-                let (_peer, mut rx) =
-                    add_test_peer(&engine, b"relay", ConnectionId::for_test(1)).await;
-
-                engine.tick_anti_entropy().await;
-
-                let filters = drain_digest_filters(&mut rx);
-                let bootstrap = Filter::Namespace(Bytes::from_static(reserved::SUBSCRIBE_NAME));
-                assert!(
-                    filters.contains(&bootstrap),
-                    "bootstrap digest must fire (got {filters:?})"
-                );
-                assert!(
-                    filters.contains(&chat_filter),
-                    "per-filter digest must fire on anti-entropy tick (got {filters:?})"
-                );
             })
             .await;
     }
@@ -2490,6 +2731,483 @@ mod tests {
                         assert_eq!(observed_at_unix_ms, 1_700_000_000_000);
                     }
                     other => panic!("unexpected event: {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// Spin up alice + bob over `TestNetwork`, run both engines, and
+    /// dial bob → alice. Returns the two `TestPeer`s; the engine run
+    /// loops are aborted automatically when the `TestPeer`s drop.
+    async fn spawn_pair() -> (crate::test_helpers::TestPeer, crate::test_helpers::TestPeer) {
+        let net = TestNetwork::new();
+        let alice = crate::test_helpers::TestPeer::spawn(&net, b"alice");
+        let bob = crate::test_helpers::TestPeer::spawn(&net, b"bob");
+        bob.engine.add_peer(alice.addr.clone()).await.unwrap();
+        (alice, bob)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_interest_armed_fires_once_per_subscribe() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+                let bob_id = bob_peer.id.clone();
+                let mut events = alice.subscribe_engine_events().await;
+                let filter = Filter::Keyspace(vk(b"chat"));
+
+                bob.subscribe_via(
+                    filter.clone(),
+                    alice_peer.id.clone(),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+
+                let mut armed_count = 0;
+                let deadline = std::time::Duration::from_secs(2);
+                let _ = tokio::time::timeout(deadline, async {
+                    while let Some(ev) = events.recv().await {
+                        if let EngineEvent::PeerInterestArmed {
+                            receiver,
+                            filter: f,
+                        } = ev
+                            && receiver == bob_id
+                            && f == filter
+                        {
+                            armed_count += 1;
+                            // Linger briefly to catch a double-fire.
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            break;
+                        }
+                    }
+                })
+                .await;
+                assert_eq!(armed_count, 1, "PeerInterestArmed must fire exactly once");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_interest_withdrawn_fires_once_per_unsubscribe() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+                let bob_id = bob_peer.id.clone();
+                let filter = Filter::Keyspace(vk(b"chat"));
+
+                bob.subscribe_via(
+                    filter.clone(),
+                    alice_peer.id.clone(),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    alice
+                        .wait_for_peer_interest(&bob_id, &filter, std::time::Duration::from_secs(2))
+                        .await,
+                    "alice did not arm bob's interest"
+                );
+
+                let mut events = alice.subscribe_engine_events().await;
+
+                bob.unsubscribe_via(filter.clone(), alice_peer.id.clone())
+                    .await
+                    .unwrap();
+
+                let mut withdrawn_count = 0;
+                let deadline = std::time::Duration::from_secs(2);
+                let _ = tokio::time::timeout(deadline, async {
+                    while let Some(ev) = events.recv().await {
+                        if let EngineEvent::PeerInterestWithdrawn {
+                            receiver,
+                            filter: f,
+                        } = ev
+                            && receiver == bob_id
+                            && f == filter
+                        {
+                            withdrawn_count += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            break;
+                        }
+                    }
+                })
+                .await;
+                assert_eq!(
+                    withdrawn_count, 1,
+                    "PeerInterestWithdrawn must fire exactly once"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_peer_interest_returns_immediately_when_already_armed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+                let bob_id = bob_peer.id.clone();
+                let filter = Filter::Keyspace(vk(b"chat"));
+
+                bob.subscribe_via(
+                    filter.clone(),
+                    alice_peer.id.clone(),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    alice
+                        .wait_for_peer_interest(&bob_id, &filter, std::time::Duration::from_secs(2))
+                        .await,
+                    "alice did not arm bob's interest"
+                );
+
+                // Second call should hit the snapshot path and return
+                // immediately.
+                let start = tokio::time::Instant::now();
+                let result = alice
+                    .wait_for_peer_interest(&bob_id, &filter, std::time::Duration::from_secs(5))
+                    .await;
+                assert!(result, "second wait_for_peer_interest should succeed");
+                assert!(
+                    start.elapsed() < std::time::Duration::from_millis(100),
+                    "wait_for_peer_interest must return immediately when already armed"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_peer_interest_resolves_on_later_emit() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (alice_peer, bob_peer) = spawn_pair().await;
+                let alice = &alice_peer.engine;
+                let bob = &bob_peer.engine;
+                let bob_id = bob_peer.id.clone();
+                let filter = Filter::Keyspace(vk(b"chat"));
+
+                // Wait BEFORE bob subscribes to exercise the
+                // event-channel path (not the snapshot path).
+                let alice_for_wait = alice.clone();
+                let filter_for_wait = filter.clone();
+                let bob_id_for_wait = bob_id.clone();
+                let waiter = crate::spawn::spawn_local(async move {
+                    alice_for_wait
+                        .wait_for_peer_interest(
+                            &bob_id_for_wait,
+                            &filter_for_wait,
+                            std::time::Duration::from_secs(2),
+                        )
+                        .await
+                });
+
+                bob.subscribe_via(
+                    filter,
+                    alice_peer.id.clone(),
+                    crate::routing::SubscriptionPolicy::store_data(),
+                )
+                .await
+                .unwrap();
+
+                let armed = waiter.await.expect("waiter task joined");
+                assert!(armed, "waiter must resolve true on later emit");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bootstrap_routes_is_noop_when_no_peer_sessions() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+
+                // bob authored Active{provider=alice}, but is not
+                // currently in peer_sessions.
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let sub_value = crate::routing::SubscriptionEntry::Active {
+                    filter: filter.clone(),
+                    provider: local_peer.clone(),
+                };
+                let block = ContentBlock {
+                    data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
+                    references: vec![],
+                };
+                let name = crate::routing::subscription_name(&filter, &local_peer);
+                let entry = SignedKvEntry {
+                    verifying_key: vk(b"bob"),
+                    name,
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry, Some(block)).await.unwrap();
+
+                assert!(engine.state.lock().await.peer_sessions.is_empty());
+
+                engine.bootstrap_routes().await.expect("bootstrap_routes");
+
+                assert!(
+                    engine.state.lock().await.peer_sessions.is_empty(),
+                    "bootstrap_routes must not create peer_sessions"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bootstrap_routes_populates_interests_for_connected_peer() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+                let bob = PeerId(vk(b"bob"));
+
+                let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
+                engine.state.lock().await.peer_sessions.insert(
+                    bob.clone(),
+                    PeerSession {
+                        conn_id: ConnectionId::for_test(1),
+                        kind: TransportKind::Unknown,
+                        tx,
+                        _shutdown: tokio::sync::watch::channel(()).0,
+                        interests: std::collections::HashMap::new(),
+                    },
+                );
+
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let sub_value = crate::routing::SubscriptionEntry::Active {
+                    filter: filter.clone(),
+                    provider: local_peer.clone(),
+                };
+                let block = ContentBlock {
+                    data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
+                    references: vec![],
+                };
+                let name = crate::routing::subscription_name(&filter, &local_peer);
+                let entry = SignedKvEntry {
+                    verifying_key: bob.0.clone(),
+                    name: name.clone(),
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry, Some(block)).await.unwrap();
+
+                engine.bootstrap_routes().await.expect("bootstrap_routes");
+
+                let state = engine.state.lock().await;
+                let session = state.peer_sessions.get(&bob).expect("bob's session");
+                let filter_hash = crate::routing::filter_hash(&filter);
+                let installed = session.interests.get(&filter_hash);
+                assert_eq!(
+                    installed,
+                    Some(&filter),
+                    "bootstrap_routes must populate interests for connected peers"
+                );
+            })
+            .await;
+    }
+
+    fn install_peer_session(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        peer: PeerId,
+    ) -> mpsc::UnboundedReceiver<SyncMessage> {
+        let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
+        let mut state = engine
+            .state
+            .try_lock()
+            .expect("test fixture: state lock uncontended");
+        state.peer_sessions.insert(
+            peer,
+            PeerSession {
+                conn_id: ConnectionId::for_test(1),
+                kind: TransportKind::Unknown,
+                tx,
+                _shutdown: tokio::sync::watch::channel(()).0,
+                interests: std::collections::HashMap::new(),
+            },
+        );
+        rx
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_subscription_entry_event_ignores_malformed_value() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+                let bob = PeerId(vk(b"bob"));
+                let _rx = install_peer_session(&engine, bob.clone());
+
+                // Well-formed SUBSCRIBE_PREFIX name; value blob is not
+                // a postcard-encoded SubscriptionEntry.
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let block = ContentBlock {
+                    data: Bytes::from_static(b"\xff\xff\xff garbage \xff\xff"),
+                    references: vec![],
+                };
+                let name = crate::routing::subscription_name(&filter, &local_peer);
+                let entry = SignedKvEntry {
+                    verifying_key: bob.0.clone(),
+                    name,
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry.clone(), Some(block)).await.unwrap();
+
+                engine
+                    .handle_local_store_event(sunset_store::Event::Inserted(entry))
+                    .await;
+
+                let state = engine.state.lock().await;
+                let session = state.peer_sessions.get(&bob).expect("bob's session");
+                assert!(
+                    session.interests.is_empty(),
+                    "malformed value must not arm any interest"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_subscription_entry_event_ignores_malformed_name() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+                let bob = PeerId(vk(b"bob"));
+                let _rx = install_peer_session(&engine, bob.clone());
+
+                // SUBSCRIBE_PREFIX'd name whose tail is not a valid
+                // `<filter-hash-hex>/<provider-hex>` shape, so
+                // `decode_filter_hash_from_name` returns None.
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let sub_value = crate::routing::SubscriptionEntry::Active {
+                    filter: filter.clone(),
+                    provider: local_peer.clone(),
+                };
+                let block = ContentBlock {
+                    data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
+                    references: vec![],
+                };
+                let bad_name =
+                    Bytes::from([crate::routing::SUBSCRIBE_PREFIX, b"not-a-valid-suffix"].concat());
+                let entry = SignedKvEntry {
+                    verifying_key: bob.0.clone(),
+                    name: bad_name,
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry.clone(), Some(block)).await.unwrap();
+
+                engine
+                    .handle_local_store_event(sunset_store::Event::Inserted(entry))
+                    .await;
+
+                let state = engine.state.lock().await;
+                let session = state.peer_sessions.get(&bob).expect("bob's session");
+                assert!(
+                    session.interests.is_empty(),
+                    "malformed name must not arm any interest"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_subscription_entry_event_self_authored_skips_digest_request() {
+        use sunset_store::{ContentBlock, SignedKvEntry, Store as _};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = Arc::new(MemoryStore::with_accept_all());
+                let engine = Rc::new(make_engine_with_store("alice", b"alice", store.clone()));
+                let local_peer = PeerId(vk(b"alice"));
+                // Self-loopback: install a peer_session keyed on the
+                // local peer so the Active arm has somewhere to mirror.
+                let mut rx = install_peer_session(&engine, local_peer.clone());
+
+                let filter = Filter::Keyspace(vk(b"chat"));
+                let sub_value = crate::routing::SubscriptionEntry::Active {
+                    filter: filter.clone(),
+                    provider: local_peer.clone(),
+                };
+                let block = ContentBlock {
+                    data: Bytes::from(postcard::to_stdvec(&sub_value).unwrap()),
+                    references: vec![],
+                };
+                let name = crate::routing::subscription_name(&filter, &local_peer);
+                let entry = SignedKvEntry {
+                    verifying_key: local_peer.0.clone(),
+                    name,
+                    value_hash: block.hash(),
+                    priority: 1,
+                    expires_at: None,
+                    signature: Bytes::new(),
+                };
+                store.insert(entry.clone(), Some(block)).await.unwrap();
+
+                engine
+                    .handle_local_store_event(sunset_store::Event::Inserted(entry))
+                    .await;
+
+                {
+                    let state = engine.state.lock().await;
+                    let session = state.peer_sessions.get(&local_peer).expect("self session");
+                    let filter_hash = crate::routing::filter_hash(&filter);
+                    assert_eq!(
+                        session.interests.get(&filter_hash),
+                        Some(&filter),
+                        "self-authored Active must still mirror the interest"
+                    );
+                }
+
+                // No DigestRequest must have been sent — we'd be asking
+                // ourselves over the network for data we already have.
+                // (An EventDelivery for the same self-authored entry may
+                // be queued by `fanout_application_entry`; ignore.)
+                while let Ok(msg) = rx.try_recv() {
+                    assert!(
+                        !matches!(msg, SyncMessage::DigestRequest { .. }),
+                        "self-authored Active must not trigger a DigestRequest, got {msg:?}"
+                    );
                 }
             })
             .await;

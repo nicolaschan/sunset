@@ -12,6 +12,7 @@ workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+hex.workspace = true
 sunset-sync.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "net", "time"] }
@@ -20,7 +21,6 @@ url.workspace = true
 wtransport.workspace = true
 
 [dev-dependencies]
-hex.workspace = true
 sunset-noise.workspace = true
 sunset-core.workspace = true
 sunset-store-memory.workspace = true

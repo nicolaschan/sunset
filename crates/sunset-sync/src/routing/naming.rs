@@ -30,13 +30,31 @@ pub const SUBSCRIBE_PREFIX: &[u8] = b"_sunset-sync/subscribe/";
 /// human-debuggable. The 2× size cost is negligible at the wire level
 /// and pays for cheap grepping of live entries during incident response.
 pub fn subscription_name(filter: &Filter, provider: &PeerId) -> Bytes {
-    let filter_bytes = postcard::to_stdvec(filter).expect("postcard filter encode is infallible");
-    let filter_hash = blake3::hash(&filter_bytes);
-    let filter_hex = hex::encode(filter_hash.as_bytes());
+    let filter_hex = hex::encode(crate::routing::filter_hash(filter));
     let provider_hex = hex::encode(provider.0.as_bytes());
-    Bytes::from(format!(
-        "_sunset-sync/subscribe/{filter_hex}/{provider_hex}"
-    ))
+    let prefix = std::str::from_utf8(SUBSCRIBE_PREFIX).expect("SUBSCRIBE_PREFIX is ASCII");
+    Bytes::from(format!("{prefix}{filter_hex}/{provider_hex}"))
+}
+
+/// True if `name` is one of the per-(filter, provider) subscription entry
+/// names produced by `subscription_name`.
+pub fn is_subscription_name(name: &[u8]) -> bool {
+    name.starts_with(SUBSCRIBE_PREFIX)
+}
+
+/// Extract the filter-hash component from a `_sunset-sync/subscribe/<hex>/<hex>`
+/// entry name. Returns None if the name doesn't have the expected shape.
+/// Inverse of `subscription_name`.
+pub fn decode_filter_hash_from_name(name: &[u8]) -> Option<crate::routing::FilterHash> {
+    let rest = name.strip_prefix(SUBSCRIBE_PREFIX)?;
+    let rest = std::str::from_utf8(rest).ok()?;
+    let (hash_hex, _) = rest.split_once('/')?;
+    if hash_hex.len() != crate::routing::FILTER_HASH_HEX_LEN {
+        return None;
+    }
+    let mut out = [0u8; std::mem::size_of::<crate::routing::FilterHash>()];
+    hex::decode_to_slice(hash_hex, &mut out).ok()?;
+    Some(out)
 }
 
 #[cfg(test)]
@@ -88,14 +106,137 @@ mod tests {
         let filter_hex = parts.next().unwrap();
         let provider_hex = parts.next().unwrap();
         assert!(parts.next().is_none());
+        // Literal 64 (not crate::routing::FILTER_HASH_HEX_LEN): deliberate
+        // pin so a regression that changes FILTER_HASH_HEX_LEN behind our
+        // back (e.g. swapping the underlying hash to something other than
+        // blake3-256) trips this assertion instead of silently passing.
         assert_eq!(filter_hex.len(), 64); // blake3 = 32 bytes = 64 hex chars
         assert_eq!(provider_hex, hex::encode(b"provider-1"));
     }
 
     #[test]
+    fn subscription_name_decode_round_trip() {
+        let f = Filter::Namespace(Bytes::from_static(b"room/x"));
+        let p = pid(b"provider");
+        let name = subscription_name(&f, &p);
+        let hash = decode_filter_hash_from_name(&name).expect("decode");
+        assert_eq!(hash, crate::routing::filter_hash(&f));
+    }
+
+    #[test]
+    fn is_subscription_name_round_trip() {
+        let f = Filter::Namespace(Bytes::from_static(b"room/x"));
+        let p = pid(b"provider");
+        let name = subscription_name(&f, &p);
+        assert!(is_subscription_name(&name));
+    }
+
+    #[test]
+    fn is_subscription_name_rejects_other_reserved_names() {
+        assert!(!is_subscription_name(LINKS_NAME));
+        assert!(!is_subscription_name(PROVIDER_TICK_NAME));
+    }
+
+    #[test]
+    fn is_subscription_name_rejects_application_names() {
+        assert!(!is_subscription_name(b"chat/room/general"));
+        assert!(!is_subscription_name(b""));
+    }
+
+    #[test]
     fn reserved_constants_are_under_sunset_sync_prefix() {
-        assert!(LINKS_NAME.starts_with(b"_sunset-sync/"));
-        assert!(PROVIDER_TICK_NAME.starts_with(b"_sunset-sync/"));
-        assert!(SUBSCRIBE_PREFIX.starts_with(b"_sunset-sync/"));
+        use crate::reserved::RESERVED_PREFIX;
+        assert!(LINKS_NAME.starts_with(RESERVED_PREFIX));
+        assert!(PROVIDER_TICK_NAME.starts_with(RESERVED_PREFIX));
+        assert!(SUBSCRIBE_PREFIX.starts_with(RESERVED_PREFIX));
+    }
+
+    /// Wire-format pin for `SUBSCRIBE_PREFIX`. Subscription entry names
+    /// produced by every sunset-sync deploy embed this byte string;
+    /// changing it without coordinated rollout silently splits the
+    /// network into peers whose `is_subscription_name` / `decode_*`
+    /// reject each other's entries.
+    #[test]
+    fn subscribe_prefix_wire_format_pin() {
+        assert_eq!(SUBSCRIBE_PREFIX, b"_sunset-sync/subscribe/");
+        assert_eq!(LINKS_NAME, b"_sunset-sync/links");
+        assert_eq!(PROVIDER_TICK_NAME, b"_sunset-sync/provider-tick");
+    }
+
+    /// Frozen hex vector for `filter_hash`. The wire format is
+    /// `blake3(postcard(filter))`; this test fails if either the hash
+    /// function or the postcard encoding of `Filter` changes. A wire-
+    /// format break here means any in-flight `_sunset-sync/subscribe/*`
+    /// entry from an older peer becomes un-decodable to a newer peer
+    /// (and vice-versa) — the routing tick republishes under a new
+    /// hash but the old peer's interest map still keys on the old one.
+    ///
+    /// Mirrors the `ContentBlock::hash` hex pin in
+    /// `sunset-store/src/types.rs` for the same reason.
+    #[test]
+    fn filter_hash_namespace_room_general_hex_vector() {
+        let f = Filter::Namespace(Bytes::from_static(b"room/general"));
+        let got = hex::encode(crate::routing::filter_hash(&f));
+        assert_eq!(
+            got, "dc56a60a0a4023f23916e4e5ba861f6b42152786ddab9280291b0706187843b6",
+            "filter_hash(Namespace(\"room/general\")) wire format changed — \
+             this is a breaking change to the SUBSCRIBE_PREFIX entry namespace"
+        );
+    }
+
+    // -- decode_filter_hash_from_name rejection paths --
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_empty_name() {
+        assert_eq!(decode_filter_hash_from_name(b""), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_unrelated_name() {
+        assert_eq!(decode_filter_hash_from_name(b"chat/room/general"), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_wrong_reserved_prefix() {
+        assert_eq!(decode_filter_hash_from_name(LINKS_NAME), None);
+        assert_eq!(decode_filter_hash_from_name(PROVIDER_TICK_NAME), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_short_hash() {
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"00".repeat(16)); // 32 hex chars = 16 bytes
+        name.extend_from_slice(b"/abcd");
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_long_hash() {
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"00".repeat(64));
+        name.extend_from_slice(b"/abcd");
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_non_hex_hash() {
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"z".repeat(64));
+        name.extend_from_slice(b"/abcd");
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_missing_provider_segment() {
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"a".repeat(64));
+        assert_eq!(decode_filter_hash_from_name(&name), None);
+    }
+
+    #[test]
+    fn decode_filter_hash_from_name_rejects_non_utf8_after_prefix() {
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        assert_eq!(decode_filter_hash_from_name(&name), None);
     }
 }

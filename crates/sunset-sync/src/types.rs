@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use sunset_store::{Filter, VerifyingKey};
 
-use crate::reserved;
+use crate::routing;
 
 /// A peer's identity. Currently transparent over `VerifyingKey` — the peer
 /// is identified by its public key. Future schemes (e.g., a separate
@@ -44,8 +44,10 @@ pub struct SyncConfig {
     pub anti_entropy_interval: Duration,
     pub bloom_size_bits: usize,
     pub bloom_hash_fns: u32,
-    /// Filter used for the bootstrap digest exchange (always
-    /// `_sunset-sync/subscribe` namespace).
+    /// Filter used for the bootstrap digest exchange. Always covers the
+    /// `_sunset-sync/subscribe/` prefix so a (re)connected peer
+    /// rehydrates its view of our per-(filter, provider) subscription
+    /// entries.
     pub bootstrap_filter: Filter,
     /// Cadence at which each per-peer task sends `SyncMessage::Ping`.
     /// Default 15 s. Three intervals must elapse without a `Pong`
@@ -64,7 +66,7 @@ impl Default for SyncConfig {
             anti_entropy_interval: Duration::from_secs(30),
             bloom_size_bits: 4096,
             bloom_hash_fns: 4,
-            bootstrap_filter: Filter::Namespace(reserved::SUBSCRIBE_NAME.into()),
+            bootstrap_filter: Filter::NamePrefix(routing::SUBSCRIBE_PREFIX.into()),
             heartbeat_interval: Duration::from_secs(15),
             heartbeat_timeout: Duration::from_secs(45),
         }

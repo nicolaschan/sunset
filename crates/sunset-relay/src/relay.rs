@@ -26,8 +26,10 @@ use sunset_noise::{
 };
 use sunset_store::{Filter, VerifyingKey};
 use sunset_store_fs::FsStore;
+use sunset_sync::routing::{self, SubscriptionPolicy};
 use sunset_sync::{
-    DualInboundTransport, PeerAddr, PeerId, Signer, SpawningAcceptor, SyncConfig, SyncEngine,
+    DualInboundTransport, PeerAddr, PeerId, RawConnection, Signer, SpawningAcceptor, SyncConfig,
+    SyncEngine,
 };
 use sunset_sync_webtransport_native::{
     WebTransportRawConnection, WebTransportRawTransport, build_server_endpoint,
@@ -46,48 +48,44 @@ use crate::snapshot::{build_dashboard_snapshot, build_identity_snapshot};
 /// callers interact with `RelayHandle`, not this type.
 type InboundTransport = DualInboundTransport<WsAcceptor, WtAcceptor>;
 
-/// WebSocket half. Same shape as before WT was added.
+/// Future returned by the SpawningAcceptor "promote" closure for raw
+/// connection `R`: runs the Noise IK responder and yields a
+/// `NoiseConnection<R>`.
+type NoiseHandshakeFuture<R> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = sunset_sync::Result<NoiseConnection<R>>> + 'static>,
+>;
+
+/// SpawningAcceptor "promote" closure for raw connection `R`. Both the
+/// WS and WT acceptors use this same shape.
+type NoisePromote<R> = Box<dyn Fn(R) -> NoiseHandshakeFuture<R> + 'static>;
+
+/// WebSocket half.
 type WsAcceptor = SpawningAcceptor<
     WebSocketRawTransport,
     NoiseTransport<WebSocketRawTransport>,
-    WsPromote,
-    WsHandshakeFuture,
+    NoisePromote<sunset_sync_ws_native::WebSocketRawConnection>,
+    NoiseHandshakeFuture<sunset_sync_ws_native::WebSocketRawConnection>,
     NoiseConnection<sunset_sync_ws_native::WebSocketRawConnection>,
->;
-
-type WsPromote =
-    Box<dyn Fn(sunset_sync_ws_native::WebSocketRawConnection) -> WsHandshakeFuture + 'static>;
-
-type WsHandshakeFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = sunset_sync::Result<
-                    NoiseConnection<sunset_sync_ws_native::WebSocketRawConnection>,
-                >,
-            > + 'static,
-    >,
 >;
 
 /// WebTransport half. Mirrors the WS shape.
 type WtAcceptor = SpawningAcceptor<
     WebTransportRawTransport,
     NoiseTransport<WebTransportRawTransport>,
-    WtPromote,
-    WtHandshakeFuture,
+    NoisePromote<WebTransportRawConnection>,
+    NoiseHandshakeFuture<WebTransportRawConnection>,
     NoiseConnection<WebTransportRawConnection>,
 >;
 
-type WtPromote = Box<dyn Fn(WebTransportRawConnection) -> WtHandshakeFuture + 'static>;
-
-type WtHandshakeFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = sunset_sync::Result<NoiseConnection<WebTransportRawConnection>>,
-            > + 'static,
-    >,
->;
-
 type Engine = SyncEngine<FsStore, InboundTransport>;
+
+/// Task handles returned by `RelayHandle::start_engine_workloads`.
+struct EngineWorkloadHandles {
+    /// Engine `run()` task. Lives on the LocalSet (engine isn't Send).
+    engine_task: tokio::task::JoinHandle<sunset_sync::Result<()>>,
+    /// axum `serve()` task. Lives on the multi-thread runtime workers.
+    serve_task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
 
 pub struct Relay {/* sealed; see RelayHandle */}
 
@@ -99,6 +97,7 @@ pub struct RelayHandle {
     engine: Rc<Engine>,
     peers: Vec<String>,
     subscription_filter: Filter,
+    subscription_policy: SubscriptionPolicy,
     listener: Option<TcpListener>,
     /// Senders the axum app uses. Built once in `new`; cloned into
     /// `AppState` in `run` / `run_for_test`.
@@ -156,12 +155,7 @@ impl Relay {
         let identity = identity::load_or_generate(&config.identity_secret_path).await?;
 
         let ed25519_public = identity.public().as_bytes();
-        let x25519_public = {
-            let s = ed25519_seed_to_x25519_secret(&identity.secret_bytes());
-            use curve25519_dalek::{MontgomeryPoint, scalar::Scalar};
-            let scalar = Scalar::from_bytes_mod_order(*s);
-            MontgomeryPoint::mul_base(&scalar).to_bytes()
-        };
+        let x25519_public = derive_x25519_public(&identity);
 
         // 2. Store.
         let store_root = config.data_dir.join("store");
@@ -183,17 +177,7 @@ impl Relay {
 
         // 5. WebSocket SpawningAcceptor — Noise IK on its own task.
         let handshake_timeout = Duration::from_secs(config.accept_handshake_timeout_secs);
-        let ws_promote: WsPromote = {
-            let identity = noise_id.clone();
-            Box::new(move |raw_conn| {
-                let identity = identity.clone();
-                Box::pin(async move {
-                    do_handshake_responder(raw_conn, identity)
-                        .await
-                        .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
-                })
-            })
-        };
+        let ws_promote: NoisePromote<_> = make_noise_promote(noise_id.clone());
         let ws_transport =
             SpawningAcceptor::new(ws_raw_inbound, ws_connector, ws_promote, handshake_timeout);
 
@@ -207,72 +191,12 @@ impl Relay {
         let (wt_raw_inbound, wt_accept_tx) = WebTransportRawTransport::serving();
         let wt_raw_outbound = WebTransportRawTransport::dial_only();
         let wt_connector = NoiseTransport::new(wt_raw_outbound, noise_id.clone());
-        let wt_promote: WtPromote = {
-            let identity = noise_id.clone();
-            Box::new(move |raw_conn| {
-                let identity = identity.clone();
-                Box::pin(async move {
-                    do_handshake_responder(raw_conn, identity)
-                        .await
-                        .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
-                })
-            })
-        };
+        let wt_promote: NoisePromote<_> = make_noise_promote(noise_id.clone());
         let wt_transport =
             SpawningAcceptor::new(wt_raw_inbound, wt_connector, wt_promote, handshake_timeout);
 
-        // The dial-host SAN list determines which hostnames the
-        // browser is allowed to dial when reaching this WT listener.
-        // Despite the W3C spec saying `serverCertificateHashes`
-        // *replaces* chain validation, Chrome's implementation still
-        // enforces the dialed hostname being in the cert's SAN — so
-        // production deployments behind a public hostname must include
-        // that hostname here. Default is `["127.0.0.1", "localhost"]`
-        // (sufficient for tests and loopback dev); operators set
-        // `webtransport_san` in the relay config TOML to add their
-        // public hostname.
-        //
-        // We also append the listen address's literal IP when it's
-        // explicit and non-loopback — e.g. binding `203.0.113.1:8443`
-        // makes the cert valid for that IP automatically. When binding
-        // `0.0.0.0` (the production shape behind a proxy) the listen IP
-        // is meaningless and we don't append it.
-        let mut wt_sans: Vec<String> = config.webtransport_san.clone();
-        let listen_ip = bound.ip().to_string();
-        if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
-            wt_sans.push(listen_ip);
-        }
-        let wt_cert_hex_opt = match crate::wt_cert::load_or_generate(&config.data_dir, &wt_sans)
-            .await
-        {
-            Ok(wt_identity) => {
-                let cert_hash = wt_identity.certificate_chain().as_slice()[0].hash();
-                let cert_hex = sha256_digest_to_hex(&cert_hash);
-                let wt_bind: SocketAddr = bound;
-                match build_server_endpoint(wt_bind, wt_identity, Some(Duration::from_secs(15))) {
-                    Ok(endpoint) => {
-                        spawn_wt_accept_loop(endpoint, wt_accept_tx);
-                        // Ship only the cert hash to the descriptor.
-                        // The relay has no reliable way to know the
-                        // public hostname clients will reach it on
-                        // (it binds `0.0.0.0` and may sit behind any
-                        // number of proxies); the resolver builds the
-                        // actual WT URL from the user-typed authority.
-                        // Shipping a URL here was the prod-bug origin
-                        // — see PR fixing the `0.0.0.0:8443` regression.
-                        Some(cert_hex)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "wt: server endpoint bind failed; degrading to WS-only");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "wt: self-signed identity failed; degrading to WS-only");
-                None
-            }
-        };
+        let wt_sans = compute_wt_sans(&config.webtransport_san, bound);
+        let wt_cert_hex_opt = try_start_wt(&config.data_dir, &wt_sans, bound, wt_accept_tx).await;
 
         // 7. Combine WS + WT into the engine's inbound transport.
         let transport = DualInboundTransport::new(ws_transport, wt_transport);
@@ -288,10 +212,11 @@ impl Relay {
             signer,
         ));
 
-        // 9. Subscription filter for the relay's broad ingestion.
+        // 9. Subscription filter + policy for the relay's broad ingestion.
         let subscription_filter = match config.interest_filter {
-            InterestFilter::All => Filter::NamePrefix(Bytes::new()),
+            InterestFilter::All => routing::relay_broad_filter(),
         };
+        let subscription_policy = SubscriptionPolicy::relay_broad();
 
         // 10. Bridge channels.
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RelayCommand>();
@@ -311,18 +236,7 @@ impl Relay {
         spawn_command_pump(cmd_rx, cmd_ctx.clone());
 
         // 12. Banner.
-        let mut banner = identity::format_address(&bound, &identity);
-        banner.push_str(&format!("\n  dashboard: http://{bound}/dashboard"));
-        banner.push_str(&format!("\n  identity:  http://{bound}/"));
-        if let Some(cert_hex) = &wt_cert_hex_opt {
-            banner.push_str(&format!(
-                "\n  wt:        cert-sha256={cert_hex} (clients build the URL from the hostname they reached the descriptor on)"
-            ));
-        } else {
-            banner.push_str("\n  wt:        (disabled — UDP bind failed)");
-        }
-        tracing::info!("\n{}", banner);
-        println!("{banner}");
+        emit_startup_banner(&bound, &identity, wt_cert_hex_opt.as_deref());
 
         Ok(RelayHandle {
             local_address,
@@ -331,11 +245,121 @@ impl Relay {
             engine,
             peers: config.peers,
             subscription_filter,
+            subscription_policy,
             listener: Some(listener),
             ws_tx,
             cmd_tx,
             cmd_ctx,
         })
+    }
+}
+
+/// Derive the relay's X25519 public key from its Ed25519 identity. The
+/// X25519 half is what Noise IK uses; we publish it in the dial URL
+/// fragment so peers can pin the responder static key.
+fn derive_x25519_public(identity: &Identity) -> [u8; 32] {
+    use curve25519_dalek::{MontgomeryPoint, scalar::Scalar};
+    let s = ed25519_seed_to_x25519_secret(&identity.secret_bytes());
+    let scalar = Scalar::from_bytes_mod_order(*s);
+    MontgomeryPoint::mul_base(&scalar).to_bytes()
+}
+
+/// Compute the WebTransport SAN list: start from the operator-configured
+/// list and append the listen address's literal IP when it's explicit
+/// (binding `203.0.113.1:8443` makes the cert valid for that IP
+/// automatically). Skip the append when binding `0.0.0.0` (the
+/// production shape behind a proxy) — the listen IP is meaningless
+/// there.
+///
+/// The dial-host SAN list determines which hostnames the browser is
+/// allowed to dial when reaching this WT listener. Despite the W3C spec
+/// saying `serverCertificateHashes` *replaces* chain validation,
+/// Chrome's implementation still enforces the dialed hostname being in
+/// the cert's SAN — so production deployments behind a public hostname
+/// must include that hostname in `webtransport_san` in the relay
+/// config TOML. Default is `["127.0.0.1", "localhost"]` (sufficient for
+/// tests and loopback dev).
+fn compute_wt_sans(configured: &[String], bound: SocketAddr) -> Vec<String> {
+    let mut wt_sans: Vec<String> = configured.to_vec();
+    let listen_ip = bound.ip().to_string();
+    if !wt_sans.iter().any(|s| s == &listen_ip) && !bound.ip().is_unspecified() {
+        wt_sans.push(listen_ip);
+    }
+    wt_sans
+}
+
+/// Format and emit (both `tracing::info!` and stdout `println!`) the
+/// startup banner showing the dial URL, dashboard URL, identity URL,
+/// and WT cert hash (or a degraded-mode note when WT bringup failed).
+fn emit_startup_banner(bound: &SocketAddr, identity: &Identity, wt_cert_hex: Option<&str>) {
+    let mut banner = identity::format_address(bound, identity);
+    banner.push_str(&format!("\n  dashboard: http://{bound}/dashboard"));
+    banner.push_str(&format!("\n  identity:  http://{bound}/"));
+    if let Some(cert_hex) = wt_cert_hex {
+        banner.push_str(&format!(
+            "\n  wt:        cert-sha256={cert_hex} (clients build the URL from the hostname they reached the descriptor on)"
+        ));
+    } else {
+        banner.push_str("\n  wt:        (disabled — UDP bind failed)");
+    }
+    tracing::info!("\n{}", banner);
+    println!("{banner}");
+}
+
+/// Build the SpawningAcceptor "promote" closure that runs the Noise IK
+/// responder handshake on an inbound raw connection. The WS and WT
+/// acceptors are the same closure modulo the captured raw-connection
+/// type; this generic helper produces both from the same Noise identity.
+fn make_noise_promote<R>(identity: Arc<dyn NoiseIdentity>) -> NoisePromote<R>
+where
+    R: RawConnection + 'static,
+{
+    Box::new(move |raw_conn| {
+        let identity = identity.clone();
+        Box::pin(async move {
+            do_handshake_responder(raw_conn, identity)
+                .await
+                .map_err(|e| sunset_sync::Error::Transport(format!("noise responder: {e}")))
+        })
+    })
+}
+
+/// Try to bring up the WebTransport listener. Returns `Some(cert_hex)`
+/// (SHA-256 of the SPKI for the listener's cert) on success, or `None`
+/// when WT bringup fails — in which case the relay degrades to WS-only
+/// rather than aborting startup. Both failure paths (cert load/generate,
+/// UDP endpoint bind) emit a `warn!` and return `None`.
+///
+/// On success this also spawns the accept loop that drains incoming
+/// sessions onto `wt_accept_tx`.
+async fn try_start_wt(
+    data_dir: &std::path::Path,
+    wt_sans: &[String],
+    bound: SocketAddr,
+    wt_accept_tx: mpsc::UnboundedSender<wtransport::Connection>,
+) -> Option<String> {
+    let wt_identity = match crate::wt_cert::load_or_generate(data_dir, wt_sans).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, "wt: self-signed identity failed; degrading to WS-only");
+            return None;
+        }
+    };
+    let cert_hash = wt_identity.certificate_chain().as_slice()[0].hash();
+    let cert_hex = sha256_digest_to_hex(&cert_hash);
+    match build_server_endpoint(bound, wt_identity, Some(Duration::from_secs(15))) {
+        Ok(endpoint) => {
+            spawn_wt_accept_loop(endpoint, wt_accept_tx);
+            // Cert hash only — the relay binds `0.0.0.0` by default and
+            // may sit behind any number of proxies, so it can't reliably
+            // know the public hostname clients reach it on. The resolver
+            // builds the actual WT URL from the user-typed authority.
+            Some(cert_hex)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "wt: server endpoint bind failed; degrading to WS-only");
+            None
+        }
     }
 }
 
@@ -441,12 +465,25 @@ impl RelayHandle {
         }
     }
 
-    /// Drive the engine + axum until shutdown.
-    pub async fn run(mut self) -> Result<()> {
+    /// Spawn the engine + axum tasks, publish the broad subscription, and
+    /// dial any federated peers. Both `run` (production) and
+    /// `run_for_test` (tests) share this bringup; they only differ in how
+    /// they wait for shutdown and what they do with the task handles.
+    ///
+    /// `engine_task` runs on the LocalSet (the engine isn't Send); the
+    /// axum serve task runs on the multi-thread runtime workers (the
+    /// listener+router are Send-friendly).
+    ///
+    /// Caller is responsible for aborting the returned tasks at shutdown
+    /// (or letting the runtime drop cancel them, in the test case).
+    async fn start_engine_workloads(
+        &mut self,
+        consumer_label: &'static str,
+    ) -> Result<EngineWorkloadHandles> {
         let listener = self
             .listener
             .take()
-            .expect("RelayHandle::run consumed twice");
+            .unwrap_or_else(|| panic!("RelayHandle::{consumer_label} consumed twice"));
         let app: Router = build_app(self.build_app_state());
 
         let engine_clone = self.engine.clone();
@@ -457,10 +494,23 @@ impl RelayHandle {
 
         // Subscription publish + federated dials happen on the engine side.
         self.engine
-            .publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))
+            .subscribe(self.subscription_filter.clone(), self.subscription_policy)
             .await?;
         tracing::info!("published broad subscription");
         self.dial_configured_peers().await;
+
+        Ok(EngineWorkloadHandles {
+            engine_task,
+            serve_task,
+        })
+    }
+
+    /// Drive the engine + axum until shutdown.
+    pub async fn run(mut self) -> Result<()> {
+        let EngineWorkloadHandles {
+            engine_task,
+            serve_task,
+        } = self.start_engine_workloads("run").await?;
 
         #[cfg(unix)]
         {
@@ -493,22 +543,9 @@ impl RelayHandle {
     pub async fn run_for_test(
         &mut self,
     ) -> Result<tokio::task::JoinHandle<sunset_sync::Result<()>>> {
-        let listener = self
-            .listener
-            .take()
-            .expect("RelayHandle::run_for_test consumed twice");
-        let app: Router = build_app(self.build_app_state());
-
-        let engine_clone = self.engine.clone();
-        let engine_task = tokio::task::spawn_local(async move { engine_clone.run().await });
-
-        let _serve_task = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        self.engine
-            .publish_subscription(self.subscription_filter.clone(), Duration::from_secs(3600))
-            .await?;
-        self.dial_configured_peers().await;
-
+        // serve_task is detached; the test runtime drop will cancel it.
+        let EngineWorkloadHandles { engine_task, .. } =
+            self.start_engine_workloads("run_for_test").await?;
         Ok(engine_task)
     }
 
@@ -525,8 +562,7 @@ impl RelayHandle {
 //   • `cmd_ctx` (this clone) drops → refcount drops by 1.
 //   • The pump task's own `cmd_ctx` clone drops when the task ends →
 //     refcount → 0 → CommandContext drops, releasing Rc<Engine> and Arc<FsStore>.
-// The empty Drop body marks this as a deliberate ownership shape, not an
-// oversight. tracing::trace! could go here in the future.
+// The empty Drop body marks this as a deliberate ownership shape.
 impl Drop for RelayHandle {
     fn drop(&mut self) {}
 }
