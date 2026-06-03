@@ -3,7 +3,7 @@
 //!
 //! Gated by the `test-helpers` feature so production builds don't pull these
 //! in. The synchronous fixture constructors (`vk`, `n`, `block`, `entry`,
-//! `entry_expiring_at`, `CountingVerifier`) live in [`crate::fixtures`] and
+//! `entry_expiring_at`) live in [`crate::fixtures`] and
 //! are available unconditionally inside the crate (and re-exported from this
 //! module when the `test-helpers` feature is on) — they're the canonical
 //! helpers every backend's unit tests should reach for.
@@ -13,7 +13,7 @@ use crate::filter::{Event, Filter, Replay};
 use crate::store::Store;
 use crate::types::{ContentBlock, SignedKvEntry};
 
-pub use crate::fixtures::{CountingVerifier, block, entry, entry_expiring_at, n, vk};
+pub use crate::fixtures::{block, entry, entry_expiring_at, n, vk};
 
 /// Drain a subscription stream until an event matching `predicate` is found.
 /// Times out after a short duration. The conformance suite uses this so tests
