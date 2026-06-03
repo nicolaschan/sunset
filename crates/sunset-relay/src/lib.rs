@@ -13,6 +13,7 @@ pub mod app;
 pub mod bridge;
 pub mod config;
 pub mod error;
+pub(crate) mod fs_util;
 pub mod identity;
 pub mod relay;
 pub mod render;
