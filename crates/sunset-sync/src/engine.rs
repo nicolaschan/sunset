@@ -1363,14 +1363,37 @@ where
                 let _ = session.tx.send(msg.clone());
             }
         } else {
-            for (_peer, session) in crate::routing::forward_targets(
+            Self::fan_out_to_interested(
                 &state.peer_sessions,
                 &entry.verifying_key,
                 &entry.name,
-            ) {
-                let _ = session.tx.send(msg.clone());
-            }
+                &msg,
+                None,
+            );
         }
+    }
+
+    /// Send `msg` to every interest-matched forward target for `(vk, name)`
+    /// except `exclude`, returning how many sessions received it. The single
+    /// fan-out primitive shared by durable foreign-entry forwarding and
+    /// ephemeral re-forward; the two differ only in whether they exclude the
+    /// source peer and whether the caller consumes the count.
+    fn fan_out_to_interested(
+        peer_sessions: &HashMap<PeerId, PeerSession>,
+        vk: &VerifyingKey,
+        name: &[u8],
+        msg: &SyncMessage,
+        exclude: Option<&PeerId>,
+    ) -> u64 {
+        let mut fanned = 0u64;
+        for (peer, session) in crate::routing::forward_targets(peer_sessions, vk, name) {
+            if exclude == Some(peer) {
+                continue;
+            }
+            let _ = session.tx.send(msg.clone());
+            fanned += 1;
+        }
+        fanned
     }
 
     /// Snapshot of currently connected peers (peers for which the engine has
@@ -1634,18 +1657,13 @@ where
             let msg = SyncMessage::EphemeralDelivery {
                 datagram: datagram.clone(),
             };
-            let mut fanned = 0u64;
-            for (peer, session) in crate::routing::forward_targets(
+            let fanned = Self::fan_out_to_interested(
                 &st.peer_sessions,
                 &datagram.verifying_key,
                 &datagram.name,
-            ) {
-                if *peer == from {
-                    continue;
-                }
-                let _ = session.tx.send(msg.clone());
-                fanned += 1;
-            }
+                &msg,
+                Some(&from),
+            );
 
             // Advance the HWM regardless (dedup), but count only real
             // fan-out so the counter stays flat when nothing was forwarded.
@@ -2825,6 +2843,77 @@ mod tests {
                     "seq=0 after HWM=1 must be dropped"
                 );
                 assert_eq!(engine.ephemeral_forwarded().await, 2);
+            })
+            .await;
+    }
+
+    /// Dropping a peer prunes its per-`(sender, name)` HWM slots, so when
+    /// that peer reconnects and restarts its ephemeral stream from seq 0 the
+    /// fresh seq=0 is forwarded rather than suppressed as a replay. Without
+    /// the prune in `drop_peer_session`, a reconnected peer's audio would
+    /// stall permanently behind a stale high-water mark.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_hwm_pruned_on_peer_drop_unblocks_reconnect() {
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("relay", b"relay"));
+
+                let sender = PeerId(vk(b"sender"));
+                let b = PeerId(vk(b"bob"));
+                let name = Bytes::from_static(b"voice/sender/0001");
+
+                let mut b_rx = arm_peer(
+                    &engine,
+                    b.clone(),
+                    Filter::NamePrefix(Bytes::from_static(b"voice/sender")),
+                );
+
+                let deliver_seq_0 = || {
+                    let engine = engine.clone();
+                    let sender = sender.clone();
+                    let name = name.clone();
+                    async move {
+                        engine
+                            .handle_ephemeral_delivery(
+                                sender,
+                                SignedDatagram {
+                                    verifying_key: vk(b"sender"),
+                                    name,
+                                    payload: Bytes::from_static(b"frame-0"),
+                                    seq: 0,
+                                    signature: Bytes::from_static(&[0u8; 64]),
+                                },
+                            )
+                            .await;
+                    }
+                };
+
+                // First seq=0 forwards and arms HWM[(sender, name)] = 0.
+                deliver_seq_0().await;
+                assert!(b_rx.try_recv().is_ok(), "first seq=0 must forward");
+
+                // A replay of seq=0 is dropped by the HWM — confirms the
+                // mark is armed, so the next assertion is meaningful.
+                deliver_seq_0().await;
+                assert!(
+                    b_rx.try_recv().is_err(),
+                    "replay of seq=0 is dropped while the HWM is armed"
+                );
+
+                // The sender drops. This must prune its HWM slot.
+                engine.drop_peer_session(sender.clone()).await;
+
+                // The sender reconnects and restarts its stream at seq=0.
+                // With the HWM pruned, this is a fresh first value and must
+                // forward again rather than being mistaken for a replay.
+                deliver_seq_0().await;
+                assert!(
+                    b_rx.try_recv().is_ok(),
+                    "seq=0 after the sender dropped must forward (stale HWM pruned)"
+                );
             })
             .await;
     }

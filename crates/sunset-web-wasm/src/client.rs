@@ -97,8 +97,12 @@ pub struct Client {
     /// room the call targets.
     voice: crate::voice::VoiceCell,
     /// Bus shared between voice sessions. Rc so it can be upcast to
-    /// Rc<dyn DynBus> without allocation.
+    /// Rc<dyn Bus> without allocation.
     bus: crate::voice::BusArc,
+    /// Relay-only mode: when set, voice sessions never attempt a direct
+    /// WebRTC link, so all audio flows through the relay's re-forward.
+    /// A privacy/firewall option, read when a voice session starts.
+    relay_only: std::cell::Cell<bool>,
 }
 
 #[wasm_bindgen]
@@ -191,7 +195,7 @@ impl Client {
             async move { s.run().await }
         });
 
-        // Rc so it can be upcast to Rc<dyn DynBus>.
+        // Rc so it can be upcast to Rc<dyn Bus>.
         let bus: crate::voice::BusArc = Rc::new(sunset_core::bus::BusImpl::new(
             store.clone(),
             engine.clone(),
@@ -211,7 +215,16 @@ impl Client {
             identity,
             voice: crate::voice::new_voice_cell(),
             bus,
+            relay_only: std::cell::Cell::new(false),
         })
+    }
+
+    /// Enable or disable relay-only mode. When enabled, subsequently-started
+    /// voice sessions never attempt a direct WebRTC link — all voice is
+    /// carried by the relay's re-forward. Takes effect at the next
+    /// `voice_start` / `voice_observe_start`.
+    pub fn set_relay_only(&self, enabled: bool) {
+        self.relay_only.set(enabled);
     }
 
     #[wasm_bindgen(getter)]
@@ -305,9 +318,12 @@ impl Client {
             &self.identity,
             room_handle,
             &self.bus,
-            on_pcm,
-            on_drop_peer,
-            on_voice_peer_state,
+            self.relay_only.get(),
+            crate::voice::VoiceCallbacks {
+                on_pcm,
+                on_drop_peer,
+                on_voice_peer_state,
+            },
         )
     }
 
@@ -330,9 +346,12 @@ impl Client {
             &self.identity,
             room_handle,
             &self.bus,
-            on_pcm,
-            on_drop_peer,
-            on_voice_peer_state,
+            self.relay_only.get(),
+            crate::voice::VoiceCallbacks {
+                on_pcm,
+                on_drop_peer,
+                on_voice_peer_state,
+            },
         )
     }
 

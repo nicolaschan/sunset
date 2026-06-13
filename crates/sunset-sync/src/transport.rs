@@ -160,4 +160,22 @@ mod tests {
     fn default_kind_is_unknown() {
         assert_eq!(DummyConn.kind(), TransportKind::Unknown);
     }
+
+    #[test]
+    fn frame_via_maps_transport_kind() {
+        // Only a Secondary (direct WebRTC) session is a genuine direct link.
+        assert_eq!(FrameVia::from(TransportKind::Secondary), FrameVia::Direct);
+        assert_eq!(FrameVia::from(TransportKind::Primary), FrameVia::Relay);
+        assert_eq!(FrameVia::from(TransportKind::Unknown), FrameVia::Relay);
+    }
+
+    #[test]
+    fn frame_via_wire_labels_are_stable() {
+        // These strings are the on-wire/JSON contract surfaced to clients
+        // (and asserted by the relay-fallback e2e); a swap here is a silent
+        // protocol break, so pin them.
+        assert_eq!(FrameVia::Local.as_str(), "local");
+        assert_eq!(FrameVia::Direct.as_str(), "direct");
+        assert_eq!(FrameVia::Relay.as_str(), "relay");
+    }
 }

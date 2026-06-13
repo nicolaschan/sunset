@@ -13,14 +13,14 @@ use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
-use crate::runtime::dyn_bus::DynBus;
 use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
 use crate::{Denoiser, VoiceDecoder, VoiceEncoder};
+use sunset_core::bus::Bus;
 
 pub(crate) struct RuntimeInner {
     pub identity: Identity,
     pub room: Rc<Room>,
-    pub bus: Rc<dyn DynBus>,
+    pub bus: Rc<dyn Bus>,
     pub dialer: Rc<dyn Dialer>,
     /// Interior-mutable so `test-hooks` can swap in a recording wrapper
     /// via `VoiceRuntime::set_frame_sink` without changing the contract.
@@ -72,7 +72,7 @@ pub(crate) struct RuntimeInner {
     /// even when the receiver is deafened. The runtime keeps no audio
     /// buffer of its own — the host's playback path absorbs jitter. Read
     /// by test hooks (`observed_voice_peers`).
-    pub last_delivered_seq: RefCell<HashMap<PeerId, u64>>,
+    pub peer_envelope_hwm: RefCell<HashMap<PeerId, u64>>,
     pub auto_connect_state: RefCell<HashMap<PeerId, AutoConnectState>>,
     pub last_emitted: RefCell<HashMap<PeerId, EmittedState>>,
 

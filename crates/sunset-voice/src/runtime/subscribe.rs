@@ -88,7 +88,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     // must be dropped before decode, not just before the
                     // sink.
                     {
-                        let mut last = inner.last_delivered_seq.borrow_mut();
+                        let mut last = inner.peer_envelope_hwm.borrow_mut();
                         match last.get(&peer) {
                             Some(&h) if envelope_seq <= h => continue,
                             _ => {

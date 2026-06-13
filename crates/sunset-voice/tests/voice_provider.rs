@@ -13,7 +13,7 @@
 //! issuing `unsubscribe_via(old)` + `subscribe_via(new)` only when the
 //! armed provider differs from the desired one.
 //!
-//! The substrate is a scriptable `DynBus` whose `current_peers()` and
+//! The substrate is a scriptable `Bus` whose `current_peers()` and
 //! engine-event stream the test drives directly, recording every
 //! `subscribe_via` / `unsubscribe_via` so the convergence is observable.
 
@@ -28,13 +28,11 @@ use rand_chacha::rand_core::SeedableRng;
 
 use sunset_core::Identity;
 use sunset_core::Room;
-use sunset_core::bus::BusEvent;
+use sunset_core::bus::{Bus, BusEvent};
 use sunset_store::{ContentBlock, Filter, SignedDatagram, SignedKvEntry, VerifyingKey};
 use sunset_sync::routing::SubscriptionPolicy;
 use sunset_sync::{EngineEvent, PeerId, TransportKind};
-use sunset_voice::runtime::{
-    Dialer, DynBus, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime,
-};
+use sunset_voice::runtime::{Dialer, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime};
 
 /// One routing-interest mutation issued by the provider component.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,7 +43,7 @@ enum RoutingCall {
 
 type RoutingLog = Rc<RefCell<Vec<RoutingCall>>>;
 
-/// Scriptable `DynBus` for the provider component. `current_peers` is
+/// Scriptable `Bus` for the provider component. `current_peers` is
 /// read from a shared cell the test mutates; engine events are pushed
 /// through `events_tx`; presence (roster) and ephemeral traffic are
 /// injected directly.
@@ -85,13 +83,13 @@ impl ProviderTestBus {
 }
 
 #[async_trait(?Send)]
-impl DynBus for ProviderTestBus {
+impl Bus for ProviderTestBus {
     async fn publish_ephemeral(
         &self,
         _name: Bytes,
         _seq: u64,
         _payload: Bytes,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), sunset_core::Error> {
         Ok(())
     }
 
@@ -99,14 +97,15 @@ impl DynBus for ProviderTestBus {
         &self,
         _entry: SignedKvEntry,
         _block: Option<ContentBlock>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), sunset_core::Error> {
         Ok(())
     }
 
-    async fn subscribe_prefix(
+    async fn subscribe(
         &self,
-        prefix: Bytes,
-    ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {
+        filter: Filter,
+    ) -> Result<LocalBoxStream<'static, BusEvent>, sunset_core::Error> {
+        let prefix = filter_prefix(&filter);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SignedKvEntry>();
         self.durable_sinks.lock().await.push(tx);
         let stream = async_stream::stream! {
@@ -125,7 +124,7 @@ impl DynBus for ProviderTestBus {
         filter: Filter,
         provider: PeerId,
         _policy: SubscriptionPolicy,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), sunset_core::Error> {
         self.routing_log
             .borrow_mut()
             .push(RoutingCall::SubscribeVia {
@@ -139,7 +138,7 @@ impl DynBus for ProviderTestBus {
         &self,
         filter: Filter,
         provider: PeerId,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), sunset_core::Error> {
         self.routing_log
             .borrow_mut()
             .push(RoutingCall::UnsubscribeVia {
@@ -262,7 +261,7 @@ fn spawn_provider_runtime(
     room: &Rc<Room>,
     bus_impl: &Rc<ProviderTestBus>,
 ) -> (VoiceRuntime, RoutingLog) {
-    let bus: Rc<dyn DynBus> = bus_impl.clone();
+    let bus: Rc<dyn Bus> = bus_impl.clone();
     let dialer: Rc<dyn Dialer> = Rc::new(NoopDialer);
     let frame_sink: Rc<dyn FrameSink> = Rc::new(NoopFrameSink);
     let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
@@ -498,7 +497,7 @@ async fn relay_only_participant_sets_in_call() {
             let (alice, _) = make_identity_and_room(10);
 
             let bus = ProviderTestBus::new();
-            let bus_dyn: Rc<dyn DynBus> = bus.clone();
+            let bus_dyn: Rc<dyn Bus> = bus.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(NoopDialer);
             let frame_sink: Rc<dyn FrameSink> = Rc::new(NoopFrameSink);
             let events: EventSink = Rc::new(RefCell::new(vec![]));

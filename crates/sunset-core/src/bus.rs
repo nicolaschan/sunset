@@ -378,33 +378,66 @@ mod tests {
     /// outbound-intent snapshot.
     #[tokio::test(flavor = "current_thread")]
     async fn routing_observation_seam_delegates_and_local_ephemeral_arms_no_intent() {
+        use sunset_store::Store as _;
         use sunset_sync::TransportKind;
-        use sunset_sync::routing::SubscriptionPolicy;
+        use sunset_sync::routing::{SubscriptionEntry, SubscriptionPolicy, subscription_name};
 
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let (bus, _identity, run_handle) = make_bus();
                 let other = PeerId(Identity::generate(&mut OsRng).store_verifying_key());
+                let filter = Filter::NamePrefix(Bytes::from_static(b"voice/"));
 
                 // current_peers is callable and yields (PeerId, TransportKind).
                 let peers: Vec<(PeerId, TransportKind)> = bus.current_peers().await;
                 assert!(peers.is_empty(), "no peers connected in this harness");
 
-                // subscribe_via / unsubscribe_via are callable through the trait.
+                // Read back the SubscriptionEntry the local peer published at
+                // the `(filter, provider)` key — the observable effect of
+                // subscribe_via/unsubscribe_via. Reading at a key *derived
+                // from the args* means a delegation that dropped or swapped
+                // the filter/provider lands at the wrong key and is caught.
+                let local_vk = bus.identity.store_verifying_key();
+                let store = bus.store.clone();
+                let read_sub = |filter: Filter, provider: PeerId| {
+                    let store = store.clone();
+                    let local_vk = local_vk.clone();
+                    async move {
+                        let name = subscription_name(&filter, &provider);
+                        let entry = store.get_entry(&local_vk, name.as_ref()).await.unwrap()?;
+                        let block = store.get_content(&entry.value_hash).await.unwrap()?;
+                        postcard::from_bytes::<SubscriptionEntry>(&block.data).ok()
+                    }
+                };
+
+                // subscribe_via delegates: an Active entry naming exactly this
+                // filter+provider appears in the local store.
                 bus.subscribe_via(
-                    Filter::NamePrefix(Bytes::from_static(b"voice/")),
+                    filter.clone(),
                     other.clone(),
                     SubscriptionPolicy::store_data(),
                 )
                 .await
                 .expect("subscribe_via callable");
-                bus.unsubscribe_via(
-                    Filter::NamePrefix(Bytes::from_static(b"voice/")),
-                    other.clone(),
-                )
-                .await
-                .expect("unsubscribe_via callable");
+                assert_eq!(
+                    read_sub(filter.clone(), other.clone()).await,
+                    Some(SubscriptionEntry::Active {
+                        filter: filter.clone(),
+                        provider: other.clone(),
+                    }),
+                    "subscribe_via must publish an Active SubscriptionEntry at the (filter, provider) key",
+                );
+
+                // unsubscribe_via delegates: the same key flips to Withdrawn.
+                bus.unsubscribe_via(filter.clone(), other.clone())
+                    .await
+                    .expect("unsubscribe_via callable");
+                assert_eq!(
+                    read_sub(filter.clone(), other.clone()).await,
+                    Some(SubscriptionEntry::Withdrawn),
+                    "unsubscribe_via must publish a Withdrawn entry at the same key",
+                );
 
                 // subscribe_engine_events is callable and returns a receiver.
                 let _events = bus.subscribe_engine_events().await;

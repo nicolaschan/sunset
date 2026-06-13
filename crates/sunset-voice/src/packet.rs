@@ -245,4 +245,29 @@ mod tests {
             "If this fails, serde field order / postcard encoding drifted — DO NOT update without a wire-format bump.",
         );
     }
+
+    /// The pre-bump wire bytes carried a `seq` (here `07`) between
+    /// `codec_id` and `sender_time_ms`. After the bump (`seq` moved to the
+    /// `SignedDatagram` envelope) those exact bytes must NOT decode back to
+    /// the post-bump frame — proof the field genuinely left the
+    /// `VoicePacket` wire rather than the frozen vector merely being
+    /// refreshed to whatever the new code emits.
+    #[test]
+    fn pre_bump_frame_vector_no_longer_decodes_to_post_bump_frame() {
+        let pre_bump = hex::decode("00046f7075730780d095ffbc3104aabbccdd").unwrap();
+        let post_bump = VoicePacket::Frame {
+            codec_id: "opus".to_string(),
+            sender_time_ms: 1_700_000_000_000,
+            payload: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        };
+        match postcard::from_bytes::<VoicePacket>(&pre_bump) {
+            // Acceptable: the stray seq byte derails the rest of the decode.
+            Err(_) => {}
+            // If it does decode, it must NOT reconstruct the post-bump frame.
+            Ok(decoded) => assert_ne!(
+                decoded, post_bump,
+                "pre-bump bytes must not reproduce the post-bump frame",
+            ),
+        }
+    }
 }

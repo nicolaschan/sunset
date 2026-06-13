@@ -12,8 +12,6 @@
 //! (`wasm_bindgen_futures::spawn_local` for browser, `LocalSet::spawn_local`
 //! for native).
 
-mod dyn_bus;
-mod dyn_bus_impl;
 mod state;
 mod traits;
 
@@ -24,13 +22,13 @@ use std::time::Duration;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
+use sunset_core::bus::Bus;
 use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
 use crate::VoiceEncoder;
 
-pub use dyn_bus::DynBus;
 pub use traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -76,7 +74,7 @@ pub struct VoiceTasks {
 
 impl VoiceRuntime {
     pub fn new(
-        bus: Rc<dyn DynBus>,
+        bus: Rc<dyn Bus>,
         room: Rc<Room>,
         identity: Identity,
         dialer: Rc<dyn Dialer>,
@@ -113,7 +111,7 @@ impl VoiceRuntime {
             frame_liveness,
             membership_liveness,
             voice_presence_liveness,
-            last_delivered_seq: RefCell::new(Default::default()),
+            peer_envelope_hwm: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
             last_emitted: RefCell::new(Default::default()),
             is_active: RefCell::new(false),
@@ -340,17 +338,18 @@ impl VoiceRuntime {
             .collect()
     }
 
-    /// Test-only: peers for which the subscribe loop has decoded at
+    /// Test-only: peers for which the subscribe loop has accepted at
     /// least one inbound voice payload (Frame or Heartbeat). Frames
-    /// land in `last_delivered_seq` (after decode + sink delivery);
-    /// Heartbeats land in `last_emitted`. The union of these two
-    /// maps' keys tells us which peers the receiver has actually
-    /// heard from over the WebRTC datachannel.
+    /// advance `peer_envelope_hwm` (in the dedup gate, before decode, so
+    /// a deafened receiver still registers the peer); Heartbeats land in
+    /// `last_emitted`. The union of these two maps' keys tells us which
+    /// peers the receiver has actually heard from over the WebRTC
+    /// datachannel.
     #[cfg(feature = "test-hooks")]
     pub fn observed_voice_peers(&self) -> Vec<sunset_sync::PeerId> {
         let mut peers: std::collections::HashSet<sunset_sync::PeerId> = self
             .inner
-            .last_delivered_seq
+            .peer_envelope_hwm
             .borrow()
             .keys()
             .cloned()

@@ -29,7 +29,7 @@ use std::rc::Weak;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 
-use sunset_core::bus::{Filter, SubscriptionPolicy};
+use sunset_core::bus::{Bus, Filter, SubscriptionPolicy};
 use sunset_core::liveness::LivenessState;
 use sunset_sync::PeerId;
 use sunset_sync::transport::TransportKind;
@@ -85,6 +85,11 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 else => return,
             }
 
+            // This task holds its own `Rc<dyn Bus>`/`Arc<Liveness>`
+            // clones, so the event/roster streams stay open even after the
+            // sole `Rc<RuntimeInner>` is dropped. The upgrade check is how we
+            // notice that drop and exit — it is the real shutdown signal, not
+            // dead code (stream closure alone would never fire here).
             if weak.upgrade().is_none() {
                 return;
             }
@@ -98,7 +103,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
 /// Recompute `desired_provider(A)` for every roster participant and
 /// converge `armed` to it, issuing the minimal routing mutations.
 async fn converge(
-    bus: &std::rc::Rc<dyn super::DynBus>,
+    bus: &std::rc::Rc<dyn Bus>,
     room_fp: &str,
     roster: &HashSet<PeerId>,
     armed: &mut HashMap<PeerId, PeerId>,
