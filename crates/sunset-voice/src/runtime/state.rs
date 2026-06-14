@@ -78,11 +78,15 @@ pub(crate) struct RuntimeInner {
 
     /// `false` ⇒ the runtime is in observer mode: it consumes durable
     /// `voice-presence/...` events (so the UI can render who is in the
-    /// channel) but does not publish presence, send heartbeats, or
-    /// auto-dial peers. `true` ⇒ the user has joined the call; the
-    /// active tasks resume normal operation. Toggled via
-    /// `VoiceRuntime::set_active`.
-    pub is_active: RefCell<bool>,
+    /// channel) but does not publish presence, send heartbeats, auto-dial
+    /// peers, or arm any relay/direct audio forwarding. `true` ⇒ the user
+    /// has joined the call; the active tasks resume normal operation.
+    /// Toggled via `VoiceRuntime::set_active`.
+    ///
+    /// A `watch::Sender` (not a `RefCell`) so event-driven tasks (the voice
+    /// provider) can `.subscribe()` and wake on the join/leave transition;
+    /// polling tasks still read the current value with `*…​.borrow()`.
+    pub is_active: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

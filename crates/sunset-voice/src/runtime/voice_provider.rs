@@ -21,7 +21,16 @@
 //! voice-presence tracker (`voice_presence_liveness`), the same source of
 //! truth the combiner uses for `in_voice_channel`. The presence stream
 //! relays through the store, so a participant is known before its ephemeral
-//! voice flows — the provider arms it the moment it joins the roster.
+//! voice flows — the provider arms it the moment it joins the roster *once
+//! the local user has actually joined the call*.
+//!
+//! Arming is gated on `is_active`: in observer mode (the user is watching the
+//! roster but has not joined) the provider arms nothing, so the relay never
+//! re-forwards anyone's audio to us — an observer neither hears the call nor
+//! shows as `in_call`. On `set_active(true)` it converges and arms; on
+//! `set_active(false)` it withdraws everything. The active transition is
+//! delivered through the `is_active` watch so a join/leave is acted on
+//! promptly rather than only on the next connectivity event.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Weak;
@@ -37,8 +46,16 @@ use sunset_sync::transport::TransportKind;
 use super::state::RuntimeInner;
 
 pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture<'static, ()> {
+    // Subscribe to the active-state watch synchronously, before this future
+    // is first polled, so a `set_active(true)` that races task startup is
+    // still delivered as a change — otherwise the join that should arm the
+    // call could be missed when the roster is already populated.
+    let active_rx = weak.upgrade().map(|inner| inner.is_active.subscribe());
     async move {
         let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let Some(mut active_rx) = active_rx else {
             return;
         };
         let room_fp = inner.room.fingerprint().to_hex();
@@ -82,6 +99,13 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                         }
                     }
                 }
+                changed = active_rx.changed() => {
+                    // The local user joined or left the call: reconverge so we
+                    // arm (on join) or withdraw everything (on leave).
+                    if changed.is_err() {
+                        return; // sender dropped — the runtime is gone.
+                    }
+                }
                 else => return,
             }
 
@@ -94,20 +118,35 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                 return;
             }
 
-            converge(&bus, &room_fp, &roster, &mut armed).await;
+            let active = *active_rx.borrow();
+            converge(&bus, &room_fp, active, &roster, &mut armed).await;
         }
     }
     .boxed_local()
 }
 
-/// Recompute `desired_provider(A)` for every roster participant and
-/// converge `armed` to it, issuing the minimal routing mutations.
+/// Recompute the desired provider for every roster participant and converge
+/// `armed` to it, issuing the minimal routing mutations. When the local user
+/// is not active (observer mode) the desired set is empty: every arm is
+/// withdrawn so the relay forwards no audio to us.
 async fn converge(
     bus: &std::rc::Rc<dyn Bus>,
     room_fp: &str,
+    active: bool,
     roster: &HashSet<PeerId>,
     armed: &mut HashMap<PeerId, PeerId>,
 ) {
+    if !active {
+        // Observer: pull no audio. Withdraw every arm (collect first so we
+        // don't hold a borrow on `armed` across the awaits).
+        let to_withdraw: Vec<(PeerId, PeerId)> = armed.drain().collect();
+        for (participant, provider) in to_withdraw {
+            let filter = voice_filter(room_fp, &participant);
+            let _ = bus.unsubscribe_via(filter, provider).await;
+        }
+        return;
+    }
+
     let peers = bus.current_peers().await;
     let relay = sole_primary(&peers);
 

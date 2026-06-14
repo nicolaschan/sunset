@@ -114,7 +114,7 @@ impl VoiceRuntime {
             peer_envelope_hwm: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
             last_emitted: RefCell::new(Default::default()),
-            is_active: RefCell::new(false),
+            is_active: tokio::sync::watch::channel(false).0,
         });
 
         let tasks = VoiceTasks {
@@ -240,7 +240,10 @@ impl VoiceRuntime {
     /// active tasks resume on their next iteration; `set_active(false)`
     /// returns to observer mode.
     pub fn set_active(&self, active: bool) {
-        *self.inner.is_active.borrow_mut() = active;
+        // `send_replace` updates the value and wakes every subscriber (the
+        // voice provider) so the join/leave transition arms/withdraws audio
+        // forwarding promptly; polling tasks pick it up on their next tick.
+        let _ = self.inner.is_active.send_replace(active);
     }
 
     /// Read the active flag. Useful for tests; production code consults
