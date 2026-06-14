@@ -25,6 +25,50 @@ pub enum TransportKind {
     Unknown,
 }
 
+/// Which inbound path actually carried a received ephemeral frame.
+/// Stamped per-frame at the point of delivery (not re-derived from
+/// later connectivity), so a direct/relay switchover labels each frame
+/// by the transport it truly arrived on rather than by where the path
+/// stands now. Surfaced as a first-class readout a UI could render
+/// (e.g. a "relayed" indicator) — not a test-only probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum FrameVia {
+    /// Our own loopback publish — the frame never left this host.
+    Local,
+    /// Arrived over an inbound `Secondary` session (direct WebRTC).
+    Direct,
+    /// Arrived over an inbound `Primary` session (the relay).
+    Relay,
+}
+
+impl FrameVia {
+    /// Lowercase wire/JSON label (`"local"` / `"direct"` / `"relay"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameVia::Local => "local",
+            FrameVia::Direct => "direct",
+            FrameVia::Relay => "relay",
+        }
+    }
+}
+
+impl From<TransportKind> for FrameVia {
+    /// Map the inbound session's transport kind to the frame's
+    /// provenance. Only a `Secondary` session is a genuine direct
+    /// link; every other real inbound peer — `Primary` (the relay)
+    /// and `Unknown` (single-transport / test setups that nonetheless
+    /// reach us through a peer session) — is treated as `Relay`. A
+    /// loopback frame never goes through a session, so `Local` has no
+    /// `TransportKind` to map from and is set explicitly by the
+    /// publisher.
+    fn from(kind: TransportKind) -> Self {
+        match kind {
+            TransportKind::Secondary => FrameVia::Direct,
+            TransportKind::Primary | TransportKind::Unknown => FrameVia::Relay,
+        }
+    }
+}
+
 /// A factory for inbound and outbound peer connections.
 ///
 /// Implementations are `?Send`-compatible so they work in single-threaded
@@ -58,9 +102,13 @@ pub trait TransportConnection {
     async fn recv_reliable(&self) -> Result<Bytes>;
 
     /// Send one message on the unreliable channel (datagram-shaped).
-    /// Used by the Bus's ephemeral delivery path. Transports that don't
-    /// support unreliable should return `Err`; the per-peer task drops
-    /// failed unreliable sends silently and keeps the peer alive.
+    /// Used by the Bus's ephemeral delivery path. Transports with no
+    /// datagram channel return `Err`; the per-peer send task treats that
+    /// `Err` as "could not send" and falls back to the reliable channel so
+    /// loss-tolerant ephemeral traffic (voice) still reaches a peer reached
+    /// only over a reliable transport (e.g. a WS relay leg). Datagrams
+    /// dropped *in transit* must return `Ok` (they were sent) so the
+    /// fallback never reliably re-sends a lost-on-the-wire frame.
     async fn send_unreliable(&self, bytes: Bytes) -> Result<()>;
 
     /// Receive one message from the unreliable channel. May return spurious
@@ -115,5 +163,23 @@ mod tests {
     #[test]
     fn default_kind_is_unknown() {
         assert_eq!(DummyConn.kind(), TransportKind::Unknown);
+    }
+
+    #[test]
+    fn frame_via_maps_transport_kind() {
+        // Only a Secondary (direct WebRTC) session is a genuine direct link.
+        assert_eq!(FrameVia::from(TransportKind::Secondary), FrameVia::Direct);
+        assert_eq!(FrameVia::from(TransportKind::Primary), FrameVia::Relay);
+        assert_eq!(FrameVia::from(TransportKind::Unknown), FrameVia::Relay);
+    }
+
+    #[test]
+    fn frame_via_wire_labels_are_stable() {
+        // These strings are the on-wire/JSON contract surfaced to clients
+        // (and asserted by the relay-fallback e2e); a swap here is a silent
+        // protocol break, so pin them.
+        assert_eq!(FrameVia::Local.as_str(), "local");
+        assert_eq!(FrameVia::Direct.as_str(), "direct");
+        assert_eq!(FrameVia::Relay.as_str(), "relay");
     }
 }

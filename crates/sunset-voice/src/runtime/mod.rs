@@ -12,8 +12,6 @@
 //! (`wasm_bindgen_futures::spawn_local` for browser, `LocalSet::spawn_local`
 //! for native).
 
-mod dyn_bus;
-mod dyn_bus_impl;
 mod state;
 mod traits;
 
@@ -24,13 +22,13 @@ use std::time::Duration;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
+use sunset_core::bus::Bus;
 use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
 use crate::VoiceEncoder;
 
-pub use dyn_bus::DynBus;
 pub use traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -62,6 +60,10 @@ pub struct VoiceTasks {
     pub subscribe: futures::future::LocalBoxFuture<'static, ()>,
     pub combiner: futures::future::LocalBoxFuture<'static, ()>,
     pub auto_connect: futures::future::LocalBoxFuture<'static, ()>,
+    /// Per-participant voice-provider convergence: arms `subscribe_via`
+    /// for each call participant, preferring a direct WebRTC link and
+    /// falling back to the relay, recomputed on every engine peer-event.
+    pub voice_provider: futures::future::LocalBoxFuture<'static, ()>,
     pub voice_presence_publisher: futures::future::LocalBoxFuture<'static, ()>,
     /// Subscribes to durable `voice-presence/<room_fp>/` entries and
     /// observes them into `voice_presence_liveness`. Emits the
@@ -72,7 +74,7 @@ pub struct VoiceTasks {
 
 impl VoiceRuntime {
     pub fn new(
-        bus: Rc<dyn DynBus>,
+        bus: Rc<dyn Bus>,
         room: Rc<Room>,
         identity: Identity,
         dialer: Rc<dyn Dialer>,
@@ -109,10 +111,10 @@ impl VoiceRuntime {
             frame_liveness,
             membership_liveness,
             voice_presence_liveness,
-            last_delivered_seq: RefCell::new(Default::default()),
+            peer_envelope_hwm: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
             last_emitted: RefCell::new(Default::default()),
-            is_active: RefCell::new(false),
+            is_active: tokio::sync::watch::channel(false).0,
         });
 
         let tasks = VoiceTasks {
@@ -120,6 +122,7 @@ impl VoiceRuntime {
             subscribe: subscribe::spawn(Rc::downgrade(&inner)),
             combiner: combiner::spawn(Rc::downgrade(&inner)),
             auto_connect: auto_connect::spawn(Rc::downgrade(&inner)),
+            voice_provider: voice_provider::spawn(Rc::downgrade(&inner)),
             voice_presence_publisher: voice_presence_publisher::spawn(Rc::downgrade(&inner)),
             voice_presence_membership: voice_presence_membership::spawn(Rc::downgrade(&inner)),
         };
@@ -178,6 +181,9 @@ impl VoiceRuntime {
                 .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // The per-frame counter is stamped on the SignedDatagram
+            // envelope (below), not inside the encrypted packet — one
+            // authoritative seq per stream, routing-visible and signed.
             let seq = {
                 let mut s = inner.seq.borrow_mut();
                 let v = *s;
@@ -186,7 +192,6 @@ impl VoiceRuntime {
             };
             let pkt = crate::packet::VoicePacket::Frame {
                 codec_id: crate::CODEC_ID.to_string(),
-                seq,
                 sender_time_ms: now_ms,
                 payload: encoded,
             };
@@ -216,7 +221,7 @@ impl VoiceRuntime {
             let name = bytes::Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
             let _ = inner
                 .bus
-                .publish_ephemeral(name, bytes::Bytes::from(payload))
+                .publish_ephemeral(name, seq, bytes::Bytes::from(payload))
                 .await;
         });
     }
@@ -235,7 +240,10 @@ impl VoiceRuntime {
     /// active tasks resume on their next iteration; `set_active(false)`
     /// returns to observer mode.
     pub fn set_active(&self, active: bool) {
-        *self.inner.is_active.borrow_mut() = active;
+        // `send_replace` updates the value and wakes every subscriber (the
+        // voice provider) so the join/leave transition arms/withdraws audio
+        // forwarding promptly; polling tasks pick it up on their next tick.
+        let _ = self.inner.is_active.send_replace(active);
     }
 
     /// Read the active flag. Useful for tests; production code consults
@@ -333,17 +341,18 @@ impl VoiceRuntime {
             .collect()
     }
 
-    /// Test-only: peers for which the subscribe loop has decoded at
+    /// Test-only: peers for which the subscribe loop has accepted at
     /// least one inbound voice payload (Frame or Heartbeat). Frames
-    /// land in `last_delivered_seq` (after decode + sink delivery);
-    /// Heartbeats land in `last_emitted`. The union of these two
-    /// maps' keys tells us which peers the receiver has actually
-    /// heard from over the WebRTC datachannel.
+    /// advance `peer_envelope_hwm` (in the dedup gate, before decode, so
+    /// a deafened receiver still registers the peer); Heartbeats land in
+    /// `last_emitted`. The union of these two maps' keys tells us which
+    /// peers the receiver has actually heard from over the WebRTC
+    /// datachannel.
     #[cfg(feature = "test-hooks")]
     pub fn observed_voice_peers(&self) -> Vec<sunset_sync::PeerId> {
         let mut peers: std::collections::HashSet<sunset_sync::PeerId> = self
             .inner
-            .last_delivered_seq
+            .peer_envelope_hwm
             .borrow()
             .keys()
             .cloned()
@@ -386,3 +395,4 @@ mod heartbeat;
 mod subscribe;
 mod voice_presence_membership;
 mod voice_presence_publisher;
+mod voice_provider;

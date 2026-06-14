@@ -13,14 +13,14 @@ use sunset_core::liveness::Liveness;
 use sunset_core::{Identity, Room};
 use sunset_sync::PeerId;
 
-use crate::runtime::dyn_bus::DynBus;
 use crate::runtime::traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
 use crate::{Denoiser, VoiceDecoder, VoiceEncoder};
+use sunset_core::bus::Bus;
 
 pub(crate) struct RuntimeInner {
     pub identity: Identity,
     pub room: Rc<Room>,
-    pub bus: Rc<dyn DynBus>,
+    pub bus: Rc<dyn Bus>,
     pub dialer: Rc<dyn Dialer>,
     /// Interior-mutable so `test-hooks` can swap in a recording wrapper
     /// via `VoiceRuntime::set_frame_sink` without changing the contract.
@@ -65,22 +65,28 @@ pub(crate) struct RuntimeInner {
     /// connection yet.
     pub voice_presence_liveness: Arc<Liveness>,
 
-    /// Last per-peer wire sequence number delivered to the
-    /// `FrameSink`. The runtime keeps no audio buffer of its own —
-    /// the host's playback path absorbs jitter. This map is read by
-    /// test hooks (`observed_voice_peers`) so a peer remains "seen
-    /// via frames" even when nothing else stores their PCM.
-    pub last_delivered_seq: RefCell<HashMap<PeerId, u64>>,
+    /// Per-peer highest envelope `seq` accepted by the receiver dedup
+    /// gate — the high-water mark that drops a frame seen twice during a
+    /// direct/relay switchover. Advanced once per accepted frame
+    /// (before decode), so it also marks a peer as "seen via frames"
+    /// even when the receiver is deafened. The runtime keeps no audio
+    /// buffer of its own — the host's playback path absorbs jitter. Read
+    /// by test hooks (`observed_voice_peers`).
+    pub peer_envelope_hwm: RefCell<HashMap<PeerId, u64>>,
     pub auto_connect_state: RefCell<HashMap<PeerId, AutoConnectState>>,
     pub last_emitted: RefCell<HashMap<PeerId, EmittedState>>,
 
     /// `false` ⇒ the runtime is in observer mode: it consumes durable
     /// `voice-presence/...` events (so the UI can render who is in the
-    /// channel) but does not publish presence, send heartbeats, or
-    /// auto-dial peers. `true` ⇒ the user has joined the call; the
-    /// active tasks resume normal operation. Toggled via
-    /// `VoiceRuntime::set_active`.
-    pub is_active: RefCell<bool>,
+    /// channel) but does not publish presence, send heartbeats, auto-dial
+    /// peers, or arm any relay/direct audio forwarding. `true` ⇒ the user
+    /// has joined the call; the active tasks resume normal operation.
+    /// Toggled via `VoiceRuntime::set_active`.
+    ///
+    /// A `watch::Sender` (not a `RefCell`) so event-driven tasks (the voice
+    /// provider) can `.subscribe()` and wake on the join/leave transition;
+    /// polling tasks still read the current value with `*…​.borrow()`.
+    pub is_active: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

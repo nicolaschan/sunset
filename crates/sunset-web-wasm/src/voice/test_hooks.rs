@@ -11,15 +11,15 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use sha2::Digest;
-use sunset_sync::PeerId;
+use sunset_sync::{FrameVia, PeerId};
 use sunset_voice::FrameSink;
 
 const RING_PER_PEER: usize = 1024;
 
 /// A single recorded frame: length in samples, SHA-256 checksum
 /// (hex) of the raw f32 bytes, root-mean-square amplitude, the
-/// wire sequence number (low 32 bits of `VoicePacket::Frame::seq`),
-/// and a 440 Hz tone-purity ratio.
+/// wire sequence number (low 32 bits of the frame stream's
+/// `SignedDatagram.seq` envelope counter), and a 440 Hz tone-purity ratio.
 ///
 /// `checksum` is a stuck-frame tripwire — distinct decoded frames
 /// land at distinct checksums even after Opus, so consecutive
@@ -49,6 +49,11 @@ pub struct RecordedFrame {
     pub rms: f32,
     pub seq: u32,
     pub tone_purity_440: f32,
+    /// Which inbound transport carried this frame (`local` / `direct` /
+    /// `relay`). The honesty signal for the relay-fallback e2e: it lets
+    /// the test assert a received frame crossed the relay (and flipped to
+    /// direct after WebRTC came up) rather than inferring the path.
+    pub via: FrameVia,
 }
 
 struct Inner {
@@ -112,7 +117,7 @@ fn tone_purity_440_left_channel(stereo_interleaved: &[f32]) -> f32 {
 }
 
 impl FrameSink for RecordingFrameSink {
-    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]) {
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32], via: FrameVia) {
         let mut hasher = sha2::Sha256::new();
         for s in pcm {
             hasher.update(s.to_le_bytes());
@@ -127,6 +132,7 @@ impl FrameSink for RecordingFrameSink {
             rms,
             seq,
             tone_purity_440,
+            via,
         };
         let mut inner = self.inner.borrow_mut();
         let q = inner.frames.entry(peer.clone()).or_default();
@@ -135,7 +141,7 @@ impl FrameSink for RecordingFrameSink {
         }
         q.push_back(frame);
         drop(inner);
-        self.forward.deliver(peer, seq, pcm);
+        self.forward.deliver(peer, seq, pcm, via);
     }
 
     fn drop_peer(&self, peer: &PeerId) {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use sunset_store::{Event, Filter, Replay, Store};
+use sunset_store::{Event, Filter, Replay, Store, VerifyingKey};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::digest::{BloomFilter, build_digest, entries_missing_from_remote};
@@ -279,11 +279,28 @@ pub(crate) struct EngineState {
     /// receiver being dropped) are evicted lazily on the next emit.
     pub event_subs: Vec<mpsc::UnboundedSender<EngineEvent>>,
     /// Active in-process ephemeral subscribers. Each is a (filter,
-    /// sender) pair; the engine dispatches a `SignedDatagram` to
-    /// every subscriber whose filter matches the datagram's name.
-    /// Dead senders (closed receivers) are evicted lazily on the
-    /// next dispatch.
-    pub ephemeral_subs: Vec<(Filter, mpsc::UnboundedSender<sunset_store::SignedDatagram>)>,
+    /// sender) pair; the engine dispatches a `(SignedDatagram, FrameVia)`
+    /// to every subscriber whose filter matches the datagram's name.
+    /// The `FrameVia` tags which inbound transport carried the frame
+    /// (or `Local` for our own loopback publish). Dead senders (closed
+    /// receivers) are evicted lazily on the next dispatch.
+    pub ephemeral_subs: Vec<(
+        Filter,
+        mpsc::UnboundedSender<(sunset_store::SignedDatagram, crate::transport::FrameVia)>,
+    )>,
+    /// Highest ephemeral `seq` already passed through, per
+    /// `(sender verifying_key, stream name)`. The in-memory analog of
+    /// the store's idempotency for durable re-forward: an inbound
+    /// datagram at-or-below the recorded seq has already been handled,
+    /// so dropping it terminates re-forward loops. Pruned when the
+    /// sender peer drops.
+    pub ephemeral_hwm: HashMap<(VerifyingKey, Bytes), u64>,
+    /// Count of ephemeral datagrams this engine re-forwarded to at
+    /// least one peer, summed over recipients. Stays flat when an
+    /// inbound datagram matches no armed peer — the server-side ground
+    /// truth that the relay actually carried (or stopped carrying)
+    /// traffic.
+    pub ephemeral_forwarded: u64,
 }
 
 pub struct SyncEngine<S: Store, T: Transport> {
@@ -329,6 +346,8 @@ where
                 peer_sessions: HashMap::new(),
                 event_subs: Vec::new(),
                 ephemeral_subs: Vec::new(),
+                ephemeral_hwm: HashMap::new(),
+                ephemeral_forwarded: 0,
             })),
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(Some(cmd_rx))),
@@ -404,8 +423,9 @@ where
     pub async fn subscribe_ephemeral(
         &self,
         filter: Filter,
-    ) -> mpsc::UnboundedReceiver<sunset_store::SignedDatagram> {
-        let (tx, rx) = mpsc::unbounded_channel::<sunset_store::SignedDatagram>();
+    ) -> mpsc::UnboundedReceiver<(sunset_store::SignedDatagram, crate::transport::FrameVia)> {
+        let (tx, rx) =
+            mpsc::unbounded_channel::<(sunset_store::SignedDatagram, crate::transport::FrameVia)>();
         self.state.lock().await.ephemeral_subs.push((filter, tx));
         rx
     }
@@ -419,7 +439,10 @@ where
     /// persist; does NOT retry. Returns `Ok(())` even if no peers
     /// match.
     pub async fn publish_ephemeral(&self, datagram: sunset_store::SignedDatagram) -> Result<()> {
-        self.dispatch_ephemeral_local(&datagram).await;
+        // Our own publish never crossed a transport — the loopback copy
+        // is `Local`.
+        self.dispatch_ephemeral_local(&datagram, crate::transport::FrameVia::Local)
+            .await;
 
         let msg = SyncMessage::EphemeralDelivery {
             datagram: datagram.clone(),
@@ -1340,14 +1363,37 @@ where
                 let _ = session.tx.send(msg.clone());
             }
         } else {
-            for (_peer, session) in crate::routing::forward_targets(
+            Self::fan_out_to_interested(
                 &state.peer_sessions,
                 &entry.verifying_key,
                 &entry.name,
-            ) {
-                let _ = session.tx.send(msg.clone());
-            }
+                &msg,
+                None,
+            );
         }
+    }
+
+    /// Send `msg` to every interest-matched forward target for `(vk, name)`
+    /// except `exclude`, returning how many sessions received it. The single
+    /// fan-out primitive shared by durable foreign-entry forwarding and
+    /// ephemeral re-forward; the two differ only in whether they exclude the
+    /// source peer and whether the caller consumes the count.
+    fn fan_out_to_interested(
+        peer_sessions: &HashMap<PeerId, PeerSession>,
+        vk: &VerifyingKey,
+        name: &[u8],
+        msg: &SyncMessage,
+        exclude: Option<&PeerId>,
+    ) -> u64 {
+        let mut fanned = 0u64;
+        for (peer, session) in crate::routing::forward_targets(peer_sessions, vk, name) {
+            if exclude == Some(peer) {
+                continue;
+            }
+            let _ = session.tx.send(msg.clone());
+            fanned += 1;
+        }
+        fanned
     }
 
     /// Snapshot of currently connected peers (peers for which the engine has
@@ -1523,7 +1569,14 @@ where
     async fn drop_peer_session(&self, peer_id: PeerId) -> bool {
         let was_present = {
             let mut state = self.state.lock().await;
-            state.peer_sessions.remove(&peer_id).is_some()
+            let removed = state.peer_sessions.remove(&peer_id).is_some();
+            // Drop this sender's HWM slots: a future reconnection restarts
+            // its ephemeral streams from seq 0, which a stale HWM would
+            // wrongly suppress.
+            state
+                .ephemeral_hwm
+                .retain(|(sender, _), _| *sender != peer_id.0);
+            removed
         };
         if was_present {
             self.emit_engine_event(EngineEvent::PeerRemoved {
@@ -1535,23 +1588,30 @@ where
     }
 
     /// Fan-out a datagram to every in-process subscriber whose filter
-    /// matches `(datagram.verifying_key, datagram.name)`. Drops dead
-    /// senders (closed receivers) lazily.
-    async fn dispatch_ephemeral_local(&self, datagram: &sunset_store::SignedDatagram) {
+    /// matches `(datagram.verifying_key, datagram.name)`, tagged with
+    /// the `via` provenance the caller resolved at delivery time. Drops
+    /// dead senders (closed receivers) lazily.
+    async fn dispatch_ephemeral_local(
+        &self,
+        datagram: &sunset_store::SignedDatagram,
+        via: crate::transport::FrameVia,
+    ) {
         let mut state = self.state.lock().await;
         state.ephemeral_subs.retain(|(filter, tx)| {
             if filter.matches(&datagram.verifying_key, &datagram.name) {
-                tx.send(datagram.clone()).is_ok()
+                tx.send((datagram.clone(), via)).is_ok()
             } else {
                 !tx.is_closed()
             }
         });
     }
 
-    /// Handle an inbound `EphemeralDelivery`: verify the datagram's
-    /// signature against the store's configured verifier and, on
-    /// success, fan it out to every in-process subscriber whose filter
-    /// matches.
+    /// Handle an inbound `EphemeralDelivery`: verify the signature, drop
+    /// already-seen seqs via the per-`(sender, name)` HWM, re-forward to
+    /// every interested peer except the source, then dispatch to local
+    /// subscribers. The re-forward mirrors `fanout_application_entry` —
+    /// `forward_targets` is interest-gated, so a leaf with no armed peer
+    /// fans out nothing by construction (no relay-role gate).
     async fn handle_ephemeral_delivery(
         &self,
         from: PeerId,
@@ -1566,7 +1626,62 @@ where
             tracing::debug!(from = ?from, "dropping ephemeral datagram — bad signature");
             return;
         }
-        self.dispatch_ephemeral_local(&datagram).await;
+
+        let key = (datagram.verifying_key.clone(), datagram.name.clone());
+        let via;
+        {
+            let mut st = self.state.lock().await;
+            // Provenance is sourced from the *delivering* session's
+            // transport kind, read here at delivery time and stamped onto
+            // this frame — never re-derived later from connectivity, which
+            // would mislabel an already-delivered frame across a
+            // direct/relay switchover. A Secondary session is the only
+            // genuine direct link ⇒ Direct; every other real inbound path
+            // (Primary relay, Unknown single-transport) ⇒ Relay. If the
+            // session has vanished between recv and handling, the frame
+            // still arrived over a non-direct path, so default to Relay
+            // (never Direct, which requires a confirmed Secondary).
+            via = st
+                .peer_sessions
+                .get(&from)
+                .map(|s| crate::transport::FrameVia::from(s.kind))
+                .unwrap_or(crate::transport::FrameVia::Relay);
+
+            // Option gate, not `unwrap_or(0)`: seq=0 is a real first value,
+            // so "no HWM yet" must forward while "HWM == 0" must drop a replay.
+            match st.ephemeral_hwm.get(&key) {
+                Some(&h) if datagram.seq <= h => return,
+                _ => {}
+            }
+
+            let msg = SyncMessage::EphemeralDelivery {
+                datagram: datagram.clone(),
+            };
+            let fanned = Self::fan_out_to_interested(
+                &st.peer_sessions,
+                &datagram.verifying_key,
+                &datagram.name,
+                &msg,
+                Some(&from),
+            );
+
+            // Advance the HWM regardless (dedup), but count only real
+            // fan-out so the counter stays flat when nothing was forwarded.
+            st.ephemeral_hwm.insert(key, datagram.seq);
+            if fanned > 0 {
+                st.ephemeral_forwarded += fanned;
+            }
+        }
+
+        self.dispatch_ephemeral_local(&datagram, via).await;
+    }
+
+    /// Count of ephemeral datagrams this engine re-forwarded, summed over
+    /// recipients. Server-side ground truth for the relay-fallback e2e:
+    /// it rises while the relay carries audio and stays flat once a direct
+    /// path supplants it.
+    pub async fn ephemeral_forwarded(&self) -> u64 {
+        self.state.lock().await.ephemeral_forwarded
     }
 
     /// Re-publish an active subscription to refresh its TTL. Called by the
@@ -1791,7 +1906,6 @@ where
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use sunset_store::VerifyingKey;
     use sunset_store_memory::MemoryStore;
 
     use crate::Signer;
@@ -2356,6 +2470,7 @@ mod tests {
                             verifying_key: vk(b"bob"),
                             name: Bytes::from_static(b"voice/bob/0001"),
                             payload: Bytes::from_static(b"forged"),
+                            seq: 0,
                             signature: Bytes::from_static(&[0u8; 64]),
                         },
                     )
@@ -2404,13 +2519,401 @@ mod tests {
                     verifying_key: vk(b"alice"),
                     name: Bytes::from_static(b"voice/alice/0001"),
                     payload: Bytes::from_static(b"frame"),
+                    seq: 0,
                     signature: Bytes::from_static(&[0u8; 64]),
                 };
 
                 engine.publish_ephemeral(datagram.clone()).await.unwrap();
 
-                let got = sub.recv().await.expect("loopback delivery");
+                let (got, _via) = sub.recv().await.expect("loopback delivery");
                 assert_eq!(got, datagram);
+            })
+            .await;
+    }
+
+    /// Inject a peer session with an explicit `TransportKind` and no
+    /// armed interest. Used to set up the *delivering* peer of an
+    /// inbound `EphemeralDelivery` so the test controls which inbound
+    /// transport kind the frame's provenance is sourced from.
+    fn inject_session_kind(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        peer: PeerId,
+        kind: TransportKind,
+    ) {
+        let (tx, _rx) = mpsc::unbounded_channel::<SyncMessage>();
+        engine
+            .state
+            .try_lock()
+            .expect("uncontended in single-threaded test")
+            .peer_sessions
+            .insert(
+                peer,
+                PeerSession {
+                    conn_id: ConnectionId::for_test(1),
+                    kind,
+                    tx,
+                    _shutdown: tokio::sync::watch::channel(()).0,
+                    interests: std::collections::HashMap::new(),
+                },
+            );
+    }
+
+    /// A received frame is tagged with the inbound transport it arrived
+    /// on, sourced from the *delivering* session's `TransportKind` at
+    /// delivery time: an inbound `Secondary` session ⇒ `Direct`, an
+    /// inbound `Primary` session (the relay) ⇒ `Relay`. The mapping is
+    /// fixed at delivery and must NOT be re-derived from later
+    /// connectivity (a switchover-time re-derive would mislabel an
+    /// already-delivered frame), which is why each datagram is stamped
+    /// here from `peer_sessions[from].kind` rather than from
+    /// `current_peers()`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_ephemeral_delivery_tags_via_from_inbound_session_kind() {
+        use crate::transport::FrameVia;
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("relay", b"relay"));
+
+                let mut sub = engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+
+                // Datagram delivered BY a Secondary (direct WebRTC) session.
+                let direct_peer = PeerId(vk(b"direct"));
+                inject_session_kind(&engine, direct_peer.clone(), TransportKind::Secondary);
+                engine
+                    .handle_ephemeral_delivery(
+                        direct_peer.clone(),
+                        SignedDatagram {
+                            verifying_key: vk(b"alice"),
+                            name: Bytes::from_static(b"voice/alice/0001"),
+                            payload: Bytes::from_static(b"via-direct"),
+                            seq: 0,
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                let (dg, via) = sub.recv().await.expect("direct frame delivered locally");
+                assert_eq!(dg.payload, Bytes::from_static(b"via-direct"));
+                assert_eq!(
+                    via,
+                    FrameVia::Direct,
+                    "frame from an inbound Secondary session is Direct"
+                );
+
+                // Datagram delivered BY a Primary (relay) session, different
+                // sender so the per-(sender,name) HWM doesn't dedup it.
+                let relay_peer = PeerId(vk(b"relay-peer"));
+                inject_session_kind(&engine, relay_peer.clone(), TransportKind::Primary);
+                engine
+                    .handle_ephemeral_delivery(
+                        relay_peer.clone(),
+                        SignedDatagram {
+                            verifying_key: vk(b"bob"),
+                            name: Bytes::from_static(b"voice/bob/0001"),
+                            payload: Bytes::from_static(b"via-relay"),
+                            seq: 0,
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                let (dg, via) = sub.recv().await.expect("relay frame delivered locally");
+                assert_eq!(dg.payload, Bytes::from_static(b"via-relay"));
+                assert_eq!(
+                    via,
+                    FrameVia::Relay,
+                    "frame from an inbound Primary (relay) session is Relay"
+                );
+            })
+            .await;
+    }
+
+    /// A loopback `publish_ephemeral` tags the local subscriber's copy
+    /// `Local` — the frame never crossed a transport.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_ephemeral_loopback_tags_via_local() {
+        use crate::transport::FrameVia;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("alice", b"alice"));
+
+                let mut sub = engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+
+                engine
+                    .publish_ephemeral(sunset_store::SignedDatagram {
+                        verifying_key: vk(b"alice"),
+                        name: Bytes::from_static(b"voice/alice/0001"),
+                        payload: Bytes::from_static(b"frame"),
+                        seq: 0,
+                        signature: Bytes::from_static(&[0u8; 64]),
+                    })
+                    .await
+                    .unwrap();
+
+                let (_dg, via) = sub.recv().await.expect("loopback delivery");
+                assert_eq!(via, FrameVia::Local, "loopback publish is Local");
+            })
+            .await;
+    }
+
+    /// Inject a peer session whose interests arm `filter`, with a fake
+    /// outbound channel so the test can observe what is re-forwarded to it.
+    fn arm_peer(
+        engine: &SyncEngine<MemoryStore, TestTransport>,
+        peer: PeerId,
+        filter: Filter,
+    ) -> mpsc::UnboundedReceiver<SyncMessage> {
+        let (tx, rx) = mpsc::unbounded_channel::<SyncMessage>();
+        let mut interests = std::collections::HashMap::new();
+        interests.insert(crate::routing::filter_hash(&filter), filter);
+        engine
+            .state
+            .try_lock()
+            .expect("uncontended in single-threaded test")
+            .peer_sessions
+            .insert(
+                peer,
+                PeerSession {
+                    conn_id: ConnectionId::for_test(1),
+                    kind: TransportKind::Unknown,
+                    tx,
+                    _shutdown: tokio::sync::watch::channel(()).0,
+                    interests,
+                },
+            );
+        rx
+    }
+
+    /// `ephemeral_forwarded` counts recipients on real fan-out and stays
+    /// FLAT when an inbound datagram matches no armed peer. The flat
+    /// property is the server-side ground truth the e2e relies on to prove
+    /// the relay stops carrying audio once a direct path forms.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_forwarded_only_when_fanned_out() {
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("relay", b"relay"));
+
+                let a = PeerId(vk(b"alice"));
+                let b = PeerId(vk(b"bob"));
+
+                // Both A and B have armed interest in alice's voice stream
+                // (A would, e.g., via a broad subscribe at the relay). A is
+                // therefore a fan-out candidate — the source-exclusion is
+                // what keeps it from being echoed its own frame.
+                let mut a_rx = arm_peer(
+                    &engine,
+                    a.clone(),
+                    Filter::NamePrefix(Bytes::from_static(b"voice/alice")),
+                );
+                let mut b_rx = arm_peer(
+                    &engine,
+                    b.clone(),
+                    Filter::NamePrefix(Bytes::from_static(b"voice/alice")),
+                );
+
+                // A delivers a datagram on its voice stream (seq=0).
+                engine
+                    .handle_ephemeral_delivery(
+                        a.clone(),
+                        SignedDatagram {
+                            verifying_key: vk(b"alice"),
+                            name: Bytes::from_static(b"voice/alice/0001"),
+                            payload: Bytes::from_static(b"frame-0"),
+                            seq: 0,
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                // Forwarded to B exactly once; never echoed to A. The send
+                // is synchronous inside handle_ephemeral_delivery, so a
+                // non-blocking try_recv is deterministic — and a regression
+                // that drops the forward fails fast instead of hanging.
+                let fwd = b_rx.try_recv().expect("forwarded to B");
+                match fwd {
+                    SyncMessage::EphemeralDelivery { datagram } => {
+                        assert_eq!(datagram.payload, Bytes::from_static(b"frame-0"));
+                    }
+                    other => panic!("expected EphemeralDelivery, got {other:?}"),
+                }
+                assert!(
+                    a_rx.try_recv().is_err(),
+                    "source A must not be echoed its own datagram"
+                );
+                // Only B counted, not the source A.
+                assert_eq!(engine.ephemeral_forwarded().await, 1);
+
+                // A second datagram with NO matching armed peer: a different
+                // sender whose stream nobody armed. Counter must stay FLAT.
+                engine
+                    .handle_ephemeral_delivery(
+                        PeerId(vk(b"carol")),
+                        SignedDatagram {
+                            verifying_key: vk(b"carol"),
+                            name: Bytes::from_static(b"voice/carol/0001"),
+                            payload: Bytes::from_static(b"frame-x"),
+                            seq: 0,
+                            signature: Bytes::from_static(&[0u8; 64]),
+                        },
+                    )
+                    .await;
+
+                assert_eq!(
+                    engine.ephemeral_forwarded().await,
+                    1,
+                    "counter must stay flat when nothing was fanned out"
+                );
+            })
+            .await;
+    }
+
+    /// HWM dedup is Option-based: seq=0 is a real first value (forwarded),
+    /// replays at-or-below the HWM drop, a higher seq advances and forwards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_hwm_first_seq_0_then_dedups() {
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("relay", b"relay"));
+
+                let s = PeerId(vk(b"sender"));
+                let b = PeerId(vk(b"bob"));
+                let name = Bytes::from_static(b"voice/sender/0001");
+
+                let mut b_rx = arm_peer(
+                    &engine,
+                    b.clone(),
+                    Filter::NamePrefix(Bytes::from_static(b"voice/sender")),
+                );
+
+                let deliver = |seq: u64| {
+                    let engine = engine.clone();
+                    let s = s.clone();
+                    let name = name.clone();
+                    async move {
+                        engine
+                            .handle_ephemeral_delivery(
+                                s,
+                                SignedDatagram {
+                                    verifying_key: vk(b"sender"),
+                                    name,
+                                    payload: Bytes::from_static(b"frame"),
+                                    seq,
+                                    signature: Bytes::from_static(&[0u8; 64]),
+                                },
+                            )
+                            .await;
+                    }
+                };
+
+                // First datagram seq=0 IS forwarded (Option gate, not `<=0`).
+                deliver(0).await;
+                assert!(b_rx.try_recv().is_ok(), "seq=0 must be forwarded");
+                assert_eq!(engine.ephemeral_forwarded().await, 1);
+
+                // Same (sender,name,0) again → dropped.
+                deliver(0).await;
+                assert!(b_rx.try_recv().is_err(), "replay of seq=0 must be dropped");
+                assert_eq!(engine.ephemeral_forwarded().await, 1);
+
+                // seq=1 → forwarded.
+                deliver(1).await;
+                assert!(b_rx.try_recv().is_ok(), "seq=1 must be forwarded");
+                assert_eq!(engine.ephemeral_forwarded().await, 2);
+
+                // seq=0 after the HWM advanced → dropped.
+                deliver(0).await;
+                assert!(
+                    b_rx.try_recv().is_err(),
+                    "seq=0 after HWM=1 must be dropped"
+                );
+                assert_eq!(engine.ephemeral_forwarded().await, 2);
+            })
+            .await;
+    }
+
+    /// Dropping a peer prunes its per-`(sender, name)` HWM slots, so when
+    /// that peer reconnects and restarts its ephemeral stream from seq 0 the
+    /// fresh seq=0 is forwarded rather than suppressed as a replay. Without
+    /// the prune in `drop_peer_session`, a reconnected peer's audio would
+    /// stall permanently behind a stale high-water mark.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_hwm_pruned_on_peer_drop_unblocks_reconnect() {
+        use sunset_store::SignedDatagram;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let engine = Rc::new(make_engine("relay", b"relay"));
+
+                let sender = PeerId(vk(b"sender"));
+                let b = PeerId(vk(b"bob"));
+                let name = Bytes::from_static(b"voice/sender/0001");
+
+                let mut b_rx = arm_peer(
+                    &engine,
+                    b.clone(),
+                    Filter::NamePrefix(Bytes::from_static(b"voice/sender")),
+                );
+
+                let deliver_seq_0 = || {
+                    let engine = engine.clone();
+                    let sender = sender.clone();
+                    let name = name.clone();
+                    async move {
+                        engine
+                            .handle_ephemeral_delivery(
+                                sender,
+                                SignedDatagram {
+                                    verifying_key: vk(b"sender"),
+                                    name,
+                                    payload: Bytes::from_static(b"frame-0"),
+                                    seq: 0,
+                                    signature: Bytes::from_static(&[0u8; 64]),
+                                },
+                            )
+                            .await;
+                    }
+                };
+
+                // First seq=0 forwards and arms HWM[(sender, name)] = 0.
+                deliver_seq_0().await;
+                assert!(b_rx.try_recv().is_ok(), "first seq=0 must forward");
+
+                // A replay of seq=0 is dropped by the HWM — confirms the
+                // mark is armed, so the next assertion is meaningful.
+                deliver_seq_0().await;
+                assert!(
+                    b_rx.try_recv().is_err(),
+                    "replay of seq=0 is dropped while the HWM is armed"
+                );
+
+                // The sender drops. This must prune its HWM slot.
+                engine.drop_peer_session(sender.clone()).await;
+
+                // The sender reconnects and restarts its stream at seq=0.
+                // With the HWM pruned, this is a fresh first value and must
+                // forward again rather than being mistaken for a replay.
+                deliver_seq_0().await;
+                assert!(
+                    b_rx.try_recv().is_ok(),
+                    "seq=0 after the sender dropped must forward (stale HWM pruned)"
+                );
             })
             .await;
     }
@@ -2430,6 +2933,7 @@ mod tests {
                     verifying_key: vk(b"alice"),
                     name: Bytes::from_static(b"chat/alice/0001"),
                     payload: Bytes::from_static(b"frame"),
+                    seq: 0,
                     signature: Bytes::from_static(&[0u8; 64]),
                 };
 

@@ -97,6 +97,13 @@ async fn get_root_returns_identity_json() {
                 body.contains("\"address\":\"ws://"),
                 "address field missing: {body}"
             );
+            // The voice relay-fallback e2e fetches this route and polls
+            // the forward counter; it must be present (zero on a fresh
+            // relay that has forwarded nothing yet).
+            assert!(
+                body.contains("\"ephemeral_forwarded\":0"),
+                "ephemeral_forwarded field missing on fresh relay: {body}"
+            );
         })
         .await;
 }

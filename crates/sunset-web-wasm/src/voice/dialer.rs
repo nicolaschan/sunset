@@ -51,11 +51,20 @@ pub(crate) struct WebDialer {
     /// membership-stale, and (for any survivors) by `Drop` on
     /// runtime shutdown. See the module docs for the full lifecycle.
     pub intent_ids: RefCell<HashMap<PeerId, IntentId>>,
+    /// Relay-only mode: never attempt a direct WebRTC link, so all voice
+    /// flows through the relay's re-forward. A user-facing privacy/firewall
+    /// option (no P2P IP exposure); also what the relay-audio-fallback e2e
+    /// uses to deterministically exercise the relayed path.
+    pub relay_only: bool,
 }
 
 #[async_trait(?Send)]
 impl Dialer for WebDialer {
     async fn ensure_direct(&self, peer: PeerId) {
+        if self.relay_only {
+            // No direct dial: the relay re-forwards this peer's voice.
+            return;
+        }
         let pk_bytes = peer.0.as_bytes();
         let arr: [u8; 32] = match pk_bytes.try_into() {
             Ok(a) => a,

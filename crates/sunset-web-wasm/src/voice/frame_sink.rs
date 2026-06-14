@@ -9,7 +9,7 @@ use std::rc::Rc;
 use js_sys::{Float32Array, Function, Uint8Array};
 use wasm_bindgen::JsValue;
 
-use sunset_sync::PeerId;
+use sunset_sync::{FrameVia, PeerId};
 use sunset_voice::FrameSink;
 
 pub(crate) struct WebFrameSink {
@@ -20,7 +20,12 @@ pub(crate) struct WebFrameSink {
 }
 
 impl FrameSink for WebFrameSink {
-    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]) {
+    // Playback routing keys on `(peer, seq)` alone. The per-frame `via`
+    // provenance arrives with every frame, but this production sink does
+    // not forward it to the worklet callback — provenance is surfaced for
+    // assertions only through the test-hooks recorder's JSON (a "relayed"
+    // readout), so this sink deliberately ignores it.
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32], _via: FrameVia) {
         if let Some(f) = self.on_pcm.borrow().as_ref() {
             let id = Uint8Array::from(peer.0.as_bytes());
             let arr = Float32Array::from(pcm);

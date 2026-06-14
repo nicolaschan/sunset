@@ -16,10 +16,10 @@ use std::rc::Rc;
 use js_sys::{Float32Array, Function};
 use wasm_bindgen::prelude::*;
 
-use sunset_core::bus::BusImpl;
+use sunset_core::bus::{Bus, BusImpl};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::MultiTransport;
-use sunset_voice::runtime::{DynBus, FrameSink, VoiceRuntime};
+use sunset_voice::runtime::{FrameSink, VoiceRuntime};
 
 use crate::client::{RtcT, WsT};
 use crate::room_handle::RoomHandle;
@@ -44,6 +44,15 @@ pub(crate) fn new_voice_cell() -> VoiceCell {
     Rc::new(RefCell::new(None))
 }
 
+/// The host (JS) callbacks a voice session delivers into: decoded PCM,
+/// per-peer drop, and `VoicePeerState` changes. Bundled so the start
+/// functions stay below the argument-count lint.
+pub(crate) struct VoiceCallbacks {
+    pub on_pcm: Function,
+    pub on_drop_peer: Function,
+    pub on_voice_peer_state: Function,
+}
+
 /// Start the voice subsystem in *observer* mode. Constructs `WebDialer`,
 /// `WebFrameSink`, `WebPeerStateSink`, builds `VoiceRuntime`, and spawns
 /// all six runtime tasks. The runtime starts inactive: the three
@@ -62,17 +71,16 @@ pub(crate) fn voice_observe_start(
     identity: &sunset_core::Identity,
     room_handle: &RoomHandle,
     bus: &BusArc,
-    on_pcm: Function,
-    on_drop_peer: Function,
-    on_voice_peer_state: Function,
+    relay_only: bool,
+    callbacks: VoiceCallbacks,
 ) -> Result<(), JsError> {
     if cell.borrow().is_some() {
         return Err(JsError::new("voice already started"));
     }
 
-    let on_pcm_rc = Rc::new(RefCell::new(Some(on_pcm)));
-    let on_drop_rc = Rc::new(RefCell::new(Some(on_drop_peer)));
-    let on_state_rc = Rc::new(RefCell::new(Some(on_voice_peer_state)));
+    let on_pcm_rc = Rc::new(RefCell::new(Some(callbacks.on_pcm)));
+    let on_drop_rc = Rc::new(RefCell::new(Some(callbacks.on_drop_peer)));
+    let on_state_rc = Rc::new(RefCell::new(Some(callbacks.on_voice_peer_state)));
 
     let web_frame_sink: Rc<dyn FrameSink> = Rc::new(frame_sink::WebFrameSink {
         on_pcm: on_pcm_rc,
@@ -81,14 +89,15 @@ pub(crate) fn voice_observe_start(
     let dialer: Rc<dyn sunset_voice::Dialer> = Rc::new(dialer::WebDialer {
         open_room: room_handle.open_room_rc(),
         intent_ids: RefCell::new(Default::default()),
+        relay_only,
     });
     let peer_state_sink: Rc<dyn sunset_voice::PeerStateSink> =
         Rc::new(peer_state_sink::WebPeerStateSink {
             handler: on_state_rc,
         });
 
-    // Upcast the Rc<BusImpl> to Rc<dyn DynBus>. Single-threaded data plane.
-    let dyn_bus: Rc<dyn DynBus> = bus.clone();
+    // Upcast the Rc<BusImpl> to Rc<dyn Bus>. Single-threaded data plane.
+    let dyn_bus: Rc<dyn Bus> = bus.clone();
 
     let (runtime, tasks) = VoiceRuntime::new(
         dyn_bus,
@@ -103,6 +112,7 @@ pub(crate) fn voice_observe_start(
     wasm_bindgen_futures::spawn_local(tasks.subscribe);
     wasm_bindgen_futures::spawn_local(tasks.combiner);
     wasm_bindgen_futures::spawn_local(tasks.auto_connect);
+    wasm_bindgen_futures::spawn_local(tasks.voice_provider);
     wasm_bindgen_futures::spawn_local(tasks.voice_presence_publisher);
     wasm_bindgen_futures::spawn_local(tasks.voice_presence_membership);
 
@@ -151,19 +161,10 @@ pub(crate) fn voice_start(
     identity: &sunset_core::Identity,
     room_handle: &RoomHandle,
     bus: &BusArc,
-    on_pcm: Function,
-    on_drop_peer: Function,
-    on_voice_peer_state: Function,
+    relay_only: bool,
+    callbacks: VoiceCallbacks,
 ) -> Result<(), JsError> {
-    voice_observe_start(
-        cell,
-        identity,
-        room_handle,
-        bus,
-        on_pcm,
-        on_drop_peer,
-        on_voice_peer_state,
-    )?;
+    voice_observe_start(cell, identity, room_handle, bus, relay_only, callbacks)?;
     voice_activate(cell)
 }
 
@@ -315,6 +316,12 @@ pub(crate) fn recorded_frames(cell: &VoiceCell, peer_bytes: &[u8]) -> Result<JsV
             &obj,
             &JsValue::from_str("tone_purity_440"),
             &JsValue::from_f64(frame.tone_purity_440 as f64),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("via"),
+            &JsValue::from_str(frame.via.as_str()),
         )
         .unwrap();
         arr.push(&obj);

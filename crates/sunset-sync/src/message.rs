@@ -142,6 +142,7 @@ mod tests {
                 verifying_key: vk(b"alice"),
                 name: Bytes::from_static(b"room/voice/alice/0042"),
                 payload: Bytes::from_static(b"opus-frame-bytes"),
+                seq: 0,
                 signature: Bytes::from_static(&[0xab; 64]),
             },
         };
@@ -161,14 +162,16 @@ mod tests {
                 verifying_key: vk(b"alice"),
                 name: Bytes::from_static(b"room/voice/alice/0042"),
                 payload: Bytes::from_static(b"opus-frame-bytes"),
+                seq: 0,
                 signature: Bytes::from_static(&[0xab; 64]),
             },
         };
         let encoded = m.encode().unwrap();
         let digest = blake3::hash(&encoded);
+        // Regenerated 2026-06-01: deliberate pre-1.0 ephemeral wire bump (added SignedDatagram.seq).
         assert_eq!(
             digest.to_hex().as_str(),
-            "313e80dd346c26e06cc1cc6288a1446b87a162dce603061ae97194cc44bbe019",
+            "01959ec994a6f4af8b37dbcc92facbf0e9e47e54c2419f2fcd931ac22450bbca",
             "If this fails the EphemeralDelivery wire format has drifted — DO NOT update this hex without bumping the wire-format version.",
         );
     }

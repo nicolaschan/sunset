@@ -34,7 +34,7 @@ use std::rc::Weak;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 
-use sunset_core::bus::BusEvent;
+use sunset_core::bus::{BusEvent, Filter};
 use sunset_core::liveness::LivenessState;
 use sunset_store::VerifyingKey;
 use sunset_sync::PeerId;
@@ -77,7 +77,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
             sleep(std::time::Duration::from_millis(100)).await;
         }
 
-        let mut presence_stream = match bus.subscribe_prefix(prefix.clone()).await {
+        let mut presence_stream = match bus.subscribe(Filter::NamePrefix(prefix.clone())).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "voice-presence subscribe failed");
@@ -143,10 +143,10 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                             drop(state);
                             // Drop per-peer playback resources.
                             inner.frame_sink.borrow().drop_peer(&ev.peer);
-                            // Forget the last seq we delivered so re-entry
-                            // starts fresh (the host-side jitter buffer is
-                            // also reset via `drop_peer`).
-                            inner.last_delivered_seq.borrow_mut().remove(&ev.peer);
+                            // Forget this peer's envelope high-water mark so
+                            // re-entry starts fresh (the host-side jitter
+                            // buffer is also reset via `drop_peer`).
+                            inner.peer_envelope_hwm.borrow_mut().remove(&ev.peer);
                             inner.dialer.clone()
                         };
                         // Release any session-scoped connection state

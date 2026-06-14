@@ -15,12 +15,10 @@ use rand_chacha::rand_core::SeedableRng;
 
 use sunset_core::Identity;
 use sunset_core::Room;
-use sunset_core::bus::BusEvent;
-use sunset_store::{ContentBlock, SignedDatagram, SignedKvEntry, VerifyingKey};
+use sunset_core::bus::{Bus, BusEvent};
+use sunset_store::{ContentBlock, Filter, SignedDatagram, SignedKvEntry, VerifyingKey};
 use sunset_sync::PeerId;
-use sunset_voice::runtime::{
-    Dialer, DynBus, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime,
-};
+use sunset_voice::runtime::{Dialer, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime};
 
 /// Type alias to avoid clippy::type_complexity.
 type DeliveredSink = Rc<RefCell<Vec<(PeerId, u32, Vec<f32>)>>>;
@@ -29,7 +27,7 @@ type DroppedSink = Rc<RefCell<Vec<PeerId>>>;
 /// Type alias to avoid clippy::type_complexity.
 type EventSink = Rc<RefCell<Vec<VoicePeerState>>>;
 
-/// Minimal in-memory `DynBus` for tests. Supports ephemeral and durable
+/// Minimal in-memory `Bus` for tests. Supports ephemeral and durable
 /// publish + subscribe. Loopback is included (publishes are visible to
 /// subscribers including the publisher).
 ///
@@ -42,20 +40,42 @@ struct TestBus {
     ephemeral_sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedDatagram>>>,
     /// Sinks registered by subscribe_prefix calls (for durable entries).
     durable_sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedKvEntry>>>,
+    /// Held senders for subscribe_engine_events receivers, so the channels
+    /// stay open for the receiver's lifetime. This fixture never emits
+    /// engine events; the receivers simply idle.
+    event_sinks:
+        tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<sunset_sync::EngineEvent>>>,
     /// Broadcast channel for publish_ephemeral so tests can observe outbound traffic.
     obs_tx: tokio::sync::broadcast::Sender<SignedDatagram>,
+    /// Provenance tag this fixture stamps on datagrams handed to
+    /// `subscribe_ephemeral_local`. Defaults to `Local` (the loopback has no
+    /// transport substrate); a test can set `Direct`/`Relay` to exercise the
+    /// runtime's pass-through of inbound provenance to the frame sink.
+    inbound_via: sunset_sync::FrameVia,
 }
 
 impl TestBus {
     fn new(
         self_pk: sunset_store::VerifyingKey,
     ) -> (Rc<Self>, tokio::sync::broadcast::Sender<SignedDatagram>) {
+        Self::new_with_via(self_pk, sunset_sync::FrameVia::Local)
+    }
+
+    /// Like [`new`], but stamps inbound ephemeral frames with `via` instead
+    /// of the default `Local` — lets a test drive the runtime as if frames
+    /// arrived over a direct or relay session.
+    fn new_with_via(
+        self_pk: sunset_store::VerifyingKey,
+        inbound_via: sunset_sync::FrameVia,
+    ) -> (Rc<Self>, tokio::sync::broadcast::Sender<SignedDatagram>) {
         let (obs_tx, _) = tokio::sync::broadcast::channel(64);
         let bus = Rc::new(Self {
             self_pk,
             ephemeral_sinks: tokio::sync::Mutex::new(vec![]),
             durable_sinks: tokio::sync::Mutex::new(vec![]),
+            event_sinks: tokio::sync::Mutex::new(vec![]),
             obs_tx: obs_tx.clone(),
+            inbound_via,
         });
         (bus, obs_tx)
     }
@@ -78,17 +98,20 @@ impl TestBus {
 }
 
 #[async_trait(?Send)]
-impl DynBus for TestBus {
+impl Bus for TestBus {
     async fn publish_ephemeral(
         &self,
         name: Bytes,
+        seq: u64,
         payload: Bytes,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Build a SignedDatagram with self as verifying_key.
+    ) -> Result<(), sunset_core::Error> {
+        // Build a SignedDatagram with self as verifying_key, stamping the
+        // caller's per-stream seq onto the envelope.
         let dgram = SignedDatagram {
             verifying_key: self.self_pk.clone(),
             name,
             payload,
+            seq,
             signature: Bytes::new(),
         };
         // Fan out to ephemeral subscribers (loopback).
@@ -105,7 +128,7 @@ impl DynBus for TestBus {
         &self,
         entry: SignedKvEntry,
         _block: Option<ContentBlock>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), sunset_core::Error> {
         // Fan out to durable subscribers (loopback).
         let sinks = self.durable_sinks.lock().await;
         for sink in sinks.iter() {
@@ -114,30 +137,14 @@ impl DynBus for TestBus {
         Ok(())
     }
 
-    async fn subscribe_voice_prefix(
+    async fn subscribe(
         &self,
-        prefix: Bytes,
-    ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
-        // Register sink — all subsequent inject() and publish_ephemeral() calls
-        // will fan out to this sender.
-        self.ephemeral_sinks.lock().await.push(tx);
-
-        let stream = async_stream::stream! {
-            let mut r = rx;
-            while let Some(d) = r.recv().await {
-                if d.name.starts_with(&prefix) {
-                    yield BusEvent::Ephemeral(d);
-                }
-            }
+        filter: Filter,
+    ) -> Result<LocalBoxStream<'static, BusEvent>, sunset_core::Error> {
+        let prefix = match filter {
+            Filter::NamePrefix(p) => p,
+            _ => Bytes::new(),
         };
-        Ok(Box::pin(stream))
-    }
-
-    async fn subscribe_prefix(
-        &self,
-        prefix: Bytes,
-    ) -> Result<LocalBoxStream<'static, BusEvent>, Box<dyn std::error::Error>> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SignedKvEntry>();
         // Register sink — all subsequent inject_durable() and publish_durable() calls
         // will fan out to this sender.
@@ -152,6 +159,70 @@ impl DynBus for TestBus {
             }
         };
         Ok(Box::pin(stream))
+    }
+
+    async fn subscribe_via(
+        &self,
+        _filter: Filter,
+        _provider: PeerId,
+        _policy: sunset_sync::routing::SubscriptionPolicy,
+    ) -> Result<(), sunset_core::Error> {
+        // This loopback fixture has no provider-routing substrate; arming
+        // remote interest is a no-op here.
+        Ok(())
+    }
+
+    async fn unsubscribe_via(
+        &self,
+        _filter: Filter,
+        _provider: PeerId,
+    ) -> Result<(), sunset_core::Error> {
+        Ok(())
+    }
+
+    async fn current_peers(&self) -> Vec<(PeerId, sunset_sync::TransportKind)> {
+        // No real peer set in the loopback fixture.
+        vec![]
+    }
+
+    async fn subscribe_engine_events(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<sunset_sync::EngineEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.event_sinks.lock().await.push(tx);
+        rx
+    }
+
+    async fn subscribe_ephemeral_local(
+        &self,
+        filter: sunset_store::Filter,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(SignedDatagram, sunset_sync::FrameVia)> {
+        // Local ephemeral receive: register a sink so inject()/publish loopback
+        // reaches it, filtered by name prefix, WITHOUT arming remote interest
+        // (subscribe_via above is the separate remote-arming path).
+        let prefix = match filter {
+            sunset_store::Filter::NamePrefix(p) => p,
+            _ => Bytes::new(),
+        };
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
+        self.ephemeral_sinks.lock().await.push(sink_tx);
+        let (out_tx, out_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(SignedDatagram, sunset_sync::FrameVia)>();
+        // Forward only prefix-matching datagrams to the caller's receiver,
+        // tagged with this fixture's configured provenance (`Local` by
+        // default; a test may set `Direct`/`Relay`). Real provenance
+        // derivation from an inbound session kind is covered by the engine's
+        // own tests; here we exercise the runtime's pass-through of whatever
+        // the bus reports.
+        let via = self.inbound_via;
+        tokio::task::spawn_local(async move {
+            while let Some(d) = sink_rx.recv().await {
+                if d.name.starts_with(&prefix) {
+                    let _ = out_tx.send((d, via));
+                }
+            }
+        });
+        out_rx
     }
 }
 
@@ -188,7 +259,7 @@ struct RecordingFrameSink {
     dropped: DroppedSink,
 }
 impl FrameSink for RecordingFrameSink {
-    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32]) {
+    fn deliver(&self, peer: &PeerId, seq: u32, pcm: &[f32], _via: sunset_sync::FrameVia) {
         self.delivered
             .borrow_mut()
             .push((peer.clone(), seq, pcm.to_vec()));
@@ -265,7 +336,7 @@ async fn heartbeat_publishes_periodically_with_is_muted_flag() {
             let (alice, room) = make_identity_and_room(1);
             let pk = alice.store_verifying_key();
             let (bus_impl, tx) = TestBus::new(pk.clone());
-            let bus: Rc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn Bus> = bus_impl;
 
             let dialer_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
@@ -353,7 +424,7 @@ async fn send_pcm_publishes_frame_when_unmuted() {
             let (alice, room) = make_identity_and_room(2);
             let pk = alice.store_verifying_key();
             let (bus_impl, tx) = TestBus::new(pk.clone());
-            let bus: Rc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn Bus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -423,7 +494,7 @@ async fn send_pcm_drops_frames_when_muted() {
             let (alice, room) = make_identity_and_room(3);
             let pk = alice.store_verifying_key();
             let (bus_impl, tx) = TestBus::new(pk.clone());
-            let bus: Rc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn Bus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -480,7 +551,7 @@ async fn subscribe_decodes_frame_and_delivers_to_sink() {
             let alice_pk = alice.store_verifying_key();
 
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -513,7 +584,6 @@ async fn subscribe_decodes_frame_and_delivers_to_sink() {
             let bytes = enc.encode(&pcm).unwrap();
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
-                seq: 42,
                 sender_time_ms: 1000,
                 payload: bytes,
             };
@@ -525,11 +595,13 @@ async fn subscribe_decodes_frame_and_delivers_to_sink() {
             let sender_pk = hex::encode(alice_pk.as_bytes());
             let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
 
-            // Inject as if it came through the bus from alice.
+            // Inject as if it came through the bus from alice. The
+            // authoritative seq is on the envelope (42), not in the packet.
             let dgram = SignedDatagram {
                 verifying_key: alice_pk.clone(),
                 name,
                 payload: Bytes::from(payload),
+                seq: 42,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -553,7 +625,7 @@ async fn subscribe_decodes_frame_and_delivers_to_sink() {
             assert_eq!(snapshot.len(), 1, "exactly one frame delivered");
             let (peer, seq, pcm) = &snapshot[0];
             assert_eq!(peer, &alice_peer);
-            assert_eq!(*seq, 42, "wire seq must be propagated to sink");
+            assert_eq!(*seq, 42, "envelope seq must be propagated to sink");
             assert_eq!(
                 pcm.len(),
                 sunset_voice::FRAME_SAMPLES_PER_CHANNEL * sunset_voice::PLAYBACK_CHANNELS as usize
@@ -572,7 +644,7 @@ async fn deafened_skips_decode_and_delivery() {
             let alice_pk = alice.store_verifying_key();
 
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -603,7 +675,6 @@ async fn deafened_skips_decode_and_delivery() {
             let bytes = enc.encode(&pcm).unwrap();
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
-                seq: 7,
                 sender_time_ms: 1000,
                 payload: bytes,
             };
@@ -618,6 +689,7 @@ async fn deafened_skips_decode_and_delivery() {
                 verifying_key: alice_pk.clone(),
                 name,
                 payload: Bytes::from(payload),
+                seq: 0,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -640,7 +712,7 @@ async fn combiner_emits_state_on_heartbeat() {
             let (alice, room) = make_identity_and_room(6);
             let (bob, _) = make_identity_and_room(7);
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -683,6 +755,7 @@ async fn combiner_emits_state_on_heartbeat() {
                 verifying_key: alice.store_verifying_key(),
                 name,
                 payload: Bytes::from(payload),
+                seq: 0,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -729,7 +802,7 @@ async fn combiner_evicts_peer_seen_only_via_frames() {
             let alice_pk = alice.store_verifying_key();
 
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -765,7 +838,6 @@ async fn combiner_evicts_peer_seen_only_via_frames() {
                 .unwrap_or(0);
             let pkt = sunset_voice::packet::VoicePacket::Frame {
                 codec_id: sunset_voice::CODEC_ID.to_string(),
-                seq: 1,
                 sender_time_ms: now_ms,
                 payload: bytes,
             };
@@ -780,6 +852,7 @@ async fn combiner_evicts_peer_seen_only_via_frames() {
                 verifying_key: alice_pk.clone(),
                 name,
                 payload: Bytes::from(payload),
+                seq: 0,
                 signature: Bytes::new(),
             };
             bob_bus_impl.inject(dgram).await;
@@ -836,7 +909,7 @@ async fn auto_connect_dials_on_voice_presence_only_once() {
             // the dial when self_pk < peer_pk, so we force that ordering.
             let (bob, alice, room) = make_pair_self_smaller(9, 8);
             let (bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bus: Rc<dyn DynBus> = bus_impl.clone();
+            let bus: Rc<dyn Bus> = bus_impl.clone();
             let calls: DroppedSink = Rc::new(RefCell::new(vec![]));
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: calls.clone(),
@@ -910,7 +983,7 @@ async fn auto_connect_releases_dialer_on_membership_stale_and_redials() {
             // fires (otherwise bob is the acceptor and never dials).
             let (bob, alice, room) = make_pair_self_smaller(9, 8);
             let (bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bus: Rc<dyn DynBus> = bus_impl.clone();
+            let bus: Rc<dyn Bus> = bus_impl.clone();
 
             let dial_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
             let release_calls: DroppedSink = Rc::new(RefCell::new(vec![]));
@@ -1014,7 +1087,7 @@ async fn auto_connect_skips_dial_when_self_pk_is_larger() {
             // voice-presence is from the smaller one. Expectation: no
             // dial fires.
             let (bus_impl, _obs_tx) = TestBus::new(larger.store_verifying_key());
-            let bus: Rc<dyn DynBus> = bus_impl.clone();
+            let bus: Rc<dyn Bus> = bus_impl.clone();
             let calls: DroppedSink = Rc::new(RefCell::new(vec![]));
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: calls.clone(),
@@ -1070,7 +1143,7 @@ async fn membership_marks_in_voice_channel_without_p2p_traffic() {
             let (bob, alice, room) = make_pair_self_smaller(20, 21);
             let alice_pk = alice.store_verifying_key();
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -1138,7 +1211,7 @@ async fn voice_presence_publisher_emits_periodically() {
             let (alice, room) = make_identity_and_room(12);
             let alice_pk = alice.store_verifying_key();
             let (bus_impl, _obs_tx) = TestBus::new(alice_pk.clone());
-            let bus: Rc<dyn DynBus> = bus_impl.clone();
+            let bus: Rc<dyn Bus> = bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -1167,7 +1240,7 @@ async fn voice_presence_publisher_emits_periodically() {
 
             // Subscribe to durable presence entries before spawning the publisher.
             let mut stream = bus_impl
-                .subscribe_prefix(presence_prefix)
+                .subscribe(Filter::NamePrefix(presence_prefix))
                 .await
                 .expect("subscribe succeeded");
 
@@ -1218,7 +1291,7 @@ async fn dropping_runtime_terminates_all_tasks() {
             let (bus_impl, _tx) = TestBus::new(alice.store_verifying_key());
             // Keep a typed reference for post-drop injection (see below).
             let bus_for_inject = bus_impl.clone();
-            let bus: Rc<dyn DynBus> = bus_impl;
+            let bus: Rc<dyn Bus> = bus_impl;
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -1275,6 +1348,7 @@ async fn dropping_runtime_terminates_all_tasks() {
                     verifying_key: dummy_peer_vk,
                     name: voice_name,
                     payload: Bytes::new(),
+                    seq: 0,
                     signature: Bytes::new(),
                 })
                 .await;
@@ -1351,7 +1425,7 @@ async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
                     let alice_pk = alice.store_verifying_key();
 
                     let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-                    let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+                    let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
                     let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                         calls: Rc::new(RefCell::new(vec![])),
                     });
@@ -1363,7 +1437,13 @@ async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
                         count: Rc<RefCell<usize>>,
                     }
                     impl FrameSink for RmsSink {
-                        fn deliver(&self, _peer: &PeerId, _seq: u32, pcm: &[f32]) {
+                        fn deliver(
+                            &self,
+                            _peer: &PeerId,
+                            _seq: u32,
+                            pcm: &[f32],
+                            _via: sunset_sync::FrameVia,
+                        ) {
                             let s: f32 = pcm.iter().map(|s| s * s).sum();
                             let rms = (s / pcm.len() as f32).sqrt();
                             *self.sum.borrow_mut() += rms;
@@ -1400,6 +1480,11 @@ async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
                     // Mono encoder; decoder upmixes to stereo, so the
                     // RMS sink sees 1920-sample stereo frames either
                     // way and the on/off comparison is fair.
+                    // One encoder threaded through all 30 frames for codec
+                    // continuity; the transport plumbing (encrypt → name →
+                    // inject) lives in `inject_encoded_frame`. Strictly
+                    // increasing envelope seqs so the receiver dedup gate
+                    // doesn't drop them as replays.
                     let mut enc =
                         sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
                     let mut rng_seed: u32 = 0xBEEF_F00D;
@@ -1410,34 +1495,16 @@ async fn set_peer_denoise_toggle_attenuates_inbound_noise() {
                             let n = (rng_seed as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0;
                             *s = n * 0.05;
                         }
-                        let bytes = enc.encode(&pcm).unwrap();
-                        let pkt = sunset_voice::packet::VoicePacket::Frame {
-                            codec_id: sunset_voice::CODEC_ID.to_string(),
-                            seq,
-                            sender_time_ms: 1000 + seq * 20,
-                            payload: bytes,
-                        };
-                        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seq);
-                        let ev = sunset_voice::packet::encrypt(
+                        inject_encoded_frame(
+                            &bob_bus_impl,
                             &room,
-                            0,
-                            &alice.public(),
-                            &pkt,
-                            &mut rng,
+                            &alice,
+                            &alice_pk,
+                            &mut enc,
+                            &pcm,
+                            seq,
                         )
-                        .unwrap();
-                        let payload = postcard::to_stdvec(&ev).unwrap();
-                        let room_fp = room.fingerprint().to_hex();
-                        let sender_pk = hex::encode(alice_pk.as_bytes());
-                        let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}"));
-                        bob_bus_impl
-                            .inject(SignedDatagram {
-                                verifying_key: alice_pk.clone(),
-                                name,
-                                payload: Bytes::from(payload),
-                                signature: Bytes::new(),
-                            })
-                            .await;
+                        .await;
                     }
 
                     // Wait for at least 25 frames to be delivered. The
@@ -1495,7 +1562,7 @@ async fn observer_mode_emits_in_voice_channel_without_publishing_self() {
             let alice_pk = alice.store_verifying_key();
             let bob_pk = bob.store_verifying_key();
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob_pk.clone());
-            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -1514,7 +1581,7 @@ async fn observer_mode_emits_in_voice_channel_without_publishing_self() {
             let room_fp = room.fingerprint().to_hex();
             let presence_prefix = Bytes::from(format!("voice-presence/{room_fp}/"));
             let mut own_presence_stream = bob_bus_impl
-                .subscribe_prefix(presence_prefix)
+                .subscribe(Filter::NamePrefix(presence_prefix))
                 .await
                 .expect("presence prefix subscribe");
 
@@ -1664,7 +1731,7 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
             let carol_pk = carol.store_verifying_key();
 
             let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
-            let bob_bus: Rc<dyn DynBus> = bob_bus_impl.clone();
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
             let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
                 calls: Rc::new(RefCell::new(vec![])),
             });
@@ -1674,7 +1741,13 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
                 rms: PerPeerRms,
             }
             impl FrameSink for PerPeerRmsSink {
-                fn deliver(&self, peer: &PeerId, _seq: u32, pcm: &[f32]) {
+                fn deliver(
+                    &self,
+                    peer: &PeerId,
+                    _seq: u32,
+                    pcm: &[f32],
+                    _via: sunset_sync::FrameVia,
+                ) {
                     let s: f32 = pcm.iter().map(|s| s * s).sum();
                     let rms = (s / pcm.len() as f32).sqrt();
                     let mut map = self.rms.borrow_mut();
@@ -1748,7 +1821,6 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
             ) {
                 let pkt = sunset_voice::packet::VoicePacket::Frame {
                     codec_id: sunset_voice::CODEC_ID.to_string(),
-                    seq,
                     sender_time_ms: 1000 + seq * 20,
                     payload: bytes,
                 };
@@ -1761,11 +1833,15 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
                     "voice/{room_fp}/{}",
                     hex::encode(sender_pk.as_bytes())
                 ));
+                // Envelope seq is the per-sender stream seq (strictly
+                // increasing per sender) so the receiver dedup gate keeps
+                // every frame; the gate is keyed per sender.
                 bus_impl
                     .inject(SignedDatagram {
                         verifying_key: sender_pk.clone(),
                         name,
                         payload: Bytes::from(payload),
+                        seq,
                         signature: Bytes::new(),
                     })
                     .await;
@@ -1825,6 +1901,325 @@ async fn multi_peer_decoders_do_not_corrupt_each_other() {
             assert!(
                 carol_avg > 0.30,
                 "carol average RMS collapsed: {carol_avg} (expected ~0.35)"
+            );
+        })
+        .await;
+}
+
+/// Encode `pcm` through `enc`, encrypt it as a voice `Frame` from `sender`,
+/// and inject it on `sender`'s voice stream at envelope `seq`. The shared
+/// encode → encrypt → name → inject tail: single-frame callers pass a
+/// throwaway encoder, while multi-frame loops thread one encoder through
+/// every call to preserve codec continuity. The seq lives on the envelope,
+/// never inside the encrypted packet — mirroring what the engine stamps.
+async fn inject_encoded_frame(
+    bus_impl: &TestBus,
+    room: &Room,
+    sender: &Identity,
+    sender_pk: &VerifyingKey,
+    enc: &mut sunset_voice::VoiceEncoder,
+    pcm: &[f32],
+    seq: u64,
+) {
+    let bytes = enc.encode(pcm).unwrap();
+    let pkt = sunset_voice::packet::VoicePacket::Frame {
+        codec_id: sunset_voice::CODEC_ID.to_string(),
+        sender_time_ms: 1000 + seq,
+        payload: bytes,
+    };
+    let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seq);
+    let ev = sunset_voice::packet::encrypt(room, 0, &sender.public(), &pkt, &mut rng).unwrap();
+    let payload = postcard::to_stdvec(&ev).unwrap();
+    let room_fp = room.fingerprint().to_hex();
+    let sender_pk_hex = hex::encode(sender_pk.as_bytes());
+    let name = Bytes::from(format!("voice/{room_fp}/{sender_pk_hex}"));
+    bus_impl
+        .inject(SignedDatagram {
+            verifying_key: sender_pk.clone(),
+            name,
+            payload: Bytes::from(payload),
+            seq,
+            signature: Bytes::new(),
+        })
+        .await;
+}
+
+/// Inject a single ramp-PCM frame from `sender` at envelope `seq` (each
+/// call drives its own encoder). Convenience over [`inject_encoded_frame`]
+/// for tests that just need a distinct frame at a known seq.
+async fn inject_frame_at_seq(
+    bus_impl: &TestBus,
+    room: &Room,
+    sender: &Identity,
+    sender_pk: &VerifyingKey,
+    seq: u64,
+) {
+    let mut enc = sunset_voice::VoiceEncoder::new(sunset_voice::VoiceQuality::Voice).unwrap();
+    let pcm: Vec<f32> = (0..960).map(|i| (i as f32) * 0.001).collect();
+    inject_encoded_frame(bus_impl, room, sender, sender_pk, &mut enc, &pcm, seq).await;
+}
+
+/// Frames and heartbeats are two distinct ephemeral streams: frames
+/// publish under `voice/{fp}/{pk}`, heartbeats under
+/// `voice/{fp}/{pk}/hb`. A single `voice/{fp}/` prefix still covers both,
+/// but each carries its own per-stream seq counter (so the frame seq the
+/// jitter buffer consumes is not perturbed by heartbeats).
+#[tokio::test(flavor = "current_thread")]
+async fn frame_and_heartbeat_distinct_names() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(80);
+            let pk = alice.store_verifying_key();
+            let (bus_impl, tx) = TestBus::new(pk.clone());
+            let bus: Rc<dyn Bus> = bus_impl;
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: Rc::new(RefCell::new(vec![])),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (runtime, tasks) = VoiceRuntime::new(
+                bus,
+                room.clone(),
+                alice.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            runtime.set_active(true);
+            tokio::task::spawn_local(tasks.heartbeat);
+
+            let room_fp = room.fingerprint().to_hex();
+            let sender_pk = hex::encode(pk.as_bytes());
+            let frame_name = format!("voice/{room_fp}/{sender_pk}");
+            let hb_name = format!("voice/{room_fp}/{sender_pk}/hb");
+
+            let mut rx = tx.subscribe();
+
+            // The frame send path publishes under the frame name.
+            let pcm: Vec<f32> = (0..1920).map(|i| (i as f32) / 1000.0).collect();
+            runtime.send_pcm(&pcm);
+
+            // Collect one frame publish and one heartbeat publish.
+            let mut saw_frame = false;
+            let mut saw_hb = false;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !(saw_frame && saw_hb) {
+                    let d = rx.recv().await.unwrap();
+                    let name = String::from_utf8_lossy(&d.name).into_owned();
+                    if name == frame_name {
+                        saw_frame = true;
+                    } else if name == hb_name {
+                        saw_hb = true;
+                    } else {
+                        panic!("unexpected publish name: {name}");
+                    }
+                }
+            })
+            .await
+            .expect("both frame and heartbeat published within 3s");
+
+            assert!(saw_frame, "frame published under voice/{{fp}}/{{pk}}");
+            assert!(saw_hb, "heartbeat published under voice/{{fp}}/{{pk}}/hb");
+            drop(runtime);
+        })
+        .await;
+}
+
+/// The receiver dedup gate uses an `Option` keyed on the sender, never
+/// `unwrap_or(0)`: envelope seq 0 is a real first value, so the very
+/// first frame at seq 0 must be delivered, not silently dropped.
+#[tokio::test(flavor = "current_thread")]
+async fn receiver_delivers_first_frame_seq_0_once() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(82);
+            let (bob, _) = make_identity_and_room(83);
+            let alice_pk = alice.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: delivered.clone(),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::yield_now().await;
+
+            inject_frame_at_seq(&bob_bus_impl, &room, &alice, &alice_pk, 0).await;
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !delivered.borrow().is_empty() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("first frame at envelope seq 0 must be delivered, not dropped");
+
+            let snapshot = delivered.borrow();
+            assert_eq!(snapshot.len(), 1, "exactly one delivery for seq 0");
+            assert_eq!(snapshot[0].1, 0, "delivered seq is the envelope seq 0");
+        })
+        .await;
+}
+
+/// Two datagrams carrying the same `(sender, seq)` — the duplicate a
+/// receiver briefly sees during direct/relay switchover — must produce
+/// exactly one `deliver`.
+#[tokio::test(flavor = "current_thread")]
+async fn receiver_dedups_same_sender_seq() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(84);
+            let (bob, _) = make_identity_and_room(85);
+            let alice_pk = alice.store_verifying_key();
+
+            let (bob_bus_impl, _obs_tx) = TestBus::new(bob.store_verifying_key());
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let delivered: DeliveredSink = Rc::new(RefCell::new(vec![]));
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(RecordingFrameSink {
+                delivered: delivered.clone(),
+                dropped: Rc::new(RefCell::new(vec![])),
+            });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::yield_now().await;
+
+            // Same sender, same envelope seq, injected twice.
+            inject_frame_at_seq(&bob_bus_impl, &room, &alice, &alice_pk, 5).await;
+            inject_frame_at_seq(&bob_bus_impl, &room, &alice, &alice_pk, 5).await;
+
+            // Wait for the first to land, then give the second a chance.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !delivered.borrow().is_empty() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("first frame delivered within 1s");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                delivered.borrow().len(),
+                1,
+                "duplicate (sender, seq) must deliver exactly once"
+            );
+        })
+        .await;
+}
+
+/// A `FrameSink` that records only the `FrameVia` provenance of each
+/// delivered frame.
+struct ViaRecordingSink {
+    vias: Rc<RefCell<Vec<sunset_sync::FrameVia>>>,
+}
+
+impl FrameSink for ViaRecordingSink {
+    fn deliver(&self, _peer: &PeerId, _seq: u32, _pcm: &[f32], via: sunset_sync::FrameVia) {
+        self.vias.borrow_mut().push(via);
+    }
+    fn drop_peer(&self, _peer: &PeerId) {}
+}
+
+/// The runtime delivers each frame to the sink tagged with the *inbound*
+/// provenance the bus reported, unchanged — it never re-derives or hardcodes
+/// it. Here the bus reports `Relay` (as it would for a relay-re-forwarded
+/// frame), so the sink must see `Relay`. This is the voice-layer half of the
+/// relay-audio-fallback observability: a regression that dropped `via` or
+/// pinned it to `Local` would surface every relayed frame as local and would
+/// be caught here. (Engine-side derivation of `Relay`/`Direct` from the
+/// inbound session kind is covered by `sunset-sync`'s own tests.)
+#[tokio::test(flavor = "current_thread")]
+async fn receiver_passes_inbound_via_through_to_sink() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (alice, room) = make_identity_and_room(90);
+            let (bob, _) = make_identity_and_room(91);
+            let alice_pk = alice.store_verifying_key();
+
+            // The bus tags inbound frames `Relay`, as it would for a datagram
+            // that reached us over the relay's Primary session.
+            let (bob_bus_impl, _obs_tx) =
+                TestBus::new_with_via(bob.store_verifying_key(), sunset_sync::FrameVia::Relay);
+            let bob_bus: Rc<dyn Bus> = bob_bus_impl.clone();
+            let dialer: Rc<dyn Dialer> = Rc::new(CountingDialer {
+                calls: Rc::new(RefCell::new(vec![])),
+            });
+            let vias: Rc<RefCell<Vec<sunset_sync::FrameVia>>> = Rc::new(RefCell::new(vec![]));
+            let frame_sink: Rc<dyn FrameSink> = Rc::new(ViaRecordingSink { vias: vias.clone() });
+            let peer_state_sink: Rc<dyn PeerStateSink> = Rc::new(RecordingPeerStateSink {
+                events: Rc::new(RefCell::new(vec![])),
+            });
+
+            let (_runtime, tasks) = VoiceRuntime::new(
+                bob_bus,
+                room.clone(),
+                bob.clone(),
+                dialer,
+                frame_sink,
+                peer_state_sink,
+            );
+            tokio::task::spawn_local(tasks.subscribe);
+            tokio::task::yield_now().await;
+
+            inject_frame_at_seq(&bob_bus_impl, &room, &alice, &alice_pk, 0).await;
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !vias.borrow().is_empty() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the relay-tagged frame must be delivered to the sink");
+
+            assert_eq!(
+                vias.borrow().as_slice(),
+                &[sunset_sync::FrameVia::Relay],
+                "the runtime must pass the bus-reported provenance to the sink unchanged",
             );
         })
         .await;

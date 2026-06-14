@@ -30,7 +30,7 @@ use std::time::SystemTime;
 
 use futures::{FutureExt, StreamExt};
 
-use sunset_core::bus::BusEvent;
+use sunset_core::bus::{BusEvent, Filter};
 use sunset_sync::PeerId;
 
 use super::state::RuntimeInner;
@@ -48,7 +48,7 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
         let presence_arc = inner.voice_presence_liveness.clone();
         drop(inner);
 
-        let mut stream = match bus.subscribe_prefix(prefix.clone()).await {
+        let mut stream = match bus.subscribe(Filter::NamePrefix(prefix.clone())).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "voice-presence membership subscribe failed");

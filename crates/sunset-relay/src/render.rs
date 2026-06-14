@@ -142,6 +142,10 @@ pub fn render_identity(snap: &IdentitySnapshot) -> String {
     if let Some(cert_hex) = &snap.webtransport_cert_sha256 {
         out.push_str(&format!(",\"webtransport_cert_sha256\":\"{cert_hex}\""));
     }
+    out.push_str(&format!(
+        ",\"ephemeral_forwarded\":{}",
+        snap.ephemeral_forwarded
+    ));
     out.push_str("}\n");
     out
 }
@@ -251,13 +255,31 @@ mod tests {
             x25519_public: [0xcd; 32],
             dial_url: "ws://relay.example:8443".into(),
             webtransport_cert_sha256: None,
+            ephemeral_forwarded: 0,
         };
         let json = render_identity(&snap);
         assert_eq!(
             json,
             "{\"ed25519\":\"abababababababababababababababababababababababababababababababab\",\
              \"x25519\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\
-             \"address\":\"ws://relay.example:8443\"}\n"
+             \"address\":\"ws://relay.example:8443\",\
+             \"ephemeral_forwarded\":0}\n"
+        );
+    }
+
+    #[test]
+    fn identity_json_carries_ephemeral_forwarded_count() {
+        let snap = IdentitySnapshot {
+            ed25519_public: [0; 32],
+            x25519_public: [0; 32],
+            dial_url: "ws://relay.example:8443".into(),
+            webtransport_cert_sha256: None,
+            ephemeral_forwarded: 42,
+        };
+        let json = render_identity(&snap);
+        assert!(
+            json.contains("\"ephemeral_forwarded\":42"),
+            "forward counter missing/wrong in: {json}"
         );
     }
 
@@ -269,6 +291,7 @@ mod tests {
             x25519_public: [0xcd; 32],
             dial_url: "ws://relay.example:8443".into(),
             webtransport_cert_sha256: Some(cert_hex.clone()),
+            ephemeral_forwarded: 0,
         };
         let json = render_identity(&snap);
         assert!(

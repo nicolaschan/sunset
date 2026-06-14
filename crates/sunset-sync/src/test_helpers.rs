@@ -9,14 +9,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::sync::mpsc;
 
-use sunset_store::{ContentBlock, SignedKvEntry, Store as _, VerifyingKey};
+use sunset_store::{ContentBlock, Filter, SignedDatagram, SignedKvEntry, Store as _, VerifyingKey};
 use sunset_store_memory::MemoryStore;
 
+use crate::routing::{SubscriptionPolicy, relay_broad_filter};
 use crate::spawn::{JoinHandle, spawn_local};
 use crate::test_transport::{TestNetwork, TestTransport};
+use crate::transport::FrameVia;
 use crate::types::{PeerAddr, PeerId, SyncConfig};
-use crate::{Signer, SyncEngine};
+use crate::{Signer, SyncEngine, TrustSet};
 
 /// Poll `condition` until it returns `true` or the deadline elapses.
 ///
@@ -97,10 +100,31 @@ impl TestPeer {
     /// Same as `spawn`, but with a caller-supplied `SyncConfig` (e.g.
     /// for tests that tune heartbeat intervals).
     pub fn spawn_with_config(net: &TestNetwork, label: &[u8], config: SyncConfig) -> Self {
+        Self::spawn_inner(net, label, config, false)
+    }
+
+    /// Same as `spawn`, but over a reliable-only transport (no datagram
+    /// channel — `send_unreliable` errors), mirroring a WS-only link. Used
+    /// to test that ephemeral (voice) traffic falls back to the reliable
+    /// channel and still reaches the peer.
+    pub fn spawn_reliable_only(net: &TestNetwork, label: &[u8]) -> Self {
+        Self::spawn_inner(net, label, SyncConfig::default(), true)
+    }
+
+    fn spawn_inner(
+        net: &TestNetwork,
+        label: &[u8],
+        config: SyncConfig,
+        reliable_only: bool,
+    ) -> Self {
         let id = PeerId(vk(label));
         let addr = PeerAddr::new(Bytes::copy_from_slice(label));
         let store = Arc::new(MemoryStore::with_accept_all());
-        let transport = net.transport(id.clone(), addr.clone());
+        let transport = if reliable_only {
+            net.transport_reliable_only(id.clone(), addr.clone())
+        } else {
+            net.transport(id.clone(), addr.clone())
+        };
         let signer: Arc<dyn Signer> = Arc::new(StubSigner::new(id.0.clone()));
         let engine = Rc::new(SyncEngine::new(
             store.clone(),
@@ -167,4 +191,121 @@ pub async fn wait_for_entry(
         store.get_entry(writer, name).await.unwrap().is_some()
     })
     .await
+}
+
+/// A wired-up relay-fallback star (A — R — B) with one ephemeral datagram
+/// already re-forwarded from A to B through R. The leaves never connect to
+/// each other, so B's only path to A's voice is R's re-forward.
+///
+/// Holds the three `TestPeer`s so their engine run-loops stay alive for the
+/// life of the value; drop it (end of test) to tear the star down.
+pub struct RelayStar {
+    pub a: TestPeer,
+    pub r: TestPeer,
+    pub b: TestPeer,
+    /// B's ephemeral subscription to A's voice stream (armed via R). Recv to
+    /// observe the re-forwarded datagram and its `FrameVia` provenance.
+    pub b_sub: mpsc::UnboundedReceiver<(SignedDatagram, FrameVia)>,
+    /// The exact datagram A published, for an equality check on receipt.
+    pub datagram: SignedDatagram,
+}
+
+/// Build an A — R — B star where the two leaves connect only to R, arm R as
+/// a broad relay and B's interest in A's voice stream *via R*, wait until
+/// both forwarding legs are armed, then publish one ephemeral datagram from
+/// A. A — B is never wired, so B receiving the datagram proves R re-forwarded
+/// it. Used by the relay-ephemeral re-forward test and the relay's
+/// identity-snapshot forward-count test.
+///
+/// Must run inside a `LocalSet`. Panics if a forwarding leg fails to arm
+/// within two seconds — that is a harness wiring failure, not the behaviour
+/// under test.
+pub async fn relay_star_publish_one(net: &TestNetwork) -> RelayStar {
+    relay_star_publish_one_impl(net, false).await
+}
+
+/// Like [`relay_star_publish_one`], but every leg is a reliable-only
+/// transport (no datagram channel — `send_unreliable` errors), mirroring a
+/// WS-only relay deployment. The ephemeral datagram can only reach B if the
+/// engine falls back to the reliable channel for ephemeral traffic — so this
+/// fails before that fallback exists and passes after.
+pub async fn relay_star_publish_one_reliable_only(net: &TestNetwork) -> RelayStar {
+    relay_star_publish_one_impl(net, true).await
+}
+
+async fn relay_star_publish_one_impl(net: &TestNetwork, reliable_only: bool) -> RelayStar {
+    let spawn = |label: &[u8]| {
+        if reliable_only {
+            TestPeer::spawn_reliable_only(net, label)
+        } else {
+            TestPeer::spawn(net, label)
+        }
+    };
+    let a = spawn(b"alice");
+    let r = spawn(b"relay");
+    let b = spawn(b"bob");
+
+    a.engine.set_trust(TrustSet::All).await.unwrap();
+    r.engine.set_trust(TrustSet::All).await.unwrap();
+    b.engine.set_trust(TrustSet::All).await.unwrap();
+
+    // A's voice stream lives under voice/{A_hex}/...
+    let a_hex = hex::encode(a.id.0.as_bytes());
+    let a_voice_prefix = Filter::NamePrefix(Bytes::from(format!("voice/{a_hex}")));
+
+    // R broad-subscribes (acts as the relay): every peer it connects to arms
+    // R's "everything" interest, so A forwards its ephemeral to R.
+    r.engine
+        .subscribe(relay_broad_filter(), SubscriptionPolicy::relay_broad())
+        .await
+        .unwrap();
+    // B subscribes to A's voice stream via R, so R re-forwards A's datagrams.
+    b.engine
+        .subscribe_via(
+            a_voice_prefix.clone(),
+            r.id.clone(),
+            SubscriptionPolicy::store_data(),
+        )
+        .await
+        .unwrap();
+    let b_sub = b.engine.subscribe_ephemeral(a_voice_prefix.clone()).await;
+
+    // Star topology: A—R and B—R only; A—B is never wired.
+    a.engine.add_peer(r.addr.clone()).await.unwrap();
+    b.engine.add_peer(r.addr.clone()).await.unwrap();
+
+    // Wait until R has armed both legs: A's broad interest (so A forwards to
+    // R) and B's voice interest (so R forwards to B).
+    assert!(
+        a.engine
+            .wait_for_peer_interest(&r.id, &relay_broad_filter(), Duration::from_secs(2))
+            .await,
+        "A never armed R's broad interest"
+    );
+    assert!(
+        r.engine
+            .wait_for_peer_interest(&b.id, &a_voice_prefix, Duration::from_secs(2))
+            .await,
+        "R never armed B's voice interest"
+    );
+
+    // A publishes one ephemeral datagram on its voice stream. The accept-all
+    // verifier admits the stub (zero) signature, matching the established
+    // sync-test signing model.
+    let datagram = SignedDatagram {
+        verifying_key: a.id.0.clone(),
+        name: Bytes::from(format!("voice/{a_hex}/0001")),
+        payload: Bytes::from_static(b"opus-frame-bytes"),
+        seq: 0,
+        signature: Bytes::from_static(&[0u8; 64]),
+    };
+    a.engine.publish_ephemeral(datagram.clone()).await.unwrap();
+
+    RelayStar {
+        a,
+        r,
+        b,
+        b_sub,
+        datagram,
+    }
 }

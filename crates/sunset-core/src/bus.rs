@@ -8,10 +8,18 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::LocalBoxStream;
-
-use sunset_store::{ContentBlock, Filter, Replay, SignedDatagram, SignedKvEntry};
+use tokio::sync::mpsc;
 
 use crate::error::Result;
+
+// Re-export the routing/observation vocabulary so downstream crates
+// (e.g. sunset-voice) can name the seam's argument and return types
+// as `sunset_core::bus::*` without reaching into sunset-sync directly.
+pub use sunset_store::{Filter, SignedDatagram};
+pub use sunset_sync::routing::SubscriptionPolicy;
+pub use sunset_sync::{EngineEvent, FrameVia, PeerId, TransportKind};
+
+use sunset_store::{ContentBlock, Replay, SignedKvEntry};
 
 /// A message delivered to a Bus subscriber. Tagged by delivery mode
 /// so consumers can act differently (e.g. voice consumes Ephemeral,
@@ -27,10 +35,11 @@ pub enum BusEvent {
 
 /// Unified pub/sub interface. `publish_durable` writes a signed KV
 /// entry to the local store and lets the engine fan out via CRDT
-/// replication. `publish_ephemeral` signs the payload, hands it to
-/// the engine for unreliable fan-out, and dispatches a loopback copy
-/// to local subscribers. `subscribe` opens a single stream that
-/// merges both delivery modes.
+/// replication. `publish_ephemeral` stamps the caller's per-stream
+/// `seq` on the envelope, signs the payload, hands it to the engine
+/// for unreliable fan-out, and dispatches a loopback copy to local
+/// subscribers. `subscribe` opens a single stream that merges both
+/// delivery modes.
 #[async_trait(?Send)]
 pub trait Bus {
     async fn publish_durable(
@@ -39,9 +48,46 @@ pub trait Bus {
         block: Option<ContentBlock>,
     ) -> Result<()>;
 
-    async fn publish_ephemeral(&self, name: Bytes, payload: Bytes) -> Result<()>;
+    async fn publish_ephemeral(&self, name: Bytes, seq: u64, payload: Bytes) -> Result<()>;
 
     async fn subscribe(&self, filter: Filter) -> Result<LocalBoxStream<'static, BusEvent>>;
+
+    /// Declare interest in `filter` from one specific `provider`, so that
+    /// provider forwards matching traffic to us. Delegates to
+    /// `SyncEngine::subscribe_via`.
+    async fn subscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+        policy: SubscriptionPolicy,
+    ) -> Result<()>;
+
+    /// Withdraw a `subscribe_via(filter, provider)` interest. Idempotent.
+    /// Delegates to `SyncEngine::unsubscribe_via`.
+    async fn unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()>;
+
+    /// Snapshot the currently-connected peers with each peer's transport
+    /// kind. Delegates to `SyncEngine::current_peers`.
+    async fn current_peers(&self) -> Vec<(PeerId, TransportKind)>;
+
+    /// Subscribe to engine lifecycle events (peer add/remove, interest
+    /// arming, …). Each call returns a fresh receiver; no replay.
+    /// Delegates to `SyncEngine::subscribe_engine_events`.
+    async fn subscribe_engine_events(&self) -> mpsc::UnboundedReceiver<EngineEvent>;
+
+    /// Open the in-process ephemeral channel for `filter` WITHOUT arming
+    /// any remote interest — a purely local receive that does not publish
+    /// a `BroadcastIntent` (contrast with `subscribe`, which does). Used by
+    /// voice to observe local-decode/membership traffic and to receive
+    /// frames whose remote forwarding is armed separately via
+    /// `subscribe_via`. Delegates to `SyncEngine::subscribe_ephemeral`,
+    /// which records no intent. Each item carries the `FrameVia`
+    /// provenance of the datagram (`Local` for our own loopback,
+    /// `Direct`/`Relay` for the inbound transport that carried it).
+    async fn subscribe_ephemeral_local(
+        &self,
+        filter: Filter,
+    ) -> mpsc::UnboundedReceiver<(SignedDatagram, FrameVia)>;
 }
 
 use std::rc::Rc;
@@ -94,13 +140,16 @@ where
             .map_err(|e| crate::Error::Store(format!("{e}")))
     }
 
-    async fn publish_ephemeral(&self, name: Bytes, payload: Bytes) -> Result<()> {
+    async fn publish_ephemeral(&self, name: Bytes, seq: u64, payload: Bytes) -> Result<()> {
         // Build the unsigned shape, sign the canonical bytes, and
-        // assemble the final SignedDatagram.
+        // assemble the final SignedDatagram. The caller-supplied per-stream
+        // `seq` is stamped on the envelope so the signature covers it and
+        // the receiver reads the authoritative seq from the envelope.
         let unsigned = SignedDatagram {
             verifying_key: self.identity.store_verifying_key(),
             name: name.clone(),
             payload: payload.clone(),
+            seq,
             signature: Bytes::new(),
         };
         let payload_bytes = datagram_signing_payload(&unsigned);
@@ -109,6 +158,7 @@ where
             verifying_key: unsigned.verifying_key,
             name: unsigned.name,
             payload: unsigned.payload,
+            seq: unsigned.seq,
             signature,
         };
         self.engine
@@ -169,11 +219,49 @@ where
             }
         };
 
+        // The merged `subscribe` stream is the broad, intent-arming bus
+        // view; its `BusEvent::Ephemeral` carries no provenance. Voice's
+        // per-frame `via` flows through `subscribe_ephemeral_local`
+        // instead, so here we drop the `FrameVia` tag.
         let ephemeral_mapped = tokio_stream::wrappers::UnboundedReceiverStream::new(ephemeral_rx)
-            .map(BusEvent::Ephemeral);
+            .map(|(datagram, _via)| BusEvent::Ephemeral(datagram));
 
         let merged = futures::stream::select(Box::pin(durable_mapped), ephemeral_mapped);
         Ok(Box::pin(merged))
+    }
+
+    async fn subscribe_via(
+        &self,
+        filter: Filter,
+        provider: PeerId,
+        policy: SubscriptionPolicy,
+    ) -> Result<()> {
+        self.engine
+            .subscribe_via(filter, provider, policy)
+            .await
+            .map_err(|e| crate::Error::Sync(format!("{e}")))
+    }
+
+    async fn unsubscribe_via(&self, filter: Filter, provider: PeerId) -> Result<()> {
+        self.engine
+            .unsubscribe_via(filter, provider)
+            .await
+            .map_err(|e| crate::Error::Sync(format!("{e}")))
+    }
+
+    async fn current_peers(&self) -> Vec<(PeerId, TransportKind)> {
+        self.engine.current_peers().await
+    }
+
+    async fn subscribe_engine_events(&self) -> mpsc::UnboundedReceiver<EngineEvent> {
+        self.engine.subscribe_engine_events().await
+    }
+
+    async fn subscribe_ephemeral_local(
+        &self,
+        filter: Filter,
+    ) -> mpsc::UnboundedReceiver<(SignedDatagram, FrameVia)> {
+        self.engine.subscribe_ephemeral(filter).await
     }
 }
 
@@ -232,16 +320,151 @@ mod tests {
                     .await;
                 bus.publish_ephemeral(
                     Bytes::from_static(b"voice/me/0001"),
+                    0,
                     Bytes::from_static(b"frame"),
                 )
                 .await
                 .unwrap();
-                let got = tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                let (got, via) = tokio::time::timeout(Duration::from_millis(50), sub.recv())
                     .await
                     .expect("loopback fired in time")
                     .expect("subscription open");
                 assert_eq!(&got.name, &Bytes::from_static(b"voice/me/0001"));
                 assert_eq!(&got.payload, &Bytes::from_static(b"frame"));
+                assert_eq!(via, FrameVia::Local, "loopback publish is tagged Local");
+                run_handle.abort();
+            })
+            .await;
+    }
+
+    /// The caller-supplied `seq` is stamped onto the assembled
+    /// `SignedDatagram` envelope (and therefore covered by the signature),
+    /// so the receiver reads the authoritative per-stream seq from the
+    /// envelope rather than the decrypted payload.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_ephemeral_stamps_seq_on_envelope() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (bus, _identity, run_handle) = make_bus();
+                let mut sub = bus
+                    .engine
+                    .subscribe_ephemeral(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+                bus.publish_ephemeral(
+                    Bytes::from_static(b"voice/me/0001"),
+                    42,
+                    Bytes::from_static(b"frame"),
+                )
+                .await
+                .unwrap();
+                let (got, _via) = tokio::time::timeout(Duration::from_millis(50), sub.recv())
+                    .await
+                    .expect("loopback fired in time")
+                    .expect("subscription open");
+                assert_eq!(got.seq, 42, "caller seq must reach the envelope");
+                run_handle.abort();
+            })
+            .await;
+    }
+
+    /// The routing/observation seam delegates to the engine: `current_peers`
+    /// returns `(PeerId, TransportKind)` pairs, `subscribe_via`/`unsubscribe_via`
+    /// are callable through the `Bus` trait, and `subscribe_ephemeral_local`
+    /// opens the in-process ephemeral channel WITHOUT arming any remote
+    /// interest. The last property is load-bearing: a local receive must not
+    /// publish a BroadcastIntent (that would arm remote forwarding), whereas
+    /// `Bus::subscribe` does. We contrast the two against the engine's
+    /// outbound-intent snapshot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn routing_observation_seam_delegates_and_local_ephemeral_arms_no_intent() {
+        use sunset_store::Store as _;
+        use sunset_sync::TransportKind;
+        use sunset_sync::routing::{SubscriptionEntry, SubscriptionPolicy, subscription_name};
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (bus, _identity, run_handle) = make_bus();
+                let other = PeerId(Identity::generate(&mut OsRng).store_verifying_key());
+                let filter = Filter::NamePrefix(Bytes::from_static(b"voice/"));
+
+                // current_peers is callable and yields (PeerId, TransportKind).
+                let peers: Vec<(PeerId, TransportKind)> = bus.current_peers().await;
+                assert!(peers.is_empty(), "no peers connected in this harness");
+
+                // Read back the SubscriptionEntry the local peer published at
+                // the `(filter, provider)` key — the observable effect of
+                // subscribe_via/unsubscribe_via. Reading at a key *derived
+                // from the args* means a delegation that dropped or swapped
+                // the filter/provider lands at the wrong key and is caught.
+                let local_vk = bus.identity.store_verifying_key();
+                let store = bus.store.clone();
+                let read_sub = |filter: Filter, provider: PeerId| {
+                    let store = store.clone();
+                    let local_vk = local_vk.clone();
+                    async move {
+                        let name = subscription_name(&filter, &provider);
+                        let entry = store.get_entry(&local_vk, name.as_ref()).await.unwrap()?;
+                        let block = store.get_content(&entry.value_hash).await.unwrap()?;
+                        postcard::from_bytes::<SubscriptionEntry>(&block.data).ok()
+                    }
+                };
+
+                // subscribe_via delegates: an Active entry naming exactly this
+                // filter+provider appears in the local store.
+                bus.subscribe_via(
+                    filter.clone(),
+                    other.clone(),
+                    SubscriptionPolicy::store_data(),
+                )
+                .await
+                .expect("subscribe_via callable");
+                assert_eq!(
+                    read_sub(filter.clone(), other.clone()).await,
+                    Some(SubscriptionEntry::Active {
+                        filter: filter.clone(),
+                        provider: other.clone(),
+                    }),
+                    "subscribe_via must publish an Active SubscriptionEntry at the (filter, provider) key",
+                );
+
+                // unsubscribe_via delegates: the same key flips to Withdrawn.
+                bus.unsubscribe_via(filter.clone(), other.clone())
+                    .await
+                    .expect("unsubscribe_via callable");
+                assert_eq!(
+                    read_sub(filter.clone(), other.clone()).await,
+                    Some(SubscriptionEntry::Withdrawn),
+                    "unsubscribe_via must publish a Withdrawn entry at the same key",
+                );
+
+                // subscribe_engine_events is callable and returns a receiver.
+                let _events = bus.subscribe_engine_events().await;
+
+                // Local ephemeral subscribe must NOT arm a remote interest:
+                // the engine's outbound BroadcastIntent set stays empty.
+                let _eph = bus
+                    .subscribe_ephemeral_local(Filter::NamePrefix(Bytes::from_static(b"voice/")))
+                    .await;
+                let intents_after_local = bus.engine.broadcast_intent_filters_snapshot().await;
+                assert!(
+                    intents_after_local.is_empty(),
+                    "subscribe_ephemeral_local must arm NO BroadcastIntent, got {intents_after_local:?}"
+                );
+
+                // Contrast: the high-level Bus::subscribe DOES arm a BroadcastIntent.
+                let _stream = bus
+                    .subscribe(Filter::NamePrefix(Bytes::from_static(b"chat/")))
+                    .await
+                    .expect("subscribe callable");
+                let intents_after_subscribe = bus.engine.broadcast_intent_filters_snapshot().await;
+                assert_eq!(
+                    intents_after_subscribe.len(),
+                    1,
+                    "Bus::subscribe arms exactly one BroadcastIntent"
+                );
+
                 run_handle.abort();
             })
             .await;
@@ -286,6 +509,7 @@ mod tests {
                 // Publish an ephemeral on chat/ — should arrive as Ephemeral.
                 bus.publish_ephemeral(
                     Bytes::from_static(b"chat/me/eph"),
+                    0,
                     Bytes::from_static(b"now"),
                 )
                 .await

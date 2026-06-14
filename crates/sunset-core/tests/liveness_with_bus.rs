@@ -144,6 +144,7 @@ async fn liveness_tracks_alice_via_bob_bus_subscription() {
             alice_bus
                 .publish_ephemeral(
                     Bytes::from_static(b"liveness-test/alice/0001"),
+                    0,
                     event.encode(),
                 )
                 .await

@@ -67,6 +67,17 @@ export async function createClient(seed, heartbeatIntervalMs, callback) {
       ? heartbeatIntervalMs
       : 0;
   const client = new Client(seedBytes, hb);
+  // Relay-only mode when `?relay-only=1` is present: voice never attempts a
+  // direct WebRTC link, so all audio flows through the relay's re-forward.
+  // A privacy/firewall option; the relay-audio-fallback e2e uses it to
+  // exercise the relayed path deterministically. Read here, before any
+  // voice session starts, mirroring the `?heartbeat_interval_ms=` knob.
+  if (typeof window !== "undefined") {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("relay-only") === "1") {
+      client.set_relay_only(true);
+    }
+  }
   // Test-only hook: expose the client to Playwright when SUNSET_TEST is
   // set on `window` before the bundle loads. No-op in production.
   if (typeof window !== "undefined" && window.SUNSET_TEST) {
