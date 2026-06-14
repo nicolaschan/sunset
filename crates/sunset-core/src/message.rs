@@ -688,7 +688,7 @@ mod tests {
         ));
         // Re-sign the outer KV entry too (the outer signature is honest;
         // the attack is on the inner signature only).
-        let outer_sig = id.sign(&crate::canonical::signing_payload(&entry));
+        let outer_sig = id.sign(&sunset_store::canonical::signing_payload(&entry));
         entry.signature = Bytes::copy_from_slice(&outer_sig.to_bytes());
 
         // The inner signature was computed over channel="links" but the
@@ -793,7 +793,7 @@ mod tests {
             expires_at: None,
             signature: Bytes::new(),
         };
-        let outer_sig = id.sign(&crate::canonical::signing_payload(&entry));
+        let outer_sig = id.sign(&sunset_store::canonical::signing_payload(&entry));
         entry.signature = Bytes::copy_from_slice(&outer_sig.to_bytes());
 
         let err = decode_message(&room, &entry, &block).unwrap_err();

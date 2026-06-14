@@ -15,6 +15,5 @@ mod parse;
 mod resolver;
 
 pub use error::{Error, Result};
-pub use json::{extract_string_field, extract_x25519_from_json};
 pub use parse::{LookupTarget, ParsedInput, parse_input};
 pub use resolver::{HttpFetch, ResolvedAddress, Resolver};

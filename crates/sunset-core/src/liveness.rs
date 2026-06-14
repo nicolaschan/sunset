@@ -314,27 +314,12 @@ mod tests {
         pub fn set(&self, t: SystemTime) {
             *self.now.lock().unwrap() = t;
         }
-
-        #[allow(dead_code)]
-        pub fn advance(&self, d: Duration) {
-            let mut g = self.now.lock().unwrap();
-            *g += d;
-        }
     }
 
     impl Clock for MockClock {
         fn now(&self) -> SystemTime {
             *self.now.lock().unwrap()
         }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn skeleton_constructs() {
-        let clock = MockClock::new(SystemTime::UNIX_EPOCH);
-        let liveness = Liveness::with_clock(Duration::from_secs(3), clock);
-        // Just checks the value type — Arc<Liveness>, with a clock and a
-        // 3-second window. Behaviour is added in subsequent tasks.
-        assert_eq!(liveness.stale_after, Duration::from_secs(3));
     }
 
     use bytes::Bytes;

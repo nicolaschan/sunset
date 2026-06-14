@@ -29,16 +29,7 @@ pub fn read_roots(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Hash>> {
     let mut stmt = conn.prepare("SELECT value_hash FROM entries")?;
     let rows = stmt.query_map(params![], |row| {
         let bytes: Vec<u8> = row.get(0)?;
-        let mut buf = [0u8; 32];
-        if bytes.len() != 32 {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                bytes.len(),
-                rusqlite::types::Type::Blob,
-                Box::<dyn std::error::Error + Send + Sync>::from("value_hash != 32 bytes"),
-            ));
-        }
-        buf.copy_from_slice(&bytes);
-        Ok(Hash::from(buf))
+        crate::kv::hash_from_blob(&bytes)
     })?;
     rows.collect()
 }

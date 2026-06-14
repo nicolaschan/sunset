@@ -43,18 +43,15 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // ---- identities + rooms ----
             let alice = Identity::generate(&mut OsRng);
             let bob = Identity::generate(&mut OsRng);
             let alice_room = Room::open_with_params("plan-c-test", &test_fast_params()).unwrap();
             let bob_room = Room::open_with_params("plan-c-test", &test_fast_params()).unwrap();
             assert_eq!(alice_room.fingerprint(), bob_room.fingerprint());
 
-            // ---- both stores use Ed25519Verifier ----
             let alice_store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
             let bob_store = Arc::new(MemoryStore::new(Arc::new(Ed25519Verifier)));
 
-            // ---- bob listens on a random port via in-process axum ----
             let (bob_raw, ws_tx) = WebSocketRawTransport::serving();
             let app = axum::Router::new().route(
                 "/",
@@ -73,7 +70,6 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             let bob_noise =
                 NoiseTransport::new(bob_raw, Arc::new(IdentityNoiseAdapter(bob.clone())));
 
-            // ---- alice dials ----
             let alice_raw = WebSocketRawTransport::dial_only();
             let alice_noise =
                 NoiseTransport::new(alice_raw, Arc::new(IdentityNoiseAdapter(alice.clone())));
@@ -92,7 +88,6 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
                 hex::encode(bob_x25519_pub),
             )));
 
-            // ---- engines (with real signers) ----
             let alice_signer: Arc<dyn sunset_sync::Signer> = Arc::new(alice.clone());
             let bob_signer: Arc<dyn sunset_sync::Signer> = Arc::new(bob.clone());
 
@@ -128,14 +123,12 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
                 async move { e.run().await }
             });
 
-            // ---- bob declares interest ----
             let bob_filter = room_messages_filter(&bob_room);
             bob_engine
                 .subscribe(bob_filter.clone(), SubscriptionPolicy::store_data())
                 .await
                 .unwrap();
 
-            // ---- alice connects to bob ----
             alice_engine.add_peer(bob_addr).await.unwrap();
 
             // Wait until Bob's `SubscriptionEntry::Active(provider=alice)`
@@ -156,7 +149,6 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             .await;
             assert!(registered, "alice did not learn bob's subscription");
 
-            // ---- alice composes + inserts ----
             let body = "hello bob via real ws + noise";
             let sent_at = 1_700_000_000_000u64;
             let ComposedMessage { entry, block } = compose_message(
@@ -175,7 +167,6 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
                 .await
                 .expect("alice's own store accepts her real-signed entry");
 
-            // ---- bob receives entry + block ----
             let bob_has_entry = wait_for(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
@@ -204,7 +195,6 @@ async fn alice_encrypts_bob_decrypts_over_ws_and_noise() {
             .await;
             assert!(bob_has_block, "bob did not receive alice's content block");
 
-            // ---- bob decodes ----
             let bob_entry = bob_store
                 .get_entry(&alice.store_verifying_key(), &entry.name)
                 .await

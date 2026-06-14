@@ -103,12 +103,6 @@ pub struct RelayHandle {
     /// `AppState` in `run` / `run_for_test`.
     ws_tx: mpsc::UnboundedSender<axum::extract::ws::WebSocket>,
     cmd_tx: mpsc::UnboundedSender<RelayCommand>,
-    /// Engine-side context used by the command pump (one shared Rc).
-    /// Held here so the pump's Rc graph stays alive for the relay's
-    /// lifetime. The field is read-only (the pump task already holds
-    /// its own clone), but storing it here documents the ownership.
-    #[allow(dead_code)]
-    cmd_ctx: Rc<CommandContext>,
 }
 
 /// Held by the command pump task on the engine side. Captures the
@@ -249,7 +243,6 @@ impl Relay {
             listener: Some(listener),
             ws_tx,
             cmd_tx,
-            cmd_ctx,
         })
     }
 }
@@ -556,15 +549,4 @@ impl RelayHandle {
     pub fn engine(&self) -> &Rc<Engine> {
         &self.engine
     }
-}
-
-// `cmd_ctx` is held inside `RelayHandle` so the command pump's `Rc` graph
-// stays alive for the relay's lifetime. When `RelayHandle` drops:
-//   • `cmd_tx` drops → cmd_rx returns None → pump task exits.
-//   • `cmd_ctx` (this clone) drops → refcount drops by 1.
-//   • The pump task's own `cmd_ctx` clone drops when the task ends →
-//     refcount → 0 → CommandContext drops, releasing Rc<Engine> and Arc<FsStore>.
-// The empty Drop body marks this as a deliberate ownership shape.
-impl Drop for RelayHandle {
-    fn drop(&mut self) {}
 }

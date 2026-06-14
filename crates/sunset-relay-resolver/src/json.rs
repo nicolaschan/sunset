@@ -40,36 +40,13 @@ pub fn extract_string_field(body: &str, field: &str) -> Result<Option<String>> {
     Ok(Some(body_quoted[..close_quote].to_string()))
 }
 
+/// Extract the `x25519` field and decode its hex value into a 32-byte key.
+/// Built on [`extract_string_field`]; `hex::decode` + `try_into` enforce the
+/// hex-validity and 32-byte-length contract.
 pub fn extract_x25519_from_json(body: &str) -> Result<[u8; 32]> {
-    let key = "\"x25519\"";
-    let key_start = body
-        .find(key)
+    let hex_str = extract_string_field(body, "x25519")?
         .ok_or_else(|| Error::BadJson("missing \"x25519\" field".into()))?;
-    let after_key = &body[key_start + key.len()..];
-    let after_colon = after_key
-        .trim_start()
-        .strip_prefix(':')
-        .ok_or_else(|| Error::BadJson("expected ':' after \"x25519\"".into()))?;
-    let value = after_colon.trim_start();
-    let body_quoted = value
-        .strip_prefix('"')
-        .ok_or_else(|| Error::BadJson("\"x25519\" value not a quoted string".into()))?;
-    let close_quote = body_quoted
-        .find('"')
-        .ok_or_else(|| Error::BadJson("unterminated \"x25519\" string".into()))?;
-    let hex_str = &body_quoted[..close_quote];
-    if hex_str.len() != 64 {
-        return Err(Error::BadX25519(format!(
-            "expected 64 hex chars, got {}",
-            hex_str.len()
-        )));
-    }
-    if !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::BadX25519(format!(
-            "non-hex chars in x25519: {hex_str}"
-        )));
-    }
-    let bytes = hex::decode(hex_str).map_err(|e| Error::BadX25519(format!("hex decode: {e}")))?;
+    let bytes = hex::decode(&hex_str).map_err(|e| Error::BadX25519(format!("hex decode: {e}")))?;
     bytes
         .as_slice()
         .try_into()

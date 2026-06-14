@@ -603,34 +603,10 @@ impl<St: Store + 'static, T: Transport + 'static> OpenRoom<St, T> {
             .clear();
     }
 
-    /// Convenience wrapper: sends a reaction under the default
-    /// `general` channel. New callers that want explicit channel
-    /// routing should use [`OpenRoom::send_reaction_in_channel`]. The
-    /// reaction tracker (spawned in `Peer::open_room`) picks it up via
-    /// its `<room_fp>/msg/` subscription and dispatches a snapshot
-    /// change to `on_reactions_changed`. `action` is "add" or "remove".
-    pub async fn send_reaction(
-        &self,
-        target: sunset_store::Hash,
-        emoji: String,
-        action: crate::ReactionAction,
-        sent_at_ms: u64,
-    ) -> crate::Result<()> {
-        self.send_reaction_in_channel(
-            ChannelLabel::default_general(),
-            target,
-            emoji,
-            action,
-            sent_at_ms,
-        )
-        .await
-    }
-
     /// Compose and insert a Reaction entry under `channel`. Reactions
     /// inherit the channel of the message they target — callers of
     /// this method are expected to pass the same channel as the
-    /// target Text. See [`OpenRoom::send_reaction`] for the
-    /// channel-defaulted convenience wrapper.
+    /// target Text.
     pub async fn send_reaction_in_channel(
         &self,
         channel: ChannelLabel,
