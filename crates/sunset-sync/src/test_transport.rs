@@ -39,6 +39,24 @@ impl TestNetwork {
     /// Build a `TestTransport` with the given identity and address.
     /// Registering the address on the network makes it `connect`able.
     pub fn transport(&self, peer_id: PeerId, addr: PeerAddr) -> TestTransport {
+        self.transport_inner(peer_id, addr, false)
+    }
+
+    /// Like [`transport`], but the connections it produces have **no
+    /// datagram channel**: `send_unreliable`/`recv_unreliable` return `Err`,
+    /// mirroring a WebSocket-only transport. Used to test that ephemeral
+    /// (voice) traffic falls back to the reliable channel and still reaches
+    /// the peer (the relay-audio-fallback path over a WS relay leg).
+    pub fn transport_reliable_only(&self, peer_id: PeerId, addr: PeerAddr) -> TestTransport {
+        self.transport_inner(peer_id, addr, true)
+    }
+
+    fn transport_inner(
+        &self,
+        peer_id: PeerId,
+        addr: PeerAddr,
+        reliable_only: bool,
+    ) -> TestTransport {
         let (tx, rx) = mpsc::unbounded_channel::<ConnectRequest>();
         self.inboxes
             .borrow_mut()
@@ -48,6 +66,7 @@ impl TestNetwork {
             addr,
             net: self.clone(),
             accept_rx: Rc::new(Mutex::new(rx)),
+            reliable_only,
         }
     }
 }
@@ -77,6 +96,9 @@ pub struct TestTransport {
     /// held across `.await` without tripping `clippy::await_holding_refcell_ref`.
     /// Single-threaded `?Send` executor — there is no real contention.
     accept_rx: Rc<Mutex<mpsc::UnboundedReceiver<ConnectRequest>>>,
+    /// When true, connections from this transport have no datagram channel
+    /// (unreliable send/recv return `Err`) — mirrors a WS-only link.
+    reliable_only: bool,
 }
 
 impl TestTransport {
@@ -142,6 +164,7 @@ impl Transport for TestTransport {
             rx_acceptor_to_initiator,
             tx_initiator_to_acceptor_unrel,
             rx_acceptor_to_initiator_unrel,
+            self.reliable_only,
         ))
     }
 
@@ -160,6 +183,7 @@ impl Transport for TestTransport {
             req.rx_from_initiator,
             req.tx_to_initiator_unrel,
             req.rx_from_initiator_unrel,
+            self.reliable_only,
         ))
     }
 }
@@ -174,6 +198,9 @@ pub struct TestConnection {
     rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
     tx_unrel: mpsc::UnboundedSender<Bytes>,
     rx_unrel: Mutex<mpsc::UnboundedReceiver<Bytes>>,
+    /// When true, this connection has no datagram channel — unreliable
+    /// send/recv return `Err` (mirrors a WS-only link).
+    reliable_only: bool,
 }
 
 impl TestConnection {
@@ -183,6 +210,7 @@ impl TestConnection {
         rx: mpsc::UnboundedReceiver<Bytes>,
         tx_unrel: mpsc::UnboundedSender<Bytes>,
         rx_unrel: mpsc::UnboundedReceiver<Bytes>,
+        reliable_only: bool,
     ) -> Self {
         Self {
             peer_id,
@@ -190,6 +218,7 @@ impl TestConnection {
             rx: Mutex::new(rx),
             tx_unrel,
             rx_unrel: Mutex::new(rx_unrel),
+            reliable_only,
         }
     }
 }
@@ -212,12 +241,22 @@ impl TransportConnection for TestConnection {
     }
 
     async fn send_unreliable(&self, bytes: Bytes) -> Result<()> {
+        if self.reliable_only {
+            return Err(Error::Transport(
+                "test transport: no datagram channel".into(),
+            ));
+        }
         self.tx_unrel
             .send(bytes)
             .map_err(|_| Error::Transport("connection closed".into()))
     }
 
     async fn recv_unreliable(&self) -> Result<Bytes> {
+        if self.reliable_only {
+            return Err(Error::Transport(
+                "test transport: no datagram channel".into(),
+            ));
+        }
         self.rx_unrel
             .lock()
             .await

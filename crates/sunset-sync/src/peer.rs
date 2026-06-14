@@ -367,13 +367,30 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                         }
                     }
                     ChannelKind::Unreliable => {
-                        // Unreliable is by-design lossy. A failure (transport
-                        // doesn't support unreliable, queue full, etc.) drops
-                        // the datagram but MUST NOT disconnect the peer —
-                        // peers who only have reliable transports (e.g.
-                        // WS-only) still need to function for chat traffic.
-                        // Per spec failure-mode table.
-                        let _ = send_unreliable_message(&*conn, &msg).await;
+                        // Ephemeral (voice frames/heartbeats) prefers the
+                        // unreliable datagram channel — loss-tolerant, no
+                        // head-of-line blocking. But a transport with no
+                        // datagram channel (a WS-only relay leg) returns Err
+                        // from send_unreliable; that Err means the datagram
+                        // never left, so fall back to the reliable channel
+                        // rather than silently dropping it. Without this,
+                        // voice could never traverse a WS relay (the
+                        // relay-audio-fallback path). A datagram dropped *in
+                        // transit* returns Ok, so this never re-sends a
+                        // lost-on-the-wire frame — only ones the transport
+                        // could not send at all. A reliable-fallback failure
+                        // means the connection is dead, so surface it like
+                        // the Reliable arm for prompt teardown.
+                        if send_unreliable_message(&*conn, &msg).await.is_err()
+                            && let Err(e) = send_reliable_message(&*conn, &msg).await
+                        {
+                            let _ = inbound_tx.send(InboundEvent::Disconnected {
+                                peer_id: peer_id.clone(),
+                                conn_id,
+                                reason: format!("send ephemeral (reliable fallback): {e}"),
+                            });
+                            break;
+                        }
                     }
                 }
             }

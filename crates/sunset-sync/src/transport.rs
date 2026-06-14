@@ -102,9 +102,13 @@ pub trait TransportConnection {
     async fn recv_reliable(&self) -> Result<Bytes>;
 
     /// Send one message on the unreliable channel (datagram-shaped).
-    /// Used by the Bus's ephemeral delivery path. Transports that don't
-    /// support unreliable should return `Err`; the per-peer task drops
-    /// failed unreliable sends silently and keeps the peer alive.
+    /// Used by the Bus's ephemeral delivery path. Transports with no
+    /// datagram channel return `Err`; the per-peer send task treats that
+    /// `Err` as "could not send" and falls back to the reliable channel so
+    /// loss-tolerant ephemeral traffic (voice) still reaches a peer reached
+    /// only over a reliable transport (e.g. a WS relay leg). Datagrams
+    /// dropped *in transit* must return `Ok` (they were sent) so the
+    /// fallback never reliably re-sends a lost-on-the-wire frame.
     async fn send_unreliable(&self, bytes: Bytes) -> Result<()>;
 
     /// Receive one message from the unreliable channel. May return spurious

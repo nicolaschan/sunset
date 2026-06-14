@@ -100,10 +100,31 @@ impl TestPeer {
     /// Same as `spawn`, but with a caller-supplied `SyncConfig` (e.g.
     /// for tests that tune heartbeat intervals).
     pub fn spawn_with_config(net: &TestNetwork, label: &[u8], config: SyncConfig) -> Self {
+        Self::spawn_inner(net, label, config, false)
+    }
+
+    /// Same as `spawn`, but over a reliable-only transport (no datagram
+    /// channel — `send_unreliable` errors), mirroring a WS-only link. Used
+    /// to test that ephemeral (voice) traffic falls back to the reliable
+    /// channel and still reaches the peer.
+    pub fn spawn_reliable_only(net: &TestNetwork, label: &[u8]) -> Self {
+        Self::spawn_inner(net, label, SyncConfig::default(), true)
+    }
+
+    fn spawn_inner(
+        net: &TestNetwork,
+        label: &[u8],
+        config: SyncConfig,
+        reliable_only: bool,
+    ) -> Self {
         let id = PeerId(vk(label));
         let addr = PeerAddr::new(Bytes::copy_from_slice(label));
         let store = Arc::new(MemoryStore::with_accept_all());
-        let transport = net.transport(id.clone(), addr.clone());
+        let transport = if reliable_only {
+            net.transport_reliable_only(id.clone(), addr.clone())
+        } else {
+            net.transport(id.clone(), addr.clone())
+        };
         let signer: Arc<dyn Signer> = Arc::new(StubSigner::new(id.0.clone()));
         let engine = Rc::new(SyncEngine::new(
             store.clone(),
@@ -200,9 +221,29 @@ pub struct RelayStar {
 /// within two seconds — that is a harness wiring failure, not the behaviour
 /// under test.
 pub async fn relay_star_publish_one(net: &TestNetwork) -> RelayStar {
-    let a = TestPeer::spawn(net, b"alice");
-    let r = TestPeer::spawn(net, b"relay");
-    let b = TestPeer::spawn(net, b"bob");
+    relay_star_publish_one_impl(net, false).await
+}
+
+/// Like [`relay_star_publish_one`], but every leg is a reliable-only
+/// transport (no datagram channel — `send_unreliable` errors), mirroring a
+/// WS-only relay deployment. The ephemeral datagram can only reach B if the
+/// engine falls back to the reliable channel for ephemeral traffic — so this
+/// fails before that fallback exists and passes after.
+pub async fn relay_star_publish_one_reliable_only(net: &TestNetwork) -> RelayStar {
+    relay_star_publish_one_impl(net, true).await
+}
+
+async fn relay_star_publish_one_impl(net: &TestNetwork, reliable_only: bool) -> RelayStar {
+    let spawn = |label: &[u8]| {
+        if reliable_only {
+            TestPeer::spawn_reliable_only(net, label)
+        } else {
+            TestPeer::spawn(net, label)
+        }
+    };
+    let a = spawn(b"alice");
+    let r = spawn(b"relay");
+    let b = spawn(b"bob");
 
     a.engine.set_trust(TrustSet::All).await.unwrap();
     r.engine.set_trust(TrustSet::All).await.unwrap();
