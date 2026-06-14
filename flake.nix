@@ -176,8 +176,10 @@
             cp ${./web/voice-e2e-test.html} $out/voice-e2e-test.html
             cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm.js $out/sunset_web_wasm.js
             cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm_bg.wasm $out/sunset_web_wasm_bg.wasm
-            cp audio/voice-capture-worklet.js $out/audio/
-            cp audio/voice-playback-worklet.js $out/audio/
+            # All voice worklet modules and the JS they import (resampler.js
+            # is imported by the capture worklet). Glob so a new audio module
+            # can't silently 404 by being forgotten here.
+            cp audio/*.js $out/audio/
             runHook postInstall
           '';
         };
@@ -242,8 +244,7 @@
             # and getUserMedia rolls back with "Unable to load a worklet's
             # module" / "operation was aborted" depending on the browser.
             mkdir -p $out/audio
-            cp ${./web/audio/voice-capture-worklet.js} $out/audio/voice-capture-worklet.js
-            cp ${./web/audio/voice-playback-worklet.js} $out/audio/voice-playback-worklet.js
+            cp ${./web/audio}/*.js $out/audio/
             # Lustre emits an absolute `/sunset_web.js` script src which only
             # works at site root. Rewrite to a relative path so the artefact
             # serves correctly under any GitHub Pages sub-path.
@@ -287,8 +288,7 @@
             cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm.js $out/
             cp ${sunsetWebWasmTestHooksPkg}/sunset_web_wasm_bg.wasm $out/
             cp ${./web/voice-e2e-test.html} $out/voice-e2e-test.html
-            cp audio/voice-capture-worklet.js $out/audio/
-            cp audio/voice-playback-worklet.js $out/audio/
+            cp audio/*.js $out/audio/
             # Generate a 5-second 440 Hz sine sweep WAV for the real-mic test.
             ${pkgs.sox}/bin/sox -n -r 48000 -c 1 -e signed-integer -b 16 \
               $out/audio/test-fixtures/sweep.wav synth 5 sine 440
@@ -321,6 +321,11 @@
           cd "$(${pkgs.git}/bin/git rev-parse --show-toplevel)/web"
           rm -f node_modules
           ln -sfn "${webNodeModules}/node_modules" node_modules
+
+          # Web JS unit tests (audio resampler) — fast and dependency-free;
+          # run them first so a DSP regression fails before the browser
+          # suite spins up. `set -euo pipefail` aborts here on failure.
+          ${pkgs.nodejs}/bin/node audio/resampler.test.mjs
 
           exec node_modules/.bin/playwright test "$@"
         '';

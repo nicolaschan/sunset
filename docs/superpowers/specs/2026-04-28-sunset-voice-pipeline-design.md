@@ -74,12 +74,30 @@ All choices are standard VoIP defaults. No per-deployment knobs in C2a.
 
 | Parameter | Value | Why |
 |---|---|---|
-| Sample rate | **48 kHz** | Opus's native rate. Browser AudioContext is created with `{ sampleRate: 48000 }` so we never need to resample. |
+| Sample rate | **48 kHz** | Opus's native rate. The codec and the JS↔Rust frame contract are fixed at 48 kHz; the WebAudio device-rate domain is decoupled from it (see the 2026-06-14 revision below). |
 | Channels | **Mono** | Stereo for voice doubles bandwidth for negligible UX gain. |
 | Frame size | **20 ms (960 samples)** | Standard VoIP cadence. Opus supports 2.5/5/10/20/40/60 ms; 20 ms is the universal sweet spot for latency vs. compression. |
 | Bitrate | **24 kbit/s** (Opus default for `Application::Voip`) | Good speech quality at low bandwidth. Tunable later. |
 | Opus application | `Application::Voip` | Tuned for speech rather than music. |
 | Complexity | 5 (Opus default) | Balanced encode-side CPU vs. quality. |
+
+> **Revision (2026-06-14):** The original "Browser AudioContext is created
+> with `{ sampleRate: 48000 }` so we never need to resample" was wrong on
+> browsers/hardware whose audio device isn't 48 kHz. Forcing the *capture*
+> context to 48 kHz makes `createMediaStreamSource(micStream)` throw on
+> browsers that don't transparently resample a `MediaStream` into a
+> mismatched-rate context — notably Firefox: *"Connecting AudioNodes from
+> AudioContexts with different sample-rate is currently not supported"* —
+> which the UI mislabelled as a "Microphone access required" toast. As
+> built: the **capture** context is created unforced (`new AudioContext()`)
+> so it adopts the device rate and the mic always connects; the capture
+> worklet resamples each channel up to 48 kHz (`web/audio/resampler.js`,
+> Catmull-Rom cubic, lossless when already at 48 kHz) before posting frames,
+> so the JS↔Rust 48 kHz / 960-sample contract is unchanged. The **playback**
+> context stays pinned to 48 kHz to match the Opus decoder output —
+> AudioContext *output* resampling to the speaker is universally supported;
+> only mic *input* resampling is refused. The 48 kHz codec rate itself is
+> unchanged.
 
 ## Components
 
@@ -272,9 +290,13 @@ Inside `voice.rs`, the encoder pushes encoded bytes into a `mpsc::UnboundedSende
 ## Data flow
 
 **Capture path:**
-1. `getUserMedia` returns a `MediaStream` with one mono audio track at 48 kHz.
+1. `getUserMedia` returns a `MediaStream` whose audio track runs at the
+   audio *device* rate (not necessarily 48 kHz — see the 2026-06-14
+   revision above); the capture `AudioContext` adopts that same rate.
 2. `MediaStreamSource` feeds into `AudioWorkletNode("voice-capture")`.
-3. The capture worklet buffers 128-sample quanta into 960-sample frames.
+3. The capture worklet resamples each channel from the device rate to
+   48 kHz (lossless when already 48 kHz) and buffers it into 960-sample
+   frames.
 4. Each frame is `postMessage`d (with transfer) to the main thread.
 5. Main thread calls `client.voice_input(pcm)`.
 6. Rust encodes via `VoiceEncoder::encode`.

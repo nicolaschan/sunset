@@ -1,5 +1,5 @@
 // JS-side voice wiring. Owns:
-// - the AudioContext (created lazily on first start)
+// - the capture + playback AudioContexts (created lazily on first start)
 // - per-peer { workletNode, gainNode } table
 // - capture worklet stream
 // - per-peer GainNode updates (setPeerVolume), called directly from
@@ -8,7 +8,20 @@
 
 import { Ok, Error as GError } from "../../prelude.mjs";
 
-let ctx = null;
+// Two AudioContexts with different sample-rate strategies:
+//
+//   * captureCtx runs at the audio *device* rate (unforced). The mic
+//     MediaStream is delivered at the device rate, and some browsers
+//     (notably Firefox) throw from createMediaStreamSource when the
+//     stream's rate differs from the context's. Matching the device rate
+//     makes the connection succeed everywhere; the capture worklet then
+//     resamples up to the fixed 48 kHz codec rate.
+//   * playbackCtx is pinned to 48 kHz to match the Opus decoder output.
+//     AudioContext *output* resampling to the speaker device is
+//     universally supported (it's mic *input* resampling that Firefox
+//     refuses), so the playback worklet stays unchanged.
+let captureCtx = null;
+let playbackCtx = null;
 const peers = new Map(); // peerHex -> { worklet, gain }
 let captureNode = null;
 let captureStream = null;
@@ -74,8 +87,10 @@ function clamp01(x) {
 }
 
 export function ensureCtx() {
-  if (!ctx) ctx = new AudioContext({ sampleRate: 48000 });
-  return ctx;
+  // captureCtx: device rate (so the mic always connects). playbackCtx:
+  // 48 kHz (Opus decoder output; browser resamples to the speaker).
+  if (!captureCtx) captureCtx = new AudioContext();
+  if (!playbackCtx) playbackCtx = new AudioContext({ sampleRate: 48000 });
 }
 
 // Frame size constants must agree with the Rust constants in
@@ -131,8 +146,8 @@ let currentMicProfile = null;
 
 export async function startCapture(client) {
   ensureCtx();
-  await ctx.audioWorklet.addModule("/audio/voice-capture-worklet.js");
-  await ctx.audioWorklet.addModule("/audio/voice-playback-worklet.js");
+  await captureCtx.audioWorklet.addModule("/audio/voice-capture-worklet.js");
+  await playbackCtx.audioWorklet.addModule("/audio/voice-playback-worklet.js");
   startLevelDecayTimer();
   const preset = readPersistedQuality();
   const ec = readPersistedEchoCancellation();
@@ -148,8 +163,8 @@ async function openCaptureStream(client, preset, echoCancellation) {
     audio: micConstraints(preset, echoCancellation),
   });
   currentMicProfile = micProfile(preset, echoCancellation);
-  const src = ctx.createMediaStreamSource(captureStream);
-  captureNode = new AudioWorkletNode(ctx, "voice-capture", {
+  const src = captureCtx.createMediaStreamSource(captureStream);
+  captureNode = new AudioWorkletNode(captureCtx, "voice-capture", {
     // The capture worklet reads from a stereo source; tell the audio
     // graph not to downmix to mono before the worklet sees it.
     channelCount: 2,
@@ -378,18 +393,18 @@ function stopCaptureSource() {
 }
 
 export function deliverFrame(peerHex, seq, pcm) {
-  if (!ctx) return;
+  if (!playbackCtx) return;
   let slot = peers.get(peerHex);
   if (!slot) {
-    const w = new AudioWorkletNode(ctx, "voice-playback", {
+    const w = new AudioWorkletNode(playbackCtx, "voice-playback", {
       // Decoder always emits stereo; configure the worklet's output
       // node accordingly so the audio graph routes L/R to the
       // appropriate destination channels rather than downmixing.
       outputChannelCount: [2],
     });
-    const g = ctx.createGain();
+    const g = playbackCtx.createGain();
     g.gain.value = 1.0;
-    w.connect(g).connect(ctx.destination);
+    w.connect(g).connect(playbackCtx.destination);
     slot = { worklet: w, gain: g };
     peers.set(peerHex, slot);
   }

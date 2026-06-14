@@ -29,7 +29,10 @@ const testHooks = process.env.SUNSET_TEST_HOOKS === "1";
 // the top-level pattern.
 function ignoreFor(...extra) {
   const base = testHooks ? [] : [/voice_.*\.spec\.js$/];
-  return [...base, ...extra];
+  // The sample-rate regression reproduces only on Firefox (where the audio
+  // device runs at a non-48 kHz rate); it runs solely under the `firefox`
+  // project, so every Chromium project ignores it.
+  return [...base, /voice_samplerate_firefox\.spec\.js$/, ...extra];
 }
 
 export default defineConfig({
@@ -121,6 +124,24 @@ export default defineConfig({
       // the `_real_mic` suffix so new specs slot in without touching
       // the config.
       testMatch: /voice_.*_real_mic\.spec\.js|voice_real_mic\.spec\.js/,
+    },
+    // Firefox project, scoped to the sample-rate regression spec. Firefox
+    // delivers the mic at the audio device rate (44.1 kHz here) and refuses
+    // createMediaStreamSource into a 48 kHz AudioContext — the exact bug
+    // this guards. `firefoxUserPrefs` supply a fake mic and auto-grant
+    // permission (the Chromium `--use-fake-*` flags don't apply to Firefox).
+    {
+      name: "firefox",
+      use: {
+        ...devices["Desktop Firefox"],
+        launchOptions: {
+          firefoxUserPrefs: {
+            "media.navigator.streams.fake": true,
+            "media.navigator.permission.disabled": true,
+          },
+        },
+      },
+      testMatch: /voice_samplerate_firefox\.spec\.js$/,
     },
   ],
   webServer: {
