@@ -4,34 +4,42 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 
+use base64::Engine as _;
 use sunset_core::{ImageAttachment, OpenRoom};
 use sunset_store_memory::MemoryStore;
 use sunset_sync::MultiTransport;
 
 use crate::client::{RtcT, WsT};
 
-/// Decode a JS `Array<{ mime_type, data_base64 }>` into a `Vec<ImageAttachment>`.
-/// Each entry must be a plain JS object exposing those two string fields
-/// — the JS bridge owns the contract; the wasm core only validates the
-/// shape and rejects anything else with a JsError so a typo in the
-/// bridge fails loud instead of silently dropping attachments.
+/// Decode a JS `Array<{ data_base64 }>` of staged attachments into a
+/// `Vec<ImageAttachment>`, **running each entry through
+/// `ImageAttachment::preprocess`** so the bytes that hit the wire are
+/// the normalised JPEG (or pass-through GIF / WebP for animated
+/// formats) produced by `sunset-image`, never the original camera
+/// payload.
+///
+/// The JS bridge keeps the raw bytes around for the composer's
+/// thumbnail strip; what crosses this boundary is the post-preprocess
+/// wire form. The JS-side `mime_type` field is sent but ignored — the
+/// sniffer trusts magic bytes (browsers mis-label HEIC and renamed
+/// files). Errors surface back to JS as `JsError` strings the caller
+/// can render.
 fn images_from_js(arr: &js_sys::Array) -> Result<Vec<ImageAttachment>, JsError> {
     let len = arr.length() as usize;
     let mut out = Vec::with_capacity(len);
+    let b64 = base64::engine::general_purpose::STANDARD;
     for i in 0..arr.length() {
         let item = arr.get(i);
-        let mime = js_sys::Reflect::get(&item, &JsValue::from_str("mime_type"))
-            .map_err(|_| JsError::new(&format!("images[{i}]: missing mime_type")))?
-            .as_string()
-            .ok_or_else(|| JsError::new(&format!("images[{i}].mime_type must be a string")))?;
         let data = js_sys::Reflect::get(&item, &JsValue::from_str("data_base64"))
             .map_err(|_| JsError::new(&format!("images[{i}]: missing data_base64")))?
             .as_string()
             .ok_or_else(|| JsError::new(&format!("images[{i}].data_base64 must be a string")))?;
-        out.push(ImageAttachment {
-            mime_type: mime,
-            data_base64: data,
-        });
+        let raw = b64
+            .decode(&data)
+            .map_err(|e| JsError::new(&format!("images[{i}]: base64 decode: {e}")))?;
+        let attachment = ImageAttachment::preprocess(&raw)
+            .map_err(|e| JsError::new(&format!("images[{i}]: {e}")))?;
+        out.push(attachment);
     }
     Ok(out)
 }

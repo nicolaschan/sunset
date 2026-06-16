@@ -1,0 +1,31 @@
+[package]
+name = "sunset-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Decode JPEG/PNG/WebP/GIF, resize, encode JPEG. Default features pull
+# in formats and codecs we don't need (TIFF, EXR, etc.); the explicit
+# feature list keeps the wasm bundle lean.
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+  "gif",
+] }
+
+# NOTE: HEIC decode is intentionally not wired up yet. The only
+# pure-Rust + wasm-compatible HEIC decoder we found (imazen/heic) is
+# AGPL-3.0 / commercial; adopting it would relicense the workspace.
+# The sniffer rejects HEIC with a distinct error variant so callers
+# can surface a clean message until a license decision is made. See
+# the design spec's "HEIC licensing" section for the open decision.
+
+thiserror = { workspace = true }
+
+[dev-dependencies]
