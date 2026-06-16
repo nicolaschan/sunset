@@ -1,23 +1,19 @@
-name: Deploy web to GitHub Pages
+name: Deploy web to Cloudflare Pages
 
 on:
   push:
     branches:
       - master
       - main
+  pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
 concurrency:
-  group: pages
+  group: pages-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,22 +30,46 @@ jobs:
         run: nix build .#web
 
       # `nix build` produces a read-only result/ symlink into /nix/store; the
-      # Pages upload action needs a regular directory it can read.
+      # Cloudflare Pages upload needs a regular directory it can read.
       - name: Stage artefact
         run: |
           mkdir -p web-dist
           cp -rL result/. web-dist/
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@v3
         with:
-          path: web-dist
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy web-dist --project-name=sunset --branch=${{ github.head_ref || github.ref_name }}
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Comment preview URL on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `Preview deployed to: ${process.env.DEPLOYMENT_URL}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.startsWith('Preview deployed to:'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+          env:
+            DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}
