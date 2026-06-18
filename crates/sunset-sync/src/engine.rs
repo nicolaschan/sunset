@@ -1196,11 +1196,25 @@ where
                 self.handle_subscription_active(filter_hash, receiver, filter, is_self_authored)
                     .await;
             }
-            crate::routing::SubscriptionEntry::Withdrawn => {
+            // A `Withdrawn` is scoped to the provider it names, exactly like
+            // `Active`: only retract our interest when *we* are the named
+            // provider. The provider lives in the entry name (the `Withdrawn`
+            // value is a unit variant). Without this guard, a receiver that
+            // subscribes to one filter via several providers (the
+            // relay-fallback co-arm: `voice/<sender>` via the direct peer AND
+            // via the relay) would, on withdrawing one, tear down the
+            // interest armed by the others — the interest map is keyed by
+            // `FilterHash` alone — silently cutting forwarding. A self-authored
+            // `Withdrawn` reaches every connected peer, so each non-target
+            // provider must ignore it.
+            crate::routing::SubscriptionEntry::Withdrawn
+                if crate::routing::decode_provider_from_name(&entry.name)
+                    .is_some_and(|provider| provider == self.local_peer) =>
+            {
                 self.handle_subscription_withdrawn(filter_hash, receiver)
                     .await;
             }
-            // Active naming someone else: ignored. Recursive
+            // Active/Withdrawn naming someone else: ignored. Recursive
             // subscription (forwarding interest upstream) is not yet
             // implemented.
             _ => {}
