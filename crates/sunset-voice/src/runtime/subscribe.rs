@@ -16,7 +16,7 @@ use futures::FutureExt;
 
 use sunset_core::bus::Filter;
 use sunset_core::identity::IdentityKey;
-use sunset_sync::PeerId;
+use sunset_sync::{FrameVia, PeerId};
 
 use super::state::RuntimeInner;
 use crate::packet::{EncryptedVoicePacket, VoicePacket, decrypt};
@@ -69,6 +69,23 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     continue;
                 }
             };
+            // Direct-path liveness: a frame OR heartbeat that arrived over a
+            // direct (`Secondary`) link proves the direct path is actually
+            // delivering — not merely connected. The voice provider gates the
+            // relay→direct downgrade on this signal so the relay is dropped
+            // only once direct delivery is confirmed (and re-armed if it goes
+            // stale). Observed *before* the frame dedup gate below: a frame
+            // duplicated across a relay/direct overlap is dropped for playback
+            // yet is still proof the direct path works, so it must refresh the
+            // signal. Heartbeats keep a silent-but-connected peer direct-live.
+            if via == FrameVia::Direct {
+                let sent_ms = match &packet {
+                    VoicePacket::Frame { sender_time_ms, .. } => *sender_time_ms,
+                    VoicePacket::Heartbeat { sent_at_ms, .. } => *sent_at_ms,
+                };
+                let st = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sent_ms);
+                inner.direct_frame_liveness.observe(peer.clone(), st).await;
+            }
             match packet {
                 VoicePacket::Frame {
                     payload,

@@ -31,7 +31,7 @@ use sunset_core::Room;
 use sunset_core::bus::{Bus, BusEvent};
 use sunset_store::{ContentBlock, Filter, SignedDatagram, SignedKvEntry, VerifyingKey};
 use sunset_sync::routing::SubscriptionPolicy;
-use sunset_sync::{EngineEvent, PeerId, TransportKind};
+use sunset_sync::{EngineEvent, FrameVia, PeerId, TransportKind};
 use sunset_voice::runtime::{Dialer, FrameSink, PeerStateSink, VoicePeerState, VoiceRuntime};
 
 /// One routing-interest mutation issued by the provider component.
@@ -53,7 +53,8 @@ struct ProviderTestBus {
     events_tx: tokio::sync::mpsc::UnboundedSender<EngineEvent>,
     events_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<EngineEvent>>>,
     durable_sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedKvEntry>>>,
-    ephemeral_sinks: tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SignedDatagram>>>,
+    ephemeral_sinks:
+        tokio::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<(SignedDatagram, FrameVia)>>>,
 }
 
 impl ProviderTestBus {
@@ -75,9 +76,19 @@ impl ProviderTestBus {
         }
     }
 
+    /// Inject an ephemeral datagram delivered over the relay (Primary)
+    /// path — the default for a star where the leaf has no direct link.
     async fn inject(&self, dgram: SignedDatagram) {
+        self.inject_with_via(dgram, FrameVia::Relay).await;
+    }
+
+    /// Inject an ephemeral datagram tagged with the inbound transport that
+    /// carried it. `FrameVia::Direct` simulates a frame/heartbeat that
+    /// arrived over a direct WebRTC (Secondary) link — the signal the
+    /// provider uses to confirm the direct path before dropping the relay.
+    async fn inject_with_via(&self, dgram: SignedDatagram, via: FrameVia) {
         for sink in self.ephemeral_sinks.lock().await.iter() {
-            let _ = sink.send(dgram.clone());
+            let _ = sink.send((dgram.clone(), via));
         }
     }
 }
@@ -166,17 +177,18 @@ impl Bus for ProviderTestBus {
         filter: Filter,
     ) -> tokio::sync::mpsc::UnboundedReceiver<(SignedDatagram, sunset_sync::FrameVia)> {
         let prefix = filter_prefix(&filter);
-        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<SignedDatagram>();
+        let (sink_tx, mut sink_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(SignedDatagram, FrameVia)>();
         self.ephemeral_sinks.lock().await.push(sink_tx);
         let (out_tx, out_rx) =
             tokio::sync::mpsc::unbounded_channel::<(SignedDatagram, sunset_sync::FrameVia)>();
-        // This loopback fixture has no transport substrate, so injected
-        // datagrams are tagged `Local` — provenance derivation from a real
-        // inbound session kind is covered by the engine's own tests.
+        // Carry the injected provenance through unchanged: a test injects a
+        // datagram with the `FrameVia` of the transport that would have
+        // delivered it (`Relay` via `inject`, `Direct` via `inject_with_via`).
         tokio::task::spawn_local(async move {
-            while let Some(d) = sink_rx.recv().await {
+            while let Some((d, via)) = sink_rx.recv().await {
                 if d.name.starts_with(&prefix) {
-                    let _ = out_tx.send((d, sunset_sync::FrameVia::Local));
+                    let _ = out_tx.send((d, via));
                 }
             }
         });
@@ -281,7 +293,44 @@ fn spawn_provider_runtime(
     // presence stream. Both always run together in production.
     tokio::task::spawn_local(tasks.voice_presence_membership);
     tokio::task::spawn_local(tasks.voice_provider);
+    // `subscribe` decodes inbound ephemeral traffic and feeds the
+    // per-provenance liveness the provider consults to confirm a direct
+    // path before dropping the relay. Spawned here so a test that injects
+    // `FrameVia::Direct` traffic drives the real receive path end-to-end.
+    tokio::task::spawn_local(tasks.subscribe);
     (runtime, bus_impl.routing_log.clone())
+}
+
+/// Build a signed, encrypted Direct-or-Relay heartbeat datagram for
+/// `sender` in `room`, on the `voice/<room>/<sender>/hb` subtree the
+/// receive loop listens to. Heartbeats keep a silent-but-connected peer's
+/// per-provenance liveness fresh, so a direct path stays "confirmed" even
+/// when the peer isn't currently talking.
+fn make_heartbeat_datagram(sender: &Identity, room: &Room, seq: u64) -> SignedDatagram {
+    // Real wall-clock send time so the direct-path liveness sweep (which
+    // compares `last_heard_at` against `now`) keeps the peer direct-live for
+    // the whole test rather than immediately staling a year-1970 timestamp.
+    let now_ms = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let pkt = sunset_voice::packet::VoicePacket::Heartbeat {
+        sent_at_ms: now_ms,
+        is_muted: false,
+    };
+    let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seq.wrapping_add(1));
+    let ev = sunset_voice::packet::encrypt(room, 0, &sender.public(), &pkt, &mut rng).unwrap();
+    let payload = postcard::to_stdvec(&ev).unwrap();
+    let room_fp = room.fingerprint().to_hex();
+    let sender_pk = hex::encode(sender.store_verifying_key().as_bytes());
+    let name = Bytes::from(format!("voice/{room_fp}/{sender_pk}/hb"));
+    SignedDatagram {
+        verifying_key: sender.store_verifying_key(),
+        name,
+        payload: Bytes::from(payload),
+        seq,
+        signature: Bytes::new(),
+    }
 }
 
 /// Wait until `pred(log)` holds or the deadline elapses.
@@ -380,10 +429,16 @@ async fn provider_relay_when_no_direct() {
         .await;
 }
 
-/// The provider derives the choice and converges on each event: direct →
-/// drop direct (PeerRemoved) → relay → re-add direct (PeerAdded Secondary)
-/// → direct, issuing exactly the right (un)subscribe sequence, and a
-/// duplicate event does not double-arm.
+/// The provider derives a *set* of providers and converges on each event,
+/// across the full lifecycle: direct link appears (co-arm A + relay) →
+/// direct link drops (PeerRemoved → relay only) → direct link re-appears
+/// (co-arm again, relay kept) → direct traffic confirmed (drop relay). The
+/// load-bearing property is that the relay — the always-available fallback —
+/// is NEVER withdrawn on mere link presence, only once direct delivery is
+/// observed. (The pre-fix version asserted the opposite: that re-adding a
+/// direct link immediately withdrew the relay. That eager withdraw WAS the
+/// dark-window bug — it stranded the sender's audio whenever the direct path
+/// had not yet armed.) A duplicate no-op event must not re-issue any call.
 #[tokio::test(flavor = "current_thread")]
 async fn convergence_via_consequence() {
     tokio::task::LocalSet::new()
@@ -394,6 +449,23 @@ async fn convergence_via_consequence() {
             let a_peer = PeerId(alice.store_verifying_key());
             let relay_peer = PeerId(relay.store_verifying_key());
             let a_filter = voice_filter(&room, &alice.store_verifying_key());
+
+            let sub_a = RoutingCall::SubscribeVia {
+                filter: a_filter.clone(),
+                provider: a_peer.clone(),
+            };
+            let unsub_a = RoutingCall::UnsubscribeVia {
+                filter: a_filter.clone(),
+                provider: a_peer.clone(),
+            };
+            let sub_relay = RoutingCall::SubscribeVia {
+                filter: a_filter.clone(),
+                provider: relay_peer.clone(),
+            };
+            let unsub_relay = RoutingCall::UnsubscribeVia {
+                filter: a_filter.clone(),
+                provider: relay_peer.clone(),
+            };
 
             let bus = ProviderTestBus::new();
             // Start with both relay (Primary) and A direct (Secondary).
@@ -407,14 +479,14 @@ async fn convergence_via_consequence() {
 
             bus.inject_durable(make_presence_entry(&alice, &room)).await;
 
-            // Phase 1: direct link present → provider = A.
+            // Phase 1: direct link present but no direct traffic yet → arm
+            // BOTH the direct peer and the relay (co-armed overlap).
             wait_for_log(&log, |calls| {
-                calls.contains(&RoutingCall::SubscribeVia {
-                    filter: a_filter.clone(),
-                    provider: a_peer.clone(),
-                })
+                calls.contains(&sub_a) && calls.contains(&sub_relay)
             })
             .await;
+            // The relay must not have been withdrawn — direct is unproven.
+            assert!(!log.borrow().contains(&unsub_relay));
             let after_p1 = log.borrow().len();
 
             // A duplicate event must NOT re-arm (idempotent recompute).
@@ -432,27 +504,20 @@ async fn convergence_via_consequence() {
                 "a no-op event must not issue any new routing call"
             );
 
-            // Phase 2: drop the direct link → recompute → provider = relay.
+            // Phase 2: drop the direct link → withdraw A, keep the relay.
             *bus.current_peers.borrow_mut() = vec![(relay_peer.clone(), TransportKind::Primary)];
             bus.events_tx
                 .send(EngineEvent::PeerRemoved {
                     peer_id: a_peer.clone(),
                 })
                 .unwrap();
+            wait_for_log(&log, |calls| calls.contains(&unsub_a)).await;
+            // The relay was already armed in Phase 1 and stays armed.
+            assert!(!log.borrow().contains(&unsub_relay));
 
-            wait_for_log(&log, |calls| {
-                // The switch must withdraw A and arm the relay.
-                calls.contains(&RoutingCall::UnsubscribeVia {
-                    filter: a_filter.clone(),
-                    provider: a_peer.clone(),
-                }) && calls.contains(&RoutingCall::SubscribeVia {
-                    filter: a_filter.clone(),
-                    provider: relay_peer.clone(),
-                })
-            })
-            .await;
-
-            // Phase 3: re-add the direct link → recompute → provider = A.
+            // Phase 3: re-add the direct link → re-arm A, relay STILL kept
+            // (no direct traffic yet). The pre-fix bug lived here: it
+            // withdrew the relay the instant the link reappeared.
             *bus.current_peers.borrow_mut() = vec![
                 (relay_peer.clone(), TransportKind::Primary),
                 (a_peer.clone(), TransportKind::Secondary),
@@ -463,22 +528,97 @@ async fn convergence_via_consequence() {
                     kind: TransportKind::Secondary,
                 })
                 .unwrap();
-
+            // A is re-armed: a fresh SubscribeVia{A} after Phase 2's withdraw.
             wait_for_log(&log, |calls| {
-                // Withdraw the relay and re-arm A (the last such pair).
-                let last_unsub_relay = calls.iter().rposition(|c| {
-                    *c == RoutingCall::UnsubscribeVia {
-                        filter: a_filter.clone(),
-                        provider: relay_peer.clone(),
-                    }
-                });
-                let last_sub_a = calls.iter().rposition(|c| {
-                    *c == RoutingCall::SubscribeVia {
-                        filter: a_filter.clone(),
-                        provider: a_peer.clone(),
-                    }
-                });
-                matches!((last_unsub_relay, last_sub_a), (Some(u), Some(s)) if u < s)
+                let last_unsub_a = calls.iter().rposition(|c| *c == unsub_a);
+                let last_sub_a = calls.iter().rposition(|c| *c == sub_a);
+                matches!((last_unsub_a, last_sub_a), (Some(u), Some(s)) if u < s)
+            })
+            .await;
+            assert!(
+                !log.borrow().contains(&unsub_relay),
+                "relay must stay armed across a direct-link flap until direct traffic is proven"
+            );
+
+            // Phase 4: direct traffic from A actually arrives → the relay is
+            // now redundant and is dropped (the confirmed downgrade).
+            bus.inject_with_via(make_heartbeat_datagram(&alice, &room, 0), FrameVia::Direct)
+                .await;
+            wait_for_log(&log, |calls| calls.contains(&unsub_relay)).await;
+        })
+        .await;
+}
+
+/// Recovery: after the relay has been dropped in favour of a confirmed
+/// direct path, losing the direct (Secondary) link must re-arm the relay
+/// (and withdraw the now-unreachable direct peer) so audio keeps flowing.
+/// The downgrade is reversible — derived from live connectivity + traffic,
+/// not a one-way edge transition.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_link_drop_after_downgrade_rearms_relay() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (me, room) = make_identity_and_room(14);
+            let (alice, _) = make_identity_and_room(15);
+            let (relay, _) = make_identity_and_room(16);
+            let a_peer = PeerId(alice.store_verifying_key());
+            let relay_peer = PeerId(relay.store_verifying_key());
+            let a_filter = voice_filter(&room, &alice.store_verifying_key());
+            let unsub_relay = RoutingCall::UnsubscribeVia {
+                filter: a_filter.clone(),
+                provider: relay_peer.clone(),
+            };
+            let sub_relay = RoutingCall::SubscribeVia {
+                filter: a_filter.clone(),
+                provider: relay_peer.clone(),
+            };
+            let sub_a = RoutingCall::SubscribeVia {
+                filter: a_filter.clone(),
+                provider: a_peer.clone(),
+            };
+            let unsub_a = RoutingCall::UnsubscribeVia {
+                filter: a_filter.clone(),
+                provider: a_peer.clone(),
+            };
+
+            let bus = ProviderTestBus::new();
+            // Co-armed from the start: relay + direct link to A.
+            *bus.current_peers.borrow_mut() = vec![
+                (relay_peer.clone(), TransportKind::Primary),
+                (a_peer.clone(), TransportKind::Secondary),
+            ];
+            let (_rt, log) = spawn_provider_runtime(&me, &room, &bus);
+            tokio::task::yield_now().await;
+            bus.inject_durable(make_presence_entry(&alice, &room)).await;
+
+            // The peer joins and is co-armed (relay + direct) before any
+            // direct traffic flows — the realistic ordering.
+            wait_for_log(&log, |calls| {
+                calls.contains(&sub_a) && calls.contains(&sub_relay)
+            })
+            .await;
+
+            // Confirm the direct path → relay dropped (direct-only).
+            bus.inject_with_via(make_heartbeat_datagram(&alice, &room, 0), FrameVia::Direct)
+                .await;
+            wait_for_log(&log, |calls| calls.contains(&unsub_relay)).await;
+
+            // The direct link drops.
+            *bus.current_peers.borrow_mut() = vec![(relay_peer.clone(), TransportKind::Primary)];
+            bus.events_tx
+                .send(EngineEvent::PeerRemoved {
+                    peer_id: a_peer.clone(),
+                })
+                .unwrap();
+
+            // The relay is re-armed (a SubscribeVia{relay} *after* the
+            // earlier drop) and the unreachable direct peer is withdrawn.
+            wait_for_log(&log, |calls| {
+                let last_unsub_relay = calls.iter().rposition(|c| *c == unsub_relay);
+                let last_sub_relay = calls.iter().rposition(|c| *c == sub_relay);
+                let relay_rearmed =
+                    matches!((last_unsub_relay, last_sub_relay), (Some(u), Some(s)) if u < s);
+                relay_rearmed && calls.contains(&unsub_a)
             })
             .await;
         })
@@ -560,6 +700,79 @@ async fn relay_only_participant_sets_in_call() {
             assert!(
                 result.in_call,
                 "a relay-delivered heartbeat must set in_call via membership_liveness"
+            );
+        })
+        .await;
+}
+
+/// Regression for the relay→direct "dark window".
+///
+/// When a direct (Secondary) link to A appears, the provider must arm the
+/// direct path for A while KEEPING the relay armed — it must not withdraw
+/// the relay until direct traffic from A is actually observed. The pre-fix
+/// code derived a single provider from mere link presence and withdrew the
+/// relay the instant the Secondary link showed up. That stranded A's audio
+/// for as long as A had not yet armed our interest on the direct path
+/// (seconds to minutes, healing only via ~30s anti-entropy), even though A
+/// could still hear us — the exact asymmetric "B can't hear A" bug.
+#[tokio::test(flavor = "current_thread")]
+async fn secondary_link_does_not_withdraw_relay_before_direct_traffic() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (me, room) = make_identity_and_room(11);
+            let (alice, _) = make_identity_and_room(12);
+            let (relay, _) = make_identity_and_room(13);
+            let a_peer = PeerId(alice.store_verifying_key());
+            let relay_peer = PeerId(relay.store_verifying_key());
+            let a_filter = voice_filter(&room, &alice.store_verifying_key());
+
+            let bus = ProviderTestBus::new();
+            // Relay only at first: A is reachable through the relay.
+            *bus.current_peers.borrow_mut() = vec![(relay_peer.clone(), TransportKind::Primary)];
+
+            let (_rt, log) = spawn_provider_runtime(&me, &room, &bus);
+            tokio::task::yield_now().await;
+            bus.inject_durable(make_presence_entry(&alice, &room)).await;
+
+            // Relay-only → relay armed for A.
+            wait_for_log(&log, |calls| {
+                calls.contains(&RoutingCall::SubscribeVia {
+                    filter: a_filter.clone(),
+                    provider: relay_peer.clone(),
+                })
+            })
+            .await;
+
+            // A direct WebRTC (Secondary) link to A appears.
+            *bus.current_peers.borrow_mut() = vec![
+                (relay_peer.clone(), TransportKind::Primary),
+                (a_peer.clone(), TransportKind::Secondary),
+            ];
+            bus.events_tx
+                .send(EngineEvent::PeerAdded {
+                    peer_id: a_peer.clone(),
+                    kind: TransportKind::Secondary,
+                })
+                .unwrap();
+
+            // The provider must arm the direct path for A...
+            wait_for_log(&log, |calls| {
+                calls.contains(&RoutingCall::SubscribeVia {
+                    filter: a_filter.clone(),
+                    provider: a_peer.clone(),
+                })
+            })
+            .await;
+
+            // ...without having withdrawn the relay. No direct traffic has
+            // been observed yet, so the relay is still the only proven path.
+            let snap = log.borrow().clone();
+            assert!(
+                !snap.contains(&RoutingCall::UnsubscribeVia {
+                    filter: a_filter.clone(),
+                    provider: relay_peer.clone(),
+                }),
+                "relay must stay armed until direct traffic from A is observed; log: {snap:?}"
             );
         })
         .await;

@@ -34,6 +34,14 @@ pub use traits::{Dialer, FrameSink, PeerStateSink, VoicePeerState};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const FRAME_STALE_AFTER: Duration = Duration::from_millis(1000);
 const MEMBERSHIP_STALE_AFTER: Duration = Duration::from_secs(5);
+/// Stale-after window for the per-peer *direct-path* liveness that gates
+/// the relay→direct downgrade (see `RuntimeInner::direct_frame_liveness`).
+/// Must exceed `HEARTBEAT_INTERVAL` (2s) so a silent-but-connected peer —
+/// which emits only heartbeats — stays "direct-live" between them; a
+/// tighter window would flap the relay back on during ordinary silence.
+/// 5s tolerates two missed heartbeats before declaring the direct path
+/// dead and re-arming the relay.
+const DIRECT_PATH_STALE_AFTER: Duration = Duration::from_secs(5);
 pub(crate) const VOICE_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const VOICE_PRESENCE_TTL: Duration = Duration::from_secs(6);
 /// Stale-after window for the durable-presence-driven `in_voice_channel`
@@ -88,6 +96,7 @@ impl VoiceRuntime {
 
         let frame_liveness = Liveness::new(FRAME_STALE_AFTER);
         let membership_liveness = Liveness::new(MEMBERSHIP_STALE_AFTER);
+        let direct_frame_liveness = Liveness::new(DIRECT_PATH_STALE_AFTER);
         let voice_presence_liveness = Liveness::new(VOICE_PRESENCE_STALE_AFTER);
 
         let inner = Rc::new(state::RuntimeInner {
@@ -110,6 +119,7 @@ impl VoiceRuntime {
             decoders: RefCell::new(Default::default()),
             frame_liveness,
             membership_liveness,
+            direct_frame_liveness,
             voice_presence_liveness,
             peer_envelope_hwm: RefCell::new(Default::default()),
             auto_connect_state: RefCell::new(Default::default()),
