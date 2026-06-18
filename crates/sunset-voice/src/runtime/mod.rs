@@ -42,6 +42,15 @@ const MEMBERSHIP_STALE_AFTER: Duration = Duration::from_secs(5);
 /// 5s tolerates two missed heartbeats before declaring the direct path
 /// dead and re-arming the relay.
 const DIRECT_PATH_STALE_AFTER: Duration = Duration::from_secs(5);
+// Enforce the "must exceed the heartbeat interval" invariant at compile
+// time, not just in prose: if a future edit lowers DIRECT_PATH_STALE_AFTER
+// at or below HEARTBEAT_INTERVAL, a silent-but-connected peer would stale
+// between heartbeats and flap the relay back on. This is the kind of
+// load-bearing relationship that must fail the build, not the call.
+const _: () = assert!(
+    DIRECT_PATH_STALE_AFTER.as_millis() > HEARTBEAT_INTERVAL.as_millis(),
+    "DIRECT_PATH_STALE_AFTER must exceed HEARTBEAT_INTERVAL"
+);
 pub(crate) const VOICE_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const VOICE_PRESENCE_TTL: Duration = Duration::from_secs(6);
 /// Stale-after window for the durable-presence-driven `in_voice_channel`

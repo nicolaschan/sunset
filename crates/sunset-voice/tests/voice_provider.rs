@@ -356,6 +356,52 @@ fn voice_filter(room: &Room, participant: &VerifyingKey) -> Bytes {
     Bytes::from(format!("voice/{room_fp}/{pk_hex}"))
 }
 
+/// The scaffolding every convergence test needs: identities for self, a
+/// participant `A`, and a relay; their peer ids; and the four `RoutingCall`
+/// constants the assertions match on (subscribe/unsubscribe of A's voice
+/// filter via A directly vs via the relay). Destructure it into the same
+/// local names the test bodies use, so only the setup line changes:
+/// `let ProviderFixture { me, a_peer, sub_relay, .. } = provider_fixture(..);`
+struct ProviderFixture {
+    me: Identity,
+    room: Rc<Room>,
+    alice: Identity,
+    a_peer: PeerId,
+    relay_peer: PeerId,
+    sub_a: RoutingCall,
+    unsub_a: RoutingCall,
+    sub_relay: RoutingCall,
+    unsub_relay: RoutingCall,
+}
+
+fn provider_fixture(me_seed: u8, alice_seed: u8, relay_seed: u8) -> ProviderFixture {
+    let (me, room) = make_identity_and_room(me_seed);
+    let (alice, _) = make_identity_and_room(alice_seed);
+    let (relay, _) = make_identity_and_room(relay_seed);
+    let a_peer = PeerId(alice.store_verifying_key());
+    let relay_peer = PeerId(relay.store_verifying_key());
+    let a_filter = voice_filter(&room, &alice.store_verifying_key());
+    let sub = |provider: &PeerId| RoutingCall::SubscribeVia {
+        filter: a_filter.clone(),
+        provider: provider.clone(),
+    };
+    let unsub = |provider: &PeerId| RoutingCall::UnsubscribeVia {
+        filter: a_filter.clone(),
+        provider: provider.clone(),
+    };
+    ProviderFixture {
+        sub_a: sub(&a_peer),
+        unsub_a: unsub(&a_peer),
+        sub_relay: sub(&relay_peer),
+        unsub_relay: unsub(&relay_peer),
+        me,
+        room,
+        alice,
+        a_peer,
+        relay_peer,
+    }
+}
+
 /// Roster {A}; a direct (A, Secondary) link exists → the provider arms
 /// `subscribe_via(voice/{A}, provider=A)` and never arms the relay for A.
 #[tokio::test(flavor = "current_thread")]
@@ -443,29 +489,17 @@ async fn provider_relay_when_no_direct() {
 async fn convergence_via_consequence() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let (me, room) = make_identity_and_room(6);
-            let (alice, _) = make_identity_and_room(7);
-            let (relay, _) = make_identity_and_room(8);
-            let a_peer = PeerId(alice.store_verifying_key());
-            let relay_peer = PeerId(relay.store_verifying_key());
-            let a_filter = voice_filter(&room, &alice.store_verifying_key());
-
-            let sub_a = RoutingCall::SubscribeVia {
-                filter: a_filter.clone(),
-                provider: a_peer.clone(),
-            };
-            let unsub_a = RoutingCall::UnsubscribeVia {
-                filter: a_filter.clone(),
-                provider: a_peer.clone(),
-            };
-            let sub_relay = RoutingCall::SubscribeVia {
-                filter: a_filter.clone(),
-                provider: relay_peer.clone(),
-            };
-            let unsub_relay = RoutingCall::UnsubscribeVia {
-                filter: a_filter.clone(),
-                provider: relay_peer.clone(),
-            };
+            let ProviderFixture {
+                me,
+                room,
+                alice,
+                a_peer,
+                relay_peer,
+                sub_a,
+                unsub_a,
+                sub_relay,
+                unsub_relay,
+            } = provider_fixture(6, 7, 8);
 
             let bus = ProviderTestBus::new();
             // Start with both relay (Primary) and A direct (Secondary).
@@ -558,28 +592,17 @@ async fn convergence_via_consequence() {
 async fn direct_link_drop_after_downgrade_rearms_relay() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let (me, room) = make_identity_and_room(14);
-            let (alice, _) = make_identity_and_room(15);
-            let (relay, _) = make_identity_and_room(16);
-            let a_peer = PeerId(alice.store_verifying_key());
-            let relay_peer = PeerId(relay.store_verifying_key());
-            let a_filter = voice_filter(&room, &alice.store_verifying_key());
-            let unsub_relay = RoutingCall::UnsubscribeVia {
-                filter: a_filter.clone(),
-                provider: relay_peer.clone(),
-            };
-            let sub_relay = RoutingCall::SubscribeVia {
-                filter: a_filter.clone(),
-                provider: relay_peer.clone(),
-            };
-            let sub_a = RoutingCall::SubscribeVia {
-                filter: a_filter.clone(),
-                provider: a_peer.clone(),
-            };
-            let unsub_a = RoutingCall::UnsubscribeVia {
-                filter: a_filter.clone(),
-                provider: a_peer.clone(),
-            };
+            let ProviderFixture {
+                me,
+                room,
+                alice,
+                a_peer,
+                relay_peer,
+                sub_a,
+                unsub_a,
+                sub_relay,
+                unsub_relay,
+            } = provider_fixture(14, 15, 16);
 
             let bus = ProviderTestBus::new();
             // Co-armed from the start: relay + direct link to A.
@@ -719,12 +742,17 @@ async fn relay_only_participant_sets_in_call() {
 async fn secondary_link_does_not_withdraw_relay_before_direct_traffic() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let (me, room) = make_identity_and_room(11);
-            let (alice, _) = make_identity_and_room(12);
-            let (relay, _) = make_identity_and_room(13);
-            let a_peer = PeerId(alice.store_verifying_key());
-            let relay_peer = PeerId(relay.store_verifying_key());
-            let a_filter = voice_filter(&room, &alice.store_verifying_key());
+            let ProviderFixture {
+                me,
+                room,
+                alice,
+                a_peer,
+                relay_peer,
+                sub_a,
+                sub_relay,
+                unsub_relay,
+                ..
+            } = provider_fixture(11, 12, 13);
 
             let bus = ProviderTestBus::new();
             // Relay only at first: A is reachable through the relay.
@@ -735,13 +763,7 @@ async fn secondary_link_does_not_withdraw_relay_before_direct_traffic() {
             bus.inject_durable(make_presence_entry(&alice, &room)).await;
 
             // Relay-only → relay armed for A.
-            wait_for_log(&log, |calls| {
-                calls.contains(&RoutingCall::SubscribeVia {
-                    filter: a_filter.clone(),
-                    provider: relay_peer.clone(),
-                })
-            })
-            .await;
+            wait_for_log(&log, |calls| calls.contains(&sub_relay)).await;
 
             // A direct WebRTC (Secondary) link to A appears.
             *bus.current_peers.borrow_mut() = vec![
@@ -756,22 +778,13 @@ async fn secondary_link_does_not_withdraw_relay_before_direct_traffic() {
                 .unwrap();
 
             // The provider must arm the direct path for A...
-            wait_for_log(&log, |calls| {
-                calls.contains(&RoutingCall::SubscribeVia {
-                    filter: a_filter.clone(),
-                    provider: a_peer.clone(),
-                })
-            })
-            .await;
+            wait_for_log(&log, |calls| calls.contains(&sub_a)).await;
 
             // ...without having withdrawn the relay. No direct traffic has
             // been observed yet, so the relay is still the only proven path.
             let snap = log.borrow().clone();
             assert!(
-                !snap.contains(&RoutingCall::UnsubscribeVia {
-                    filter: a_filter.clone(),
-                    provider: relay_peer.clone(),
-                }),
+                !snap.contains(&unsub_relay),
                 "relay must stay armed until direct traffic from A is observed; log: {snap:?}"
             );
         })
