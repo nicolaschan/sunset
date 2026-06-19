@@ -116,8 +116,18 @@ impl Liveness {
     /// was produced at `sender_time`. Out-of-order observations (older
     /// than our current `last_heard_at`) are ignored — liveness state
     /// never goes backwards from a single observation.
+    ///
+    /// `sender_time` is **clamped to our receive-time**: a peer cannot have
+    /// been heard from the future. `sender_time` is untrusted network input
+    /// (a sender-claimed clock value), and a value ahead of our clock —
+    /// ordinary skew on `Date.now()`-backed WASM clocks, or a hostile peer —
+    /// would otherwise make `sweep_stale`'s `now.duration_since(last_heard_at)`
+    /// underflow to `Err` and the peer would *never* go Stale, silently
+    /// defeating stale detection. Clamping makes that state unreachable by
+    /// construction.
     pub async fn observe(&self, peer: PeerId, sender_time: SystemTime) {
         let now = self.clock.now();
+        let sender_time = sender_time.min(now);
         let mut inner = self.inner.lock().await;
         let observe_change = Self::record_observation(&mut inner, &peer, sender_time);
         let stale_changes = Self::sweep_stale(&mut inner, now, self.stale_after, Some(&peer));
@@ -538,6 +548,34 @@ mod tests {
         fn sender_time(&self) -> SystemTime {
             self.sender_time
         }
+    }
+
+    /// A sender-claimed timestamp in the *future* (clock skew or a hostile
+    /// peer) must be clamped to our receive-time, otherwise
+    /// `sweep_stale`'s `now.duration_since(last_heard_at)` underflows to
+    /// `Err` forever and the peer can never go Stale — silently defeating
+    /// stale detection (and, e.g., permanently wedging a relay→direct
+    /// downgrade that gates on it).
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_clamps_future_sender_time_to_receive_time() {
+        let clock = MockClock::new(t_secs(100));
+        let liveness = Liveness::with_clock(Duration::from_secs(3), clock.clone());
+        let mut sub = liveness.subscribe().await;
+
+        // Peer claims a wildly future send-time.
+        liveness.observe(pk(1), t_secs(10_000)).await;
+        let live = sub.next().await.expect("live emitted");
+        assert_eq!(live.state, LivenessState::Live);
+        // Stored time is clamped to receive-time, not the future claim.
+        assert_eq!(live.last_heard_at, t_secs(100));
+
+        // Advancing past the window must still stale the peer — without the
+        // clamp the future timestamp would pin it Live forever.
+        clock.set(t_secs(104));
+        liveness.run_sweep().await;
+        let stale = sub.next().await.expect("stale emitted");
+        assert_eq!(stale.peer, pk(1));
+        assert_eq!(stale.state, LivenessState::Stale);
     }
 
     #[tokio::test(flavor = "current_thread")]

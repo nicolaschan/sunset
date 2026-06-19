@@ -9,14 +9,14 @@
 //!   the combiner can emit it.
 
 use std::rc::Weak;
-use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::FutureExt;
 
 use sunset_core::bus::Filter;
 use sunset_core::identity::IdentityKey;
-use sunset_sync::PeerId;
+use sunset_core::liveness::HasSenderTime;
+use sunset_sync::{FrameVia, PeerId};
 
 use super::state::RuntimeInner;
 use crate::packet::{EncryptedVoicePacket, VoicePacket, decrypt};
@@ -69,15 +69,28 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                     continue;
                 }
             };
+            // Sender-claimed production time, in one place via `HasSenderTime`
+            // (clamped to receive-time inside `Liveness::observe`). Shared by
+            // all three liveness observers below.
+            let send_time = packet.sender_time();
+            // Direct-path liveness: a frame OR heartbeat that arrived over a
+            // direct (`Secondary`) link proves the direct path is actually
+            // delivering — not merely connected. The voice provider gates the
+            // relay→direct downgrade on this signal so the relay is dropped
+            // only once direct delivery is confirmed (and re-armed if it goes
+            // stale). Observed *before* the frame dedup gate below: a frame
+            // duplicated across a relay/direct overlap is dropped for playback
+            // yet is still proof the direct path works, so it must refresh the
+            // signal. Heartbeats keep a silent-but-connected peer direct-live.
+            if via == FrameVia::Direct {
+                inner
+                    .direct_frame_liveness
+                    .observe(peer.clone(), send_time)
+                    .await;
+            }
             match packet {
-                VoicePacket::Frame {
-                    payload,
-                    sender_time_ms,
-                    ..
-                } => {
-                    let st =
-                        SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sender_time_ms);
-                    inner.frame_liveness.observe(peer.clone(), st).await;
+                VoicePacket::Frame { payload, .. } => {
+                    inner.frame_liveness.observe(peer.clone(), send_time).await;
                     // Receiver-side dedup on the envelope seq. During a
                     // direct/relay switchover a receiver briefly gets the
                     // same frame both ways; deliver it once. The gate uses
@@ -160,12 +173,11 @@ pub(crate) fn spawn(weak: Weak<RuntimeInner>) -> futures::future::LocalBoxFuture
                         Err(e) => tracing::warn!(error = %e, "decode failed"),
                     }
                 }
-                VoicePacket::Heartbeat {
-                    sent_at_ms,
-                    is_muted,
-                } => {
-                    let st = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(sent_at_ms);
-                    inner.membership_liveness.observe(peer.clone(), st).await;
+                VoicePacket::Heartbeat { is_muted, .. } => {
+                    inner
+                        .membership_liveness
+                        .observe(peer.clone(), send_time)
+                        .await;
 
                     // Emit immediately on mute change.
                     inner.apply(peer.clone(), |s| s.is_muted = is_muted);

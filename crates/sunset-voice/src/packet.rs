@@ -34,6 +34,22 @@ pub enum VoicePacket {
     },
 }
 
+impl sunset_core::liveness::HasSenderTime for VoicePacket {
+    /// The sender-claimed production time, carried per-variant
+    /// (`Frame.sender_time_ms` / `Heartbeat.sent_at_ms`). This is the single
+    /// place the millisecond field is turned into a `SystemTime`, so every
+    /// liveness observer (`frame`/`membership`/`direct_frame`) shares one
+    /// conversion. `Liveness::observe` clamps the result to receive-time, so
+    /// a future-claimed timestamp cannot defeat stale detection.
+    fn sender_time(&self) -> std::time::SystemTime {
+        let ms = match self {
+            VoicePacket::Frame { sender_time_ms, .. } => *sender_time_ms,
+            VoicePacket::Heartbeat { sent_at_ms, .. } => *sent_at_ms,
+        };
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedVoicePacket {
     pub nonce: [u8; 24],

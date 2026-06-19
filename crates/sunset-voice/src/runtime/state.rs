@@ -57,6 +57,18 @@ pub(crate) struct RuntimeInner {
 
     pub frame_liveness: Arc<Liveness>,
     pub membership_liveness: Arc<Liveness>,
+    /// Tracks "this peer's ephemeral voice traffic (frames or heartbeats)
+    /// arrived over a direct `Secondary` link recently" — i.e. the direct
+    /// path is actually *delivering*, not merely connected. The voice
+    /// provider consults this before dropping a peer's relay subscription:
+    /// the relay (the always-available fallback) is withdrawn only once a
+    /// direct path is proven live, and re-armed if it goes stale. This is
+    /// what makes the relay→direct downgrade gap-free by construction — the
+    /// provider never tears down the working path on a mere connectivity
+    /// proxy. Fed from `subscribe.rs` on `FrameVia::Direct` arrivals; its
+    /// stale window is wider than the heartbeat interval so a
+    /// silent-but-connected peer stays "direct-live" between heartbeats.
+    pub direct_frame_liveness: Arc<Liveness>,
     /// Tracks "this peer published a fresh durable `voice-presence`
     /// entry recently" — the source of truth for `in_voice_channel`.
     /// Independent of frame/heartbeat liveness because presence

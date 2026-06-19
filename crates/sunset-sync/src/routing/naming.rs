@@ -42,6 +42,26 @@ pub fn is_subscription_name(name: &[u8]) -> bool {
     name.starts_with(SUBSCRIBE_PREFIX)
 }
 
+/// Extract the provider `PeerId` from a `_sunset-sync/subscribe/<hex>/<hex>`
+/// entry name. Returns None if the name doesn't have the expected shape.
+/// Inverse of the provider half of [`subscription_name`].
+///
+/// The provider lives in the entry *name*, not in the
+/// [`crate::routing::SubscriptionEntry::Withdrawn`] value (which is a unit
+/// variant), so this is how a `Withdrawn` is scoped to the provider it
+/// targets — the symmetric counterpart of the `provider` field an `Active`
+/// carries. An engine must only act on a `Withdrawn` that names *it* as the
+/// provider, exactly as it only arms an `Active` that does.
+pub fn decode_provider_from_name(name: &[u8]) -> Option<PeerId> {
+    let rest = name.strip_prefix(SUBSCRIBE_PREFIX)?;
+    let rest = std::str::from_utf8(rest).ok()?;
+    let (_hash_hex, provider_hex) = rest.split_once('/')?;
+    let bytes = hex::decode(provider_hex).ok()?;
+    Some(PeerId(sunset_store::VerifyingKey::new(
+        Bytes::copy_from_slice(&bytes),
+    )))
+}
+
 /// Extract the filter-hash component from a `_sunset-sync/subscribe/<hex>/<hex>`
 /// entry name. Returns None if the name doesn't have the expected shape.
 /// Inverse of `subscription_name`.
@@ -121,6 +141,44 @@ mod tests {
         let name = subscription_name(&f, &p);
         let hash = decode_filter_hash_from_name(&name).expect("decode");
         assert_eq!(hash, crate::routing::filter_hash(&f));
+    }
+
+    #[test]
+    fn decode_provider_from_name_round_trip() {
+        let f = Filter::Namespace(Bytes::from_static(b"room/x"));
+        for p in [pid(b"provider-1"), pid(b"a-much-longer-provider-key-32by")] {
+            let name = subscription_name(&f, &p);
+            assert_eq!(decode_provider_from_name(&name), Some(p));
+        }
+    }
+
+    /// The decoded provider distinguishes two subscriptions to the same
+    /// filter via different providers — the property the provider-scoped
+    /// `Withdrawn` handling relies on.
+    #[test]
+    fn decode_provider_from_name_distinguishes_providers() {
+        let f = Filter::Namespace(Bytes::from_static(b"room/x"));
+        let p1 = pid(b"provider-1");
+        let p2 = pid(b"provider-2");
+        assert_eq!(
+            decode_provider_from_name(&subscription_name(&f, &p1)),
+            Some(p1)
+        );
+        assert_eq!(
+            decode_provider_from_name(&subscription_name(&f, &p2)),
+            Some(p2)
+        );
+    }
+
+    #[test]
+    fn decode_provider_from_name_rejects_non_subscription_names() {
+        assert_eq!(decode_provider_from_name(b""), None);
+        assert_eq!(decode_provider_from_name(b"chat/room/general"), None);
+        assert_eq!(decode_provider_from_name(LINKS_NAME), None);
+        // Missing the `/provider` segment.
+        let mut name = Vec::from(SUBSCRIBE_PREFIX);
+        name.extend_from_slice(&b"a".repeat(64));
+        assert_eq!(decode_provider_from_name(&name), None);
     }
 
     #[test]
