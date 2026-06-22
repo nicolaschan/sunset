@@ -10,12 +10,14 @@ import { Ok, Error as GError } from "../../prelude.mjs";
 
 let ctx = null;
 const peers = new Map(); // peerHex -> { worklet, gain }
-// peerHex -> gain to apply to this peer's GainNode. Survives slot
-// teardown (dropPeer / stopCapture / call end) and the peer leaving and
-// rejoining, so a volume the user set — or one rehydrated from the
-// persisted cache at startup, before any audio has arrived — is applied
-// the moment the GainNode is (re)created in deliverFrame, not lost to
-// the hardcoded unity default. Intentionally NOT cleared on stopCapture.
+// peerHex -> the gain this peer's GainNode should currently have: the
+// user's chosen volume, or 0 while they're muted-for-me. Written by
+// setPeerVolume on every volume/mute change and seeded from the
+// persisted volume cache at startup (before any audio has arrived).
+// Survives slot teardown (dropPeer / stopCapture / call end) and the
+// peer leaving and rejoining, so the node is (re)created at the right
+// gain in deliverFrame instead of the hardcoded unity default.
+// Intentionally NOT cleared on stopCapture.
 const desiredGain = new Map();
 let captureNode = null;
 let captureStream = null;
@@ -395,11 +397,11 @@ export function deliverFrame(peerHex, seq, pcm) {
       outputChannelCount: [2],
     });
     const g = ctx.createGain();
-    // Start at the gain the user last chose for this peer (or rehydrated
-    // from the persisted cache), falling back to unity for a peer we've
-    // never heard before. Without this the node would always open at 1.0
-    // and a remembered volume wouldn't take effect until the user nudged
-    // the slider again.
+    // Open at the gain this peer should currently have — their chosen
+    // volume, or 0 if muted-for-me — falling back to unity for a peer
+    // we've never heard before. Without this the node would always open
+    // at 1.0 and a remembered volume (or mute) wouldn't take effect
+    // until the user nudged the slider again.
     g.gain.value = desiredGain.get(peerHex) ?? 1.0;
     w.connect(g).connect(ctx.destination);
     slot = { worklet: w, gain: g };
@@ -440,9 +442,10 @@ const PEER_GAIN_MAX = 16.0;
 
 export function setPeerVolume(peerHex, gain) {
   const clamped = Math.max(0, Math.min(PEER_GAIN_MAX, gain));
-  // Record the desired gain unconditionally so it's applied when this
-  // peer's GainNode is (re)created later — covers volumes set before the
-  // first frame arrives and volumes rehydrated from the cache at startup.
+  // Record the gain unconditionally so it's reapplied when this peer's
+  // GainNode is (re)created later — covers gains set before the first
+  // frame arrives, mute (gain 0), and volumes rehydrated from the cache
+  // at startup.
   desiredGain.set(peerHex, clamped);
   const slot = peers.get(peerHex);
   if (slot) slot.gain.gain.value = clamped;

@@ -241,10 +241,12 @@ pub type Model {
     /// the applied GainNode. Volumes are seeded from `peer_volume_cache`
     /// at startup; denoise/deafened are session-local and reset each load.
     voice_settings: Dict(String, domain.VoiceSettings),
-    /// Persisted FIFO cache of the volumes the user chose per peer, the
-    /// single source of truth that survives reload. The volume in
-    /// `voice_settings` is kept in sync through one write path
-    /// (`put_member_volume`); no other code writes either independently.
+    /// Persisted FIFO cache of the volumes the user chose per peer — the
+    /// source of truth for volume that survives reload. The *volume* in
+    /// `voice_settings` mirrors this cache, and both are written only
+    /// through `put_member_volume`. (The denoise/deafened fields of
+    /// `voice_settings` are owned by the `Toggle*` handlers, which leave
+    /// the volume untouched.)
     peer_volume_cache: VolumeCache,
     /// Engine handle. None until the wasm bundle finishes initialising.
     client: Option(ClientHandle),
@@ -737,14 +739,16 @@ fn peer_level_for_member(
   }
 }
 
-/// The single write path for a user-chosen peer volume. Stores `next`
+/// The single write path for a user-chosen peer *volume*. Stores `next`
 /// as the live settings, applies the matching gain to the audio bridge,
 /// and — for real peers, not the local "output volume" monitoring row —
 /// records the percent in the persisted FIFO cache and writes it back to
 /// localStorage. Routing both the slider (`SetMemberVolume`) and the
-/// reset action (`ResetMemberVoice`) through here is what keeps
-/// `voice_settings` and `peer_volume_cache` from drifting: exactly one
-/// place updates either.
+/// reset action (`ResetMemberVoice`) through here is what keeps the
+/// volume in `voice_settings` and `peer_volume_cache` from drifting:
+/// every volume change goes through this one function. (The `Toggle*`
+/// handlers write `voice_settings`' denoise/deafened fields but never
+/// the volume, so they don't touch the cache.)
 fn put_member_volume(
   model: Model,
   hex: String,

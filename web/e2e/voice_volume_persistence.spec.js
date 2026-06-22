@@ -255,6 +255,21 @@ test("peer volume persists across reload and re-applies to the recreated GainNod
     alice.page.locator('[data-testid="voice-popover-volume"]'),
   ).toHaveValue("300", { timeout: 2_000 });
 
+  // Reset bob via the popover's reset control: it routes through the same
+  // write path, so it must restore unity gain, snap the slider to 100,
+  // AND rewrite the remembered 300 to 100 in the persisted cache.
+  await alice.page.locator('[data-testid="voice-popover-reset"]').click();
+  await expectPeerGainCloseTo(alice.page, bobHex, 1.0);
+  await expect(
+    alice.page.locator('[data-testid="voice-popover-volume"]'),
+  ).toHaveValue("100", { timeout: 2_000 });
+  await expect
+    .poll(() => readVolumeCache(alice.page), {
+      timeout: 2_000,
+      message: "reset should rewrite the cache to bob@100",
+    })
+    .toEqual([[bobHex, 100]]);
+
   await alice.ctx.close();
   await bob.ctx.close();
 });

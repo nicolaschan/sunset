@@ -6,10 +6,12 @@
 ////
 //// Eviction is first-in-first-out, bounded by `capacity`: when a new
 //// peer's volume is recorded and the cache is full, the oldest-inserted
-//// entry is dropped. Re-recording a peer already in the cache updates
-//// its value in place and does NOT refresh its position — strict FIFO,
-//// not LRU. So the peers you keep are the 20 you most recently met, not
-//// the 20 you most recently adjusted.
+//// entry is dropped. A peer is inserted the first time its volume is
+//// set, and re-setting a peer already in the cache updates its value in
+//// place without moving it — strict FIFO, not LRU. So the cache holds
+//// the volumes for the `capacity` peers whose volume you most recently
+//// *first* set; re-adjusting an existing peer does not protect it from
+//// aging out.
 
 import gleam/list
 

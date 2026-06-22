@@ -30,22 +30,34 @@ function safeParseRooms(raw) {
   }
 }
 
-export function readJoinedRooms() {
+// Read a JSON-array localStorage value under `key`, sanitize the raw
+// string into a plain JS array with `sanitize`, and hand back a Gleam
+// list. localStorage can throw in private mode / disabled storage, so
+// fall back to an empty list rather than propagate.
+function readJsonList(key, sanitize) {
   try {
-    return toList(safeParseRooms(localStorage.getItem(ROOMS_KEY)));
+    return toList(sanitize(localStorage.getItem(key)));
   } catch {
-    // localStorage can throw in private mode / disabled storage; fall
-    // back to an empty list and don't propagate.
     return toList([]);
   }
 }
 
-export function writeJoinedRooms(rooms) {
+// Persist a Gleam list as a JSON array under `key`. Best-effort: storage
+// failures (private mode / quota) are swallowed.
+function writeJsonList(key, list) {
   try {
-    localStorage.setItem(ROOMS_KEY, JSON.stringify(listToArray(rooms)));
+    localStorage.setItem(key, JSON.stringify(listToArray(list)));
   } catch {
     // ignored: storage is best-effort.
   }
+}
+
+export function readJoinedRooms() {
+  return readJsonList(ROOMS_KEY, safeParseRooms);
+}
+
+export function writeJoinedRooms(rooms) {
+  writeJsonList(ROOMS_KEY, rooms);
 }
 
 export function readHash() {
@@ -150,22 +162,14 @@ function safeParsePeerVolumes(raw) {
 /// Read the persisted (peerHex, percent) volume pairs, oldest-first.
 /// Empty list when nothing is stored or storage is unavailable.
 export function readPeerVolumes() {
-  try {
-    return toList(safeParsePeerVolumes(localStorage.getItem(PEER_VOLUMES_KEY)));
-  } catch {
-    return toList([]);
-  }
+  return readJsonList(PEER_VOLUMES_KEY, safeParsePeerVolumes);
 }
 
 /// Persist the (peerHex, percent) volume pairs. Each pair arrives as a
 /// Gleam 2-tuple, which is a 2-element array on the JS target, so the
 /// list serializes straight to a JSON array of `[hex, percent]`.
 export function writePeerVolumes(pairs) {
-  try {
-    localStorage.setItem(PEER_VOLUMES_KEY, JSON.stringify(listToArray(pairs)));
-  } catch {
-    // ignored: storage is best-effort.
-  }
+  writeJsonList(PEER_VOLUMES_KEY, pairs);
 }
 
 // True if the OS / browser is currently advertising a dark colour
