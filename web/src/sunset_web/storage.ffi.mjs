@@ -121,6 +121,53 @@ export function writeSelfName(value) {
   } catch {}
 }
 
+// Per-peer playback volumes the user has chosen, as a JSON array of
+// [peerHex, percent] pairs ordered oldest-first. The Gleam side
+// (`voice_volume_cache`) owns the FIFO bound + eviction; this layer only
+// serializes the ordered list it hands down.
+const PEER_VOLUMES_KEY = "sunset/peer-volumes";
+
+function safeParsePeerVolumes(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (p) =>
+          Array.isArray(p) &&
+          p.length === 2 &&
+          typeof p[0] === "string" &&
+          typeof p[1] === "number" &&
+          Number.isFinite(p[1]),
+      )
+      .map((p) => [p[0], Math.trunc(p[1])]);
+  } catch {
+    return [];
+  }
+}
+
+/// Read the persisted (peerHex, percent) volume pairs, oldest-first.
+/// Empty list when nothing is stored or storage is unavailable.
+export function readPeerVolumes() {
+  try {
+    return toList(safeParsePeerVolumes(localStorage.getItem(PEER_VOLUMES_KEY)));
+  } catch {
+    return toList([]);
+  }
+}
+
+/// Persist the (peerHex, percent) volume pairs. Each pair arrives as a
+/// Gleam 2-tuple, which is a 2-element array on the JS target, so the
+/// list serializes straight to a JSON array of `[hex, percent]`.
+export function writePeerVolumes(pairs) {
+  try {
+    localStorage.setItem(PEER_VOLUMES_KEY, JSON.stringify(listToArray(pairs)));
+  } catch {
+    // ignored: storage is best-effort.
+  }
+}
+
 // True if the OS / browser is currently advertising a dark colour
 // scheme via the prefers-color-scheme media query. Used as the
 // fallback when the user hasn't picked a theme yet.

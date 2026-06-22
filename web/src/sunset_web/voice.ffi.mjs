@@ -10,6 +10,13 @@ import { Ok, Error as GError } from "../../prelude.mjs";
 
 let ctx = null;
 const peers = new Map(); // peerHex -> { worklet, gain }
+// peerHex -> gain to apply to this peer's GainNode. Survives slot
+// teardown (dropPeer / stopCapture / call end) and the peer leaving and
+// rejoining, so a volume the user set — or one rehydrated from the
+// persisted cache at startup, before any audio has arrived — is applied
+// the moment the GainNode is (re)created in deliverFrame, not lost to
+// the hardcoded unity default. Intentionally NOT cleared on stopCapture.
+const desiredGain = new Map();
 let captureNode = null;
 let captureStream = null;
 
@@ -388,7 +395,12 @@ export function deliverFrame(peerHex, seq, pcm) {
       outputChannelCount: [2],
     });
     const g = ctx.createGain();
-    g.gain.value = 1.0;
+    // Start at the gain the user last chose for this peer (or rehydrated
+    // from the persisted cache), falling back to unity for a peer we've
+    // never heard before. Without this the node would always open at 1.0
+    // and a remembered volume wouldn't take effect until the user nudged
+    // the slider again.
+    g.gain.value = desiredGain.get(peerHex) ?? 1.0;
     w.connect(g).connect(ctx.destination);
     slot = { worklet: w, gain: g };
     peers.set(peerHex, slot);
@@ -427,9 +439,13 @@ export function dropPeer(peerHex) {
 const PEER_GAIN_MAX = 16.0;
 
 export function setPeerVolume(peerHex, gain) {
+  const clamped = Math.max(0, Math.min(PEER_GAIN_MAX, gain));
+  // Record the desired gain unconditionally so it's applied when this
+  // peer's GainNode is (re)created later — covers volumes set before the
+  // first frame arrives and volumes rehydrated from the cache at startup.
+  desiredGain.set(peerHex, clamped);
   const slot = peers.get(peerHex);
-  if (!slot) return;
-  slot.gain.gain.value = Math.max(0, Math.min(PEER_GAIN_MAX, gain));
+  if (slot) slot.gain.gain.value = clamped;
 }
 
 export function getPeerGain(peerHex) {

@@ -62,6 +62,7 @@ import sunset_web/views/voice_minibar
 import sunset_web/views/voice_popover
 import sunset_web/voice
 import sunset_web/voice_volume
+import sunset_web/voice_volume_cache.{type VolumeCache}
 
 /// Relays the client dials at startup when the URL has no
 /// `?relay=…` query parameter. Each entry is fed through
@@ -235,9 +236,16 @@ pub type Model {
     /// Name of the room currently hovered over while dragging — used
     /// for the visible drop-target indicator.
     drag_over_room: Option(String),
-    /// Per-member voice tweaks (volume / denoise / deafened),
-    /// keyed by member name. Seeded from the fixture once.
+    /// Per-member voice tweaks (volume / denoise / deafened), keyed by
+    /// verifying-key hex. The live working copy: drives the popover and
+    /// the applied GainNode. Volumes are seeded from `peer_volume_cache`
+    /// at startup; denoise/deafened are session-local and reset each load.
     voice_settings: Dict(String, domain.VoiceSettings),
+    /// Persisted FIFO cache of the volumes the user chose per peer, the
+    /// single source of truth that survives reload. The volume in
+    /// `voice_settings` is kept in sync through one write path
+    /// (`put_member_volume`); no other code writes either independently.
+    peer_volume_cache: VolumeCache,
     /// Engine handle. None until the wasm bundle finishes initialising.
     client: Option(ClientHandle),
     /// Per-intent state snapshots from the supervisor, keyed by
@@ -358,6 +366,10 @@ pub type Msg {
   OpenRelayPopover(id: Float, anchor_y: option.Option(Float))
   CloseRelayPopover
   Tick(Int)
+  /// Volume slider moved in a member's voice popover: `(member_hex,
+  /// percent)`. The sole volume-change message — applies the gain and
+  /// (for peers) records it in the persisted cache via
+  /// `put_member_volume`.
   SetMemberVolume(String, Int)
   ToggleMemberDenoise(String)
   ToggleMemberDeafen(String)
@@ -435,7 +447,6 @@ pub type Msg {
   )
   VoicePeerLevelChanged(peer_hex: String, level: Float)
   VoiceSelfLevelChanged(level: Float)
-  SetPeerVolume(peer_hex: String, gain: Float)
   ToggleMuteForPeer(peer_hex: String)
   VoicePermissionDenied(message: String)
   ResetVoiceError
@@ -453,6 +464,27 @@ pub fn main() {
 
 fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   let stored_rooms = storage.read_joined_rooms()
+  // Rehydrate the persisted per-peer volume cache. `voice_settings` is
+  // seeded from it so the popover slider shows the remembered percent,
+  // and `hydrate_peer_gains_eff` pushes the matching gains into the
+  // audio bridge so a peer's GainNode opens at the remembered level the
+  // instant their first frame arrives — even before the user touches a
+  // slider this session.
+  let peer_volume_cache =
+    voice_volume_cache.from_list(
+      voice_volume_cache.default_capacity,
+      storage.read_peer_volumes(),
+    )
+  let cached_volumes = voice_volume_cache.to_list(peer_volume_cache)
+  let initial_voice_settings =
+    list.fold(cached_volumes, dict.new(), fn(acc, pair) {
+      let #(hex, percent) = pair
+      dict.insert(
+        acc,
+        hex,
+        domain.VoiceSettings(volume: percent, denoise: True, deafened: False),
+      )
+    })
   let initial_hash = storage.read_hash()
   let initial_pref = case storage.read_saved_theme() {
     "dark" -> DarkPref
@@ -501,7 +533,8 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
       reactions: dict.new(),
       dragging_room: None,
       drag_over_room: None,
-      voice_settings: dict.new(),
+      voice_settings: initial_voice_settings,
+      peer_volume_cache: peer_volume_cache,
       client: None,
       intents: dict.new(),
       viewport: initial_viewport,
@@ -643,12 +676,24 @@ fn init(_flags: Nil) -> #(Model, Effect(Msg)) {
   let initial_compose_reset_eff =
     effect.from(fn(_dispatch) { composer.reset_textarea("composer-textarea") })
 
+  // Push the rehydrated peer volumes into the audio bridge. With no
+  // GainNode yet, each call just records the desired gain; deliverFrame
+  // applies it when the peer's node is created on their first frame.
+  let hydrate_peer_gains_eff =
+    effect.from(fn(_dispatch) {
+      list.each(cached_volumes, fn(pair) {
+        let #(hex, percent) = pair
+        voice.set_peer_volume(hex, voice_volume.percent_to_gain(percent))
+      })
+    })
+
   #(
     model,
     effect.batch([
       subscribe_hash,
       initial_persist,
       initial_hash_sync,
+      hydrate_peer_gains_eff,
       bootstrap,
       subscribe_viewport,
       subscribe_touch_drag,
@@ -692,13 +737,45 @@ fn peer_level_for_member(
   }
 }
 
-/// Convert a linear gain float to the matching integer slider
-/// percent. Mirrors the linear-then-exponential curve in
-/// `voice_volume.percent_to_gain` so a model that stores raw gain
-/// (e.g. when an FFI caller dispatched `SetPeerVolume` with a
-/// multiplier) can be rendered back into the slider's position.
-fn float_to_volume_int(gain: Float) -> Int {
-  voice_volume.gain_to_percent(gain)
+/// The single write path for a user-chosen peer volume. Stores `next`
+/// as the live settings, applies the matching gain to the audio bridge,
+/// and — for real peers, not the local "output volume" monitoring row —
+/// records the percent in the persisted FIFO cache and writes it back to
+/// localStorage. Routing both the slider (`SetMemberVolume`) and the
+/// reset action (`ResetMemberVoice`) through here is what keeps
+/// `voice_settings` and `peer_volume_cache` from drifting: exactly one
+/// place updates either.
+fn put_member_volume(
+  model: Model,
+  hex: String,
+  next: domain.VoiceSettings,
+) -> #(Model, Effect(Msg)) {
+  let voice_settings = dict.insert(model.voice_settings, hex, next)
+  let gain = voice_volume.percent_to_gain(next.volume)
+  let apply_eff = effect.from(fn(_) { voice.set_peer_volume(hex, gain) })
+  case is_self(model, hex) {
+    True -> #(Model(..model, voice_settings: voice_settings), apply_eff)
+    False -> {
+      let cache =
+        voice_volume_cache.set(model.peer_volume_cache, hex, next.volume)
+      let persist_eff =
+        effect.from(fn(_) {
+          storage.write_peer_volumes(voice_volume_cache.to_list(cache))
+        })
+      #(
+        Model(..model, voice_settings: voice_settings, peer_volume_cache: cache),
+        effect.batch([apply_eff, persist_eff]),
+      )
+    }
+  }
+}
+
+/// True when `hex` is the local user's own verifying key. The popover's
+/// self row drives "output volume" (local monitoring) through the same
+/// slider, but the local user isn't a peer, so that choice never enters
+/// the persisted peer-volume cache.
+fn is_self(model: Model, hex: String) -> Bool {
+  option.map(model.client, client_pubkey_hex) == Some(hex)
 }
 
 /// Add `name` to `existing` if it isn't already present (prepending
@@ -1802,18 +1879,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     Tick(now) -> #(Model(..model, now_ms: now), effect.none())
     SetMemberVolume(name, value) -> {
       let settings = member_voice_settings(model.voice_settings, name)
-      let next = domain.VoiceSettings(..settings, volume: value)
-      // Also forward to FFI so real peers (when name == peer_hex) get
-      // updated. The slider is linear below 100% and exponential above
-      // — see `voice_volume` for the curve and rationale.
-      let gain = voice_volume.percent_to_gain(value)
-      let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
-      #(
-        Model(
-          ..model,
-          voice_settings: dict.insert(model.voice_settings, name, next),
-        ),
-        eff,
+      put_member_volume(
+        model,
+        name,
+        domain.VoiceSettings(..settings, volume: value),
       )
     }
     ToggleMemberDenoise(name) -> {
@@ -1852,21 +1921,15 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         eff,
       )
     }
-    ResetMemberVoice(name) -> {
-      // Reset volume to 100% and restore GainNode via FFI.
-      let eff = effect.from(fn(_) { voice.set_peer_volume(name, 1.0) })
-      #(
-        Model(
-          ..model,
-          voice_settings: dict.insert(
-            model.voice_settings,
-            name,
-            domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
-          ),
-        ),
-        eff,
+    ResetMemberVoice(name) ->
+      // Back to defaults: 100% volume (gain 1.0), denoise on, un-muted.
+      // Routes through the same write path so the remembered volume for a
+      // real peer is reset to 100% in the persisted cache too.
+      put_member_volume(
+        model,
+        name,
+        domain.VoiceSettings(volume: 100, denoise: True, deafened: False),
       )
-    }
     SetVoiceQuality(label) -> {
       // Persist + apply. The JS bridge writes localStorage and pushes
       // the change to the active encoder (no-op if voice isn't
@@ -2183,25 +2246,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     VoiceSelfLevelChanged(level) -> {
       let new_voice = VoiceModel(..model.voice, self_level: level)
       #(Model(..model, voice: new_voice), effect.none())
-    }
-
-    SetPeerVolume(peer_hex, gain) -> {
-      let eff = effect.from(fn(_) { voice.set_peer_volume(peer_hex, gain) })
-      // Also store in voice_settings (by hex) for display.
-      let vol = float_to_volume_int(gain)
-      let settings = member_voice_settings(model.voice_settings, peer_hex)
-      let new_settings = domain.VoiceSettings(..settings, volume: vol)
-      #(
-        Model(
-          ..model,
-          voice_settings: dict.insert(
-            model.voice_settings,
-            peer_hex,
-            new_settings,
-          ),
-        ),
-        eff,
-      )
     }
 
     ToggleMuteForPeer(peer_hex) -> {
@@ -2664,9 +2708,7 @@ fn room_view_with_state(
               echo_cancellation: model.voice_echo_cancellation,
               level: peer_level_for_member(model.voice, m, id_str),
               on_close: CloseVoicePopover,
-              on_set_volume: fn(v) {
-                SetPeerVolume(id_str, voice_volume.percent_to_gain(v))
-              },
+              on_set_volume: fn(v) { SetMemberVolume(id_str, v) },
               on_toggle_denoise: ToggleMemberDenoise(id_str),
               on_set_voice_quality: SetVoiceQuality,
               on_set_echo_cancellation: SetVoiceEchoCancellation,
@@ -3009,9 +3051,7 @@ fn voice_popover_overlay(
             echo_cancellation: model.voice_echo_cancellation,
             level: peer_level_for_member(model.voice, m, id_str),
             on_close: CloseVoicePopover,
-            on_set_volume: fn(v) {
-              SetPeerVolume(id_str, voice_volume.percent_to_gain(v))
-            },
+            on_set_volume: fn(v) { SetMemberVolume(id_str, v) },
             on_toggle_denoise: ToggleMemberDenoise(id_str),
             on_set_voice_quality: SetVoiceQuality,
             on_set_echo_cancellation: SetVoiceEchoCancellation,
