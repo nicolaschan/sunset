@@ -10,6 +10,15 @@ import { Ok, Error as GError } from "../../prelude.mjs";
 
 let ctx = null;
 const peers = new Map(); // peerHex -> { worklet, gain }
+// peerHex -> the gain this peer's GainNode should currently have: the
+// user's chosen volume, or 0 while they're muted-for-me. Written by
+// setPeerVolume on every volume/mute change and seeded from the
+// persisted volume cache at startup (before any audio has arrived).
+// Survives slot teardown (dropPeer / stopCapture / call end) and the
+// peer leaving and rejoining, so the node is (re)created at the right
+// gain in deliverFrame instead of the hardcoded unity default.
+// Intentionally NOT cleared on stopCapture.
+const desiredGain = new Map();
 let captureNode = null;
 let captureStream = null;
 
@@ -388,7 +397,12 @@ export function deliverFrame(peerHex, seq, pcm) {
       outputChannelCount: [2],
     });
     const g = ctx.createGain();
-    g.gain.value = 1.0;
+    // Open at the gain this peer should currently have — their chosen
+    // volume, or 0 if muted-for-me — falling back to unity for a peer
+    // we've never heard before. Without this the node would always open
+    // at 1.0 and a remembered volume (or mute) wouldn't take effect
+    // until the user nudged the slider again.
+    g.gain.value = desiredGain.get(peerHex) ?? 1.0;
     w.connect(g).connect(ctx.destination);
     slot = { worklet: w, gain: g };
     peers.set(peerHex, slot);
@@ -427,9 +441,14 @@ export function dropPeer(peerHex) {
 const PEER_GAIN_MAX = 16.0;
 
 export function setPeerVolume(peerHex, gain) {
+  const clamped = Math.max(0, Math.min(PEER_GAIN_MAX, gain));
+  // Record the gain unconditionally so it's reapplied when this peer's
+  // GainNode is (re)created later — covers gains set before the first
+  // frame arrives, mute (gain 0), and volumes rehydrated from the cache
+  // at startup.
+  desiredGain.set(peerHex, clamped);
   const slot = peers.get(peerHex);
-  if (!slot) return;
-  slot.gain.gain.value = Math.max(0, Math.min(PEER_GAIN_MAX, gain));
+  if (slot) slot.gain.gain.value = clamped;
 }
 
 export function getPeerGain(peerHex) {

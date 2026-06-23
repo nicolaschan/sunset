@@ -75,28 +75,6 @@ pub fn percent_to_gain(percent: Int) -> Float {
   }
 }
 
-/// Inverse of `percent_to_gain`. Used when the model only retains a
-/// raw gain value (e.g. an FFI caller dispatched `SetPeerVolume`
-/// with a multiplier) and the popover needs to render the matching
-/// slider position.
-///
-/// Inputs are clamped to `[0.0, max_gain]`. Output rounds to the
-/// nearest integer percent on each segment.
-pub fn gain_to_percent(gain: Float) -> Int {
-  let clamped = clamp_gain(gain)
-  case clamped <=. 1.0 {
-    True -> float.round(clamped *. 100.0)
-    False ->
-      case float.logarithm(clamped) {
-        // log base 2: log_2(x) = ln(x) / ln(2). ln(2) ≈ 0.6931472.
-        Ok(ln_x) -> float.round(100.0 +. ln_x /. 0.6931471805599453 *. 100.0)
-        // logarithm is only Error for x <= 0, and we just clamped
-        // above 1.0; never reached.
-        Error(_) -> 100
-      }
-  }
-}
-
 fn clamp_percent(percent: Int) -> Int {
   case percent < min_percent {
     True -> min_percent
@@ -104,17 +82,6 @@ fn clamp_percent(percent: Int) -> Int {
       case percent > max_percent_other {
         True -> max_percent_other
         False -> percent
-      }
-  }
-}
-
-fn clamp_gain(gain: Float) -> Float {
-  case gain <. 0.0 {
-    True -> 0.0
-    False ->
-      case gain >. max_gain {
-        True -> max_gain
-        False -> gain
       }
   }
 }

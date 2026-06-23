@@ -32,6 +32,16 @@ pub fn read_self_name() -> String
 @external(javascript, "./storage.ffi.mjs", "writeSelfName")
 pub fn write_self_name(value: String) -> Nil
 
+/// Read the persisted per-peer volume cache as oldest-first
+/// `(peer_hex, percent)` pairs. Empty when nothing is stored.
+@external(javascript, "./storage.ffi.mjs", "readPeerVolumes")
+pub fn read_peer_volumes() -> List(#(String, Int))
+
+/// Persist the per-peer volume cache. Pairs are written oldest-first so
+/// a reload reconstructs the same FIFO eviction queue.
+@external(javascript, "./storage.ffi.mjs", "writePeerVolumes")
+pub fn write_peer_volumes(pairs: List(#(String, Int))) -> Nil
+
 /// True when the OS / browser is currently advertising a dark colour
 /// scheme via prefers-color-scheme. Used as the fallback when the
 /// user hasn't toggled the theme yet.

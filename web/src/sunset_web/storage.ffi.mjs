@@ -30,22 +30,34 @@ function safeParseRooms(raw) {
   }
 }
 
-export function readJoinedRooms() {
+// Read a JSON-array localStorage value under `key`, sanitize the raw
+// string into a plain JS array with `sanitize`, and hand back a Gleam
+// list. localStorage can throw in private mode / disabled storage, so
+// fall back to an empty list rather than propagate.
+function readJsonList(key, sanitize) {
   try {
-    return toList(safeParseRooms(localStorage.getItem(ROOMS_KEY)));
+    return toList(sanitize(localStorage.getItem(key)));
   } catch {
-    // localStorage can throw in private mode / disabled storage; fall
-    // back to an empty list and don't propagate.
     return toList([]);
   }
 }
 
-export function writeJoinedRooms(rooms) {
+// Persist a Gleam list as a JSON array under `key`. Best-effort: storage
+// failures (private mode / quota) are swallowed.
+function writeJsonList(key, list) {
   try {
-    localStorage.setItem(ROOMS_KEY, JSON.stringify(listToArray(rooms)));
+    localStorage.setItem(key, JSON.stringify(listToArray(list)));
   } catch {
     // ignored: storage is best-effort.
   }
+}
+
+export function readJoinedRooms() {
+  return readJsonList(ROOMS_KEY, safeParseRooms);
+}
+
+export function writeJoinedRooms(rooms) {
+  writeJsonList(ROOMS_KEY, rooms);
 }
 
 export function readHash() {
@@ -119,6 +131,45 @@ export function writeSelfName(value) {
       window.localStorage.setItem(SELF_NAME_KEY, value);
     }
   } catch {}
+}
+
+// Per-peer playback volumes the user has chosen, as a JSON array of
+// [peerHex, percent] pairs ordered oldest-first. The Gleam side
+// (`voice_volume_cache`) owns the FIFO bound + eviction; this layer only
+// serializes the ordered list it hands down.
+const PEER_VOLUMES_KEY = "sunset/peer-volumes";
+
+function safeParsePeerVolumes(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (p) =>
+          Array.isArray(p) &&
+          p.length === 2 &&
+          typeof p[0] === "string" &&
+          typeof p[1] === "number" &&
+          Number.isFinite(p[1]),
+      )
+      .map((p) => [p[0], Math.trunc(p[1])]);
+  } catch {
+    return [];
+  }
+}
+
+/// Read the persisted (peerHex, percent) volume pairs, oldest-first.
+/// Empty list when nothing is stored or storage is unavailable.
+export function readPeerVolumes() {
+  return readJsonList(PEER_VOLUMES_KEY, safeParsePeerVolumes);
+}
+
+/// Persist the (peerHex, percent) volume pairs. Each pair arrives as a
+/// Gleam 2-tuple, which is a 2-element array on the JS target, so the
+/// list serializes straight to a JSON array of `[hex, percent]`.
+export function writePeerVolumes(pairs) {
+  writeJsonList(PEER_VOLUMES_KEY, pairs);
 }
 
 // True if the OS / browser is currently advertising a dark colour
