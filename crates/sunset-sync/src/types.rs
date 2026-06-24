@@ -57,6 +57,20 @@ pub struct SyncConfig {
     /// `Disconnected { reason: "heartbeat timeout" }`. Default 45 s
     /// (= 3 × `heartbeat_interval`).
     pub heartbeat_timeout: Duration,
+    /// Cadence at which each per-peer task sends `SyncMessage::UnreliablePing`
+    /// *over the datagram channel* to probe whether its outbound datagram
+    /// path is still delivering. Independent of (and faster than) the
+    /// reliable `heartbeat_interval`, because a silently-dead datagram path
+    /// is invisible to the reliable Ping/Pong yet still drops voice. Default
+    /// 2 s.
+    pub datagram_probe_interval: Duration,
+    /// If no `UnreliablePong` arrives within this window, the datagram path
+    /// is considered dead and ephemeral (voice) traffic falls back to the
+    /// reliable channel until the datagram path recovers. The connection
+    /// itself stays up (reliable Ping/Pong is the connection-liveness
+    /// signal); only the *channel choice* for voice changes. Default 6 s
+    /// (= 3 × `datagram_probe_interval`).
+    pub datagram_path_timeout: Duration,
 }
 
 impl Default for SyncConfig {
@@ -69,6 +83,8 @@ impl Default for SyncConfig {
             bootstrap_filter: Filter::NamePrefix(routing::SUBSCRIBE_PREFIX.into()),
             heartbeat_interval: Duration::from_secs(15),
             heartbeat_timeout: Duration::from_secs(45),
+            datagram_probe_interval: Duration::from_secs(2),
+            datagram_path_timeout: Duration::from_secs(6),
         }
     }
 }
