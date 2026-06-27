@@ -370,6 +370,8 @@ where
             protocol_version: self.config.protocol_version,
             heartbeat_interval: self.config.heartbeat_interval,
             heartbeat_timeout: self.config.heartbeat_timeout,
+            datagram_probe_interval: self.config.datagram_probe_interval,
+            datagram_path_timeout: self.config.datagram_path_timeout,
         }
     }
 
@@ -1038,6 +1040,11 @@ where
             }
             SyncMessage::Ping { .. } | SyncMessage::Pong { .. } => {
                 // Handled by the per-peer task's liveness loop; engine ignores.
+            }
+            SyncMessage::UnreliablePing { .. } | SyncMessage::UnreliablePong { .. } => {
+                // Handled by the per-peer task's datagram-liveness loop (the
+                // recv loops answer/record them and never forward); engine
+                // ignores in the unreachable case one slips through.
             }
             SyncMessage::DigestRequest { filter, range } => {
                 self.handle_digest_request(from, filter, range).await;

@@ -74,6 +74,25 @@ pub enum SyncMessage {
         filter: Filter,
         range: DigestRange,
     },
+    /// Datagram-path liveness probe, sent *over the unreliable channel* by
+    /// the per-peer datagram-liveness loop. The receiver replies with
+    /// `UnreliablePong { nonce: <same nonce> }` over the **reliable**
+    /// channel — so the ack can't itself be lost on a flaky return
+    /// datagram path. Receiving this probe proves the *sender's* outbound
+    /// datagram path is delivering; that is what gates whether ephemeral
+    /// (voice) traffic uses the datagram channel or falls back to reliable.
+    ///
+    /// New variants are appended at the end so existing postcard enum tags
+    /// (and their frozen wire vectors) don't shift.
+    UnreliablePing {
+        nonce: u64,
+    },
+    /// Reply to `UnreliablePing`, carried over the reliable channel. The
+    /// original prober updates its `last_unreliable_pong_at`; the nonce is
+    /// informational.
+    UnreliablePong {
+        nonce: u64,
+    },
 }
 
 impl SyncMessage {
@@ -198,6 +217,49 @@ mod tests {
         let bytes = msg.encode().unwrap();
         let decoded = SyncMessage::decode(&bytes).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn unreliable_ping_postcard_vector_frozen() {
+        // UnreliablePing is enum variant index 11 (appended after
+        // DigestRequest=10), so its postcard tag is 0x0b. If this changes,
+        // the variant order shifted and every existing peer's wire tags
+        // drifted — bump the wire-format version, don't edit this hex.
+        let bytes = SyncMessage::UnreliablePing { nonce: 1 }.encode().unwrap();
+        assert_eq!(bytes.as_ref(), &[0x0b, 0x01]);
+    }
+
+    #[test]
+    fn unreliable_pong_postcard_vector_frozen() {
+        // UnreliablePong is enum variant index 12, postcard tag 0x0c.
+        let bytes = SyncMessage::UnreliablePong { nonce: 1 }.encode().unwrap();
+        assert_eq!(bytes.as_ref(), &[0x0c, 0x01]);
+    }
+
+    #[test]
+    fn unreliable_ping_pong_round_trip() {
+        for msg in [
+            SyncMessage::UnreliablePing { nonce: 0xdead_beef },
+            SyncMessage::UnreliablePong { nonce: 0xfeed_face },
+        ] {
+            let bytes = msg.encode().unwrap();
+            assert_eq!(SyncMessage::decode(&bytes).unwrap(), msg);
+        }
+    }
+
+    /// The previously-frozen `Ping`/`Pong` tags must be unchanged by the
+    /// append of the two new variants — appending at the end is the whole
+    /// reason it's wire-safe.
+    #[test]
+    fn appending_variants_preserves_existing_tags() {
+        assert_eq!(
+            SyncMessage::Ping { nonce: 1 }.encode().unwrap().as_ref(),
+            &[0x08, 0x01]
+        );
+        assert_eq!(
+            SyncMessage::Pong { nonce: 1 }.encode().unwrap().as_ref(),
+            &[0x09, 0x01]
+        );
     }
 
     #[test]

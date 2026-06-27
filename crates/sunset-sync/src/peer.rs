@@ -87,6 +87,8 @@ pub(crate) struct PeerEnv {
     pub protocol_version: u32,
     pub heartbeat_interval: std::time::Duration,
     pub heartbeat_timeout: std::time::Duration,
+    pub datagram_probe_interval: std::time::Duration,
+    pub datagram_path_timeout: std::time::Duration,
 }
 
 /// Drive a single peer's connection.
@@ -123,6 +125,8 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         protocol_version: local_protocol_version,
         heartbeat_interval,
         heartbeat_timeout,
+        datagram_probe_interval,
+        datagram_path_timeout,
     } = env;
     let local_kind = conn.kind();
     // Clone of the outbound sender used by the recv-side Pong responder
@@ -229,6 +233,23 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
     // flight (loop sleeps `heartbeat_interval` between sends).
     let (pong_tx, mut pong_rx) = mpsc::unbounded_channel::<u64>();
 
+    // Datagram-path liveness: recv_reliable_task forwards every observed
+    // `UnreliablePong` nonce here so the datagram_liveness_task can refresh
+    // `last_unreliable_pong_at`. The pong rides the *reliable* channel (so the
+    // ack itself is never lost on a flaky datagram return path), but receiving
+    // it proves our most recent `UnreliablePing` *datagram* reached the peer —
+    // i.e. our outbound datagram path is delivering.
+    let (datagram_pong_tx, mut datagram_pong_rx) = mpsc::unbounded_channel::<u64>();
+
+    // Whether the outbound datagram path is currently delivering. Written by
+    // datagram_liveness_task, read by send_task on every ephemeral send to
+    // decide datagram-vs-reliable. Starts `false` (pessimistic): voice goes
+    // over the reliable channel until the datagram path is *proven* alive, so
+    // a connection whose datagram path is dead on arrival never produces
+    // one-way audio. The first probe round-trip flips it true within ~RTT for
+    // a healthy path.
+    let (datagram_alive_tx, datagram_alive_rx) = tokio::sync::watch::channel(false);
+
     // Concurrent recv loops — reliable and unreliable channels are
     // independent; each drains its own physical channel and routes the
     // decoded SyncMessage into the same `inbound_tx`. The engine's
@@ -240,6 +261,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let peer_id = peer_id.clone();
         let out_tx_for_pong = out_tx_clone.clone();
         let pong_tx = pong_tx.clone();
+        let datagram_pong_tx = datagram_pong_tx.clone();
         let mut shutdown = shutdown_rx.clone();
         async move {
             loop {
@@ -263,6 +285,12 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                             Ok(SyncMessage::Pong { nonce }) => {
                                 // Notify liveness_task with the echoed nonce.
                                 let _ = pong_tx.send(nonce);
+                            }
+                            Ok(SyncMessage::UnreliablePong { nonce }) => {
+                                // Datagram probe acked (over reliable): our
+                                // outbound datagram path is delivering. Notify
+                                // datagram_liveness_task.
+                                let _ = datagram_pong_tx.send(nonce);
                             }
                             Ok(message) => {
                                 if inbound_tx
@@ -302,6 +330,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let conn = conn.clone();
         let inbound_tx = inbound_tx.clone();
         let peer_id = peer_id.clone();
+        let out_tx_for_dgram_pong = out_tx_clone.clone();
         let mut shutdown = shutdown_rx.clone();
         async move {
             // Unreliable recv error: stop the unreliable loop only.
@@ -313,6 +342,16 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
             loop {
                 tokio::select! {
                     res = recv_unreliable_message(&*conn) => match res {
+                        Ok(SyncMessage::UnreliablePing { nonce }) => {
+                            // A datagram probe reached us, so the peer's
+                            // outbound datagram path is delivering. Ack over
+                            // the *reliable* channel (via the outbound queue,
+                            // never a direct conn write — NoiseTransport tracks
+                            // nonces per send) so the ack can't be lost on a
+                            // flaky datagram return path.
+                            let _ = out_tx_for_dgram_pong
+                                .send(SyncMessage::UnreliablePong { nonce });
+                        }
                         Ok(message) => {
                             if inbound_tx
                                 .send(InboundEvent::Message {
@@ -337,6 +376,7 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         let conn = conn.clone();
         let inbound_tx = inbound_tx.clone();
         let peer_id = peer_id.clone();
+        let datagram_alive_rx = datagram_alive_rx;
         let mut shutdown = shutdown_rx.clone();
         async move {
             loop {
@@ -367,23 +407,36 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                         }
                     }
                     ChannelKind::Unreliable => {
-                        // Ephemeral (voice frames/heartbeats) prefers the
+                        // Ephemeral (voice frames) prefers the
                         // unreliable datagram channel — loss-tolerant, no
-                        // head-of-line blocking. But a transport with no
-                        // datagram channel (a WS-only relay leg) returns Err
-                        // from send_unreliable; that Err means the datagram
-                        // never left, so fall back to the reliable channel
-                        // rather than silently dropping it. Without this,
-                        // voice could never traverse a WS relay (the
-                        // relay-audio-fallback path). A datagram dropped *in
-                        // transit* returns Ok, so this never re-sends a
-                        // lost-on-the-wire frame — only ones the transport
-                        // could not send at all. A reliable-fallback failure
-                        // means the connection is dead, so surface it like
+                        // head-of-line blocking — but ONLY while the datagram
+                        // path is proven to be delivering. The datagram path
+                        // can silently die (a NAT idle-expires the UDP mapping
+                        // while the reliable stream survives) and a datagram
+                        // dropped *in transit* returns Ok, so a naive
+                        // unreliable send would vanish with no error to fall
+                        // back on — persistent one-way audio that the reliable
+                        // Ping/Pong liveness never notices. So gate on the
+                        // datagram-liveness signal: when the path is not proven
+                        // alive, send over the reliable channel instead.
+                        //
+                        // When the path IS alive, still fall back to reliable
+                        // on a hard send error (a WS-only relay leg with no
+                        // datagram channel returns Err), so voice never depends
+                        // on a channel that can't carry it. Either fallback
+                        // failing means the connection is dead — surface it like
                         // the Reliable arm for prompt teardown.
-                        if send_unreliable_message(&*conn, &msg).await.is_err()
-                            && let Err(e) = send_reliable_message(&*conn, &msg).await
-                        {
+                        let datagram_alive = *datagram_alive_rx.borrow();
+                        let send_result = if datagram_alive {
+                            if send_unreliable_message(&*conn, &msg).await.is_err() {
+                                send_reliable_message(&*conn, &msg).await
+                            } else {
+                                Ok(())
+                            }
+                        } else {
+                            send_reliable_message(&*conn, &msg).await
+                        };
+                        if let Err(e) = send_result {
                             let _ = inbound_tx.send(InboundEvent::Disconnected {
                                 peer_id: peer_id.clone(),
                                 conn_id,
@@ -391,6 +444,18 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
                             });
                             break;
                         }
+                    }
+                    ChannelKind::DatagramProbe => {
+                        // Best-effort datagram-liveness probe. Send only over
+                        // the unreliable channel: a successful round-trip
+                        // (acked by an UnreliablePong over reliable) is the
+                        // proof that the datagram path delivers. NEVER fall
+                        // back to reliable — a probe that "succeeds" over
+                        // reliable would falsely report a dead datagram path as
+                        // alive. A send error just means no datagram could
+                        // leave, which the liveness task reads as a missing
+                        // pong; it is never a connection-level disconnect.
+                        let _ = send_unreliable_message(&*conn, &msg).await;
                     }
                 }
             }
@@ -480,23 +545,121 @@ pub(crate) async fn run_peer<C: TransportConnection + 'static>(
         }
     };
 
-    // Drop the local pong_tx so the channel closes when recv_reliable_task
-    // exits — otherwise the liveness_task's `pong_rx.recv()` would never
-    // complete after recv exits.
+    // Datagram-path liveness loop. Probes the *outbound* datagram path with
+    // `UnreliablePing` over the unreliable channel and watches for the
+    // `UnreliablePong` ack (delivered over reliable). The resulting
+    // alive/dead signal — published on `datagram_alive_tx` — is what
+    // `send_task` reads to decide whether ephemeral (voice) traffic rides the
+    // datagram channel or falls back to reliable. This is the half of
+    // connection liveness the reliable Ping/Pong loop structurally cannot
+    // cover: a datagram path that silently dies leaves the reliable channel
+    // (and thus the connection) perfectly healthy.
+    let datagram_liveness_task = {
+        let out_tx_for_dgram_ping = out_tx_clone.clone();
+        let mut shutdown = shutdown_rx.clone();
+        let alive_tx = datagram_alive_tx;
+        async move {
+            #[cfg(not(target_arch = "wasm32"))]
+            use tokio::time::Instant;
+            #[cfg(target_arch = "wasm32")]
+            use wasmtimer::std::Instant;
+
+            let mut next_nonce: u64 = 1;
+            // `None` until the first `UnreliablePong` proves the path
+            // delivers; the watch therefore stays `false` (pessimistic) for a
+            // path that never answers, and flips `true` on the first ack.
+            let mut last_unreliable_pong_at: Option<Instant> = None;
+
+            // Probe immediately so a healthy path upgrades to the datagram
+            // channel within ~one RTT instead of after a full interval.
+            let _ = out_tx_for_dgram_ping.send(SyncMessage::UnreliablePing { nonce: next_nonce });
+            next_nonce = next_nonce.wrapping_add(1);
+
+            loop {
+                #[cfg(not(target_arch = "wasm32"))]
+                let tick = tokio::time::sleep(datagram_probe_interval);
+                #[cfg(target_arch = "wasm32")]
+                let tick = wasmtimer::tokio::sleep(datagram_probe_interval);
+
+                tokio::select! {
+                    _ = tick => {
+                        if out_tx_for_dgram_ping
+                            .send(SyncMessage::UnreliablePing { nonce: next_nonce })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        next_nonce = next_nonce.wrapping_add(1);
+                        // Alive iff an ack landed within the timeout window.
+                        let alive = last_unreliable_pong_at.is_some_and(|t| {
+                            Instant::now().duration_since(t) <= datagram_path_timeout
+                        });
+                        alive_tx.send_if_modified(|cur| {
+                            if *cur != alive {
+                                *cur = alive;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                    Some(_nonce) = datagram_pong_rx.recv() => {
+                        last_unreliable_pong_at = Some(Instant::now());
+                        alive_tx.send_if_modified(|cur| {
+                            if !*cur {
+                                *cur = true;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                    // Engine dropped PeerOutbound — see recv_reliable_task.
+                    _ = shutdown.changed() => return,
+                    else => return,
+                }
+            }
+        }
+    };
+
+    // Drop the local pong senders so the channels close when
+    // recv_reliable_task exits — otherwise the liveness loops' `recv()`
+    // calls would never complete after recv exits.
     drop(pong_tx);
+    drop(datagram_pong_tx);
 
     tokio::join!(
         recv_reliable_task,
         recv_unreliable_task,
         send_task,
-        liveness_task
+        liveness_task,
+        datagram_liveness_task,
     );
 }
 
 /// Which physical channel a SyncMessage flows over.
+///
+/// Disconnect-authority invariant: **the reliable channel is the sole
+/// authority on whether the connection is alive.** A failure on the
+/// unreliable/datagram channel — a `send_unreliable` error, an undecodable
+/// datagram, or a silently-dropped one — is never on its own a disconnect.
+/// Three sites depend on this: `recv_unreliable_task` (breaks its loop without
+/// emitting `Disconnected`), the `Unreliable` send arm (an unreliable-send
+/// error falls back to reliable; only a *reliable* failure disconnects), and
+/// the `DatagramProbe` send arm (a failed probe is read as a missing pong, not
+/// a death). A real connection death always surfaces on the reliable channel
+/// (`send_reliable` error or the Ping/Pong heartbeat timeout).
 enum ChannelKind {
+    /// Ordered, retransmitted stream channel.
     Reliable,
+    /// Datagram channel for loss-tolerant ephemeral traffic, gated at send
+    /// time on the datagram-path-liveness signal (falls back to reliable when
+    /// the datagram path is not proven delivering).
     Unreliable,
+    /// Datagram-liveness probe: best-effort over the datagram channel, never
+    /// falling back to reliable (a probe that "succeeds" over reliable would
+    /// falsely report a dead datagram path as alive) and never disconnecting.
+    DatagramProbe,
 }
 
 fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
@@ -505,6 +668,10 @@ fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
     // wildcard arm — the silent default is the wrong way to fail.
     match msg {
         SyncMessage::EphemeralDelivery { .. } => ChannelKind::Unreliable,
+        // The probe must travel the datagram channel to test it; its ack
+        // (`UnreliablePong`) rides reliable so it can't be lost on a flaky
+        // datagram return path.
+        SyncMessage::UnreliablePing { .. } => ChannelKind::DatagramProbe,
         SyncMessage::Hello { .. }
         | SyncMessage::EventDelivery { .. }
         | SyncMessage::BlobRequest { .. }
@@ -514,6 +681,7 @@ fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
         | SyncMessage::Goodbye {}
         | SyncMessage::Ping { .. }
         | SyncMessage::Pong { .. }
+        | SyncMessage::UnreliablePong { .. }
         | SyncMessage::DigestRequest { .. } => ChannelKind::Reliable,
     }
 }
@@ -571,6 +739,8 @@ mod tests {
             protocol_version: 1,
             heartbeat_interval: cfg.heartbeat_interval,
             heartbeat_timeout: cfg.heartbeat_timeout,
+            datagram_probe_interval: cfg.datagram_probe_interval,
+            datagram_path_timeout: cfg.datagram_path_timeout,
         }
     }
 
@@ -593,6 +763,52 @@ mod tests {
             Err(Error::Transport(
                 "websocket: unreliable channel unsupported".into(),
             ))
+        }
+        async fn recv_unreliable(&self) -> Result<Bytes> {
+            self.inner.recv_unreliable().await
+        }
+        fn peer_id(&self) -> PeerId {
+            self.inner.peer_id()
+        }
+        fn kind(&self) -> TransportKind {
+            self.inner.kind()
+        }
+        async fn close(&self) -> Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    /// Wraps a `TestConnection` whose `send_unreliable` returns `Ok` but
+    /// *silently drops* the datagram (it never reaches the peer) while
+    /// `drop_unreliable` is set. This is the failure the `FailingUnreliableConn`
+    /// fixture cannot model: a transport WITH a datagram channel whose path
+    /// has gone dead in transit, so the local send succeeds (no Err to fall
+    /// back on) yet nothing arrives — exactly a NAT idle-expiring the UDP
+    /// mapping while the reliable stream survives. Toggleable so a test can
+    /// prove the path alive first, then kill it mid-stream.
+    struct SilentDropUnreliableConn {
+        inner: TestConnection,
+        drop_unreliable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl TransportConnection for SilentDropUnreliableConn {
+        async fn send_reliable(&self, bytes: Bytes) -> Result<()> {
+            self.inner.send_reliable(bytes).await
+        }
+        async fn recv_reliable(&self) -> Result<Bytes> {
+            self.inner.recv_reliable().await
+        }
+        async fn send_unreliable(&self, bytes: Bytes) -> Result<()> {
+            if self
+                .drop_unreliable
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // The local send "succeeds" — the datagram simply never
+                // arrives. This is the silent in-transit drop.
+                return Ok(());
+            }
+            self.inner.send_unreliable(bytes).await
         }
         async fn recv_unreliable(&self) -> Result<Bytes> {
             self.inner.recv_unreliable().await
@@ -1405,6 +1621,283 @@ mod tests {
                     ),
                 }
 
+                drop(b_out_tx);
+            })
+            .await;
+    }
+
+    /// Repro for the silent-datagram-death one-way-audio bug. Alice's
+    /// outbound datagram path is dead from the start — `send_unreliable`
+    /// returns `Ok` but the datagram never arrives (a NAT having idle-expired
+    /// the UDP mapping while the reliable stream survives). A naive
+    /// implementation routes voice over the datagram channel, where it
+    /// vanishes with no error to fall back on and no liveness signal to
+    /// notice — persistent one-way audio. With the datagram-liveness gate,
+    /// the path is never *proven* alive, so voice rides the reliable channel
+    /// and reaches the peer; the connection itself stays up (reliable
+    /// Ping/Pong is healthy), so nothing reconnects.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dead_datagram_path_delivers_voice_over_reliable() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = net.transport(PeerId(vk(b"alice")), peer_addr("alice"));
+                let bob = net.transport(PeerId(vk(b"bob")), peer_addr("bob"));
+                let bob_accept =
+                    crate::spawn::spawn_local(async move { bob.accept().await.unwrap() });
+                let alice_conn = alice.connect(peer_addr("bob")).await.unwrap();
+                let bob_conn = bob_accept.await.unwrap();
+
+                // Alice's datagram path is dead from the first frame.
+                let drop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let alice_conn = SilentDropUnreliableConn {
+                    inner: alice_conn,
+                    drop_unreliable: drop_flag.clone(),
+                };
+
+                let cfg = crate::types::SyncConfig::default();
+
+                let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+                let (b_in_tx, mut b_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(alice_conn),
+                    peer_env_for(b"alice", &cfg),
+                    crate::engine::ConnectionId::for_test(11),
+                    a_out_tx.clone(),
+                    a_out_rx,
+                    a_in_tx,
+                    None,
+                ));
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(bob_conn),
+                    peer_env_for(b"bob", &cfg),
+                    crate::engine::ConnectionId::for_test(12),
+                    b_out_tx.clone(),
+                    b_out_rx,
+                    b_in_tx,
+                    None,
+                ));
+
+                let _a_hold = match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected Hello, got {other:?}"),
+                };
+                let _b_hold = match b_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected Hello, got {other:?}"),
+                };
+
+                // Alice publishes a voice frame.
+                let ephemeral = SyncMessage::EphemeralDelivery {
+                    datagram: sunset_store::SignedDatagram {
+                        verifying_key: vk(b"alice"),
+                        name: Bytes::from_static(b"room/voice/alice/0"),
+                        payload: Bytes::from_static(b"opus-frame"),
+                        seq: 0,
+                        signature: Bytes::from_static(&[0xab; 64]),
+                    },
+                };
+                a_out_tx.send(ephemeral).unwrap();
+
+                // Bob must receive it. The datagram path silently drops, so the
+                // ONLY way it arrives is the reliable fallback. Tolerate
+                // unrelated traffic (probe acks etc.) on the way.
+                let mut saw_voice = false;
+                for _ in 0..6 {
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), b_in_rx.recv())
+                        .await
+                        .expect("bob must receive alice's voice via the reliable fallback")
+                    {
+                        Some(InboundEvent::Message {
+                            message: SyncMessage::EphemeralDelivery { datagram },
+                            ..
+                        }) => {
+                            assert_eq!(datagram.payload.as_ref(), b"opus-frame");
+                            saw_voice = true;
+                            break;
+                        }
+                        Some(_) => continue,
+                        None => panic!("bob's inbound channel closed prematurely"),
+                    }
+                }
+                assert!(
+                    saw_voice,
+                    "voice never reached bob — a dead datagram path silently dropped it with no \
+                     reliable fallback (the one-way-audio bug)"
+                );
+
+                // The connection must NOT have been torn down: the reliable
+                // channel is healthy, so a dead datagram path is not a
+                // disconnect (it's a channel-choice signal).
+                assert!(
+                    !matches!(a_in_rx.try_recv(), Ok(InboundEvent::Disconnected { .. })),
+                    "a dead datagram path must not disconnect the (healthy) connection"
+                );
+
+                drop(a_out_tx);
+                drop(b_out_tx);
+            })
+            .await;
+    }
+
+    /// A datagram path that works, then silently dies mid-stream: the
+    /// datagram-liveness loop must DETECT the death (a missing
+    /// `UnreliablePong` within `datagram_path_timeout`) and route subsequent
+    /// voice over the reliable channel — without ever disconnecting. Short
+    /// probe timings keep it fast and real-time.
+    #[tokio::test(flavor = "current_thread")]
+    async fn datagram_path_death_is_detected_and_voice_recovers() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let net = TestNetwork::new();
+                let alice = net.transport(PeerId(vk(b"alice")), peer_addr("alice"));
+                let bob = net.transport(PeerId(vk(b"bob")), peer_addr("bob"));
+                let bob_accept =
+                    crate::spawn::spawn_local(async move { bob.accept().await.unwrap() });
+                let alice_conn = alice.connect(peer_addr("bob")).await.unwrap();
+                let bob_conn = bob_accept.await.unwrap();
+
+                // Path alive to start; killed mid-test.
+                let drop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let alice_conn = SilentDropUnreliableConn {
+                    inner: alice_conn,
+                    drop_unreliable: drop_flag.clone(),
+                };
+
+                // Fast datagram probing (detection well under a second). The
+                // reliable heartbeat keeps its default so it never fires
+                // in-test and can't mask the datagram signal.
+                let cfg = crate::types::SyncConfig {
+                    datagram_probe_interval: std::time::Duration::from_millis(40),
+                    datagram_path_timeout: std::time::Duration::from_millis(120),
+                    ..crate::types::SyncConfig::default()
+                };
+
+                let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (b_out_tx, b_out_rx) = mpsc::unbounded_channel::<SyncMessage>();
+                let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+                let (b_in_tx, mut b_in_rx) = mpsc::unbounded_channel::<InboundEvent>();
+
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(alice_conn),
+                    peer_env_for(b"alice", &cfg),
+                    crate::engine::ConnectionId::for_test(13),
+                    a_out_tx.clone(),
+                    a_out_rx,
+                    a_in_tx,
+                    None,
+                ));
+                crate::spawn::spawn_local(run_peer(
+                    Rc::new(bob_conn),
+                    peer_env_for(b"bob", &cfg),
+                    crate::engine::ConnectionId::for_test(14),
+                    b_out_tx.clone(),
+                    b_out_rx,
+                    b_in_tx,
+                    None,
+                ));
+
+                let _a_hold = match a_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected Hello, got {other:?}"),
+                };
+                let _b_hold = match b_in_rx.recv().await.unwrap() {
+                    InboundEvent::PeerHello { shutdown, .. } => shutdown,
+                    other => panic!("expected Hello, got {other:?}"),
+                };
+
+                // Let the datagram path prove itself alive (a few probe
+                // round-trips), then confirm a frame flows while it's healthy.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                a_out_tx
+                    .send(SyncMessage::EphemeralDelivery {
+                        datagram: sunset_store::SignedDatagram {
+                            verifying_key: vk(b"alice"),
+                            name: Bytes::from_static(b"room/voice/alice/alive"),
+                            payload: Bytes::from_static(b"while-alive"),
+                            seq: 1,
+                            signature: Bytes::from_static(&[0xab; 64]),
+                        },
+                    })
+                    .unwrap();
+                let alive_recv = async {
+                    loop {
+                        match b_in_rx.recv().await {
+                            Some(InboundEvent::Message {
+                                message: SyncMessage::EphemeralDelivery { datagram },
+                                ..
+                            }) if datagram.payload.as_ref() == b"while-alive" => break true,
+                            Some(_) => continue,
+                            None => break false,
+                        }
+                    }
+                };
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), alive_recv)
+                        .await
+                        .expect("frame should flow while the datagram path is alive"),
+                    "alive-path frame never arrived"
+                );
+
+                // Kill the datagram path silently.
+                drop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                // Keep emitting voice; once the liveness loop detects the dead
+                // path (≤ ~timeout + interval) frames route over reliable and
+                // reach bob. Frames sent before detection ride the now-dead
+                // datagram path and are dropped — so any "after-death" frame
+                // bob receives PROVES the detection + reliable fallback fired.
+                let a_out_tx2 = a_out_tx.clone();
+                crate::spawn::spawn_local(async move {
+                    for i in 0..50u64 {
+                        if a_out_tx2
+                            .send(SyncMessage::EphemeralDelivery {
+                                datagram: sunset_store::SignedDatagram {
+                                    verifying_key: vk(b"alice"),
+                                    name: Bytes::from_static(b"room/voice/alice/dead"),
+                                    payload: Bytes::from_static(b"after-death"),
+                                    seq: 100 + i,
+                                    signature: Bytes::from_static(&[0xcd; 64]),
+                                },
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    }
+                });
+
+                let recovered = async {
+                    loop {
+                        match b_in_rx.recv().await {
+                            Some(InboundEvent::Message {
+                                message: SyncMessage::EphemeralDelivery { datagram },
+                                ..
+                            }) if datagram.payload.as_ref() == b"after-death" => break true,
+                            Some(_) => continue,
+                            None => break false,
+                        }
+                    }
+                };
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), recovered)
+                        .await
+                        .expect("voice must recover over reliable after the datagram path dies"),
+                    "voice never recovered after the datagram path died"
+                );
+
+                assert!(
+                    !matches!(a_in_rx.try_recv(), Ok(InboundEvent::Disconnected { .. })),
+                    "datagram-path death must not disconnect the connection"
+                );
+
+                drop(a_out_tx);
                 drop(b_out_tx);
             })
             .await;
