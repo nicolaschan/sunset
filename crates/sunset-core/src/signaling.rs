@@ -1,10 +1,6 @@
-//! `Signaler` impl over the `Store`: each outbound `SignalMessage` becomes
-//! a `SignedKvEntry` named `<room_fp_hex>/webrtc/<from_hex>/<to_hex>/<seq:016x>`
-//! whose content block carries the Noise_KK ciphertext for the payload.
-//!
-//! One signaler serves every open room. Noise_KK state is per *peer*: the
-//! room is only the carrier namespace the entries are replicated through,
-//! so a session established via any room is valid for all of them.
+//! `Signaler` over the `Store`: each `SignalMessage` is a `SignedKvEntry`
+//! `<room_fp_hex>/webrtc/<from_hex>/<to_hex>/<seq:016x>` carrying Noise_KK
+//! ciphertext. Noise state is per peer; the room is only the carrier.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -67,10 +63,8 @@ struct PeerKkSlot {
     session: Option<KkSession>,
     next_send_seq: u64,
     on_session_ready: Vec<oneshot::Sender<()>>,
-    /// Session frames (`seq >= 1`) that arrived before the `msg2` that
-    /// establishes the session. The CRDT channel can reorder entries and
-    /// `read_message_2` consumes the initiator by value, so they wait here
-    /// and drain in seq order once the session is up.
+    /// Session frames that overtook `msg2`; drained in seq order once the
+    /// session exists.
     pending: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -99,8 +93,6 @@ impl<S: Store + 'static> RelaySignaler<S> {
         })
     }
 
-    /// Start pumping `room`'s signaling entries into `recv`, and make it
-    /// eligible as a carrier for `send`. Idempotent.
     pub fn register_room(self: &Rc<Self>, room: RoomFingerprint) {
         let mut rooms = self.rooms.borrow_mut();
         if rooms.contains_key(&room) {
@@ -182,15 +174,10 @@ impl<S: Store + 'static> RelaySignaler<S> {
         Ok(())
     }
 
-    /// Decrypt one inbound frame; establishing a session here can also
-    /// release buffered session frames, hence zero or more plaintexts.
-    ///
-    /// The entry's `seq` is the frame discriminator: handshake frames
-    /// (`msg1`, `msg2`) are always the sender's `seq == 0` (`reset_peer`
-    /// and the rehandshake path both rewind to 0), session frames always
-    /// `seq >= 1`. Routing on it is what keeps a reordered session frame
-    /// away from `read_message_2`, which would consume the initiator and
-    /// hang the dial.
+    /// `seq == 0` is always a handshake frame (`reset_peer` and rehandshake
+    /// rewind to 0), `seq >= 1` a session frame. The CRDT channel reorders
+    /// and `read_message_2` consumes the initiator, so a session frame must
+    /// never reach the handshake.
     async fn decrypt_inbound(
         &self,
         from: &PeerId,
@@ -202,7 +189,7 @@ impl<S: Store + 'static> RelaySignaler<S> {
 
         if seq >= 1 {
             if let Some(session) = slot.session.as_mut() {
-                // Undecryptable ⇒ a superseded generation; drop it.
+                // Undecryptable ⇒ stale generation.
                 return Ok(session
                     .decrypt(ciphertext)
                     .map(|pt| vec![(seq, pt)])
@@ -212,12 +199,9 @@ impl<S: Store + 'static> RelaySignaler<S> {
             return Ok(vec![]);
         }
 
-        // A peer that restarts with the same identity sends a fresh `msg1`,
-        // which fails to decrypt under whatever state we hold. Every arm
-        // therefore falls through to "new responder"; KK's static-key
-        // authentication means only the real peer can produce a valid msg1
-        // (replaying an old one forces a reset — the same DoS surface as
-        // withholding signaling entries at the relay).
+        // A restarted peer sends a fresh `msg1` that nothing we hold can
+        // decrypt, so every arm falls through to a new responder. KK static
+        // keys mean only the real peer can produce a valid `msg1`.
         if let Some(session) = slot.session.as_mut() {
             if let Ok(pt) = session.decrypt(ciphertext) {
                 return Ok(vec![(seq, pt)]);
@@ -244,9 +228,7 @@ impl<S: Store + 'static> RelaySignaler<S> {
         let pt = resp
             .read_message_1(ciphertext)
             .map_err(|e| SyncError::Transport(format!("read_message_1: {e}")))?;
-        // Fresh generation: old state and buffered frames can't decrypt
-        // against the new key. Rewind the send seq so our `msg2` lands at
-        // seq 0, where the dialer's routing expects a handshake frame.
+        // Fresh generation; rewind seq so our `msg2` lands at seq 0.
         *slot = PeerKkSlot {
             responder: Some(resp),
             on_session_ready: std::mem::take(&mut slot.on_session_ready),
@@ -348,14 +330,10 @@ impl<S: Store + 'static> Signaler for RelaySignaler<S> {
             .ok_or_else(|| SyncError::Transport("signaler closed".into()))
     }
 
-    /// Forget the Noise state for `peer` so the next `send` writes a fresh
-    /// `msg1` at seq 0. The rewind matters: the new msg1 must *overwrite*
-    /// the old one (LWW at the same name) or a receiver replaying history
-    /// would answer the dead session's msg1 first and the dial would hang
-    /// (the "rejoin → no audio" failure). Higher-seq ICE leftovers from the
-    /// dead session are harmless noise at the WebRTC layer. Parked
-    /// `on_session_ready` waiters are dropped rather than kept: the fresh
-    /// initiator path never signals them, so they'd wait forever.
+    /// Rewinding seq to 0 makes the fresh `msg1` overwrite the old one
+    /// (LWW), so a receiver replaying history never answers the dead
+    /// session's `msg1`. Parked waiters are dropped: the fresh-initiator
+    /// path never wakes them.
     async fn reset_peer(&self, peer: &PeerId) {
         if let Some(slot) = self.peers.lock().await.get_mut(peer) {
             *slot = PeerKkSlot::default();
