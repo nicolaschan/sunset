@@ -59,6 +59,8 @@ The routing layer is a policy on top of the engine. The engine still moves bytes
 
 Three new entry shapes, all in `_sunset-sync/` reserved namespace, all signed by their publisher, all subject to existing LWW/TTL semantics.
 
+**Revision (2026-08-24):** only the subscription entry exists in the tree today. `LinkState` / `Neighbor` / `ProviderTick` and their reserved names landed as dead code in Phase 1 and were removed again before Phase 3 wired them in — see the 2026-08-24 revision in the 2026-05-24 Phase 2 design for the reasoning and for where the definitions are kept. The shapes below remain the design; Phase 3 lands them alongside the ranking that reads them.
+
 ### Subscription entry
 
 ```rust
