@@ -51,25 +51,13 @@ pub struct BroadcastIntent {
 /// Both maps are private — callers go through the accessor methods so
 /// the engine doesn't reach into the routing data structures directly.
 /// This isolates "where is this data stored?" decisions to this module.
+#[derive(Default)]
 pub struct Routes {
-    me: PeerId,
     my_subs: HashMap<OutboundKey, Outbound>,
     broadcast_intents: HashMap<FilterHash, BroadcastIntent>,
 }
 
 impl Routes {
-    pub fn new(me: PeerId) -> Self {
-        Self {
-            me,
-            my_subs: HashMap::new(),
-            broadcast_intents: HashMap::new(),
-        }
-    }
-
-    pub fn me(&self) -> &PeerId {
-        &self.me
-    }
-
     /// Keys of outbound subscriptions whose `last_published_ms` is at
     /// least `policy.refresh_interval()` behind `now_ms`.
     pub fn due_for_refresh(&self, now_ms: u64) -> Vec<OutboundKey> {
@@ -180,7 +168,7 @@ mod tests {
 
     #[test]
     fn due_for_refresh_returns_entries_past_half_threshold() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         let key = OutboundKey {
             filter_hash: [0u8; 32],
             provider: pid(b"p"),
@@ -192,7 +180,7 @@ mod tests {
 
     #[test]
     fn due_for_refresh_skips_fresh_entries() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         let key = OutboundKey {
             filter_hash: [0u8; 32],
             provider: pid(b"p"),
@@ -203,7 +191,7 @@ mod tests {
 
     #[test]
     fn due_for_refresh_honors_relay_broad_policy_cadence() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         let key = OutboundKey {
             filter_hash: [0u8; 32],
             provider: pid(b"p"),
@@ -240,21 +228,14 @@ mod tests {
     }
 
     #[test]
-    fn me_returns_constructed_peer_id() {
-        let me = pid(b"alice");
-        let routes = Routes::new(me.clone());
-        assert_eq!(routes.me(), &me);
-    }
-
-    #[test]
     fn broadcast_intents_snapshot_empty_when_none_inserted() {
-        let routes = Routes::new(pid(b"me"));
+        let routes = Routes::default();
         assert!(routes.broadcast_intents_snapshot().is_empty());
     }
 
     #[test]
     fn broadcast_intents_snapshot_returns_inserted_intents() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         let f1 = Filter::Keyspace(vk(b"writer1"));
         let f2 = Filter::Keyspace(vk(b"writer2"));
         let intent = |f: &Filter| BroadcastIntent {
@@ -286,7 +267,7 @@ mod tests {
 
     #[test]
     fn take_broadcast_intent_removes_and_returns_intent() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         let f = Filter::Keyspace(vk(b"writer"));
         let bi = BroadcastIntent {
             filter: f.clone(),
@@ -302,13 +283,13 @@ mod tests {
 
     #[test]
     fn take_broadcast_intent_returns_none_when_absent() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         assert!(routes.take_broadcast_intent(&[0u8; 32]).is_none());
     }
 
     #[test]
     fn insert_broadcast_intent_replaces_and_returns_previous() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         let f = Filter::Keyspace(vk(b"writer"));
         let first = BroadcastIntent {
             filter: f.clone(),
@@ -331,7 +312,7 @@ mod tests {
 
     #[test]
     fn outbound_providers_for_filter_only_returns_matching_filter() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         let f1: FilterHash = [1u8; 32];
         let f2: FilterHash = [2u8; 32];
         let p1 = pid(b"p1");
@@ -371,7 +352,7 @@ mod tests {
 
     #[test]
     fn outbound_filter_policy_returns_none_when_absent() {
-        let routes = Routes::new(pid(b"me"));
+        let routes = Routes::default();
         let key = OutboundKey {
             filter_hash: [0u8; 32],
             provider: pid(b"p"),
@@ -382,7 +363,7 @@ mod tests {
 
     #[test]
     fn outbound_filter_policy_returns_stored_pair() {
-        let mut routes = Routes::new(pid(b"me"));
+        let mut routes = Routes::default();
         let key = OutboundKey {
             filter_hash: [7u8; 32],
             provider: pid(b"p"),

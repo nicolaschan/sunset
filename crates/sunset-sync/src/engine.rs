@@ -338,11 +338,11 @@ where
             store,
             transport: Arc::new(transport),
             config,
-            local_peer: local_peer.clone(),
+            local_peer,
             signer,
             state: Arc::new(Mutex::new(EngineState {
                 trust: TrustSet::default(),
-                routes: crate::routing::Routes::new(local_peer),
+                routes: crate::routing::Routes::default(),
                 peer_sessions: HashMap::new(),
                 event_subs: Vec::new(),
                 ephemeral_subs: Vec::new(),
