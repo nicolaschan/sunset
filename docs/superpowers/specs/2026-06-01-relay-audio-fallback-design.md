@@ -284,6 +284,14 @@ inferred negative:
    `/metrics` JSON route — entirely within `sunset-relay`, no cross-layer ripple.
    If audio crossed the relay this rises ≥ N; if WebRTC silently worked it stays
    ~0. Load-bearing honesty signal.
+
+   > **Revision (2026-08-24):** as built, this went the `IdentitySnapshot`-JSON
+   > route; `DashboardSnapshot` and `bridge.rs` were never the shipped path and
+   > no longer exist, along with the `/dashboard` route referenced above. The
+   > counter is served on `GET /` as `ephemeral_forwarded`, pinned by
+   > `crates/sunset-relay/tests/{http_index,identity_forward_count}.rs`. See the
+   > revision at the top of
+   > `2026-05-02-relay-axum-and-concurrent-handshakes-design.md`.
 2. **Per-frame inbound provenance (`via = direct | relay`).** Thread the inbound
    `TransportKind` of the connection that delivered an `EphemeralDelivery` down to
    the voice frame recorder, surfaced as a real readout (a "relayed" indicator a

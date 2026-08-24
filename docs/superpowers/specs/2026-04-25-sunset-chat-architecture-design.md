@@ -492,11 +492,24 @@ sunset/
 
 This is a non-optional architectural commitment: every host that bears a store renders this status as a dashboard appropriate to its medium.
 
+> **Revision (2026-08-24):** the commitment above stands, and remains
+> unimplemented. The programmatic status query it describes does not exist yet
+> in `sunset-store` / `sunset-core`; it is Plan 10 ("Relay subsystem"). The
+> relay's plaintext `GET /dashboard` page — removed 2026-08-24 — was **not** an
+> implementation of it: it predated and bypassed the protocol-level query,
+> hand-rolling its own O(entries) `FsStore` scan and recursive `data_dir` walk
+> inside `sunset-relay` on every request, on the engine's `LocalSet`. It had no
+> consumer (no client, test, or ops tooling ever read it). Removing it retires a
+> placeholder, not the commitment. When Plan 10 builds the real surface, build
+> it on the shared status query and against a real consumer — do not restore the
+> per-request store scan. See the revision at the top of
+> `2026-05-02-relay-axum-and-concurrent-handshakes-design.md`.
+
 ### Dashboard renderers per host
 
 - **Web client (Gleam):** dashboard view inside the same Gleam app.
 - **TUI:** dashboard panel inside the TUI (`ratatui`).
-- **Relay:** built-in HTTP admin endpoint serving an embedded HTML dashboard.
+- **Relay:** built-in HTTP admin endpoint serving an embedded HTML dashboard. *(Not implemented as of 2026-08-24 — see the revision above; the relay serves only `GET /`, a JSON identity descriptor.)*
 - **MC mod:** minimal `/sunset status` slash-command output in chat.
 
 The same protocol-level status drives every host. Sync status is non-trivial in P2P + relay topologies; without visibility, debugging "why didn't my message arrive?" becomes painful.
