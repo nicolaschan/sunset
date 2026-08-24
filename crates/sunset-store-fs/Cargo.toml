@@ -13,7 +13,6 @@ async-trait.workspace = true
 async-stream.workspace = true
 bytes.workspace = true
 futures.workspace = true
-hex.workspace = true
 postcard.workspace = true
 sunset-store.workspace = true
 tempfile.workspace = true

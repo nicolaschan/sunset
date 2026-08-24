@@ -1125,7 +1125,7 @@ where
         let entry = match ev {
             Event::Inserted(e) => e,
             Event::Replaced { new, .. } => new,
-            // Expired / BlobAdded / BlobRemoved: not pushed in v1.
+            // Only entry writes are pushed in v1.
             _ => return,
         };
 

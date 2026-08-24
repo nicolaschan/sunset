@@ -56,14 +56,12 @@ where
     hash_mismatch_rejection(&store_factory().await).await;
     lazy_dangling_ref(&store_factory().await).await;
     ttl_pruning(&store_factory().await).await;
-    blob_gc_reachability(&store_factory().await).await;
     iter_filters(&store_factory().await).await;
     subscribe_replay_modes(&store_factory().await).await;
     subscribe_replay_since_cursor(&store_factory().await).await;
     subscribe_emits_replaced_event(&store_factory().await).await;
     subscribe_emits_expired_event(&store_factory().await).await;
     subscribe_emits_blob_added_event(&store_factory().await).await;
-    subscribe_emits_blob_removed_event(&store_factory().await).await;
     put_content_emits_blob_added(&store_factory().await).await;
     put_content_idempotent_does_not_re_emit_blob_added(&store_factory().await).await;
 }
@@ -171,25 +169,6 @@ pub async fn ttl_pruning<S: Store>(store: &S) {
             .unwrap()
             .is_some()
     );
-}
-
-/// Test: gc_blobs keeps reachable blobs and reclaims orphans.
-pub async fn blob_gc_reachability<S: Store>(store: &S) {
-    let leaf = block(b"leaf");
-    let head = ContentBlock {
-        data: bytes::Bytes::from_static(b"head"),
-        references: vec![leaf.hash()],
-    };
-    let orphan = block(b"orphan");
-    let e = entry(&head, b"a", b"r", 1);
-    store.put_content(leaf.clone()).await.unwrap();
-    store.insert(e, Some(head.clone())).await.unwrap();
-    store.put_content(orphan.clone()).await.unwrap();
-    let n = store.gc_blobs().await.unwrap();
-    assert_eq!(n, 1, "exactly one orphan reclaimed");
-    assert!(store.get_content(&head.hash()).await.unwrap().is_some());
-    assert!(store.get_content(&leaf.hash()).await.unwrap().is_some());
-    assert!(store.get_content(&orphan.hash()).await.unwrap().is_none());
 }
 
 /// Test: iter respects each filter variant.
@@ -502,28 +481,4 @@ pub async fn put_content_idempotent_does_not_re_emit_blob_added<S: Store>(store:
         result.is_err() || matches!(result, Ok(None)),
         "second put_content of same blob should not re-emit BlobAdded"
     );
-}
-
-/// Test: `gc_blobs()` emits `Event::BlobRemoved` to all subscribers for each reclaimed blob.
-///
-/// Like the BlobAdded test, the subscriber filter intentionally does NOT
-/// match anything in the store; this pins down the contract that
-/// BlobRemoved is delivered regardless of subscription filter.
-pub async fn subscribe_emits_blob_removed_event<S: Store>(store: &S) {
-    let orphan = block(b"orphan");
-    store.put_content(orphan.clone()).await.unwrap();
-
-    let mut s = store
-        .subscribe(Filter::Keyspace(vk(b"unrelated-watcher")), Replay::None)
-        .await
-        .unwrap();
-    let reclaimed = store.gc_blobs().await.unwrap();
-    assert_eq!(reclaimed, 1);
-
-    let evt = next_matching(&mut s, |e| matches!(e, Event::BlobRemoved(_))).await;
-    if let Event::BlobRemoved(h) = evt {
-        assert_eq!(h, orphan.hash());
-    } else {
-        unreachable!()
-    }
 }

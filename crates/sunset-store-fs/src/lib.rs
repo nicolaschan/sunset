@@ -2,7 +2,6 @@
 //! index and the filesystem for content blobs.
 
 pub(crate) mod blobs;
-mod gc;
 mod kv;
 mod schema;
 mod store;

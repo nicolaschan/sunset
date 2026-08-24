@@ -58,10 +58,6 @@ pub trait Store {
     /// Should emit `Event::Expired` for each on active subscriptions.
     async fn delete_expired(&self, now: u64) -> Result<usize>;
 
-    /// Mark-and-sweep over content blobs reachable from live KV entries.
-    /// Returns the count reclaimed.
-    async fn gc_blobs(&self) -> Result<usize>;
-
     /// Returns the current monotonic cursor: the next-to-be-assigned sequence
     /// number. Passing the returned cursor to `subscribe(..., Replay::Since(c))`
     /// replays entries written at or after the moment this method observed the
