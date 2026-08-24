@@ -40,5 +40,5 @@ pub use reactions::{
     ReactionEvent, ReactionHandles, ReactionSnapshot, ReactionsCallback, ReactionsCallbackSlot,
     reactions_signature, spawn_reaction_tracker,
 };
-pub use signaling::{MultiRoomSignaler, RelaySignaler, signaling_filter};
+pub use signaling::{RelaySignaler, signaling_filter};
 pub use verifier::Ed25519Verifier;

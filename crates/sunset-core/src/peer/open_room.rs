@@ -652,8 +652,7 @@ impl<St: Store + 'static, T: Transport + 'static> Drop for RoomState<St, T> {
         let Some(peer) = self.peer_weak.upgrade() else {
             return;
         };
-        peer.rtc_signaler_dispatcher
-            .unregister(&self.room.fingerprint());
+        peer.signaler.unregister_room(&self.room.fingerprint());
 
         // Pair the `engine.subscribe(room_filter, ...)` call that
         // `Peer::open_room` made on entry: without this every

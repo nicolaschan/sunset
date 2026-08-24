@@ -36,8 +36,6 @@ pub use members::MemberJs;
 pub use messages::IncomingMessage;
 #[cfg(target_arch = "wasm32")]
 pub use room_handle::RoomHandle;
-#[cfg(target_arch = "wasm32")]
-pub use sunset_core::{RelaySignaler, signaling_filter};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Client;
