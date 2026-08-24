@@ -12,12 +12,11 @@ use crate::types::PeerId;
 /// key with `expires_at` ≥ the previous entry's so it propagates through
 /// the network like any other update before being garbage-collected.
 ///
-/// `Active` carries `filter` and `provider` redundantly with the entry
-/// name (which is `subscription_name(filter, provider)`). Providers read
-/// the value directly rather than parsing the name, and receivers can
-/// reject any entry whose value disagrees with its key — so the
-/// "duplication" is a single-source claim verified at the consumer, not
-/// two independent writes.
+/// The key is the source of truth for the `(filter, provider)` pair the
+/// entry addresses — `decode_subscription_name` recovers both from it,
+/// which is the only option for `Withdrawn` (a unit variant). `Active`
+/// still carries `filter` because the key holds only its hash, and
+/// `provider` because the v1 encoding is frozen.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubscriptionEntry {
     /// The receiver wants `filter` from `provider`.

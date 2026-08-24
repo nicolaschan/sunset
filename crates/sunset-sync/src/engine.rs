@@ -866,11 +866,12 @@ where
         }
     }
 
-    /// Walk the local store for `_sunset-sync/subscribe/*` entries and,
-    /// for each `Active { provider == me }` whose receiver is currently
-    /// connected, (re)populate that peer's `interests`. `only` restricts
-    /// the scan to a single peer (the PeerHello (re)connect path); `None`
-    /// arms every connected peer (the one-shot startup scan).
+    /// Rebuild the per-`PeerSession` interest cache from the local store by
+    /// replaying every `_sunset-sync/subscribe/*` entry through
+    /// [`Self::handle_subscription_entry_event`], as if it had just arrived.
+    /// `only` restricts the replay to entries authored by a single peer (the
+    /// PeerHello (re)connect path); `None` replays all of them (the one-shot
+    /// startup scan).
     ///
     /// This is what keeps a peer's declared interest connection-independent.
     /// The durable `SubscriptionEntry` in our store is the source of truth;
@@ -892,60 +893,10 @@ where
             let Ok(entry) = entry_result else {
                 continue;
             };
-            let receiver = PeerId(entry.verifying_key.clone());
-            if only.is_some_and(|p| p != &receiver) {
+            if only.is_some_and(|p| p.0 != entry.verifying_key) {
                 continue;
             }
-            let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else {
-                continue;
-            };
-            let Ok(sub_entry) =
-                postcard::from_bytes::<crate::routing::SubscriptionEntry>(&block.data)
-            else {
-                continue;
-            };
-            let Some(filter_hash) = crate::routing::decode_filter_hash_from_name(&entry.name)
-            else {
-                continue;
-            };
-            if let crate::routing::SubscriptionEntry::Active { filter, provider } = sub_entry
-                && provider == self.local_peer
-            {
-                let (was_new, tx) = {
-                    let mut state = self.state.lock().await;
-                    let Some(session) = state.peer_sessions.get_mut(&receiver) else {
-                        // Receiver not connected: `handle_subscription_active`
-                        // arms it when their entry is (re)delivered after they
-                        // connect.
-                        continue;
-                    };
-                    let was_new = session
-                        .interests
-                        .insert(filter_hash, filter.clone())
-                        .is_none();
-                    (was_new, session.tx.clone())
-                };
-                if was_new {
-                    // These entries are authored by the receiver (a foreign
-                    // peer), so — exactly like `handle_subscription_active` —
-                    // ask them for a digest over the filter and push whatever
-                    // they are missing. This is the catch-up path: re-arming
-                    // the interest here makes the later
-                    // `handle_subscription_active` for the re-delivered entry
-                    // see it already armed and skip its own DigestRequest, so
-                    // without this a reconnecting peer would never receive the
-                    // entries written while it was gone.
-                    let _ = tx.send(SyncMessage::DigestRequest {
-                        filter: filter.clone(),
-                        range: DigestRange::All,
-                    });
-                    self.emit_engine_event(EngineEvent::PeerInterestArmed {
-                        receiver: receiver.clone(),
-                        filter,
-                    })
-                    .await;
-                }
-            }
+            self.handle_subscription_entry_event(&entry).await;
         }
         Ok(())
     }
@@ -1190,83 +1141,68 @@ where
     /// All routing-state mutation happens under a single `state.lock()`
     /// critical section per call.
     async fn handle_subscription_entry_event(&self, entry: &sunset_store::SignedKvEntry) {
-        let Some((filter_hash, sub_entry)) = self.parse_subscription_entry(entry).await else {
+        let Some((filter_hash, provider)) = crate::routing::decode_subscription_name(&entry.name)
+        else {
+            tracing::warn!(
+                name = %String::from_utf8_lossy(&entry.name),
+                "SUBSCRIBE_PREFIX entry with malformed name; ignoring"
+            );
+            return;
+        };
+        // The key names the provider both variants address, and an entry
+        // reaches every connected peer, so one addressed elsewhere is not
+        // ours to act on. The interest map is keyed by `FilterHash` alone:
+        // acting on a `Withdrawn` addressed to another provider would tear
+        // down the interest a co-armed provider is serving (the
+        // relay-fallback co-arm subscribes to `voice/<sender>` via the
+        // direct peer AND via the relay) and silently cut forwarding.
+        // Forwarding interest upstream — recursive subscription — is not
+        // yet implemented.
+        if provider != self.local_peer {
+            return;
+        }
+        let Some(sub_entry) = self.read_subscription_value(entry).await else {
             return;
         };
         let receiver = PeerId(entry.verifying_key.clone());
-        let is_self_authored = entry.verifying_key == self.local_peer.0;
 
         match sub_entry {
-            crate::routing::SubscriptionEntry::Active { filter, provider }
-                if provider == self.local_peer =>
-            {
+            crate::routing::SubscriptionEntry::Active { filter, .. } => {
+                let is_self_authored = entry.verifying_key == self.local_peer.0;
                 self.handle_subscription_active(filter_hash, receiver, filter, is_self_authored)
                     .await;
             }
-            // A `Withdrawn` is scoped to the provider it names, exactly like
-            // `Active`: only retract our interest when *we* are the named
-            // provider. The provider lives in the entry name (the `Withdrawn`
-            // value is a unit variant). Without this guard, a receiver that
-            // subscribes to one filter via several providers (the
-            // relay-fallback co-arm: `voice/<sender>` via the direct peer AND
-            // via the relay) would, on withdrawing one, tear down the
-            // interest armed by the others — the interest map is keyed by
-            // `FilterHash` alone — silently cutting forwarding. A self-authored
-            // `Withdrawn` reaches every connected peer, so each non-target
-            // provider must ignore it.
-            crate::routing::SubscriptionEntry::Withdrawn
-                if crate::routing::decode_provider_from_name(&entry.name)
-                    .is_some_and(|provider| provider == self.local_peer) =>
-            {
+            crate::routing::SubscriptionEntry::Withdrawn => {
                 self.handle_subscription_withdrawn(filter_hash, receiver)
                     .await;
             }
-            // Active/Withdrawn naming someone else: ignored. Recursive
-            // subscription (forwarding interest upstream) is not yet
-            // implemented.
-            _ => {}
         }
     }
 
-    /// Decode a SUBSCRIBE_PREFIX entry into `(filter_hash, SubscriptionEntry)`.
+    /// Decode the `SubscriptionEntry` a SUBSCRIBE_PREFIX entry points at.
     ///
-    /// Returns `None` (after a `warn!`) if either the blob is missing /
-    /// malformed or the name doesn't parse as `subscription_name`.
-    async fn parse_subscription_entry(
+    /// Returns `None` if the blob is missing (a dangling ref sync hasn't
+    /// filled yet) or, after a `warn!`, if it isn't a `SubscriptionEntry`.
+    async fn read_subscription_value(
         &self,
         entry: &sunset_store::SignedKvEntry,
-    ) -> Option<(
-        crate::routing::FilterHash,
-        crate::routing::SubscriptionEntry,
-    )> {
+    ) -> Option<crate::routing::SubscriptionEntry> {
         let block = self
             .store
             .get_content(&entry.value_hash)
             .await
             .ok()
             .flatten()?;
-        let sub_entry = match postcard::from_bytes::<crate::routing::SubscriptionEntry>(&block.data)
-        {
-            Ok(e) => e,
+        match postcard::from_bytes(&block.data) {
+            Ok(e) => Some(e),
             Err(_) => {
                 tracing::warn!(
                     name = %String::from_utf8_lossy(&entry.name),
                     "malformed SubscriptionEntry value; ignoring"
                 );
-                return None;
+                None
             }
-        };
-        let filter_hash = match crate::routing::decode_filter_hash_from_name(&entry.name) {
-            Some(h) => h,
-            None => {
-                tracing::warn!(
-                    name = %String::from_utf8_lossy(&entry.name),
-                    "SUBSCRIBE_PREFIX entry with malformed name; ignoring"
-                );
-                return None;
-            }
-        };
-        Some((filter_hash, sub_entry))
+        }
     }
 
     /// `SubscriptionEntry::Active` arm with `provider == self`. Mirrors
@@ -3639,7 +3575,7 @@ mod tests {
 
                 // SUBSCRIBE_PREFIX'd name whose tail is not a valid
                 // `<filter-hash-hex>/<provider-hex>` shape, so
-                // `decode_filter_hash_from_name` returns None.
+                // `decode_subscription_name` returns None.
                 let filter = Filter::Keyspace(vk(b"chat"));
                 let sub_value = crate::routing::SubscriptionEntry::Active {
                     filter: filter.clone(),

@@ -8,13 +8,12 @@
 //! - **Wire type** (`types`): `SubscriptionEntry`.
 //! - **Per-pair naming** (`naming`): `SUBSCRIBE_PREFIX`,
 //!   `subscription_name`, `is_subscription_name`,
-//!   `decode_filter_hash_from_name`.
+//!   `decode_subscription_name`.
 //! - **Subscription policy** (`policy`): `SubscriptionPolicy` with
 //!   `store_data()` / `relay_broad()` constructors driving entry TTL
 //!   and refresh interval, plus the `relay_broad_filter()` helper.
 //! - **Receiver-side state** (`routes`): `Routes`, `OutboundKey`,
-//!   `Outbound`, `BroadcastIntent`, `FilterHash`,
-//!   `FILTER_HASH_HEX_LEN`, `filter_hash`.
+//!   `Outbound`, `BroadcastIntent`, `FilterHash`, `filter_hash`.
 //! - **Forwarding decision** (`forward`): `forward_targets` and the
 //!   `PeerInterests` trait.
 //!
@@ -35,11 +34,8 @@ pub mod types;
 
 pub use forward::{PeerInterests, forward_targets};
 pub use naming::{
-    SUBSCRIBE_PREFIX, decode_filter_hash_from_name, decode_provider_from_name,
-    is_subscription_name, subscription_name,
+    SUBSCRIBE_PREFIX, decode_subscription_name, is_subscription_name, subscription_name,
 };
 pub use policy::{SubscriptionPolicy, relay_broad_filter};
-pub use routes::{
-    BroadcastIntent, FILTER_HASH_HEX_LEN, FilterHash, Outbound, OutboundKey, Routes, filter_hash,
-};
+pub use routes::{BroadcastIntent, FilterHash, Outbound, OutboundKey, Routes, filter_hash};
 pub use types::SubscriptionEntry;
