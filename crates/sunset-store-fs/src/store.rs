@@ -49,9 +49,12 @@ impl FsStore {
             .await
             .map_err(|e| Error::Backend(format!("open sqlite: {e}")))?;
 
-        conn.call(|c| schema::apply_schema(c).map_err(tokio_rusqlite::Error::from))
-            .await
-            .map_err(|e| Error::Backend(format!("apply schema: {e}")))?;
+        conn.call(|c| {
+            c.execute_batch(schema::SCHEMA_DDL)
+                .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("apply schema: {e}")))?;
 
         Ok(Self {
             root: Arc::new(root),
@@ -76,9 +79,9 @@ impl InsertCommitter for FsStore {
     async fn commit_insert(&self, entry: SignedKvEntry, blob: Option<ContentBlock>) -> Result<()> {
         let _w = self.writer_mutex.lock().await;
 
-        // Persist the blob first (idempotent, content-addressed). Lazy refs are
-        // allowed by spec, so a subsequent SQLite failure leaves at most an
-        // orphaned blob, which gc_blobs reclaims later.
+        // Persist the blob first (idempotent, content-addressed). A subsequent
+        // SQLite failure therefore leaves at most an orphaned blob on disk,
+        // never an entry whose blob is missing from a peer that already has it.
         let blob_added = match &blob {
             Some(b) if blobs::write_blob_atomic(&self.root, b).await? => Some(b.hash()),
             _ => None,
@@ -164,7 +167,7 @@ impl Store for FsStore {
         // or in the live channel — never both.
         let _w = self.writer_mutex.lock().await;
 
-        let history: Vec<SignedKvEntry> = match &replay {
+        let history: Vec<SignedKvEntry> = match replay {
             Replay::None => Vec::new(),
             Replay::All => self
                 .conn
@@ -176,19 +179,6 @@ impl Store for FsStore {
                 })
                 .await
                 .map_err(unwrap_store_error)?,
-            Replay::Since(cursor) => {
-                let cursor = *cursor;
-                let f = filter.clone();
-                self.conn
-                    .call(move |c| -> std::result::Result<Vec<SignedKvEntry>, Error> {
-                        Ok(kv::iter_since(c, cursor)?
-                            .into_iter()
-                            .filter(|e| f.matches(&e.verifying_key, &e.name))
-                            .collect())
-                    })
-                    .await
-                    .map_err(unwrap_store_error)?
-            }
         };
 
         self.subscriptions.add(&sub);
@@ -204,43 +194,6 @@ impl Store for FsStore {
             }
         };
         Ok(Box::pin(stream))
-    }
-
-    async fn delete_expired(&self, now: u64) -> Result<usize> {
-        let _w = self.writer_mutex.lock().await;
-        let victims: Vec<SignedKvEntry> = self
-            .conn
-            .call(move |c| -> std::result::Result<Vec<SignedKvEntry>, Error> {
-                let txn = c
-                    .transaction()
-                    .map_err(|e| Error::Backend(format!("begin transaction: {e}")))?;
-                let v = kv::delete_expired(&txn, now)?;
-                txn.commit()
-                    .map_err(|e| Error::Backend(format!("commit transaction: {e}")))?;
-                Ok(v)
-            })
-            .await
-            .map_err(unwrap_store_error)?;
-        let count = victims.len();
-        for e in victims {
-            self.subscriptions.broadcast(&Event::Expired(e));
-        }
-        Ok(count)
-    }
-
-    async fn gc_blobs(&self) -> Result<usize> {
-        let _w = self.writer_mutex.lock().await;
-        let roots = self
-            .conn
-            .call(|c| crate::gc::read_roots(c).map_err(tokio_rusqlite::Error::from))
-            .await
-            .map_err(|e| Error::Backend(format!("gc roots: {e}")))?;
-        let removed = crate::gc::mark_and_sweep(&self.root, roots).await?;
-        let count = removed.len();
-        for h in removed {
-            self.subscriptions.broadcast(&Event::BlobRemoved(h));
-        }
-        Ok(count)
     }
 
     async fn current_cursor(&self) -> Result<Cursor> {
@@ -313,7 +266,7 @@ mod iter_tests {
 #[cfg(test)]
 mod insert_tests {
     use super::*;
-    use sunset_store::test_helpers::{block, entry, entry_expiring_at, vk};
+    use sunset_store::test_helpers::{block, entry, vk};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -374,29 +327,14 @@ mod insert_tests {
         assert!(matches!(err, Error::HashMismatch));
     }
 
+    /// SQLite's AUTOINCREMENT starts at 1, so this backend's cursor origin
+    /// differs from memory's. Cursor *movement* is pinned for every backend by
+    /// `current_cursor_counts_stored_entries` in the conformance suite.
     #[tokio::test]
-    async fn current_cursor_advances_with_inserts() {
+    async fn new_store_starts_at_cursor_one() {
         let dir = TempDir::new().unwrap();
         let store = FsStore::new(dir.path()).await.unwrap();
         assert_eq!(store.current_cursor().await.unwrap(), Cursor(1));
-        let b = block(b"v");
-        store
-            .insert(entry(&b, b"a", b"k", 1), Some(b))
-            .await
-            .unwrap();
-        assert_eq!(store.current_cursor().await.unwrap(), Cursor(2));
-    }
-
-    #[tokio::test]
-    async fn delete_expired_removes_at_boundary() {
-        let dir = TempDir::new().unwrap();
-        let store = FsStore::new(dir.path()).await.unwrap();
-        let b = block(b"v");
-        let e = entry_expiring_at(&b, b"a", b"k", 1, 100);
-        store.insert(e, Some(b)).await.unwrap();
-        let n = store.delete_expired(100).await.unwrap();
-        assert_eq!(n, 1);
-        assert!(store.get_entry(&vk(b"a"), b"k").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -460,63 +398,5 @@ mod subscribe_tests {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod gc_tests {
-    use super::*;
-    use sunset_store::test_helpers::{block, entry};
-    use tempfile::TempDir;
-
-    #[tokio::test]
-    async fn gc_blobs_continues_past_corrupt_reachable_blob() {
-        let dir = TempDir::new().unwrap();
-        let store = FsStore::new(dir.path()).await.unwrap();
-        // Insert a normal blob + entry referencing it (the "good root").
-        let b_good = block(b"good");
-        store
-            .insert(entry(&b_good, b"a", b"k", 1), Some(b_good.clone()))
-            .await
-            .unwrap();
-        // Insert a second blob that's a root, then corrupt it on disk.
-        let b_corrupt = block(b"to-be-corrupted");
-        store
-            .insert(entry(&b_corrupt, b"a", b"k2", 1), Some(b_corrupt.clone()))
-            .await
-            .unwrap();
-        // Corrupt the on-disk blob (overwrite with garbage).
-        let hex = b_corrupt.hash().to_hex();
-        let corrupt_path = dir.path().join("content").join(&hex[0..2]).join(&hex[2..]);
-        std::fs::write(&corrupt_path, b"garbage-not-a-valid-postcard").unwrap();
-        // Add an unrelated orphan blob.
-        let b_orphan = block(b"orphan");
-        store.put_content(b_orphan.clone()).await.unwrap();
-        // GC should NOT abort due to the corrupt blob; it should still sweep the orphan.
-        let n = store.gc_blobs().await.unwrap();
-        assert_eq!(
-            n, 1,
-            "orphan must be reclaimed despite corrupt reachable blob"
-        );
-        assert!(store.get_content(&b_orphan.hash()).await.unwrap().is_none());
-        // The good blob remains (it was a leaf with no references; not corrupted).
-        assert!(store.get_content(&b_good.hash()).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn gc_blobs_keeps_reachable_drops_orphans() {
-        let dir = TempDir::new().unwrap();
-        let store = FsStore::new(dir.path()).await.unwrap();
-        let b_used = block(b"used");
-        let b_orphan = block(b"orphan");
-        store.put_content(b_orphan.clone()).await.unwrap();
-        store
-            .insert(entry(&b_used, b"a", b"k", 1), Some(b_used.clone()))
-            .await
-            .unwrap();
-        let n = store.gc_blobs().await.unwrap();
-        assert_eq!(n, 1);
-        assert!(store.get_content(&b_used.hash()).await.unwrap().is_some());
-        assert!(store.get_content(&b_orphan.hash()).await.unwrap().is_none());
     }
 }

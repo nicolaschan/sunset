@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Cursor, Hash, SignedKvEntry, VerifyingKey};
+use crate::types::{Hash, SignedKvEntry, VerifyingKey};
 
 /// Expression of a set of `(verifying_key, name)` pairs of interest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,16 +33,15 @@ impl Filter {
 
     /// True if this filter is interested in delivery of `event`.
     ///
-    /// Keyed events (`Inserted`, `Replaced`, `Expired`) are matched against
-    /// the filter's `(verifying_key, name)` predicate. Blob events
-    /// (`BlobAdded`, `BlobRemoved`) carry no key and are delivered to every
-    /// subscriber regardless of filter — they describe content-store state,
-    /// which is shared across the whole store.
+    /// Keyed events (`Inserted`, `Replaced`) are matched against the filter's
+    /// `(verifying_key, name)` predicate. `BlobAdded` carries no key and is
+    /// delivered to every subscriber regardless of filter — it describes
+    /// content-store state, which is shared across the whole store.
     pub fn matches_event(&self, event: &Event) -> bool {
         match event {
-            Event::Inserted(e) | Event::Expired(e) => self.matches(&e.verifying_key, &e.name),
+            Event::Inserted(e) => self.matches(&e.verifying_key, &e.name),
             Event::Replaced { new, .. } => self.matches(&new.verifying_key, &new.name),
-            Event::BlobAdded(_) | Event::BlobRemoved(_) => true,
+            Event::BlobAdded(_) => true,
         }
     }
 }
@@ -54,14 +53,6 @@ pub enum Replay {
     None,
     /// All historical matching entries first, then live updates.
     All,
-    /// Events with sequence `>= cursor`, then live updates.
-    ///
-    /// Cursors are "next-to-be-assigned" sequence numbers (see
-    /// `Store::current_cursor`). A cursor captured at time T thus represents
-    /// the boundary just after every entry written before T; replaying with
-    /// `Since(c)` therefore re-emits entries whose sequence is `>= c.0`,
-    /// which in practice means everything written at or after T.
-    Since(Cursor),
 }
 
 /// Event delivered on a subscription stream.
@@ -74,12 +65,8 @@ pub enum Event {
         old: SignedKvEntry,
         new: SignedKvEntry,
     },
-    /// An entry was removed by TTL expiration.
-    Expired(SignedKvEntry),
     /// A new ContentBlock arrived.
     BlobAdded(Hash),
-    /// A ContentBlock was reclaimed by GC.
-    BlobRemoved(Hash),
 }
 
 #[cfg(test)]

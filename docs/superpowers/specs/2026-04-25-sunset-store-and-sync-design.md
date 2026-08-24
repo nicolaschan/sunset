@@ -14,16 +14,55 @@ This document refines two architecture-spec choices in small ways:
 
 Neither refinement changes any architectural commitment in the parent spec.
 
+## Revision 2026-08-24 — the maintenance surface is removed
+
+This revision supersedes the passages below that described store-side
+maintenance. Four pieces of the original design were implemented, shipped, and
+never called by anything in the workspace; they are deleted rather than left
+as a contract the code does not honour.
+
+- **Blob GC (`gc_blobs`, `Event::BlobRemoved`, §Garbage collection).** The
+  mark phase walks `ContentBlock.references` transitively, but in this codebase
+  that DAG has depth one and never resolves. The sole producer of a non-empty
+  `references` is `sunset-core`'s message composer, which sets
+  `references: vec![pt_hash]` where `pt_hash` is blake3 of the message
+  *plaintext* — a key-derivation input for `derive_msg_key`, not a pointer to a
+  stored blob. The plaintext is deliberately never written to the content
+  store; storing it would defeat the E2E encryption. Every traversal therefore
+  read one root, pushed one reference, found it absent (the "lazy dangling ref"
+  case the spec explicitly permits), and stopped. When blob reclamation is
+  actually needed, the design that fits this data model is a refcount over live
+  `entry.value_hash` values, not a reference-DAG walk.
+- **TTL pruning (`delete_expired`, `Event::Expired`).** Nothing swept, and
+  nothing read `expires_at` to decide whether an entry was still valid.
+  Application-level expiry is derived elsewhere: presence liveness comes from
+  heartbeat age (`membership::presence_bucket`, computed from the entry's
+  priority timestamp), and stale subscription entries are superseded by LWW on
+  refresh rather than removed. `SignedKvEntry::expires_at` remains — it is
+  frozen postcard v1 and the relay renders TTL stats from it — but it is a
+  timestamp consumers may interpret, not a promise the store will act on it.
+- **`Replay::Since(Cursor)`.** No consumer ever resumed from a cursor. It
+  carried the crate's subtlest contract (`current_cursor()` is the *next* 
+  sequence, `Since` is `>=` not `>`, and the absolute origin differs per
+  backend), which is now gone with it. `Replay` is `None | All`. `Cursor` and
+  `current_cursor()` survive as the store's write counter, which the relay's
+  status output reads.
+- **The `schema_meta` version table** in the SQLite backend, written on every
+  open and read by nothing.
+
+Nothing observable changes. Expired entries and orphan blobs already lived
+forever, because no caller ever asked for them to be removed.
+
 ## sunset-store
 
 ### Purpose and shape
 
 `sunset-store` is a Rust crate that compiles to native and to WebAssembly. It provides:
 
-- A signed CRDT key-value store with priority-based last-write-wins, TTL pruning, and no tombstones.
+- A signed CRDT key-value store with priority-based last-write-wins and no tombstones.
 - A content-addressed blob store keyed by blake3.
 - Subset queries by keyspace, namespace, and name prefix.
-- Async-stream subscriptions with historical replay and cursor-based resume.
+- Async-stream subscriptions with historical replay.
 - A pluggable storage backend trait, implemented separately for memory, IndexedDB, and SQLite-plus-filesystem.
 
 The store is **message-agnostic** — it knows nothing about chat semantics, identity, or rooms. Sunset.chat is one consumer; other applications could use the store independently for any signed-CRDT-with-content-addressing workload.
@@ -38,7 +77,7 @@ pub struct SignedKvEntry {
     pub name:          Bytes,            // application-opaque
     pub value_hash:    Hash,             // blake3 of a ContentBlock; the actual value lives in the content store
     pub priority:      u64,              // monotonic ordering for LWW; default = wall-clock at write, set by caller
-    pub expires_at:    Option<u64>,      // optional TTL; entries past expiry get pruned
+    pub expires_at:    Option<u64>,      // optional expiry timestamp for consumers to interpret; the store never sweeps
     pub signature:     Bytes,            // covers the canonical encoding of all fields above
 }
 
@@ -54,14 +93,14 @@ KV entries are tiny and uniform — a few hundred bytes regardless of value size
 
 #### Why this shape
 
-- **Pure content-addressed data.** Garbage collection is uniform — anything reachable from a live KV pointer is alive; everything else is dead.
+- **Pure content-addressed data.** A blob's identity is its bytes, so liveness is a property of the KV index alone: a blob is live iff some entry's `value_hash` names it. (Nothing acts on that today — see Revision 2026-08-24 — but it is what a future refcount would count.)
 - **Deduplication.** A blob shared by many KV entries is stored once. During replication, peers re-sending KV entries don't have to re-send the underlying blobs.
 - **Tamper-evidence.** The signature on a KV entry covers `value_hash`. A malicious relay can't substitute a different ContentBlock without invalidating the signature.
 - **Replication-friendly.** A peer can ship `(SignedKvEntry, ContentBlock)` in one message, or just the entry if it has reason to believe the receiver already has the blob.
 
-#### Note on content-DAG topology
+#### Note on `references`
 
-`ContentBlock.references` form an arbitrary DAG. The store stores blocks and references but does not police what topology consumers build. **Avoiding the leak of message/content structure through the reference graph is an application-layer concern** — sunset-core's chat layer is responsible for choosing a topology (Merkle-style fan-out, padding, batching multiple operations per block) that doesn't expose meaningful structure to relays. The store will faithfully store whatever shape consumers give it.
+`ContentBlock.references` is an application-opaque list of hashes carried alongside `data`. The store neither resolves nor traverses it, and a hash listed there need not name a blob that exists anywhere — sunset-core uses it to carry blake3 of a message *plaintext*, which is deliberately never stored. **If a consumer ever does use it to link blobs, avoiding the leak of message/content structure through the resulting graph is that consumer's concern** — the store faithfully stores whatever shape it is given and reads nothing into it.
 
 ### LWW semantics
 
@@ -73,20 +112,11 @@ For a KV insert with key `(verifying_key, name)`:
 | `priority >= new`      | Reject as `Stale` (idempotent re-send is a no-op).  |
 | `priority < new`       | Replace: delete the old row, insert the new.        |
 
-TTL pruning runs independently of LWW: a background sweep deletes entries past `expires_at`.
+Removal is by supersession only. `expires_at` is carried for consumers; the store does not act on it (see Revision 2026-08-24).
 
 ### Garbage collection
 
-Mark-and-sweep over content blobs:
-
-1. Walk every live `SignedKvEntry`; accumulate `value_hash` into the live root set.
-2. For each ContentBlock in the live root set, walk its `references` transitively, marking everything reachable.
-3. Any ContentBlock not in the marked set is unreferenced.
-4. Sweep deletes unreferenced blobs.
-
-Cadence and incremental design are backend-specific. Native backends run periodic background sweeps; the IndexedDB backend likely runs sweeps on demand or on a longer cadence under browser quotas. Concurrent-insert safety during a sweep — handled by tracking inserts started before the sweep cutoff and not deleting their referenced blobs — is implementation detail of each backend.
-
-Per-event atomic insert (see §Atomicity below) means that no orphan-blob cleanup is needed for crashes — partial writes are never committed.
+There is none — see Revision 2026-08-24. Per-event atomic insert (see §Atomicity below) means crashes never commit a partial write, so a blob goes unreferenced only by supersession (its entry was replaced, and no other entry names it) or by a caller putting content it never pointed an entry at. Both accumulate.
 
 ### Trust boundary at the store
 
@@ -111,8 +141,6 @@ pub trait Store {
     async fn get_entry(&self, vk: &VerifyingKey, name: &[u8]) -> Result<Option<SignedKvEntry>>;
     async fn iter(&self, filter: Filter) -> Result<BoxStream<'_, Result<SignedKvEntry>>>;
     async fn subscribe(&self, filter: Filter, replay: Replay) -> Result<BoxStream<'_, Result<Event>>>;
-    async fn delete_expired(&self, now: u64) -> Result<usize>;
-    async fn gc_blobs(&self) -> Result<usize>;
     async fn current_cursor(&self) -> Result<Cursor>;
 }
 ```
@@ -135,7 +163,6 @@ Subscription replay mode:
 pub enum Replay {
     None,                  // only future events
     All,                   // all historical matching, then live
-    Since(Cursor),         // events with sequence > cursor, then live
 }
 ```
 
@@ -151,9 +178,7 @@ Event delivered on a subscription stream:
 pub enum Event {
     Inserted(SignedKvEntry),
     Replaced { old: SignedKvEntry, new: SignedKvEntry },
-    Expired(SignedKvEntry),
     BlobAdded(Hash),
-    BlobRemoved(Hash),
 }
 ```
 
@@ -221,20 +246,18 @@ CREATE TABLE entries (
     UNIQUE(verifying_key, name)
 );
 
-CREATE INDEX idx_entries_name       ON entries(name);             -- supports both exact-match (Namespace) and prefix queries via LIKE / range
-CREATE INDEX idx_entries_expires_at ON entries(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX idx_entries_name ON entries(name);  -- supports both exact-match (Namespace) and prefix queries via LIKE / range
 ```
 
 `sequence` provides the cursor monotonic ordering. Content blobs live on disk under a sharded directory (`content/ab/cdef...` style) for filesystem performance.
 
 ### Conformance testing
 
-A shared integration-test suite, exposed as a public test helper from `sunset-store`, that any backend implementation can run against. Verifies LWW semantics, GC correctness, subscription ordering, atomicity, error mapping, and cursor-based resume. Backends that pass the suite are interchangeable from a callers' perspective.
+A shared integration-test suite, exposed as a public test helper from `sunset-store`, that any backend implementation can run against. Verifies LWW semantics, subscription ordering, atomicity, and error mapping. Backends that pass the suite are interchangeable from a callers' perspective.
 
 ### Items deferred to implementation work
 
 - Concrete IndexedDB schema versioning and quota handling.
-- Sweep cadence and incremental sweep design for `gc_blobs`.
 - Filesystem blob layout: shard depth, fsync policy, optional compression.
 - Migration story when the postcard schema needs to evolve (forklift; new ContentBlock format → new hashes → fresh content).
 - Maximum-size limits for KV values, ContentBlock data, names.
@@ -318,7 +341,7 @@ KV entry:
 
 The entry replicates to other peers via the normal sync path. When a peer's subscription is updated (new filter, refreshed TTL), it writes a new entry with a higher priority — LWW automatically supersedes the old one.
 
-Dead peers' subscription entries simply expire. There is no need for explicit unsubscribe or "cleanup" logic — TTL handles it.
+Dead peers' subscription entries are never removed; they are only superseded when the same peer republishes at a higher priority. The original design delegated this to TTL, which was never swept (see Revision 2026-08-24). Bounding the subscription table is unsolved.
 
 ### Wire-protocol message types
 

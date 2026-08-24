@@ -66,13 +66,6 @@ impl MemoryStore {
     pub fn with_accept_all() -> Self {
         Self::new(Arc::new(sunset_store::AcceptAllVerifier))
     }
-
-    /// Returns the current cursor (the next-to-be-assigned sequence number;
-    /// `Cursor(0)` on a fresh store).
-    pub async fn current_cursor_now(&self) -> Cursor {
-        let inner = self.inner.lock().await;
-        Cursor(inner.next_sequence)
-    }
 }
 
 #[async_trait(?Send)]
@@ -163,25 +156,25 @@ impl Store for MemoryStore {
 
         // Build the historical replay portion (snapshot under the lock). Register
         // the subscription INSIDE the inner lock so it serializes with broadcasts
-        // from insert/delete_expired/gc_blobs (which now happen while the inner
-        // lock is held). This prevents a race where an event is delivered both
-        // via history replay and via the live channel.
+        // from insert (which happens while the inner lock is held). This prevents
+        // a race where an event is delivered both via history replay and via the
+        // live channel.
         let historical: Vec<sunset_store::Result<Event>> = {
             let inner = self.inner.lock().await;
             self.subscriptions.add(&sub);
-            let mut out: Vec<(u64, Event)> = inner
-                .entries
-                .iter()
-                .filter(|((vk, name), _)| filter.matches(vk, name.as_ref()))
-                .filter(|(_, stored)| match replay {
-                    sunset_store::Replay::None => false,
-                    sunset_store::Replay::All => true,
-                    sunset_store::Replay::Since(c) => stored.sequence >= c.0,
-                })
-                .map(|(_, stored)| (stored.sequence, Event::Inserted(stored.entry.clone())))
-                .collect();
-            out.sort_by_key(|(s, _)| *s);
-            out.into_iter().map(|(_, e)| Ok(e)).collect()
+            match replay {
+                sunset_store::Replay::None => Vec::new(),
+                sunset_store::Replay::All => {
+                    let mut out: Vec<(u64, Event)> = inner
+                        .entries
+                        .iter()
+                        .filter(|((vk, name), _)| filter.matches(vk, name.as_ref()))
+                        .map(|(_, stored)| (stored.sequence, Event::Inserted(stored.entry.clone())))
+                        .collect();
+                    out.sort_by_key(|(s, _)| *s);
+                    out.into_iter().map(|(_, e)| Ok(e)).collect()
+                }
+            }
         };
 
         // Stream historical, then transition to live events from the channel.
@@ -194,55 +187,9 @@ impl Store for MemoryStore {
         };
         Ok(Box::pin(live))
     }
-    async fn delete_expired(&self, now: u64) -> Result<usize> {
-        let mut inner = self.inner.lock().await;
-        let to_remove: Vec<KvKey> = inner
-            .entries
-            .iter()
-            .filter(|(_, s)| s.entry.expires_at.is_some_and(|e| e <= now))
-            .map(|(k, _)| k.clone())
-            .collect();
-        let mut count = 0;
-        for k in to_remove {
-            if let Some(s) = inner.entries.remove(&k) {
-                self.subscriptions.broadcast(&Event::Expired(s.entry));
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-    async fn gc_blobs(&self) -> Result<usize> {
-        use std::collections::HashSet;
-        let mut inner = self.inner.lock().await;
-        let mut reachable: HashSet<Hash> = HashSet::new();
-        let mut frontier: Vec<Hash> = inner.entries.values().map(|s| s.entry.value_hash).collect();
-        while let Some(h) = frontier.pop() {
-            if !reachable.insert(h) {
-                continue;
-            }
-            if let Some(block) = inner.blobs.get(&h) {
-                for r in &block.references {
-                    if !reachable.contains(r) {
-                        frontier.push(*r);
-                    }
-                }
-            }
-        }
-        let to_remove: Vec<Hash> = inner
-            .blobs
-            .keys()
-            .filter(|h| !reachable.contains(h))
-            .copied()
-            .collect();
-        let count = to_remove.len();
-        for h in to_remove {
-            inner.blobs.remove(&h);
-            self.subscriptions.broadcast(&Event::BlobRemoved(h));
-        }
-        Ok(count)
-    }
     async fn current_cursor(&self) -> Result<Cursor> {
-        Ok(self.current_cursor_now().await)
+        let inner = self.inner.lock().await;
+        Ok(Cursor(inner.next_sequence))
     }
 
     fn verifier(&self) -> Arc<dyn SignatureVerifier> {
@@ -258,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn new_store_starts_at_cursor_zero() {
         let store = MemoryStore::with_accept_all();
-        assert_eq!(store.current_cursor_now().await, Cursor(0));
+        assert_eq!(store.current_cursor().await.unwrap(), Cursor(0));
     }
 
     #[tokio::test]
@@ -293,7 +240,7 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
-    use sunset_store::test_helpers::{block, entry, entry_expiring_at, n, vk};
+    use sunset_store::test_helpers::{block, entry, n, vk};
     use sunset_store::{Filter, Replay};
 
     #[tokio::test]
@@ -515,92 +462,6 @@ mod tests {
         ]);
         let results = collect_iter(&store, f).await;
         assert_eq!(results.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn delete_expired_removes_only_past_entries() {
-        let store = MemoryStore::with_accept_all();
-        let b = block(b"x");
-        store
-            .insert(entry_expiring_at(&b, b"a", b"old", 1, 100), Some(b.clone()))
-            .await
-            .unwrap();
-        store
-            .insert(
-                entry_expiring_at(&b, b"a", b"future", 1, 1000),
-                Some(b.clone()),
-            )
-            .await
-            .unwrap();
-        store
-            .insert(entry(&b, b"a", b"forever", 1), Some(b.clone()))
-            .await
-            .unwrap();
-
-        let removed = store.delete_expired(500).await.unwrap();
-        assert_eq!(removed, 1);
-        assert!(store.get_entry(&vk(b"a"), b"old").await.unwrap().is_none());
-        assert!(
-            store
-                .get_entry(&vk(b"a"), b"future")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .get_entry(&vk(b"a"), b"forever")
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_expired_at_boundary_includes_equal() {
-        let store = MemoryStore::with_accept_all();
-        let b = block(b"x");
-        store
-            .insert(entry_expiring_at(&b, b"a", b"x", 1, 100), Some(b.clone()))
-            .await
-            .unwrap();
-        let removed = store.delete_expired(100).await.unwrap();
-        assert_eq!(removed, 1);
-    }
-
-    #[tokio::test]
-    async fn gc_blobs_keeps_reachable_drops_orphans() {
-        let store = MemoryStore::with_accept_all();
-        // A live entry pointing at a block with a transitive reference.
-        let leaf = block(b"leaf");
-        let head = ContentBlock {
-            data: bytes::Bytes::from_static(b"head"),
-            references: vec![leaf.hash()],
-        };
-        let e = entry(&head, b"a", b"x", 1);
-        store.put_content(leaf.clone()).await.unwrap();
-        store.insert(e, Some(head.clone())).await.unwrap();
-
-        // An orphan block, unreferenced.
-        let orphan = block(b"orphan");
-        store.put_content(orphan.clone()).await.unwrap();
-
-        let reclaimed = store.gc_blobs().await.unwrap();
-        assert_eq!(reclaimed, 1);
-        assert!(store.get_content(&head.hash()).await.unwrap().is_some());
-        assert!(store.get_content(&leaf.hash()).await.unwrap().is_some());
-        assert!(store.get_content(&orphan.hash()).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn gc_blobs_handles_dangling_value_hash() {
-        // KV entry references a blob we don't have locally (lazy ref); GC must not crash.
-        let store = MemoryStore::with_accept_all();
-        let b = block(b"future");
-        let e = entry(&b, b"a", b"x", 1);
-        store.insert(e, None).await.unwrap(); // no blob yet
-        let reclaimed = store.gc_blobs().await.unwrap();
-        assert_eq!(reclaimed, 0);
     }
 
     #[tokio::test]

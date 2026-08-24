@@ -203,8 +203,7 @@ where
                 let entry = match ev {
                     Ok(sunset_store::Event::Inserted(e)) => e,
                     Ok(sunset_store::Event::Replaced { new, .. }) => new,
-                    // Expired / BlobAdded / BlobRemoved are not
-                    // application-relevant for the bus.
+                    // Only entry writes are application-relevant for the bus.
                     Ok(_) => continue,
                     Err(_) => continue,
                 };

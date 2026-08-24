@@ -61,14 +61,14 @@ Currently merged: `sunset-store` (trait + types + conformance suite) and `sunset
 Every backend implements `sunset_store::Store` and must:
 
 - **Verify on insert.** Call the configured `SignatureVerifier` (no built-in scheme — verifier is host-supplied). The store crate itself doesn't know about Ed25519 / ML-DSA / etc.
-- **LWW by priority** on `(verifying_key, name)`. Higher priority wins; equal-or-lower priority returns `Error::Stale`. **No tombstones** — TTL pruning + GC handle removal.
+- **LWW by priority** on `(verifying_key, name)`. Higher priority wins; equal-or-lower priority returns `Error::Stale`. **No tombstones, and no removal at all** — an entry leaves only by being superseded. `expires_at` is a timestamp consumers may interpret; the store never sweeps it.
 - **Hash match** when an insert supplies a blob: `entry.value_hash == blob.hash()` or `Error::HashMismatch`.
 - **Atomic per-entry writes** of `(blob, entry)`. No batch atomicity across multiple entries.
 - **Lazy dangling refs** allowed: an entry whose blob isn't local yet is fine; sync fetches it later.
-- **Content-addressed blob store** with mark-and-sweep GC over reachable refs (DAG via `ContentBlock.references`).
-- **Monotonic per-store sequence** for cursors. `current_cursor()` returns the *next-to-be-assigned* sequence; `Replay::Since(c)` matches `sequence >= c.0`.
+- **Content-addressed blob store**, never garbage-collected. `ContentBlock.references` is not a link into the blob store — `sunset-core` uses it to carry a key-derivation input — so do not build reachability logic on it.
+- **Monotonic per-store sequence**, exposed as `current_cursor()` (the next-to-be-assigned sequence) and used to order `Replay::All`.
 
-Subscription event ordering (matters for tests): on a write, `Inserted`/`Replaced`/`Expired` fire first, then `BlobAdded`/`BlobRemoved`. `BlobAdded`/`BlobRemoved` are delivered to **all** subscribers regardless of filter (they have no key to match on).
+Subscription event ordering (matters for tests): on a write, `Inserted`/`Replaced` fires first, then `BlobAdded`. `BlobAdded` is delivered to **all** subscribers regardless of filter (it has no key to match on).
 
 Wire format is **postcard** (`bincode` is deprecated; do not reintroduce). The v1 encoding is frozen — there's a hex-pinned test vector for `ContentBlock::hash()` in `types.rs` to detect accidental wire-format drift.
 
@@ -85,7 +85,7 @@ The store and everything below the application layer must compile to `wasm32-unk
 
 Two non-obvious correctness rules that exist because the wrong shape is easy to write:
 
-1. **Broadcast happens inside the inner `Mutex<Inner>` critical section** (in `insert`, `delete_expired`, `gc_blobs`), and `subscribe` registers its `Weak<Subscription>` inside the same critical section. This is what serializes "history snapshot vs. live channel" and prevents an event from being delivered both ways or neither way. Don't move broadcasts outside the lock.
+1. **Broadcast happens inside the inner `Mutex<Inner>` critical section** (in `insert` and `put_content`), and `subscribe` registers its `Weak<Subscription>` inside the same critical section. This is what serializes "history snapshot vs. live channel" and prevents an event from being delivered both ways or neither way. Don't move broadcasts outside the lock.
 2. **Per-subscription channel must stay unbounded** (`mpsc::UnboundedSender`). Because `broadcast` runs under the inner mutex, switching to a bounded channel would let a slow subscriber stall every writer. The invariant is documented in `subscription.rs`; preserve it.
 
 ## Desktop client (`desktop/`)

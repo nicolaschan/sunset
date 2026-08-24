@@ -2512,7 +2512,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "hex",
  "postcard",
  "sunset-store",
  "tempfile",

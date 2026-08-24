@@ -178,7 +178,7 @@ fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
   - `publish_durable` → delegates to `store.insert` + relies on engine's existing local_sub fan-out.
   - `publish_ephemeral` → builds `SignedDatagram`, signs via `identity.sign(canonical(...))`, calls `engine.publish_ephemeral(datagram)`.
   - `subscribe` → calls `engine.publish_subscription(filter, ttl)` (so peers learn we want this filter), opens `store.subscribe(filter, Replay::All)` for the durable side, opens `engine.subscribe_ephemeral(filter)` for the ephemeral side, then merges the two:
-    - Store events: keep `Inserted` and `Replaced { new, .. }` → fetch the entry's content block via `store.get_content` if needed, emit `BusEvent::Durable { entry, block }`. Drop `Expired`/`BlobAdded`/`BlobRemoved` (not application-relevant for the bus surface).
+    - Store events: keep `Inserted` and `Replaced { new, .. }` → fetch the entry's content block via `store.get_content` if needed, emit `BusEvent::Durable { entry, block }`. Drop `BlobAdded` (not application-relevant for the bus surface).
     - Ephemeral events: each `SignedDatagram` becomes `BusEvent::Ephemeral(datagram)`.
     - Merged into one `LocalBoxStream<'static, BusEvent>`.
 
@@ -225,7 +225,7 @@ fn outbound_kind(msg: &SyncMessage) -> ChannelKind {
 4. Bus merges them into one `LocalBoxStream<'static, BusEvent>`:
    - Store `Inserted(entry)` / `Replaced { new, .. }` → `BusEvent::Durable { entry, block }` (block fetched lazily via `store.get_content` if not already in hand).
    - `SignedDatagram` → `BusEvent::Ephemeral(datagram)`.
-   - Other store event variants (`Expired`, `BlobAdded`, `BlobRemoved`) are dropped — not application-relevant for the bus.
+   - The remaining store event variant (`BlobAdded`) is dropped — not application-relevant for the bus.
 5. App reads from the merged stream; matches on `BusEvent` variants.
 
 ### Receive ephemeral (other side)

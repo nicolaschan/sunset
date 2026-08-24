@@ -2,9 +2,8 @@
 //! against this suite to verify it satisfies the documented contract.
 //!
 //! Gated by the `test-helpers` feature so production builds don't pull these
-//! in. The synchronous fixture constructors (`vk`, `n`, `block`, `entry`,
-//! `entry_expiring_at`) live in [`crate::fixtures`] and
-//! are available unconditionally inside the crate (and re-exported from this
+//! in. The synchronous fixture constructors (`vk`, `n`, `block`, `entry`)
+//! live in [`crate::fixtures`] and are available unconditionally inside the crate (and re-exported from this
 //! module when the `test-helpers` feature is on) — they're the canonical
 //! helpers every backend's unit tests should reach for.
 
@@ -13,7 +12,7 @@ use crate::filter::{Event, Filter, Replay};
 use crate::store::Store;
 use crate::types::{ContentBlock, SignedKvEntry};
 
-pub use crate::fixtures::{block, entry, entry_expiring_at, n, vk};
+pub use crate::fixtures::{block, entry, n, vk};
 
 /// Drain a subscription stream until an event matching `predicate` is found.
 /// Times out after a short duration. The conformance suite uses this so tests
@@ -55,17 +54,13 @@ where
     stale_rejection(&store_factory().await).await;
     hash_mismatch_rejection(&store_factory().await).await;
     lazy_dangling_ref(&store_factory().await).await;
-    ttl_pruning(&store_factory().await).await;
-    blob_gc_reachability(&store_factory().await).await;
     iter_filters(&store_factory().await).await;
     subscribe_replay_modes(&store_factory().await).await;
-    subscribe_replay_since_cursor(&store_factory().await).await;
     subscribe_emits_replaced_event(&store_factory().await).await;
-    subscribe_emits_expired_event(&store_factory().await).await;
     subscribe_emits_blob_added_event(&store_factory().await).await;
-    subscribe_emits_blob_removed_event(&store_factory().await).await;
     put_content_emits_blob_added(&store_factory().await).await;
     put_content_idempotent_does_not_re_emit_blob_added(&store_factory().await).await;
+    current_cursor_counts_stored_entries(&store_factory().await).await;
 }
 
 /// Test: insert + get_entry roundtrip.
@@ -141,55 +136,6 @@ pub async fn lazy_dangling_ref<S: Store>(store: &S) {
     assert!(store.get_content(&b.hash()).await.unwrap().is_none());
     store.put_content(b.clone()).await.unwrap();
     assert!(store.get_content(&b.hash()).await.unwrap().is_some());
-}
-
-/// Test: `delete_expired(now)` removes entries with `expires_at <= now` (boundary inclusive).
-pub async fn ttl_pruning<S: Store>(store: &S) {
-    let b = block(b"x");
-    let mut old = entry(&b, b"a", b"old", 1);
-    old.expires_at = Some(100);
-    let mut future = entry(&b, b"a", b"future", 1);
-    future.expires_at = Some(1000);
-    let forever = entry(&b, b"a", b"forever", 1);
-    store.insert(old, Some(b.clone())).await.unwrap();
-    store.insert(future, Some(b.clone())).await.unwrap();
-    store.insert(forever, Some(b.clone())).await.unwrap();
-    let removed = store.delete_expired(100).await.unwrap();
-    assert_eq!(removed, 1);
-    assert!(store.get_entry(&vk(b"a"), b"old").await.unwrap().is_none());
-    assert!(
-        store
-            .get_entry(&vk(b"a"), b"future")
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        store
-            .get_entry(&vk(b"a"), b"forever")
-            .await
-            .unwrap()
-            .is_some()
-    );
-}
-
-/// Test: gc_blobs keeps reachable blobs and reclaims orphans.
-pub async fn blob_gc_reachability<S: Store>(store: &S) {
-    let leaf = block(b"leaf");
-    let head = ContentBlock {
-        data: bytes::Bytes::from_static(b"head"),
-        references: vec![leaf.hash()],
-    };
-    let orphan = block(b"orphan");
-    let e = entry(&head, b"a", b"r", 1);
-    store.put_content(leaf.clone()).await.unwrap();
-    store.insert(e, Some(head.clone())).await.unwrap();
-    store.put_content(orphan.clone()).await.unwrap();
-    let n = store.gc_blobs().await.unwrap();
-    assert_eq!(n, 1, "exactly one orphan reclaimed");
-    assert!(store.get_content(&head.hash()).await.unwrap().is_some());
-    assert!(store.get_content(&leaf.hash()).await.unwrap().is_some());
-    assert!(store.get_content(&orphan.hash()).await.unwrap().is_none());
 }
 
 /// Test: iter respects each filter variant.
@@ -290,52 +236,6 @@ pub async fn subscribe_replay_modes<S: Store>(store: &S) {
     assert!(matches!(evt, Event::Inserted(e) if e.name.as_ref() == b"r4"));
 }
 
-/// Test: `Replay::Since(cursor)` emits only entries written after the cursor.
-pub async fn subscribe_replay_since_cursor<S: Store>(store: &S) {
-    use futures::StreamExt;
-    let b = block(b"x");
-    // Two entries before the cursor snapshot.
-    store
-        .insert(entry(&b, b"a", b"r1", 1), Some(b.clone()))
-        .await
-        .unwrap();
-    store
-        .insert(entry(&b, b"a", b"r2", 1), Some(b.clone()))
-        .await
-        .unwrap();
-    let cursor = store.current_cursor().await.unwrap();
-    // Two entries after the cursor snapshot.
-    store
-        .insert(entry(&b, b"a", b"r3", 1), Some(b.clone()))
-        .await
-        .unwrap();
-    store
-        .insert(entry(&b, b"a", b"r4", 1), Some(b.clone()))
-        .await
-        .unwrap();
-
-    let mut s = store
-        .subscribe(Filter::Keyspace(vk(b"a")), Replay::Since(cursor))
-        .await
-        .unwrap();
-
-    // Should replay only r3, r4 (in order).
-    let mut names = vec![];
-    for _ in 0..2 {
-        let evt = tokio::time::timeout(std::time::Duration::from_millis(500), s.next())
-            .await
-            .expect("Since-cursor replay should deliver post-cursor entries")
-            .unwrap()
-            .unwrap();
-        if let Event::Inserted(e) = evt {
-            names.push(e.name.clone());
-        } else {
-            panic!("expected Inserted, got {:?}", evt);
-        }
-    }
-    assert_eq!(names, vec![n(b"r3"), n(b"r4")]);
-}
-
 /// Test: a higher-priority insert emits `Event::Replaced` to active subscribers.
 pub async fn subscribe_emits_replaced_event<S: Store>(store: &S) {
     use futures::StreamExt;
@@ -389,28 +289,6 @@ pub async fn subscribe_emits_replaced_event<S: Store>(store: &S) {
             Ok(None) => break,
             Err(_) => break, // timeout: drain window elapsed
         }
-    }
-}
-
-/// Test: `delete_expired(now)` emits `Event::Expired` to active subscribers for each removed entry.
-pub async fn subscribe_emits_expired_event<S: Store>(store: &S) {
-    let b = block(b"x");
-    let mut e = entry(&b, b"a", b"will-expire", 1);
-    e.expires_at = Some(100);
-    store.insert(e.clone(), Some(b)).await.unwrap();
-
-    let mut s = store
-        .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
-        .await
-        .unwrap();
-    let removed = store.delete_expired(100).await.unwrap();
-    assert_eq!(removed, 1);
-
-    let evt = next_matching(&mut s, |evt| matches!(evt, Event::Expired(_))).await;
-    if let Event::Expired(expired) = evt {
-        assert_eq!(expired.name.as_ref(), b"will-expire");
-    } else {
-        unreachable!()
     }
 }
 
@@ -504,26 +382,49 @@ pub async fn put_content_idempotent_does_not_re_emit_blob_added<S: Store>(store:
     );
 }
 
-/// Test: `gc_blobs()` emits `Event::BlobRemoved` to all subscribers for each reclaimed blob.
+/// Test: `current_cursor` advances by exactly one per stored entry.
 ///
-/// Like the BlobAdded test, the subscriber filter intentionally does NOT
-/// match anything in the store; this pins down the contract that
-/// BlobRemoved is delivered regardless of subscription filter.
-pub async fn subscribe_emits_blob_removed_event<S: Store>(store: &S) {
-    let orphan = block(b"orphan");
-    store.put_content(orphan.clone()).await.unwrap();
-
-    let mut s = store
-        .subscribe(Filter::Keyspace(vk(b"unrelated-watcher")), Replay::None)
+/// Only the *delta* is portable — the absolute origin is backend-specific
+/// (memory starts at 0, SQLite at 1 because of AUTOINCREMENT), so each backend
+/// pins its own origin and this case pins the movement.
+pub async fn current_cursor_counts_stored_entries<S: Store>(store: &S) {
+    let start = store.current_cursor().await.unwrap().0;
+    let b = block(b"cursor");
+    store
+        .insert(entry(&b, b"cursor-writer", b"a", 1), Some(b.clone()))
         .await
         .unwrap();
-    let reclaimed = store.gc_blobs().await.unwrap();
-    assert_eq!(reclaimed, 1);
+    store
+        .insert(entry(&b, b"cursor-writer", b"z", 1), Some(b.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.current_cursor().await.unwrap().0,
+        start + 2,
+        "two fresh inserts must advance the cursor by two"
+    );
 
-    let evt = next_matching(&mut s, |e| matches!(e, Event::BlobRemoved(_))).await;
-    if let Event::BlobRemoved(h) = evt {
-        assert_eq!(h, orphan.hash());
-    } else {
-        unreachable!()
-    }
+    // Stale: nothing is stored, so no sequence is assigned.
+    assert!(matches!(
+        store
+            .insert(entry(&b, b"cursor-writer", b"z", 1), Some(b.clone()))
+            .await,
+        Err(Error::Stale)
+    ));
+    assert_eq!(
+        store.current_cursor().await.unwrap().0,
+        start + 2,
+        "a rejected insert must not advance the cursor"
+    );
+
+    // Supersession stores a new entry, so it takes a fresh sequence.
+    store
+        .insert(entry(&b, b"cursor-writer", b"z", 2), Some(b))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.current_cursor().await.unwrap().0,
+        start + 3,
+        "a supersession must advance the cursor by one"
+    );
 }
