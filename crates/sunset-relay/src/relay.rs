@@ -2,13 +2,12 @@
 //!
 //! `Relay::start(config)` does setup synchronously (in async fn form):
 //! identity, store, engine, the SpawningAcceptor that wraps a
-//! WebSocketRawTransport::serving(), the command pump, and a bound
+//! WebSocketRawTransport::serving(), the identity pump, and a bound
 //! TcpListener. The returned `RelayHandle` exposes the dial URL + a
 //! `run`/`run_for_test` method that drives axum and the engine task
 //! until shutdown.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,12 +36,11 @@ use sunset_sync_webtransport_native::{
 };
 use sunset_sync_ws_native::WebSocketRawTransport;
 
-use crate::app::{AppState, build_app};
-use crate::bridge::RelayCommand;
+use crate::app::{AppState, IdentityRequest, build_app};
 use crate::config::{Config, InterestFilter};
 use crate::error::Result;
 use crate::identity;
-use crate::snapshot::{build_dashboard_snapshot, build_identity_snapshot};
+use crate::snapshot::build_identity_snapshot;
 
 /// Concrete inbound-side `Transport` the engine sees. Kept private —
 /// callers interact with `RelayHandle`, not this type.
@@ -102,25 +100,18 @@ pub struct RelayHandle {
     /// Senders the axum app uses. Built once in `new`; cloned into
     /// `AppState` in `run` / `run_for_test`.
     ws_tx: mpsc::UnboundedSender<axum::extract::ws::WebSocket>,
-    cmd_tx: mpsc::UnboundedSender<RelayCommand>,
+    identity_tx: mpsc::UnboundedSender<IdentityRequest>,
 }
 
-/// Held by the command pump task on the engine side. Captures the
-/// references it needs to build snapshots without crossing runtimes.
-struct CommandContext {
+/// Held by the identity pump on the engine side: the live engine plus
+/// this process's static identity material, so the pump can answer a
+/// descriptor request without crossing runtimes.
+struct IdentityContext {
     engine: Rc<Engine>,
-    store: Arc<FsStore>,
-    data_dir: PathBuf,
     ed25519_public: [u8; 32],
     x25519_public: [u8; 32],
-    listen_addr: SocketAddr,
     dial_url: String,
-    /// SHA-256 hex of the SPKI for the WT cert, or `None` when the
-    /// relay couldn't bind its UDP listener. Shipped to the descriptor
-    /// JSON; the resolver builds the actual WT URL from the user-typed
-    /// authority.
     webtransport_cert_sha256: Option<String>,
-    configured_peers: Vec<String>,
 }
 
 /// Adapter so sunset-core's `Identity` can be used as a `NoiseIdentity`.
@@ -140,7 +131,7 @@ impl Relay {
     /// handle ready for `run()` / `run_for_test()`.
     ///
     /// **Precondition:** must be called from within a `tokio::task::LocalSet`.
-    /// The constructor spawns `spawn_local` tasks (the command pump and
+    /// The constructor spawns `spawn_local` tasks (the identity pump and
     /// `SpawningAcceptor`'s internal handshake pump); calling it without
     /// an active LocalSet will panic.
     pub async fn start(config: Config) -> Result<RelayHandle> {
@@ -199,7 +190,7 @@ impl Relay {
         let local_peer = PeerId(VerifyingKey::new(Bytes::copy_from_slice(&ed25519_public)));
         let signer: Arc<dyn Signer> = Arc::new(identity.clone());
         let engine = Rc::new(SyncEngine::new(
-            store.clone(),
+            store,
             transport,
             SyncConfig::default(),
             local_peer,
@@ -212,24 +203,21 @@ impl Relay {
         };
         let subscription_policy = SubscriptionPolicy::relay_broad();
 
-        // 10. Bridge channels.
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RelayCommand>();
+        // 10. Identity pump: answers `GET /` descriptor requests from the
+        //     engine side, where the live forward counter lives.
+        let (identity_tx, identity_rx) = mpsc::unbounded_channel::<IdentityRequest>();
+        spawn_identity_pump(
+            identity_rx,
+            IdentityContext {
+                engine: engine.clone(),
+                ed25519_public,
+                x25519_public,
+                dial_url: local_address.clone(),
+                webtransport_cert_sha256: wt_cert_hex_opt.clone(),
+            },
+        );
 
-        // 11. Command pump context + task.
-        let cmd_ctx = Rc::new(CommandContext {
-            engine: engine.clone(),
-            store: store.clone(),
-            data_dir: config.data_dir.clone(),
-            ed25519_public,
-            x25519_public,
-            listen_addr: bound,
-            dial_url: local_address.clone(),
-            webtransport_cert_sha256: wt_cert_hex_opt.clone(),
-            configured_peers: config.peers.clone(),
-        });
-        spawn_command_pump(cmd_rx, cmd_ctx.clone());
-
-        // 12. Banner.
+        // 11. Banner.
         emit_startup_banner(&bound, &identity, wt_cert_hex_opt.as_deref());
 
         Ok(RelayHandle {
@@ -242,7 +230,7 @@ impl Relay {
             subscription_policy,
             listener: Some(listener),
             ws_tx,
-            cmd_tx,
+            identity_tx,
         })
     }
 }
@@ -282,11 +270,10 @@ fn compute_wt_sans(configured: &[String], bound: SocketAddr) -> Vec<String> {
 }
 
 /// Format and emit (both `tracing::info!` and stdout `println!`) the
-/// startup banner showing the dial URL, dashboard URL, identity URL,
-/// and WT cert hash (or a degraded-mode note when WT bringup failed).
+/// startup banner showing the dial URL, identity URL, and WT cert hash
+/// (or a degraded-mode note when WT bringup failed).
 fn emit_startup_banner(bound: &SocketAddr, identity: &Identity, wt_cert_hex: Option<&str>) {
     let mut banner = identity::format_address(bound, identity);
-    banner.push_str(&format!("\n  dashboard: http://{bound}/dashboard"));
     banner.push_str(&format!("\n  identity:  http://{bound}/"));
     if let Some(cert_hex) = wt_cert_hex {
         banner.push_str(&format!(
@@ -396,34 +383,21 @@ fn spawn_wt_accept_loop(
     });
 }
 
-fn spawn_command_pump(mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>, ctx: Rc<CommandContext>) {
+fn spawn_identity_pump(
+    mut requests: mpsc::UnboundedReceiver<IdentityRequest>,
+    ctx: IdentityContext,
+) {
     tokio::task::spawn_local(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            match cmd {
-                RelayCommand::Snapshot { reply } => {
-                    let meta = crate::snapshot::RelayMeta {
-                        data_dir: &ctx.data_dir,
-                        ed25519_public: ctx.ed25519_public,
-                        x25519_public: ctx.x25519_public,
-                        listen_addr: ctx.listen_addr,
-                        dial_url: &ctx.dial_url,
-                        configured_peers: &ctx.configured_peers,
-                    };
-                    let snap = build_dashboard_snapshot(&ctx.engine, &ctx.store, &meta).await;
-                    let _ = reply.send(snap);
-                }
-                RelayCommand::Identity { reply } => {
-                    let snap = build_identity_snapshot(
-                        &ctx.engine,
-                        ctx.ed25519_public,
-                        ctx.x25519_public,
-                        &ctx.dial_url,
-                        ctx.webtransport_cert_sha256.as_deref(),
-                    )
-                    .await;
-                    let _ = reply.send(snap);
-                }
-            }
+        while let Some(reply) = requests.recv().await {
+            let snap = build_identity_snapshot(
+                &ctx.engine,
+                ctx.ed25519_public,
+                ctx.x25519_public,
+                &ctx.dial_url,
+                ctx.webtransport_cert_sha256.as_deref(),
+            )
+            .await;
+            let _ = reply.send(snap);
         }
     });
 }
@@ -456,7 +430,7 @@ impl RelayHandle {
     fn build_app_state(&self) -> AppState {
         AppState {
             ws_tx: self.ws_tx.clone(),
-            cmd_tx: self.cmd_tx.clone(),
+            identity_tx: self.identity_tx.clone(),
         }
     }
 

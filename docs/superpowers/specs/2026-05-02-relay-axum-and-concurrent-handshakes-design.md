@@ -7,6 +7,26 @@
 - Builds on `2026-04-27-sunset-relay-design.md`.
 - Builds on `2026-04-27-sunset-sync-ws-native-design.md`.
 
+> **Revision (2026-08-24, post-implementation):** the `/dashboard` status page
+> and everything built to feed it were removed. `GET /` (JSON identity
+> descriptor, or WS upgrade) is now the relay's only route. Specifically, these
+> no longer exist in `crates/sunset-relay`: the `/dashboard` route and
+> `dashboard_handler`; the `RelayCommand` enum (the engine bridge is now a bare
+> `oneshot::Sender<IdentitySnapshot>`, aliased `app::IdentityRequest`, answered
+> by `spawn_identity_pump`); `bridge.rs` (`IdentitySnapshot` now lives in
+> `snapshot.rs` beside its only producer); `render.rs` (`render_identity` now
+> lives in `app.rs` beside its only caller); and `DashboardSnapshot` /
+> `StoreStats` / `EntryTtl` / `build_dashboard_snapshot` / `render_dashboard` /
+> `RelayMeta`. The page had no consumer anywhere in the repo, and
+> `build_dashboard_snapshot` did a full O(entries) `FsStore` scan plus a
+> recursive `data_dir` walk on the engine's `LocalSet` on every request. **Do
+> not reimplement this layer from the sections below.** The rest of this
+> document is still as-built: axum routing, the `Send`-bridge split between
+> axum tasks and the `?Send` engine, and `SpawningAcceptor`. A status / metrics
+> surface is deferred to Plans 8+ and should be built against a real consumer —
+> see the matching revision in `2026-04-25-sunset-chat-architecture-design.md`
+> under "Status surface in the protocol layer".
+
 ## Problem
 
 Two coupled problems with the relay's current networking layer:
@@ -122,6 +142,10 @@ The structural future-proofing: every `spawn_local` here is a place we'd flip to
 5. Engine's `Transport::accept()` (= `SpawningAcceptor::accept`) reads the next authenticated connection from the channel and spawns its per-peer task (existing logic in `engine.rs:spawn_peer`). Engine never blocks on any inbound stage.
 
 ### Dashboard / identity
+
+> **Removed 2026-08-24.** Only the identity half of this flow still exists, and
+> it no longer goes through `RelayCommand`. See the revision at the top of this
+> file.
 
 1. axum handler receives a `GET /dashboard` (or `GET /` without an upgrade header).
 2. Handler builds a `oneshot::channel<DashboardSnapshot>` (or `<IdentitySnapshot>`), sends `RelayCommand::Snapshot { reply }` (or `Identity { reply }`) over `cmd_tx`, awaits the reply.

@@ -13,7 +13,7 @@
 
 ## Non-goals (deferred)
 
-- **HTTP admin endpoint with authentication / separate port.** A plaintext dashboard is served at `GET /dashboard` on the same port as the WebSocket listener (see Architecture). Full auth/metrics/admin UI is deferred to Plans 8+.
+- **HTTP status / admin endpoint.** *Revised 2026-08-24:* the plaintext `GET /dashboard` status page described below was removed — it had no consumer (no client, test, or ops tooling ever read it) and its store scan ran on every request. The relay now serves only `GET /` (JSON identity descriptor, or WS upgrade). Any status/metrics/admin surface is deferred to Plans 8+ and should be built against a real consumer.
 - **Allowlists / rate limiting / per-room admission.** Open relay per the Plan C decision; defer to Plans 8+.
 - **TLS termination at the relay.** v0 listens on plain `ws://`. Operators front with nginx/Caddy/Cloudflare for `wss://` termination. (TLS is independent of the Noise inner layer that already protects payloads.)
 - **Multi-relay client-side redundancy logic.** Architecture spec mentions clients accepting several relay URLs in parallel; that's a client-side concern not the relay's. (The relay-to-relay federation in this plan IS the v0 redundancy story.)
@@ -110,7 +110,6 @@ sunset-relay starting
   x25519:  <64-hex>
   listen:  ws://0.0.0.0:8443
   address: ws://0.0.0.0:8443#x25519=<64-hex>     ← share this with clients/peers
-  dashboard: http://0.0.0.0:8443/dashboard        ← plaintext status page
 ```
 
 That `address` line is what operators copy into client / peer-relay configs.

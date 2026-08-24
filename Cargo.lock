@@ -2454,7 +2454,6 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "filetime",
- "futures",
  "hex",
  "rand_core 0.6.4",
  "reqwest",
@@ -2475,7 +2474,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "web-time",
  "wtransport",
  "zeroize",
 ]
