@@ -210,17 +210,22 @@ One updated branch for the subscription namespace, replacing the existing legacy
 
 ```rust
 if entry.name.as_ref().starts_with(routing::SUBSCRIBE_PREFIX) {
+    let Some((filter_hash, provider)) = decode_subscription_name(&entry.name) else { return };
+    // The key names the provider that both variants address, and the entry
+    // reaches every connected peer, so one addressed elsewhere is not ours to
+    // act on. (Subscribing upstream on its behalf, i.e. recursive
+    // subscription, is Phase 3.)
+    if provider != self.local_peer { return }
     let Ok(Some(block)) = self.store.get_content(&entry.value_hash).await else { return };
     let Ok(sub_entry) = postcard::from_bytes::<SubscriptionEntry>(&block.data) else {
         tracing::warn!("malformed SubscriptionEntry at {}", String::from_utf8_lossy(&entry.name));
         return;
     };
-    let Some(filter_hash) = decode_filter_hash_from_name(&entry.name) else { return };
     let receiver = PeerId(entry.verifying_key.clone());
     let is_self_authored = entry.verifying_key == self.local_peer.0;
 
     match sub_entry {
-        SubscriptionEntry::Active { filter, provider } if provider == self.local_peer => {
+        SubscriptionEntry::Active { filter, .. } => {
             let was_new = {
                 let mut state = self.state.lock().await;
                 if let Some(session) = state.peer_sessions.get_mut(&receiver) {
@@ -247,12 +252,11 @@ if entry.name.as_ref().starts_with(routing::SUBSCRIBE_PREFIX) {
                 session.interests.remove(&filter_hash);
             }
         }
-        // Active naming someone else: Phase 3 recursive subscription will
-        // revisit (we may want to subscribe upstream). Phase 2 ignores.
-        _ => {}
     }
 }
 ```
+
+**Revision (2026-08-24, post-implementation):** the block above is the as-built shape. The original draft read the name through two decoders (`decode_filter_hash_from_name` and `decode_provider_from_name`) and tested the provider once per match arm — off the value for `Active`, off the name for `Withdrawn`. They are now one `decode_subscription_name(name) -> Option<(FilterHash, PeerId)>` and one early return, because the key is the single place the provider is read from for *both* variants: `Withdrawn` is a unit variant with nowhere else to carry it, and the `provider` an `Active` carries is the redundant self-verification copy the 2026-05-23 design already describes. Two consequences worth recording. The catch-all arm is gone — the match over `SubscriptionEntry` is exhaustive in two arms. And an entry whose name has a well-formed filter hash but an undecodable provider segment is now rejected outright, where before its `Active` value could still arm an interest; `subscription_name` always hex-encodes the provider, so no publisher reaches that case.
 
 Everything else in `handle_local_store_event` is unchanged. The other-author fanout (line ~1054 today) calls `forward_targets(&state.peer_sessions, &vk, &name)` instead of `state.registry.peers_matching(...)`.
 
@@ -342,8 +346,10 @@ Integration tests (new `crates/sunset-sync/tests/phase2_subscribe.rs`, follows `
 - Wire format and behavior of every existing entry type except `SUBSCRIBE_NAME` (which retires).
 - Self-author broadcast: self-authored entries still go to every directly connected peer regardless of filter.
 - `DigestRequest`/`DigestExchange`/diff/push pipeline.
-- Phase 1 substrate (`SubscriptionEntry`, `LinkState`, `Neighbor`, `ProviderTick`, `SubscriptionPolicy`, `covers`, `subscription_name`, reserved-name constants). `LinkState`, `Neighbor`, `ProviderTick`, and `covers` remain unused dead code waiting for Phase 3+.
+- Phase 1 substrate (`SubscriptionEntry`, `SubscriptionPolicy`, `subscription_name`, `SUBSCRIBE_PREFIX`).
 - Store contract, transport stack, crypto, voice frame format.
+
+**Revision (2026-08-24):** the Phase 1 substrate bullet above originally also listed `LinkState`, `Neighbor`, `ProviderTick`, `covers`, and the `LINKS_NAME` / `PROVIDER_TICK_NAME` reserved names, and said they "remain unused dead code waiting for Phase 3+." They have been deleted from the tree instead. Nothing referenced them across two phases, and carrying an unwired subset of a future design as dead code is the scaffolding this repo's principles ask us not to keep: it reads as live substrate, has to be kept compiling and pinned, and its shape gets stale against a Phase 3 that has not been designed in detail yet. Nothing on the wire changes — no peer has ever published at `_sunset-sync/links` or `_sunset-sync/provider-tick`, so no deployed encoding loses its pin. The definitions are not lost: the wire types with their postcard round-trip pins, the reserved-name constants, and the 19-case `covers` matrix are written out in full in `docs/superpowers/plans/2026-05-23-cooperative-relay-foundation.md` (tasks 4–6 for the types and names, tasks 8–12 for `covers`), and in git history at `cf576b4`. Phase 3 re-lands them together with the liveness and candidate-ranking code that reads them, and re-pins them there.
 
 ## What's new in code
 

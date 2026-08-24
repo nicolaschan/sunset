@@ -5,19 +5,15 @@
 //!
 //! Engine-facing layout:
 //!
-//! - **Wire types** (`types`): `SubscriptionEntry`, `LinkState`,
-//!   `Neighbor`, `ProviderTick`.
+//! - **Wire type** (`types`): `SubscriptionEntry`.
 //! - **Per-pair naming** (`naming`): `SUBSCRIBE_PREFIX`,
 //!   `subscription_name`, `is_subscription_name`,
-//!   `decode_filter_hash_from_name`, plus the well-known
-//!   `LINKS_NAME` / `PROVIDER_TICK_NAME` keys.
+//!   `decode_subscription_name`.
 //! - **Subscription policy** (`policy`): `SubscriptionPolicy` with
 //!   `store_data()` / `relay_broad()` constructors driving entry TTL
 //!   and refresh interval, plus the `relay_broad_filter()` helper.
-//! - **Coverage predicate** (`coverage`): `covers(superset, subset)`.
 //! - **Receiver-side state** (`routes`): `Routes`, `OutboundKey`,
-//!   `Outbound`, `BroadcastIntent`, `FilterHash`,
-//!   `FILTER_HASH_HEX_LEN`, `filter_hash`.
+//!   `Outbound`, `BroadcastIntent`, `FilterHash`, `filter_hash`.
 //! - **Forwarding decision** (`forward`): `forward_targets` and the
 //!   `PeerInterests` trait.
 //!
@@ -30,21 +26,16 @@
 //! newly-connected peer so reconnect re-establishes coverage without
 //! waiting for the next refresh.
 
-pub mod coverage;
 pub mod forward;
 pub mod naming;
 pub mod policy;
 pub mod routes;
 pub mod types;
 
-pub use coverage::covers;
 pub use forward::{PeerInterests, forward_targets};
 pub use naming::{
-    LINKS_NAME, PROVIDER_TICK_NAME, SUBSCRIBE_PREFIX, decode_filter_hash_from_name,
-    decode_provider_from_name, is_subscription_name, subscription_name,
+    SUBSCRIBE_PREFIX, decode_subscription_name, is_subscription_name, subscription_name,
 };
 pub use policy::{SubscriptionPolicy, relay_broad_filter};
-pub use routes::{
-    BroadcastIntent, FILTER_HASH_HEX_LEN, FilterHash, Outbound, OutboundKey, Routes, filter_hash,
-};
-pub use types::{LinkState, Neighbor, ProviderTick, SubscriptionEntry};
+pub use routes::{BroadcastIntent, FilterHash, Outbound, OutboundKey, Routes, filter_hash};
+pub use types::SubscriptionEntry;

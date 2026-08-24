@@ -9,11 +9,11 @@
 //! a separate concern handled by the trust filter.
 
 /// Top-level reserved namespace prefix. Every sunset-sync-managed entry
-/// name starts with this; every routing-layer name constant
-/// (`LINKS_NAME`, `PROVIDER_TICK_NAME`, `SUBSCRIBE_PREFIX`, this
-/// module's `PEER_HEALTH_NAME`) is required to begin with it. Single
-/// source of truth — `is_reserved` and the reserved-prefix invariants
-/// in `routing::naming` both anchor to this constant.
+/// name starts with this; every reserved name constant
+/// (`routing::SUBSCRIBE_PREFIX`, this module's `PEER_HEALTH_NAME`) is
+/// required to begin with it. Single source of truth — `is_reserved`
+/// and the reserved-prefix invariants in `routing::naming` both anchor
+/// to this constant.
 pub const RESERVED_PREFIX: &[u8] = b"_sunset-sync/";
 
 /// Optional liveness/health summaries (not used in v1).
