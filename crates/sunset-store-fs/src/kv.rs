@@ -99,22 +99,6 @@ pub fn insert_lww(txn: &rusqlite::Transaction<'_>, entry: &SignedKvEntry) -> Res
     })
 }
 
-/// Delete all entries with `expires_at <= now`. Returns the deleted entries
-/// (so the caller can broadcast `Event::Expired` for each).
-pub fn delete_expired(txn: &rusqlite::Transaction<'_>, now: u64) -> Result<Vec<SignedKvEntry>> {
-    let victims = query_entries(
-        txn,
-        "WHERE expires_at IS NOT NULL AND expires_at <= ?1",
-        params![now as i64],
-    )?;
-    txn.execute(
-        "DELETE FROM entries WHERE expires_at IS NOT NULL AND expires_at <= ?1",
-        params![now as i64],
-    )
-    .map_err(|e| Error::Backend(format!("delete: {e}")))?;
-    Ok(victims)
-}
-
 /// Cursor query: next-to-be-assigned sequence.
 pub fn current_cursor(conn: &rusqlite::Connection) -> rusqlite::Result<Cursor> {
     let last: Option<i64> = conn

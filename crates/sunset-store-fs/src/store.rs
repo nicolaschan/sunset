@@ -206,28 +206,6 @@ impl Store for FsStore {
         Ok(Box::pin(stream))
     }
 
-    async fn delete_expired(&self, now: u64) -> Result<usize> {
-        let _w = self.writer_mutex.lock().await;
-        let victims: Vec<SignedKvEntry> = self
-            .conn
-            .call(move |c| -> std::result::Result<Vec<SignedKvEntry>, Error> {
-                let txn = c
-                    .transaction()
-                    .map_err(|e| Error::Backend(format!("begin transaction: {e}")))?;
-                let v = kv::delete_expired(&txn, now)?;
-                txn.commit()
-                    .map_err(|e| Error::Backend(format!("commit transaction: {e}")))?;
-                Ok(v)
-            })
-            .await
-            .map_err(unwrap_store_error)?;
-        let count = victims.len();
-        for e in victims {
-            self.subscriptions.broadcast(&Event::Expired(e));
-        }
-        Ok(count)
-    }
-
     async fn current_cursor(&self) -> Result<Cursor> {
         self.conn
             .call(|c| kv::current_cursor(c))
@@ -298,7 +276,7 @@ mod iter_tests {
 #[cfg(test)]
 mod insert_tests {
     use super::*;
-    use sunset_store::test_helpers::{block, entry, entry_expiring_at, vk};
+    use sunset_store::test_helpers::{block, entry, vk};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -370,18 +348,6 @@ mod insert_tests {
             .await
             .unwrap();
         assert_eq!(store.current_cursor().await.unwrap(), Cursor(2));
-    }
-
-    #[tokio::test]
-    async fn delete_expired_removes_at_boundary() {
-        let dir = TempDir::new().unwrap();
-        let store = FsStore::new(dir.path()).await.unwrap();
-        let b = block(b"v");
-        let e = entry_expiring_at(&b, b"a", b"k", 1, 100);
-        store.insert(e, Some(b)).await.unwrap();
-        let n = store.delete_expired(100).await.unwrap();
-        assert_eq!(n, 1);
-        assert!(store.get_entry(&vk(b"a"), b"k").await.unwrap().is_none());
     }
 
     #[tokio::test]

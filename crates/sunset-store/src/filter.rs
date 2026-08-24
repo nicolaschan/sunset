@@ -39,7 +39,7 @@ impl Filter {
     /// content-store state, which is shared across the whole store.
     pub fn matches_event(&self, event: &Event) -> bool {
         match event {
-            Event::Inserted(e) | Event::Expired(e) => self.matches(&e.verifying_key, &e.name),
+            Event::Inserted(e) => self.matches(&e.verifying_key, &e.name),
             Event::Replaced { new, .. } => self.matches(&new.verifying_key, &new.name),
             Event::BlobAdded(_) => true,
         }
@@ -73,8 +73,6 @@ pub enum Event {
         old: SignedKvEntry,
         new: SignedKvEntry,
     },
-    /// An entry was removed by TTL expiration.
-    Expired(SignedKvEntry),
     /// A new ContentBlock arrived.
     BlobAdded(Hash),
 }

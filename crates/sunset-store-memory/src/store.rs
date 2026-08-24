@@ -163,9 +163,9 @@ impl Store for MemoryStore {
 
         // Build the historical replay portion (snapshot under the lock). Register
         // the subscription INSIDE the inner lock so it serializes with broadcasts
-        // from insert/delete_expired/gc_blobs (which now happen while the inner
-        // lock is held). This prevents a race where an event is delivered both
-        // via history replay and via the live channel.
+        // from insert (which happens while the inner lock is held). This prevents
+        // a race where an event is delivered both via history replay and via the
+        // live channel.
         let historical: Vec<sunset_store::Result<Event>> = {
             let inner = self.inner.lock().await;
             self.subscriptions.add(&sub);
@@ -193,23 +193,6 @@ impl Store for MemoryStore {
             while let Some(item) = rx.recv().await { yield item; }
         };
         Ok(Box::pin(live))
-    }
-    async fn delete_expired(&self, now: u64) -> Result<usize> {
-        let mut inner = self.inner.lock().await;
-        let to_remove: Vec<KvKey> = inner
-            .entries
-            .iter()
-            .filter(|(_, s)| s.entry.expires_at.is_some_and(|e| e <= now))
-            .map(|(k, _)| k.clone())
-            .collect();
-        let mut count = 0;
-        for k in to_remove {
-            if let Some(s) = inner.entries.remove(&k) {
-                self.subscriptions.broadcast(&Event::Expired(s.entry));
-                count += 1;
-            }
-        }
-        Ok(count)
     }
     async fn current_cursor(&self) -> Result<Cursor> {
         Ok(self.current_cursor_now().await)
@@ -263,7 +246,7 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
-    use sunset_store::test_helpers::{block, entry, entry_expiring_at, n, vk};
+    use sunset_store::test_helpers::{block, entry, n, vk};
     use sunset_store::{Filter, Replay};
 
     #[tokio::test]
@@ -485,57 +468,6 @@ mod tests {
         ]);
         let results = collect_iter(&store, f).await;
         assert_eq!(results.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn delete_expired_removes_only_past_entries() {
-        let store = MemoryStore::with_accept_all();
-        let b = block(b"x");
-        store
-            .insert(entry_expiring_at(&b, b"a", b"old", 1, 100), Some(b.clone()))
-            .await
-            .unwrap();
-        store
-            .insert(
-                entry_expiring_at(&b, b"a", b"future", 1, 1000),
-                Some(b.clone()),
-            )
-            .await
-            .unwrap();
-        store
-            .insert(entry(&b, b"a", b"forever", 1), Some(b.clone()))
-            .await
-            .unwrap();
-
-        let removed = store.delete_expired(500).await.unwrap();
-        assert_eq!(removed, 1);
-        assert!(store.get_entry(&vk(b"a"), b"old").await.unwrap().is_none());
-        assert!(
-            store
-                .get_entry(&vk(b"a"), b"future")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .get_entry(&vk(b"a"), b"forever")
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_expired_at_boundary_includes_equal() {
-        let store = MemoryStore::with_accept_all();
-        let b = block(b"x");
-        store
-            .insert(entry_expiring_at(&b, b"a", b"x", 1, 100), Some(b.clone()))
-            .await
-            .unwrap();
-        let removed = store.delete_expired(100).await.unwrap();
-        assert_eq!(removed, 1);
     }
 
     #[tokio::test]

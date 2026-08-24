@@ -21,9 +21,6 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_entries_name
     ON entries(name);
 
-CREATE INDEX IF NOT EXISTS idx_entries_expires_at
-    ON entries(expires_at) WHERE expires_at IS NOT NULL;
-
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value INTEGER NOT NULL

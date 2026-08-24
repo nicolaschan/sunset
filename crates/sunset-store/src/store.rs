@@ -54,10 +54,6 @@ pub trait Store {
     /// emitted before live updates.
     async fn subscribe<'a>(&'a self, filter: Filter, replay: Replay) -> Result<EventStream<'a>>;
 
-    /// Delete all entries with `expires_at <= now`. Returns the count removed.
-    /// Should emit `Event::Expired` for each on active subscriptions.
-    async fn delete_expired(&self, now: u64) -> Result<usize>;
-
     /// Returns the current monotonic cursor: the next-to-be-assigned sequence
     /// number. Passing the returned cursor to `subscribe(..., Replay::Since(c))`
     /// replays entries written at or after the moment this method observed the

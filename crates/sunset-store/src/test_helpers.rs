@@ -2,9 +2,8 @@
 //! against this suite to verify it satisfies the documented contract.
 //!
 //! Gated by the `test-helpers` feature so production builds don't pull these
-//! in. The synchronous fixture constructors (`vk`, `n`, `block`, `entry`,
-//! `entry_expiring_at`) live in [`crate::fixtures`] and
-//! are available unconditionally inside the crate (and re-exported from this
+//! in. The synchronous fixture constructors (`vk`, `n`, `block`, `entry`)
+//! live in [`crate::fixtures`] and are available unconditionally inside the crate (and re-exported from this
 //! module when the `test-helpers` feature is on) — they're the canonical
 //! helpers every backend's unit tests should reach for.
 
@@ -13,7 +12,7 @@ use crate::filter::{Event, Filter, Replay};
 use crate::store::Store;
 use crate::types::{ContentBlock, SignedKvEntry};
 
-pub use crate::fixtures::{block, entry, entry_expiring_at, n, vk};
+pub use crate::fixtures::{block, entry, n, vk};
 
 /// Drain a subscription stream until an event matching `predicate` is found.
 /// Times out after a short duration. The conformance suite uses this so tests
@@ -55,12 +54,10 @@ where
     stale_rejection(&store_factory().await).await;
     hash_mismatch_rejection(&store_factory().await).await;
     lazy_dangling_ref(&store_factory().await).await;
-    ttl_pruning(&store_factory().await).await;
     iter_filters(&store_factory().await).await;
     subscribe_replay_modes(&store_factory().await).await;
     subscribe_replay_since_cursor(&store_factory().await).await;
     subscribe_emits_replaced_event(&store_factory().await).await;
-    subscribe_emits_expired_event(&store_factory().await).await;
     subscribe_emits_blob_added_event(&store_factory().await).await;
     put_content_emits_blob_added(&store_factory().await).await;
     put_content_idempotent_does_not_re_emit_blob_added(&store_factory().await).await;
@@ -139,36 +136,6 @@ pub async fn lazy_dangling_ref<S: Store>(store: &S) {
     assert!(store.get_content(&b.hash()).await.unwrap().is_none());
     store.put_content(b.clone()).await.unwrap();
     assert!(store.get_content(&b.hash()).await.unwrap().is_some());
-}
-
-/// Test: `delete_expired(now)` removes entries with `expires_at <= now` (boundary inclusive).
-pub async fn ttl_pruning<S: Store>(store: &S) {
-    let b = block(b"x");
-    let mut old = entry(&b, b"a", b"old", 1);
-    old.expires_at = Some(100);
-    let mut future = entry(&b, b"a", b"future", 1);
-    future.expires_at = Some(1000);
-    let forever = entry(&b, b"a", b"forever", 1);
-    store.insert(old, Some(b.clone())).await.unwrap();
-    store.insert(future, Some(b.clone())).await.unwrap();
-    store.insert(forever, Some(b.clone())).await.unwrap();
-    let removed = store.delete_expired(100).await.unwrap();
-    assert_eq!(removed, 1);
-    assert!(store.get_entry(&vk(b"a"), b"old").await.unwrap().is_none());
-    assert!(
-        store
-            .get_entry(&vk(b"a"), b"future")
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        store
-            .get_entry(&vk(b"a"), b"forever")
-            .await
-            .unwrap()
-            .is_some()
-    );
 }
 
 /// Test: iter respects each filter variant.
@@ -368,28 +335,6 @@ pub async fn subscribe_emits_replaced_event<S: Store>(store: &S) {
             Ok(None) => break,
             Err(_) => break, // timeout: drain window elapsed
         }
-    }
-}
-
-/// Test: `delete_expired(now)` emits `Event::Expired` to active subscribers for each removed entry.
-pub async fn subscribe_emits_expired_event<S: Store>(store: &S) {
-    let b = block(b"x");
-    let mut e = entry(&b, b"a", b"will-expire", 1);
-    e.expires_at = Some(100);
-    store.insert(e.clone(), Some(b)).await.unwrap();
-
-    let mut s = store
-        .subscribe(Filter::Keyspace(vk(b"a")), Replay::None)
-        .await
-        .unwrap();
-    let removed = store.delete_expired(100).await.unwrap();
-    assert_eq!(removed, 1);
-
-    let evt = next_matching(&mut s, |evt| matches!(evt, Event::Expired(_))).await;
-    if let Event::Expired(expired) = evt {
-        assert_eq!(expired.name.as_ref(), b"will-expire");
-    } else {
-        unreachable!()
     }
 }
 

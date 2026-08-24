@@ -366,7 +366,6 @@ pub fn spawn_tracker<S: Store + 'static>(
                                 );
                             }
                         }
-                        Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "presence event error");
                         }
