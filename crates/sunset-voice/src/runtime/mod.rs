@@ -306,19 +306,6 @@ impl VoiceRuntime {
         self.inner.encoder.borrow().quality()
     }
 
-    /// Stop the runtime. Dropping `self` has the same effect — all tasks
-    /// observe the `Weak` upgrade failure and exit cleanly.
-    pub fn stop(self) {
-        drop(self);
-    }
-
-    /// Read mute state. Gated behind `test-hooks`; production code
-    /// reads `inner.muted` directly.
-    #[cfg(feature = "test-hooks")]
-    pub fn is_muted(&self) -> bool {
-        *self.inner.muted.borrow()
-    }
-
     /// Read denoise toggle state for one peer. Gated behind
     /// `test-hooks`; production code reads `inner.denoise_disabled`
     /// directly.

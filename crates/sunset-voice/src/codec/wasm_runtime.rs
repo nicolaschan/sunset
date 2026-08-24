@@ -24,10 +24,10 @@
 //!
 //! ## libm
 //!
-//! Pulled in via the `libm` crate (pure-Rust software implementations).
-//! libopus is built with `FLOAT_APPROX` (see `build.rs`) which keeps
-//! the surface small — no `tan` / `atan` / `pow` / `exp` /
-//! transcendentals beyond what's listed below.
+//! Pulled in via the `libm` crate (pure-Rust software
+//! implementations). libopus is built with `FLOAT_APPROX` (see
+//! `build.rs`), which swaps most transcendental calls for polynomial
+//! approximations and keeps this surface to the handful below.
 
 #![allow(non_snake_case)]
 #![allow(unsafe_code)]
@@ -123,10 +123,13 @@ pub extern "C" fn abort() -> ! {
     core::panic!("libopus called abort() — unrecoverable");
 }
 
-// `<math.h>` — pure-Rust implementations from `libm`. libopus uses
-// these from `<math.h>` directly (despite our FLOAT_APPROX defines)
-// for a few operations; this list grows only when wasm-ld reports a
-// new undefined symbol.
+// `<math.h>` — pure-Rust implementations from `libm`. The
+// `f`-suffixed entries have no textual reference in libopus: clang
+// narrows a double-precision call on float operands into one under
+// `-ffast-math`. Pruning this list takes `llvm-nm --undefined-only`
+// on the linked `.wasm` — rustc links wasm32 with `--allow-undefined`,
+// so a symbol we forget becomes a module import that fails at
+// instantiation rather than a link error.
 #[unsafe(no_mangle)]
 pub extern "C" fn sin(x: f64) -> f64 {
     libm::sin(x)
@@ -154,10 +157,6 @@ pub extern "C" fn sqrt(x: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn floor(x: f64) -> f64 {
     libm::floor(x)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn ceil(x: f64) -> f64 {
-    libm::ceil(x)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn fabs(x: f64) -> f64 {
@@ -192,34 +191,8 @@ pub extern "C" fn floorf(x: f32) -> f32 {
     libm::floorf(x)
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn ceilf(x: f32) -> f32 {
-    libm::ceilf(x)
-}
-#[unsafe(no_mangle)]
 pub extern "C" fn powf(x: f32, y: f32) -> f32 {
     libm::powf(x, y)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
-    libm::fmod(x, y)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn fmodf(x: f32, y: f32) -> f32 {
-    libm::fmodf(x, y)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn ldexp(x: f64, n: c_int) -> f64 {
-    libm::ldexp(x, n)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn frexp(x: f64, e: *mut c_int) -> f64 {
-    let (m, exp) = libm::frexp(x);
-    if !e.is_null() {
-        // SAFETY: caller-supplied `e` must point to a valid c_int per
-        // the C API contract.
-        unsafe { e.write(exp) };
-    }
-    m
 }
 // `lrint` / `lrintf` should follow the current rounding mode (per
 // ISO C). FE_TONEAREST (round-half-to-even) is the default on every
@@ -248,24 +221,8 @@ pub extern "C" fn atan2(y: f64, x: f64) -> f64 {
     libm::atan2(y, x)
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn atan2f(y: f32, x: f32) -> f32 {
-    libm::atan2f(y, x)
-}
-#[unsafe(no_mangle)]
 pub extern "C" fn atan(x: f64) -> f64 {
     libm::atan(x)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn atanf(x: f32) -> f32 {
-    libm::atanf(x)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn tan(x: f64) -> f64 {
-    libm::tan(x)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn tanf(x: f32) -> f32 {
-    libm::tanf(x)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn log10(x: f64) -> f64 {
@@ -282,22 +239,6 @@ pub extern "C" fn log2(x: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn log2f(x: f32) -> f32 {
     libm::log2f(x)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn asin(x: f64) -> f64 {
-    libm::asin(x)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn asinf(x: f32) -> f32 {
-    libm::asinf(x)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn acos(x: f64) -> f64 {
-    libm::acos(x)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn acosf(x: f32) -> f32 {
-    libm::acosf(x)
 }
 
 // libopus does its own logging via fprintf when assertions fire and

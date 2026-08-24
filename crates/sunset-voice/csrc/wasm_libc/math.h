@@ -19,7 +19,6 @@ extern "C" {
 
 double sin(double);
 double cos(double);
-double tan(double);
 double atan(double);
 double atan2(double, double);
 double exp(double);
@@ -27,35 +26,22 @@ double log(double);
 double log10(double);
 double log2(double);
 double pow(double, double);
-double asin(double);
-double acos(double);
 double sqrt(double);
 double floor(double);
-double ceil(double);
 double fabs(double);
-double fmod(double, double);
 double round(double);
-double ldexp(double, int);
-double frexp(double, int *);
 long lrint(double);
 
 float sinf(float);
 float cosf(float);
-float tanf(float);
-float atanf(float);
-float atan2f(float, float);
 float expf(float);
 float logf(float);
 float log10f(float);
 float log2f(float);
 float powf(float, float);
-float asinf(float);
-float acosf(float);
 float sqrtf(float);
 float floorf(float);
-float ceilf(float);
 float fabsf(float);
-float fmodf(float, float);
 float roundf(float);
 long lrintf(float);
 
