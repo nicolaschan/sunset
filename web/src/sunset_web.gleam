@@ -316,7 +316,6 @@ pub type Msg {
   UpdateSidebarSearch(String)
   JoinRoom(String)
   DeleteRoom(String)
-  GoToLanding
   DragRoomStart(String)
   DragRoomOver(String)
   DragRoomLeave(String)
@@ -371,7 +370,6 @@ pub type Msg {
   /// `put_member_volume`.
   SetMemberVolume(String, Int)
   ToggleMemberDenoise(String)
-  ToggleMemberDeafen(String)
   ResetMemberVoice(String)
   /// Self-row popover radio: change the active send-side Opus
   /// quality preset (`"voice"` / `"high"` / `"maximum"`).
@@ -1231,14 +1229,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         persist,
       )
     }
-    GoToLanding -> {
-      let persist =
-        effect.from(fn(_) {
-          storage.set_hash("")
-          Nil
-        })
-      #(Model(..model, view: LandingView), persist)
-    }
     DragRoomStart(name) -> #(
       Model(..model, dragging_room: Some(name)),
       effect.none(),
@@ -1843,24 +1833,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           })
         None -> effect.none()
       }
-      #(
-        Model(
-          ..model,
-          voice_settings: dict.insert(model.voice_settings, name, next),
-        ),
-        eff,
-      )
-    }
-    ToggleMemberDeafen(name) -> {
-      let settings = member_voice_settings(model.voice_settings, name)
-      let new_deafened = !settings.deafened
-      let next = domain.VoiceSettings(..settings, deafened: new_deafened)
-      // Mute-for-me: set GainNode to 0 or restore prior volume via FFI.
-      let gain = case new_deafened {
-        True -> 0.0
-        False -> voice_volume.percent_to_gain(settings.volume)
-      }
-      let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
       #(
         Model(
           ..model,
@@ -2572,9 +2544,8 @@ fn room_view_with_state(
   // For self the two coincide: if I'm in the call, I'm trivially
   // connected to myself.
   //
-  // No fixture fallback: pre-connect we just render an empty roster.
-  // The voice rail is idle; the channel goes live only when real
-  // peers start arriving.
+  // Pre-connect we just render an empty roster: the voice rail is
+  // idle, and the channel goes live only when real peers arrive.
   let members_for_channels =
     list.map(state.members, fn(m) {
       let peer_hex = hex_encode(m.pubkey)
