@@ -17,20 +17,18 @@ use sunset_sync::{IntentId, IntentSnapshot, PeerSupervisor, SyncEngine, Transpor
 
 use crate::Identity;
 use crate::crypto::room::RoomFingerprint;
-use crate::signaling::MultiRoomSignaler;
+use crate::signaling::RelaySignaler;
 
 pub struct Peer<St: Store + 'static, T: Transport + 'static> {
     identity: Identity,
     store: Arc<St>,
     engine: Rc<SyncEngine<St, T>>,
     supervisor: Rc<PeerSupervisor<St, T>>,
-    /// Held across `open_room`'s await window so two concurrent
-    /// `open_room("alpha")` calls coalesce on a single `RoomState`
-    /// rather than racing through the idempotency check, both doing
-    /// Argon2 work and both registering signalers (the second
-    /// overwriting the first in the dispatcher).
+    /// Held across `open_room`'s await window so two concurrent opens of
+    /// the same name coalesce on one `RoomState` instead of both doing the
+    /// Argon2 work.
     open_rooms: tokio::sync::Mutex<HashMap<RoomFingerprint, Weak<open_room::RoomState<St, T>>>>,
-    pub(crate) rtc_signaler_dispatcher: Rc<MultiRoomSignaler>,
+    pub(crate) signaler: Rc<RelaySignaler<St>>,
     /// Last name set via `set_self_name`. Applied to newly-opened
     /// rooms' publishers in `start_presence` so that a web client
     /// calling `set_self_name` from `ClientReady` (before any room is
@@ -49,7 +47,7 @@ where
         store: Arc<St>,
         engine: Rc<SyncEngine<St, T>>,
         supervisor: Rc<PeerSupervisor<St, T>>,
-        rtc_signaler_dispatcher: Rc<MultiRoomSignaler>,
+        signaler: Rc<RelaySignaler<St>>,
     ) -> Rc<Self> {
         Rc::new(Self {
             identity,
@@ -57,7 +55,7 @@ where
             engine,
             supervisor,
             open_rooms: tokio::sync::Mutex::new(HashMap::new()),
-            rtc_signaler_dispatcher,
+            signaler,
             pending_self_name: RefCell::new(None),
         })
     }
@@ -75,13 +73,8 @@ where
         let room = Rc::new(crate::Room::open(room_name)?);
         let fp = room.fingerprint();
 
-        // Hold the registry lock across the rest of the open: this is
-        // the idempotency guarantee. Without it two concurrent
-        // open_room("alpha") calls both pass the registry check, both
-        // register signalers (second wins), and the first signaler's
-        // spawn_dispatcher leaks. Cost: serializes opens of *different*
-        // rooms too. Acceptable — opens are rare and the work is
-        // bounded.
+        // Held across the rest of the open so a concurrent open of the same
+        // name coalesces instead of racing past the check below.
         let mut open_rooms = self.open_rooms.lock().await;
 
         // Idempotency check under lock.
@@ -91,11 +84,7 @@ where
             }
         }
 
-        // Build a fresh per-room signaler and register it with the
-        // dispatcher.
-        let signaler: Rc<crate::signaling::RelaySignaler<St>> =
-            crate::signaling::RelaySignaler::new(self.identity.clone(), fp.to_hex(), &self.store);
-        self.rtc_signaler_dispatcher.register(fp, signaler.clone());
+        self.signaler.register_room(fp);
 
         // Publish the room subscription via the high-level subscribe
         // API (records a BroadcastIntent + auto-resubscribes on
@@ -108,15 +97,6 @@ where
             )
             .await
             .map_err(|e| crate::Error::Other(format!("subscribe: {e}")))?;
-
-        // The per-room signaler doesn't need a strong ref on RoomState:
-        // RelaySignaler::new spawned its dispatcher task with its own
-        // strong Rc, and dispatcher.register stored another in the
-        // dispatcher's HashMap. RoomState::drop's `unregister` call
-        // drops the latter; the dispatcher task keeps the signaler
-        // alive until its store-subscribe stream ends. The local
-        // `signaler` binding falls out of scope here without any
-        // further wiring.
 
         // Spawn the per-room reaction tracker. It subscribes to
         // <room_fp>/msg/, decodes Reaction entries, applies LWW per
@@ -358,11 +338,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn concurrent_open_room_for_same_name_coalesces() {
-        // Race window check: two parallel open_room("alpha") calls must
-        // return handles to the same RoomState. Without serialization
-        // they'd both pass the idempotency check, both do Argon2 work,
-        // both register signalers (second overwrites the first in the
-        // dispatcher), leaking the first signaler's spawn_dispatcher.
+        // Two parallel open_room("alpha") calls must return handles to the
+        // same RoomState.
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -374,9 +351,7 @@ mod tests {
                     Rc::ptr_eq(&r1.inner, &r2.inner),
                     "concurrent open_room must coalesce to one RoomState"
                 );
-                // The dispatcher should hold exactly one signaler for this fp,
-                // not two.
-                assert_eq!(peer.rtc_signaler_dispatcher.len(), 1);
+                assert_eq!(peer.signaler.room_count(), 1);
             })
             .await;
     }
@@ -1674,8 +1649,8 @@ mod tests {
                 let s = supervisor.clone();
                 async move { s.run().await }
             });
-            let dispatcher = MultiRoomSignaler::new();
-            Peer::new(identity, store, engine, supervisor, dispatcher)
+            let signaler = RelaySignaler::new(identity.clone(), &store);
+            Peer::new(identity, store, engine, supervisor, signaler)
         }
     }
 }

@@ -130,18 +130,18 @@ impl Client {
         // `fallback_addr_for`); `ws://`/`wss://` → straight to WS.
         let primary = FallbackTransport::new(wt_noise, ws_noise);
 
-        let dispatcher = sunset_core::MultiRoomSignaler::new();
-        let dispatcher_dyn: Rc<dyn sunset_sync::Signaler> = dispatcher.clone();
+        let signaler = sunset_core::RelaySignaler::new(identity.clone(), &store);
+        let signaler_dyn: Rc<dyn sunset_sync::Signaler> = signaler.clone();
         let local_peer = PeerId(identity.store_verifying_key());
         let rtc_raw = WebRtcRawTransport::new(
-            dispatcher_dyn,
+            signaler_dyn,
             local_peer.clone(),
             vec!["stun:stun.l.google.com:19302".into()],
         );
         let rtc_noise_id: Arc<dyn NoiseIdentity> = Arc::new(IdentityNoiseAdapter(identity.clone()));
         // Outbound dialer half: Noise IK initiator on top of the same
         // raw transport. The clone shares signaling state via Rc so
-        // outgoing offers/answers/ICE flow through the same dispatcher
+        // outgoing offers/answers/ICE flow through the same signaler
         // the inbound pump is reading from.
         let rtc_connector = NoiseTransport::new(rtc_raw.clone(), rtc_noise_id.clone());
         let rtc_promote: RtcPromoteFn = {
@@ -207,7 +207,7 @@ impl Client {
             store.clone(),
             engine.clone(),
             supervisor,
-            dispatcher,
+            signaler,
         );
 
         Ok(Client {
