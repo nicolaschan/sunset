@@ -50,20 +50,10 @@ pub const PLAYBACK_CHANNELS: u32 = 2;
 /// interleaved L/R and `FRAME_SAMPLES_PER_CHANNEL * 2` long.
 pub const FRAME_SAMPLES_PER_CHANNEL: usize = 960;
 
-/// Frame duration in milliseconds.
-pub const FRAME_DURATION_MS: u32 = 20;
-
 /// Codec identifier — pinned to the WebCodecs Codec Registry name
 /// (`"opus"`). `VoiceFrame` carries this in the wire envelope so
 /// receivers refuse frames they cannot decode.
 pub const CODEC_ID: &str = "opus";
-
-// Backwards-compatible alias — pre-stereo, every frame was mono so
-// `FRAME_SAMPLES` meant the same thing as `FRAME_SAMPLES_PER_CHANNEL`.
-// Kept so existing callers (test fixtures, recorder, etc.) compile
-// without churn until we sweep them. New code should prefer the
-// per-channel constant + the decoded-frame helpers below.
-pub const FRAME_SAMPLES: usize = FRAME_SAMPLES_PER_CHANNEL;
 
 /// Send-side codec quality preset.
 ///
