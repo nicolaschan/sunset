@@ -1,18 +1,10 @@
-//! Routing-layer reserved-name constants and the deterministic encoder
-//! for per-(filter, provider) subscription entry names.
+//! The reserved-name prefix for per-(filter, provider) subscription
+//! entries, and the deterministic encoder/decoder for their names.
 
 use bytes::Bytes;
 use sunset_store::Filter;
 
 use crate::types::PeerId;
-
-/// Reserved name for self-published link-state advertisements
-/// (one entry per peer at `(self_pubkey, LINKS_NAME)`).
-pub const LINKS_NAME: &[u8] = b"_sunset-sync/links";
-
-/// Reserved name for the monotonic provider-tick liveness beacon
-/// (one entry per peer at `(self_pubkey, PROVIDER_TICK_NAME)`).
-pub const PROVIDER_TICK_NAME: &[u8] = b"_sunset-sync/provider-tick";
 
 /// Common prefix of every per-(filter, provider) subscription entry name.
 /// Useful as a filter prefix when subscribing to the control plane.
@@ -80,6 +72,7 @@ pub fn decode_filter_hash_from_name(name: &[u8]) -> Option<crate::routing::Filte
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reserved::PEER_HEALTH_NAME;
     use sunset_store::VerifyingKey;
 
     fn vk(seed: &[u8]) -> VerifyingKey {
@@ -174,7 +167,7 @@ mod tests {
     fn decode_provider_from_name_rejects_non_subscription_names() {
         assert_eq!(decode_provider_from_name(b""), None);
         assert_eq!(decode_provider_from_name(b"chat/room/general"), None);
-        assert_eq!(decode_provider_from_name(LINKS_NAME), None);
+        assert_eq!(decode_provider_from_name(PEER_HEALTH_NAME), None);
         // Missing the `/provider` segment.
         let mut name = Vec::from(SUBSCRIBE_PREFIX);
         name.extend_from_slice(&b"a".repeat(64));
@@ -191,8 +184,7 @@ mod tests {
 
     #[test]
     fn is_subscription_name_rejects_other_reserved_names() {
-        assert!(!is_subscription_name(LINKS_NAME));
-        assert!(!is_subscription_name(PROVIDER_TICK_NAME));
+        assert!(!is_subscription_name(PEER_HEALTH_NAME));
     }
 
     #[test]
@@ -204,8 +196,6 @@ mod tests {
     #[test]
     fn reserved_constants_are_under_sunset_sync_prefix() {
         use crate::reserved::RESERVED_PREFIX;
-        assert!(LINKS_NAME.starts_with(RESERVED_PREFIX));
-        assert!(PROVIDER_TICK_NAME.starts_with(RESERVED_PREFIX));
         assert!(SUBSCRIBE_PREFIX.starts_with(RESERVED_PREFIX));
     }
 
@@ -217,8 +207,6 @@ mod tests {
     #[test]
     fn subscribe_prefix_wire_format_pin() {
         assert_eq!(SUBSCRIBE_PREFIX, b"_sunset-sync/subscribe/");
-        assert_eq!(LINKS_NAME, b"_sunset-sync/links");
-        assert_eq!(PROVIDER_TICK_NAME, b"_sunset-sync/provider-tick");
     }
 
     /// Frozen hex vector for `filter_hash`. The wire format is
@@ -256,8 +244,7 @@ mod tests {
 
     #[test]
     fn decode_filter_hash_from_name_rejects_wrong_reserved_prefix() {
-        assert_eq!(decode_filter_hash_from_name(LINKS_NAME), None);
-        assert_eq!(decode_filter_hash_from_name(PROVIDER_TICK_NAME), None);
+        assert_eq!(decode_filter_hash_from_name(PEER_HEALTH_NAME), None);
     }
 
     #[test]
