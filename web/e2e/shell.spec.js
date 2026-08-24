@@ -25,6 +25,14 @@
 // covered end-to-end by reactions.spec.js, receipts.spec.js, and the
 // two_browser_chat.spec.js suite, so the duplicated single-browser
 // versions stay skipped here with a pointer to their counterpart.
+//
+// Narrower still since the fixture was deleted: the sender / delivery-path
+// sections of the details panel had no constructor outside that fixture and
+// were removed with it, so the skipped assertions on a sender hash
+// (/8f3c…a2/, /9b1d…74/) describe UI that no longer exists. Unblocking
+// those means asserting on whatever provenance the engine can actually
+// sign for, not on a restored fixture. The receipt-row and pending-state
+// halves are still real UI.
 
 import { expect, test } from "@playwright/test";
 
@@ -603,8 +611,11 @@ test.describe("phone — details sheet", () => {
 
   // Skipped: depends on fixture messages being rendered into the chat column.
   // Since Plan E, messages come from the live engine only, so the msg-row
-  // with "routing thru ravi" does not exist on a fresh page load. Unblock
-  // once fixtures are merged back or messages carry HasDetails from the engine.
+  // with "routing thru ravi" does not exist on a fresh page load. The
+  // sender / delivery-path sections this asserts on were fixture-only and
+  // have since been deleted along with the fixture, so unblocking means
+  // rewriting the test against a seeded live message and whatever
+  // provenance the engine actually surfaces -- not restoring a fixture.
   test.skip("info button on a delivered message opens the details bottom sheet", async ({
     page,
   }) => {

@@ -308,10 +308,6 @@ fn text_channel_row(
     [
       html.span([ui.css([#("color", p.text_faint)])], [html.text("#")]),
       html.span([ui.css([#("flex", "1")])], [html.text(c.name)]),
-      case c.unread {
-        0 -> element.fragment([])
-        n -> unread_pill(p, n)
-      },
     ],
   )
 }
@@ -403,10 +399,9 @@ fn voice_block(
   on_leave: msg,
   self_in_call: Bool,
 ) -> Element(msg) {
-  let is_live = c.in_call > 0
-  case is_live {
-    False -> idle_voice_row(p, c, on_join)
-    True ->
+  case in_call_members {
+    [] -> idle_voice_row(p, c, on_join)
+    _ ->
       live_voice_block(
         p,
         c,
@@ -1057,26 +1052,5 @@ fn voice_icon() -> Element(msg) {
         [],
       ),
     ],
-  )
-}
-
-fn unread_pill(p: Palette, n: Int) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("min-width", "18px"),
-        #("padding", "0 6px"),
-        #("height", "18px"),
-        #("border-radius", "999px"),
-        #("background", p.accent),
-        #("color", p.accent_ink),
-        #("font-size", "13.125px"),
-        #("font-weight", "600"),
-        #("display", "inline-flex"),
-        #("align-items", "center"),
-        #("justify-content", "center"),
-      ]),
-    ],
-    [html.text(int.to_string(n))],
   )
 }

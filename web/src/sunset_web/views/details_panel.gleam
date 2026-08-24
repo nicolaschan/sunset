@@ -1,10 +1,8 @@
 //// Right-column message-details panel — replaces the members rail
 //// when a message's info button is clicked.
 ////
-//// Renders up to five sections:
-////   • the quoted message body (always)
-////   • sender / cryptographic provenance (when full details are known)
-////   • delivery path (when full details are known)
+//// Renders three sections:
+////   • the quoted message body
 ////   • delivery acknowledgements — peers whose delivery receipt for
 ////     this message has landed locally, each stamped with the unix-ms
 ////     when that peer composed the receipt
@@ -20,7 +18,6 @@
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
 import gleam/order
 import gleam/string
 import lustre/attribute
@@ -28,8 +25,8 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import sunset_web/domain.{
-  type Member, type MessageDetails, type MessageView, type RelayStatus, Direct,
-  HasDetails, MemberId, NoDetails, NoRelay, OneHop, SelfRelay, TwoHop, ViaPeer,
+  type Member, type MessageView, type RelayStatus, Direct, MemberId, NoRelay,
+  OneHop, SelfRelay, TwoHop, ViaPeer,
 }
 import sunset_web/sunset
 import sunset_web/theme.{type Palette}
@@ -44,11 +41,6 @@ pub fn view(
   name_map nm: Dict(String, String),
   on_close on_close: msg,
 ) -> Element(msg) {
-  let detail_section = case m.details {
-    HasDetails(d) ->
-      element.fragment([sender_section(p, d), delivery_section(p, d)])
-    NoDetails -> element.fragment([])
-  }
   // Sized by the right-rail flex-column wrapper in sunset_web (which
   // also pins the self/settings row beneath). `flex: 1; min-height: 0`
   // here lets the panel fill the column above the row while its inner
@@ -83,7 +75,6 @@ pub fn view(
         ],
         [
           message_quote(p, m),
-          detail_section,
           receipts_section(p, m, r, ms, nm),
           reactions_section(p, reactions, nm),
         ],
@@ -226,79 +217,6 @@ fn message_quote(p: Palette, m: MessageView) -> Element(msg) {
       ),
     ],
   )
-}
-
-fn sender_section(p: Palette, d: MessageDetails) -> Element(msg) {
-  let badge = case d.verified {
-    True -> verified_badge(p)
-    False -> unverified_badge(p)
-  }
-  section(p, "Sender", [
-    kv_row(p, "From", mono(p, d.sender), Some(badge)),
-    kv_row(p, "Message ID", mono(p, d.message_id), None),
-    kv_row(p, "Prev", mono(p, d.prev_id), None),
-    kv_row(p, "Signature", mono(p, d.signature), None),
-  ])
-}
-
-fn delivery_section(p: Palette, d: MessageDetails) -> Element(msg) {
-  section(p, "Delivery", [
-    kv_row(p, "Sent", html.text(d.sent_at), None),
-    kv_row(p, "Delivered", html.text(d.delivered_at), None),
-    html.div(
-      [
-        ui.css([
-          #("display", "flex"),
-          #("flex-direction", "column"),
-          #("gap", "4px"),
-          #("margin-top", "2px"),
-        ]),
-      ],
-      [
-        kv_label(p, "Path"),
-        hops_chain(p, d.hops),
-      ],
-    ),
-  ])
-}
-
-fn hops_chain(p: Palette, hops: List(String)) -> Element(msg) {
-  html.div(
-    [
-      ui.css([
-        #("display", "flex"),
-        #("flex-wrap", "wrap"),
-        #("align-items", "center"),
-        #("gap", "4px"),
-        #("font-size", "13.75px"),
-        #("color", p.text),
-      ]),
-    ],
-    list.intersperse(list.map(hops, fn(name) { hop_chip(p, name) }), arrow(p)),
-  )
-}
-
-fn hop_chip(p: Palette, name: String) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("padding", "2px 8px"),
-        #("background", p.accent_soft),
-        #("color", p.accent_deep),
-        #("border-radius", "999px"),
-        #("font-weight", "500"),
-        #("font-size", "13.125px"),
-        #("white-space", "nowrap"),
-      ]),
-    ],
-    [html.text(name)],
-  )
-}
-
-fn arrow(p: Palette) -> Element(msg) {
-  html.span([ui.css([#("color", p.text_faint), #("font-size", "11.5px")])], [
-    html.text("→"),
-  ])
 }
 
 fn receipts_section(
@@ -688,94 +606,5 @@ fn section(p: Palette, title: String, rows: List(Element(msg))) -> Element(msg) 
         rows,
       ),
     ],
-  )
-}
-
-fn kv_row(
-  p: Palette,
-  label: String,
-  value: Element(msg),
-  trailing: Option(Element(msg)),
-) -> Element(msg) {
-  html.div(
-    [
-      ui.css([
-        #("display", "flex"),
-        #("align-items", "baseline"),
-        #("gap", "8px"),
-        #("flex-wrap", "wrap"),
-      ]),
-    ],
-    [
-      kv_label(p, label),
-      html.span([ui.css([#("flex", "1"), #("min-width", "0")])], [value]),
-      case trailing {
-        Some(el) -> el
-        None -> element.fragment([])
-      },
-    ],
-  )
-}
-
-fn kv_label(p: Palette, label: String) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("font-size", "12.5px"),
-        #("color", p.text_faint),
-        #("text-transform", "uppercase"),
-        #("letter-spacing", "0.04em"),
-        #("font-weight", "600"),
-        #("min-width", "70px"),
-      ]),
-    ],
-    [html.text(label)],
-  )
-}
-
-fn mono(p: Palette, s: String) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("font-family", theme.font_mono),
-        #("font-size", "13.125px"),
-        #("color", p.text),
-        #("word-break", "break-all"),
-      ]),
-    ],
-    [html.text(s)],
-  )
-}
-
-fn verified_badge(p: Palette) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("padding", "1px 7px"),
-        #("border-radius", "999px"),
-        #("background", p.ok_soft),
-        #("color", p.ok),
-        #("font-size", "11.5px"),
-        #("font-weight", "600"),
-        #("letter-spacing", "0.02em"),
-      ]),
-    ],
-    [html.text("✓ verified")],
-  )
-}
-
-fn unverified_badge(p: Palette) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("padding", "1px 7px"),
-        #("border-radius", "999px"),
-        #("background", p.warn_soft),
-        #("color", p.warn),
-        #("font-size", "11.5px"),
-        #("font-weight", "600"),
-      ]),
-    ],
-    [html.text("unverified")],
   )
 }

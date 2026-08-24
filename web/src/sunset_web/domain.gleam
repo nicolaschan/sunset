@@ -66,25 +66,11 @@ pub type RelayStatus {
 }
 
 pub type Room {
-  Room(
-    id: RoomId,
-    name: String,
-    online: Int,
-    in_call: Int,
-    status: ConnStatus,
-    last_active: String,
-    unread: Int,
-  )
+  Room(id: RoomId, name: String, online: Int, status: ConnStatus)
 }
 
 pub type Channel {
-  Channel(
-    id: ChannelId,
-    name: String,
-    kind: ChannelKind,
-    in_call: Int,
-    unread: Int,
-  )
+  Channel(id: ChannelId, name: String, kind: ChannelKind)
 }
 
 pub type Member {
@@ -96,7 +82,6 @@ pub type Member {
     relay: RelayStatus,
     you: Bool,
     in_call: Bool,
-    role: RoleOpt,
     /// Unix-ms timestamp of the last app-level presence heartbeat we
     /// received from this peer. `None` for self or peers we have not
     /// heard from. The popover renders age as `now_ms - this`.
@@ -113,34 +98,6 @@ pub type Member {
 
 pub type Reaction {
   Reaction(emoji: String, count: Int, by_you: Bool)
-}
-
-/// Per-recipient delivery confirmation, surfaced in the message-details
-/// side panel.
-pub type Receipt {
-  Receipt(name: String, time: String, relay: RelayStatus)
-}
-
-/// Cryptographic + delivery metadata available for messages we have
-/// full provenance on. In v1 only own outgoing messages have this; the
-/// chat-domain plan will populate it from real signed entries later.
-pub type MessageDetails {
-  MessageDetails(
-    sender: String,
-    message_id: String,
-    prev_id: String,
-    signature: String,
-    verified: Bool,
-    hops: List(String),
-    sent_at: String,
-    delivered_at: String,
-    receipts: List(Receipt),
-  )
-}
-
-pub type DetailsOpt {
-  HasDetails(MessageDetails)
-  NoDetails
 }
 
 /// Per-recipient voice tweaks the local user has applied to a peer
@@ -183,7 +140,6 @@ pub type Message {
     you: Bool,
     pending: Bool,
     reactions: List(Reaction),
-    details: DetailsOpt,
     /// Image attachments. Empty for text-only messages. Rendered
     /// inline below the body in the message timeline.
     attachments: List(Attachment),
@@ -208,16 +164,10 @@ pub type MessageView {
     you: Bool,
     pending: Bool,
     reactions: List(Reaction),
-    details: DetailsOpt,
     /// Mirror of `Message.attachments`. Re-emitted on the view type so
     /// the timeline doesn't have to re-look up the source Message.
     attachments: List(Attachment),
   )
-}
-
-pub type RoleOpt {
-  HasRole(String)
-  NoRole
 }
 
 /// Viewport class derived from `matchMedia("(max-width: 767px)")`.

@@ -4,8 +4,7 @@
 ////   * `LandingView` — empty state shown at root `/`. The user types a
 ////     room name and submits; we add it to their joined-rooms list and
 ////     navigate.
-////   * `RoomView(name)` — the existing 4-column chat shell rendering
-////     fixture data for the named room.
+////   * `RoomView(name)` — the 4-column chat shell for the named room.
 ////
 //// Routing is anchor-based: the URL fragment (`/#dusk-collective`) is
 //// the source of truth for which room is active. A storage FFI shim
@@ -27,10 +26,9 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Reaction, type Room, ChannelId, Reaction, Room, RoomId,
-  VoiceModel, VoicePeerStateUI,
+  type ChannelId, type Room, ChannelId, Room, RoomId, VoiceModel,
+  VoicePeerStateUI,
 }
-import sunset_web/fixture
 import sunset_web/markdown
 import sunset_web/scroll_anchor
 import sunset_web/storage
@@ -93,10 +91,9 @@ pub type RoomState {
     /// timestamp is surfaced in the message-details panel as the
     /// per-recipient delivered-at stamp.
     receipts: Dict(String, Dict(String, Int)),
-    reactions: Dict(String, List(Reaction)),
     current_channel: ChannelId,
     /// Channels the rail draws for this room. Seeded with the default
-    /// text channel + a fixture voice channel; merged with the live
+    /// text channel + the placeholder voice channel; merged with the live
     /// observed-channel set from the wasm side as `ChannelsObserved`
     /// events arrive. Sort order: default text channel first, then
     /// the rest of the observed text channels alphabetically, then
@@ -126,7 +123,6 @@ fn empty_room_state() -> RoomState {
     messages: [],
     members: [],
     receipts: dict.new(),
-    reactions: dict.new(),
     current_channel: domain.default_channel_id(),
     channels: initial_channels(),
     draft: "",
@@ -139,22 +135,18 @@ fn empty_room_state() -> RoomState {
   )
 }
 
+fn text_channel(label: String) -> domain.Channel {
+  domain.Channel(id: ChannelId(label), name: label, kind: domain.TextChannel)
+}
+
 /// Initial channel list every room starts with: the default text
 /// channel (always present, even before any traffic is observed) plus
 /// the placeholder voice channel. Voice is out of scope for the
 /// channels-within-rooms PR; we keep the rail entry so the existing
-/// voice flows keep rendering. The id/name match
-/// `fixture.channels()`'s voice entry so the live in_call overlay
-/// (computed from real members in the render path) lines up by id.
+/// voice flows keep rendering.
 fn initial_channels() -> List(domain.Channel) {
   [
-    domain.Channel(
-      id: domain.default_channel_id(),
-      name: domain.default_channel_name,
-      kind: domain.TextChannel,
-      in_call: 0,
-      unread: 0,
-    ),
+    text_channel(domain.default_channel_name),
     domain.Channel(
       // Default voice channel is named "general" in parallel to the
       // default text channel — same room-wide affordance for "the
@@ -164,8 +156,6 @@ fn initial_channels() -> List(domain.Channel) {
       id: ChannelId("voice"),
       name: "general",
       kind: domain.Voice,
-      in_call: 0,
-      unread: 0,
     ),
   ]
 }
@@ -318,7 +308,6 @@ pub type Msg {
   UpdateSidebarSearch(String)
   JoinRoom(String)
   DeleteRoom(String)
-  GoToLanding
   DragRoomStart(String)
   DragRoomOver(String)
   DragRoomLeave(String)
@@ -338,7 +327,6 @@ pub type Msg {
   RemoveAttachment(index: Int)
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
-  AddReaction(String, String)
   ReactionsChanged(target: String, snapshot: Dict(String, Dict(String, Int)))
   ToggleReactionEmoji(target: String, emoji: String)
   ReactionSent(Result(Nil, String))
@@ -374,7 +362,6 @@ pub type Msg {
   /// `put_member_volume`.
   SetMemberVolume(String, Int)
   ToggleMemberDenoise(String)
-  ToggleMemberDeafen(String)
   ResetMemberVoice(String)
   /// Self-row popover radio: change the active send-side Opus
   /// quality preset (`"voice"` / `"high"` / `"maximum"`).
@@ -880,7 +867,6 @@ fn incoming_to_message(im: IncomingMessage) -> domain.Message {
     you: sunset.inc_is_self(im),
     pending: False,
     reactions: [],
-    details: domain.NoDetails,
     attachments: attachments,
   )
 }
@@ -903,59 +889,28 @@ pub fn resolve_messages(
       you: m.you,
       pending: m.pending,
       reactions: m.reactions,
-      details: m.details,
       attachments: m.attachments,
     )
   })
 }
 
 /// Merge a fresh observed-channel snapshot into the rail's existing
-/// channel list. Each observed string becomes (or reuses) a
-/// `TextChannel`; existing per-channel UI state (unread / in_call) is
-/// preserved by id-lookup. The default text channel is always
-/// included even if the snapshot doesn't carry it. Voice channels in
-/// the previous list are kept as-is — voice rail entries don't come
-/// from the wasm side. Output is sorted via `sort_channels`.
+/// channel list. Each observed string becomes a `TextChannel`; the
+/// default text channel is always included even if the snapshot
+/// doesn't carry it. Voice channels in the previous list are kept
+/// as-is — voice rail entries don't come from the wasm side. Output
+/// is sorted via `sort_channels`.
 pub fn merge_observed_channels(
   existing: List(domain.Channel),
   observed: List(String),
 ) -> List(domain.Channel) {
   let voice_existing = list.filter(existing, fn(c) { c.kind == domain.Voice })
-  let observed_text =
-    list.map(observed, fn(label) {
-      let id = ChannelId(label)
-      case list.find(existing, fn(c) { c.id == id }) {
-        Ok(prev) -> prev
-        Error(_) ->
-          domain.Channel(
-            id: id,
-            name: label,
-            kind: domain.TextChannel,
-            in_call: 0,
-            unread: 0,
-          )
-      }
-    })
+  let observed_text = list.map(observed, text_channel)
   let with_default = case
     list.any(observed_text, fn(c) { c.id == domain.default_channel_id() })
   {
     True -> observed_text
-    False -> [
-      // Reuse the existing default-channel record (preserving unread,
-      // etc.) if we already have one in `existing`.
-      case list.find(existing, fn(c) { c.id == domain.default_channel_id() }) {
-        Ok(prev) -> prev
-        Error(_) ->
-          domain.Channel(
-            id: domain.default_channel_id(),
-            name: domain.default_channel_name,
-            kind: domain.TextChannel,
-            in_call: 0,
-            unread: 0,
-          )
-      },
-      ..observed_text
-    ]
+    False -> [text_channel(domain.default_channel_name), ..observed_text]
   }
   sort_channels(list.append(with_default, voice_existing))
 }
@@ -1263,14 +1218,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         ),
         persist,
       )
-    }
-    GoToLanding -> {
-      let persist =
-        effect.from(fn(_) {
-          storage.set_hash("")
-          Nil
-        })
-      #(Model(..model, view: LandingView), persist)
     }
     DragRoomStart(name) -> #(
       Model(..model, dragging_room: Some(name)),
@@ -1703,14 +1650,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         _ ->
           with_active_room(model, fn(state) {
             let new_id = ChannelId(trimmed)
-            let new_channel =
-              domain.Channel(
-                id: new_id,
-                name: trimmed,
-                kind: domain.TextChannel,
-                in_call: 0,
-                unread: 0,
-              )
+            let new_channel = text_channel(trimmed)
             let merged = case
               list.any(state.channels, fn(c) { c.id == new_id })
             {
@@ -1786,22 +1726,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           _ -> Some(id)
         }
         #(RoomState(..state, reacting_to: next), effect.none())
-      })
-    AddReaction(id, emoji) ->
-      with_active_room(model, fn(state) {
-        let current = case dict.get(state.reactions, id) {
-          Ok(rs) -> rs
-          Error(_) -> []
-        }
-        let next = toggle_reaction(current, emoji)
-        #(
-          RoomState(
-            ..state,
-            reactions: dict.insert(state.reactions, id, next),
-            reacting_to: None,
-          ),
-          effect.none(),
-        )
       })
     OpenDetail(id) ->
       with_active_room(model, fn(state) {
@@ -1907,24 +1831,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         eff,
       )
     }
-    ToggleMemberDeafen(name) -> {
-      let settings = member_voice_settings(model.voice_settings, name)
-      let new_deafened = !settings.deafened
-      let next = domain.VoiceSettings(..settings, deafened: new_deafened)
-      // Mute-for-me: set GainNode to 0 or restore prior volume via FFI.
-      let gain = case new_deafened {
-        True -> 0.0
-        False -> voice_volume.percent_to_gain(settings.volume)
-      }
-      let eff = effect.from(fn(_) { voice.set_peer_volume(name, gain) })
-      #(
-        Model(
-          ..model,
-          voice_settings: dict.insert(model.voice_settings, name, next),
-        ),
-        eff,
-      )
-    }
     ResetMemberVoice(name) ->
       // Back to defaults: 100% volume (gain 1.0), denoise on, un-muted.
       // Routes through the same write path so the remembered volume for a
@@ -1991,11 +1897,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         #(RoomState(..state, draft: new_value), effect.none())
       })
     }
-    // Master's reactions Msg variants — pre-multi-room these were
-    // wired to a Client-level reactions tracker. After multi-room the
-    // tracker needs to be per-OpenRoom (the per-room follow-up), so
-    // these are placeholder no-ops to keep the Msg type exhaustive.
-    // The chip-row UI still works through AddReaction (UI-only).
     ReactionsChanged(target, snapshot) -> #(
       Model(..model, reactions: dict.insert(model.reactions, target, snapshot)),
       effect.none(),
@@ -2411,31 +2312,20 @@ fn room_view_with_state(
   state: RoomState,
 ) -> Element(Msg) {
   let displayed_rooms =
-    resolve_rooms(model.joined_rooms, model.intents, model.rooms)
+    list.map(model.joined_rooms, room_for(_, model.intents, model.rooms))
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
-  let active_room = lookup_room(displayed_rooms, current_name, model.intents)
+  let active_room = room_for(current_name, model.intents, model.rooms)
 
   let self_pubkey_hex = option.map(model.client, fn(c) { client_pubkey_hex(c) })
-  let raw_messages = state.messages
-  // Two reaction sources are layered onto the message list:
-  //   1. `model.reactions[target]` — real reactions from the engine
-  //      tracker (preferred, drives chip counts + by_you).
-  //   2. `state.reactions[message_id]` — UI-only fixture toggle from
-  //      AddReaction. Falls back to this if the engine has nothing
-  //      yet (so the fixture row still pre-renders the seeded chips).
   let messages_with_live_reactions =
-    list.map(raw_messages, fn(m) {
+    list.map(state.messages, fn(m) {
       case dict.get(model.reactions, m.id) {
         Ok(snap) ->
           domain.Message(
             ..m,
             reactions: snapshot_to_reactions(snap, self_pubkey_hex),
           )
-        Error(_) ->
-          case dict.get(state.reactions, m.id) {
-            Ok(rs) -> domain.Message(..m, reactions: rs)
-            Error(_) -> m
-          }
+        Error(_) -> m
       }
     })
 
@@ -2644,9 +2534,8 @@ fn room_view_with_state(
   // For self the two coincide: if I'm in the call, I'm trivially
   // connected to myself.
   //
-  // No fixture fallback: pre-connect we just render an empty roster.
-  // The voice rail is idle; the channel goes live only when real
-  // peers start arriving.
+  // Pre-connect we just render an empty roster: the voice rail is
+  // idle, and the channel goes live only when real peers arrive.
   let members_for_channels =
     list.map(state.members, fn(m) {
       let peer_hex = hex_encode(m.pubkey)
@@ -2774,32 +2663,8 @@ fn room_view_with_state(
   // Use real voice model state: show minibar when user is in call.
   let user_in_call = option.is_some(model.voice.self_in_call)
 
-  // Derive the live in-call count for the voice channel from real
-  // members rather than the rail's stored placeholder, so the rail
-  // shows "live" iff somebody (including self) is actually connected.
-  let live_voice_count =
-    list.fold(members_for_channels, 0, fn(acc, m) {
-      case m.in_call {
-        True -> acc + 1
-        False -> acc
-      }
-    })
-
-  // state.channels is the source of truth for the rail (driven by
-  // observed channels + the always-present default + the voice
-  // placeholder). Overlay the live in_call count onto the voice
-  // entry so the rail's live-roster branch fires only when somebody
-  // is actually connected.
-  let channels_for_view =
-    list.map(state.channels, fn(c) {
-      case c.kind {
-        domain.Voice -> domain.Channel(..c, in_call: live_voice_count)
-        _ -> c
-      }
-    })
-
   let active_voice_channel_name =
-    list.find(channels_for_view, fn(c) { c.kind == domain.Voice })
+    list.find(state.channels, fn(c) { c.kind == domain.Voice })
     |> result.map(fn(c) { c.name })
     |> result.unwrap("general")
 
@@ -2866,7 +2731,7 @@ fn room_view_with_state(
     channels.view(
       palette: palette,
       room: active_room,
-      channels: channels_for_view,
+      channels: state.channels,
       members: members_for_channels,
       voice_peers: model.voice.peers,
       peer_levels: model.voice.peer_levels,
@@ -3137,26 +3002,20 @@ fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
   }
 }
 
-/// Resolve a list of joined room names to rich Room records. Names
-/// that match a fixture room reuse its mock data; anything else falls
-/// back to a synthetic Room so the rail still renders something useful.
-/// The `online` field on each returned Room is always derived from the
-/// per-room live member list (`rooms` dict) — fixture/synthetic defaults
-/// are placeholders the resolver overwrites.
-fn resolve_rooms(
-  names: List(String),
+/// Rail record for a room name. Every field is derived: `online` from
+/// the live per-room member snapshot (0 when we have none yet), the
+/// status pill from the relay intents.
+fn room_for(
+  name: String,
   intents: Dict(Float, sunset.IntentSnapshot),
   rooms: Dict(String, RoomState),
-) -> List(Room) {
-  let fixture_rooms = fixture.rooms()
-  let conn = relay_status_pill(intents)
-  list.map(names, fn(name) {
-    let online = online_count_for_room(name, rooms)
-    case list.find(fixture_rooms, fn(r) { r.name == name }) {
-      Ok(r) -> Room(..r, status: conn, id: RoomId(name), online: online)
-      Error(_) -> synthetic_room(name, intents, online)
-    }
-  })
+) -> Room {
+  Room(
+    id: RoomId(name),
+    name: name,
+    online: online_count_for_room(name, rooms),
+    status: relay_status_pill(intents),
+  )
 }
 
 fn online_count_for_room(name: String, rooms: Dict(String, RoomState)) -> Int {
@@ -3178,37 +3037,6 @@ pub fn count_online_members(members: List(domain.Member)) -> Int {
       _ -> True
     }
   })
-}
-
-fn lookup_room(
-  rs: List(Room),
-  name: String,
-  intents: Dict(Float, sunset.IntentSnapshot),
-) -> Room {
-  case list.find(rs, fn(r) { r.name == name }) {
-    Ok(r) -> r
-    Error(_) -> synthetic_room(name, intents, 0)
-  }
-}
-
-/// Default Room record for a name we have no fixture entry for. Reads
-/// like a freshly-joined room with no observed activity yet. `online`
-/// is supplied by the caller (derived from live member data); it is
-/// `0` when we have no member snapshot for this room yet.
-fn synthetic_room(
-  name: String,
-  intents: Dict(Float, sunset.IntentSnapshot),
-  online: Int,
-) -> Room {
-  Room(
-    id: RoomId(name),
-    name: name,
-    online: online,
-    in_call: 0,
-    status: relay_status_pill(intents),
-    last_active: "now",
-    unread: 0,
-  )
 }
 
 /// Derive the room-status pill from the supervisor's per-intent
@@ -3316,47 +3144,6 @@ fn find_message(
   |> option.from_result
 }
 
-/// UI-only per-room reaction toggle. Mirrors the pre-master fixture
-/// behavior: tapping an emoji adds/removes/decrements your reaction
-/// in the per-RoomState `reactions` dict. The real reactions feature
-/// (master's send_reaction / ReactionsChanged) is still a Client-level
-/// global and needs per-OpenRoom migration before this helper can be
-/// dropped. Until then, the per-room AddReaction handler keeps the
-/// chip row interactive without going through the engine.
-fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
-  case list.find(rs, fn(r) { r.emoji == emoji }) {
-    Error(_) -> [Reaction(emoji: emoji, count: 1, by_you: True), ..rs]
-    Ok(existing) ->
-      case existing.by_you {
-        True -> {
-          let updated_count = existing.count - 1
-          case updated_count {
-            0 -> list.filter(rs, fn(r) { r.emoji != emoji })
-            _ ->
-              list.map(rs, fn(r) {
-                case r.emoji == emoji {
-                  True ->
-                    Reaction(
-                      emoji: r.emoji,
-                      count: updated_count,
-                      by_you: False,
-                    )
-                  False -> r
-                }
-              })
-          }
-        }
-        False ->
-          list.map(rs, fn(r) {
-            case r.emoji == emoji {
-              True -> Reaction(emoji: r.emoji, count: r.count + 1, by_you: True)
-              False -> r
-            }
-          })
-      }
-  }
-}
-
 /// Convert a per-target snapshot dict into the `List(Reaction)` shape
 /// the chip-row view consumes. `self_pubkey_hex` decides the
 /// `by_you` flag; `None` (no client yet) treats every reaction as
@@ -3425,7 +3212,6 @@ fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
       relay: connection_mode_to_relay(sunset.mem_connection_mode(m)),
       you: sunset.mem_is_self(m),
       in_call: False,
-      role: domain.NoRole,
       last_heartbeat_ms: sunset.mem_last_heartbeat_ms(m),
       raw_name: raw,
       pubkey: pk,

@@ -2,8 +2,8 @@ import gleam/option
 import gleeunit/should
 import sunset_web
 import sunset_web/domain.{
-  type Member, Away, Direct, Member, MemberId, MutedP, NoRelay, NoRole, OfflineP,
-  Online, Speaking,
+  type Member, Away, Direct, Member, MemberId, MutedP, NoRelay, OfflineP, Online,
+  Speaking,
 }
 
 fn member(id: String, status: domain.Presence) -> Member {
@@ -15,7 +15,6 @@ fn member(id: String, status: domain.Presence) -> Member {
     relay: NoRelay,
     you: False,
     in_call: False,
-    role: NoRole,
     last_heartbeat_ms: option.None,
     raw_name: option.None,
     pubkey: <<>>,

@@ -70,10 +70,10 @@ pub fn view(
           #("background", p.surface),
           #("border-right", border_right),
           #("transition", "width 220ms ease"),
-          // Children sometimes have absolute-positioned bits (unread badges)
-          // that hang outside their bounding box, plus the inline list rows
-          // are sized for the expanded state — clip everything that doesn't
-          // fit so the collapsed 54px rail never spawns a horizontal scroll.
+          // The inline list rows are laid out for the expanded rail and
+          // keep their intrinsic width while the rail animates down to
+          // 54px — clip the overhang so collapsing never spawns a
+          // horizontal scroll.
           #("overflow", "hidden"),
           // Allow the rail to shrink below its content's intrinsic width
           // when the surrounding flex/grid context demands it. Pairs with
@@ -530,10 +530,6 @@ fn room_full(
               ),
             ],
           ),
-          case r.unread {
-            0 -> element.fragment([])
-            n -> unread_pill(p, n)
-          },
         ],
       ),
       delete_button(p, r.name, on_delete),
@@ -587,25 +583,14 @@ fn meta_line(p: Palette, r: Room) -> List(Element(msg)) {
   //
   // Each segment is a *deviation* indicator — we render only when there
   // is something to claim. "online" is omitted when we have no presence
-  // data yet (count = 0) rather than inventing a fake "1/1"; "in voice"
-  // is omitted at zero; the status segment shows only for non-Connected
-  // states. "· " separators are inserted between the segments that
-  // actually render, so a meta line starting with "in voice" doesn't
-  // begin with an orphan "· ".
+  // data yet (count = 0) rather than inventing a fake "1/1"; the status
+  // segment shows only for non-Connected states. "· " separators are
+  // inserted between the segments that actually render, so a meta line
+  // starting with "offline" doesn't begin with an orphan "· ".
   let online_seg = case r.online {
     0 -> option.None
     n ->
       option.Some(#(int_to_string(n) <> " online", [#("font-weight", "400")]))
-  }
-  let in_call_seg = case r.in_call {
-    0 -> option.None
-    n ->
-      option.Some(
-        #(int_to_string(n) <> " in voice", [
-          #("color", p.accent),
-          #("font-weight", "400"),
-        ]),
-      )
   }
   let status_seg = case r.status {
     Reconnecting ->
@@ -625,7 +610,7 @@ fn meta_line(p: Palette, r: Room) -> List(Element(msg)) {
     Connected -> option.None
   }
 
-  let segs = option.values([online_seg, in_call_seg, status_seg])
+  let segs = option.values([online_seg, status_seg])
 
   list.index_map(segs, fn(seg, i) {
     let #(text, css) = seg
@@ -714,53 +699,7 @@ fn room_mini(
     [
       problem_dot,
       html.span([], [html.text(string.uppercase(string.slice(r.name, 0, 1)))]),
-      case r.unread {
-        0 -> element.fragment([])
-        n ->
-          html.span(
-            [
-              ui.css([
-                #("position", "absolute"),
-                #("bottom", "-2px"),
-                #("right", "-2px"),
-                #("min-width", "16px"),
-                #("height", "16px"),
-                #("padding", "0 4px"),
-                #("border-radius", "999px"),
-                #("background", p.accent),
-                #("color", p.accent_ink),
-                #("font-size", "12.5px"),
-                #("font-weight", "600"),
-                #("display", "inline-flex"),
-                #("align-items", "center"),
-                #("justify-content", "center"),
-              ]),
-            ],
-            [html.text(int_to_string(n))],
-          )
-      },
     ],
-  )
-}
-
-fn unread_pill(p: Palette, n: Int) -> Element(msg) {
-  html.span(
-    [
-      ui.css([
-        #("min-width", "18px"),
-        #("padding", "0 6px"),
-        #("height", "18px"),
-        #("border-radius", "999px"),
-        #("background", p.accent),
-        #("color", p.accent_ink),
-        #("font-size", "13.125px"),
-        #("font-weight", "600"),
-        #("display", "inline-flex"),
-        #("align-items", "center"),
-        #("justify-content", "center"),
-      ]),
-    ],
-    [html.text(int_to_string(n))],
   )
 }
 
