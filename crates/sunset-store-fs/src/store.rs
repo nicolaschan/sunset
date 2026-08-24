@@ -49,9 +49,12 @@ impl FsStore {
             .await
             .map_err(|e| Error::Backend(format!("open sqlite: {e}")))?;
 
-        conn.call(|c| schema::apply_schema(c).map_err(tokio_rusqlite::Error::from))
-            .await
-            .map_err(|e| Error::Backend(format!("apply schema: {e}")))?;
+        conn.call(|c| {
+            c.execute_batch(schema::SCHEMA_DDL)
+                .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("apply schema: {e}")))?;
 
         Ok(Self {
             root: Arc::new(root),
