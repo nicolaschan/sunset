@@ -60,6 +60,7 @@ where
     subscribe_emits_blob_added_event(&store_factory().await).await;
     put_content_emits_blob_added(&store_factory().await).await;
     put_content_idempotent_does_not_re_emit_blob_added(&store_factory().await).await;
+    current_cursor_counts_stored_entries(&store_factory().await).await;
 }
 
 /// Test: insert + get_entry roundtrip.
@@ -378,5 +379,52 @@ pub async fn put_content_idempotent_does_not_re_emit_blob_added<S: Store>(store:
     assert!(
         result.is_err() || matches!(result, Ok(None)),
         "second put_content of same blob should not re-emit BlobAdded"
+    );
+}
+
+/// Test: `current_cursor` advances by exactly one per stored entry.
+///
+/// Only the *delta* is portable — the absolute origin is backend-specific
+/// (memory starts at 0, SQLite at 1 because of AUTOINCREMENT), so each backend
+/// pins its own origin and this case pins the movement.
+pub async fn current_cursor_counts_stored_entries<S: Store>(store: &S) {
+    let start = store.current_cursor().await.unwrap().0;
+    let b = block(b"cursor");
+    store
+        .insert(entry(&b, b"cursor-writer", b"a", 1), Some(b.clone()))
+        .await
+        .unwrap();
+    store
+        .insert(entry(&b, b"cursor-writer", b"z", 1), Some(b.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.current_cursor().await.unwrap().0,
+        start + 2,
+        "two fresh inserts must advance the cursor by two"
+    );
+
+    // Stale: nothing is stored, so no sequence is assigned.
+    assert!(matches!(
+        store
+            .insert(entry(&b, b"cursor-writer", b"z", 1), Some(b.clone()))
+            .await,
+        Err(Error::Stale)
+    ));
+    assert_eq!(
+        store.current_cursor().await.unwrap().0,
+        start + 2,
+        "a rejected insert must not advance the cursor"
+    );
+
+    // Supersession stores a new entry, so it takes a fresh sequence.
+    store
+        .insert(entry(&b, b"cursor-writer", b"z", 2), Some(b))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.current_cursor().await.unwrap().0,
+        start + 3,
+        "a supersession must advance the cursor by one"
     );
 }

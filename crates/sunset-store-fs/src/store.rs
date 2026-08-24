@@ -327,17 +327,14 @@ mod insert_tests {
         assert!(matches!(err, Error::HashMismatch));
     }
 
+    /// SQLite's AUTOINCREMENT starts at 1, so this backend's cursor origin
+    /// differs from memory's. Cursor *movement* is pinned for every backend by
+    /// `current_cursor_counts_stored_entries` in the conformance suite.
     #[tokio::test]
-    async fn current_cursor_advances_with_inserts() {
+    async fn new_store_starts_at_cursor_one() {
         let dir = TempDir::new().unwrap();
         let store = FsStore::new(dir.path()).await.unwrap();
         assert_eq!(store.current_cursor().await.unwrap(), Cursor(1));
-        let b = block(b"v");
-        store
-            .insert(entry(&b, b"a", b"k", 1), Some(b))
-            .await
-            .unwrap();
-        assert_eq!(store.current_cursor().await.unwrap(), Cursor(2));
     }
 
     #[tokio::test]

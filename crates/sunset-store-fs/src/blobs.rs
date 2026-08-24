@@ -101,4 +101,39 @@ mod tests {
         let missing = Hash::from([0u8; 32]);
         assert!(read_blob(dir.path(), &missing).await.unwrap().is_none());
     }
+
+    /// `read_blob` re-verifies content addressing on every read, so a tampered
+    /// or truncated file is reported rather than served as authentic. This is
+    /// live public behaviour: `FsStore::get_content` returns `read_blob` verbatim.
+    #[tokio::test]
+    async fn read_rejects_bytes_that_decode_to_a_different_block() {
+        let dir = TempDir::new().unwrap();
+        let b = block(b"authentic");
+        let h = b.hash();
+        write_blob_atomic(dir.path(), &b).await.unwrap();
+        // Swap in a well-formed block that hashes differently.
+        let impostor = postcard::to_stdvec(&block(b"substituted")).unwrap();
+        tokio::fs::write(blob_path(dir.path(), &h), impostor)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_blob(dir.path(), &h).await,
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_undecodable_bytes() {
+        let dir = TempDir::new().unwrap();
+        let b = block(b"authentic");
+        let h = b.hash();
+        write_blob_atomic(dir.path(), &b).await.unwrap();
+        tokio::fs::write(blob_path(dir.path(), &h), b"garbage-not-a-valid-postcard")
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_blob(dir.path(), &h).await,
+            Err(Error::Corrupt(_))
+        ));
+    }
 }

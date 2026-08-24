@@ -55,10 +55,11 @@ pub trait Store {
     async fn subscribe<'a>(&'a self, filter: Filter, replay: Replay) -> Result<EventStream<'a>>;
 
     /// Returns the store's write cursor: the next sequence number to be
-    /// assigned. Only the *relative* ordering is meaningful — a cursor read
-    /// later is strictly greater than one read earlier if inserts happened in
-    /// between. The absolute starting value is backend-specific (memory starts
-    /// at 0; SQLite starts at 1 because of AUTOINCREMENT).
+    /// assigned. It advances by exactly one per entry actually stored, so a
+    /// rejected insert leaves it unchanged and a supersession moves it. Only
+    /// that movement is portable — the absolute starting value is
+    /// backend-specific (memory starts at 0; SQLite starts at 1 because of
+    /// AUTOINCREMENT).
     async fn current_cursor(&self) -> Result<Cursor>;
 
     /// The signature verifier this store was constructed with.
