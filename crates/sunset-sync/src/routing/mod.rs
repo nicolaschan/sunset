@@ -14,7 +14,6 @@
 //! - **Subscription policy** (`policy`): `SubscriptionPolicy` with
 //!   `store_data()` / `relay_broad()` constructors driving entry TTL
 //!   and refresh interval, plus the `relay_broad_filter()` helper.
-//! - **Coverage predicate** (`coverage`): `covers(superset, subset)`.
 //! - **Receiver-side state** (`routes`): `Routes`, `OutboundKey`,
 //!   `Outbound`, `BroadcastIntent`, `FilterHash`,
 //!   `FILTER_HASH_HEX_LEN`, `filter_hash`.
@@ -30,14 +29,12 @@
 //! newly-connected peer so reconnect re-establishes coverage without
 //! waiting for the next refresh.
 
-pub mod coverage;
 pub mod forward;
 pub mod naming;
 pub mod policy;
 pub mod routes;
 pub mod types;
 
-pub use coverage::covers;
 pub use forward::{PeerInterests, forward_targets};
 pub use naming::{
     LINKS_NAME, PROVIDER_TICK_NAME, SUBSCRIBE_PREFIX, decode_filter_hash_from_name,
