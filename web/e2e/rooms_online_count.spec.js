@@ -1,11 +1,11 @@
 // Rooms-list online-count e2e.
 //
 // The rooms rail used to render "N/M online" where M was either a
-// hardcoded fixture value or a hardcoded `1` from `synthetic_room`
+// hardcoded demo-table value or a hardcoded `1` from `synthetic_room`
 // — so a freshly-joined room read "1/1 online" regardless of who
 // was actually present. That format conflated "people we've ever
 // seen" with "people online right now", and the denominator was
-// frequently wrong (e.g. always 14 for the dusk-collective fixture).
+// frequently wrong (e.g. always 14 for the dusk-collective demo row).
 //
 // Contract this test pins:
 //   1. The rail row for a joined room shows "N online" — never the
@@ -76,10 +76,10 @@ test("rooms rail does not invent an online count before presence arrives", async
   page,
 }) => {
   // Negative contract: nowhere in the rail should we see the
-  // fixture-leaked "14 online" / "6 online" / etc. for dusk-collective.
-  // Those numbers came from `fixture.gleam`'s hardcoded `online: 6`
-  // / `members: 14`; after this change the only "N online" string in
-  // the rail is the live one.
+  // demo-leaked "14 online" / "6 online" / etc. for dusk-collective.
+  // Those numbers came from a hardcoded demo room table (`online: 6`
+  // / `members: 14`) that has since been deleted outright; the only
+  // "N online" string in the rail is the live one.
   const rail = page.getByTestId("rooms-rail");
   await expect(rail).toBeVisible();
 
@@ -89,7 +89,7 @@ test("rooms rail does not invent an online count before presence arrives", async
   });
 
   const railText = await rail.textContent();
-  // The previous fixture values for dusk-collective were 6/14. Neither
+  // The previous demo values for dusk-collective were 6/14. Neither
   // should ever appear as a "online" segment in a single-browser run.
   expect(railText).not.toMatch(/\b6 online\b/);
   expect(railText).not.toMatch(/\b14 online\b/);

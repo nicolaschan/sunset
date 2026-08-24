@@ -210,6 +210,8 @@ pub type RoomState {
 
 Render path: messages list is filtered by `state.current_channel` before being passed to `main_panel.view`. The composer's `SubmitDraft` sends with `channel = current_channel`. The channels rail iterates `state.channels`. `unread` per channel is best-effort (count of messages in that channel since last view) — out of scope here, leave it as 0 for v1 and add later.
 
+> **Revision 2026-08-24 (post-implementation cleanup):** the placeholder `Channel.unread` field described above has been **removed**, along with `Room.unread` and both copies of the `unread_pill` view helper (channels rail and rooms rail) and the collapsed-rooms-rail unread badge. Pinned at 0 for v1, the field's only nonzero values ever came from the deleted demo fixture table, so every pill and badge it fed was statically unreachable; a field and a UI that render nothing are not scaffolding, they are a promise the code does not keep. Behavior is unchanged (a deleted field and a field pinned at 0 render identically). Reintroducing per-channel unread counts means reintroducing the field — and, per the note above, it needs a real "last seen at sequence" cursor to derive from rather than a hand-maintained counter. The e2e cross-check named under Testing below is likewise unread-free today.
+
 A `ChannelsObserved(room_name, List(String))` Msg arrives from `on_channels_changed`. The reducer merges into `state.channels`, preserving rail order (alphabetical for now; default `"general"` always pinned to top).
 
 ### Testing

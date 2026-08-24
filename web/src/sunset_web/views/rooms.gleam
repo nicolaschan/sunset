@@ -70,10 +70,10 @@ pub fn view(
           #("background", p.surface),
           #("border-right", border_right),
           #("transition", "width 220ms ease"),
-          // Children sometimes have absolute-positioned bits (unread badges)
-          // that hang outside their bounding box, plus the inline list rows
-          // are sized for the expanded state — clip everything that doesn't
-          // fit so the collapsed 54px rail never spawns a horizontal scroll.
+          // The inline list rows are laid out for the expanded rail and
+          // keep their intrinsic width while the rail animates down to
+          // 54px — clip the overhang so collapsing never spawns a
+          // horizontal scroll.
           #("overflow", "hidden"),
           // Allow the rail to shrink below its content's intrinsic width
           // when the surrounding flex/grid context demands it. Pairs with

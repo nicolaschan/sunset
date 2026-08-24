@@ -25,6 +25,14 @@
 // covered end-to-end by reactions.spec.js, receipts.spec.js, and the
 // two_browser_chat.spec.js suite, so the duplicated single-browser
 // versions stay skipped here with a pointer to their counterpart.
+//
+// Narrower still since the fixture was deleted: the sender / delivery-path
+// sections of the details panel had no constructor outside that fixture and
+// were removed with it, so the skipped assertions on a sender hash
+// (/8f3c…a2/, /9b1d…74/) describe UI that no longer exists. Unblocking
+// those means asserting on whatever provenance the engine can actually
+// sign for, not on a restored fixture. The receipt-row and pending-state
+// halves are still real UI.
 
 import { expect, test } from "@playwright/test";
 

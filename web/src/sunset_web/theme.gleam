@@ -2,8 +2,8 @@
 ////
 //// Neutral-first palette: surfaces are warm-tinted gray/white (light)
 //// and near-black (dark), text is plain neutral. The sunset accent is
-//// reserved for branding, primary actions, and unread badges — it is
-//// *not* used as a status color. Status uses universal semantics:
+//// reserved for branding and primary actions — it is *not* used as
+//// a status color. Status uses universal semantics:
 //// `ok` = green (connected/healthy), `warn` = amber (needs attention),
 //// `danger` = red (error), `live` = green (actively speaking), and
 //// neutral grays for offline/idle. Surfaces still carry a subtle warm
@@ -61,8 +61,8 @@ pub type Palette {
     text: String,
     text_muted: String,
     text_faint: String,
-    /// Sunset accent. Reserved for branding (logo, app name), primary
-    /// CTA buttons, and unread badges. Do NOT use to convey status.
+    /// Sunset accent. Reserved for branding (logo, app name) and
+    /// primary CTA buttons. Do NOT use to convey status.
     accent: String,
     accent_soft: String,
     accent_deep: String,
@@ -175,7 +175,7 @@ fn light() -> Palette {
     // Deep magenta-rose — the "purple hour" of a sunset, where pink
     // gives way to violet. Keeps the brand warm without competing with
     // the green/amber/red status palette. Used sparingly: brand mark,
-    // primary CTAs, unread badges, own-message author name.
+    // primary CTAs, own-message author name.
     accent: "#a83565",
     accent_soft: "#f3dde6",
     accent_deep: "#7a2046",
@@ -216,7 +216,7 @@ fn dark() -> Palette {
     text_faint: "#5c5c61",
     // Lifted toward pink for dark mode so the magenta-rose reads on
     // near-black without losing chroma. Same role as the light accent:
-    // brand mark, primary CTAs, unread badges.
+    // brand mark, primary CTAs.
     accent: "#e283ad",
     accent_soft: "#36202a",
     accent_deep: "#f198bd",
