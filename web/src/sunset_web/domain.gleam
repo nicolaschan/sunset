@@ -100,34 +100,6 @@ pub type Reaction {
   Reaction(emoji: String, count: Int, by_you: Bool)
 }
 
-/// Per-recipient delivery confirmation, surfaced in the message-details
-/// side panel.
-pub type Receipt {
-  Receipt(name: String, time: String, relay: RelayStatus)
-}
-
-/// Cryptographic + delivery metadata available for messages we have
-/// full provenance on. In v1 only own outgoing messages have this; the
-/// chat-domain plan will populate it from real signed entries later.
-pub type MessageDetails {
-  MessageDetails(
-    sender: String,
-    message_id: String,
-    prev_id: String,
-    signature: String,
-    verified: Bool,
-    hops: List(String),
-    sent_at: String,
-    delivered_at: String,
-    receipts: List(Receipt),
-  )
-}
-
-pub type DetailsOpt {
-  HasDetails(MessageDetails)
-  NoDetails
-}
-
 /// Per-recipient voice tweaks the local user has applied to a peer
 /// in an active call. Mutated via the voice-member popover.
 pub type VoiceSettings {
@@ -168,7 +140,6 @@ pub type Message {
     you: Bool,
     pending: Bool,
     reactions: List(Reaction),
-    details: DetailsOpt,
     /// Image attachments. Empty for text-only messages. Rendered
     /// inline below the body in the message timeline.
     attachments: List(Attachment),
@@ -193,7 +164,6 @@ pub type MessageView {
     you: Bool,
     pending: Bool,
     reactions: List(Reaction),
-    details: DetailsOpt,
     /// Mirror of `Message.attachments`. Re-emitted on the view type so
     /// the timeline doesn't have to re-look up the source Message.
     attachments: List(Attachment),

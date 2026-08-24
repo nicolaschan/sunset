@@ -603,8 +603,11 @@ test.describe("phone — details sheet", () => {
 
   // Skipped: depends on fixture messages being rendered into the chat column.
   // Since Plan E, messages come from the live engine only, so the msg-row
-  // with "routing thru ravi" does not exist on a fresh page load. Unblock
-  // once fixtures are merged back or messages carry HasDetails from the engine.
+  // with "routing thru ravi" does not exist on a fresh page load. The
+  // sender / delivery-path sections this asserts on were fixture-only and
+  // have since been deleted along with the fixture, so unblocking means
+  // rewriting the test against a seeded live message and whatever
+  // provenance the engine actually surfaces -- not restoring a fixture.
   test.skip("info button on a delivered message opens the details bottom sheet", async ({
     page,
   }) => {

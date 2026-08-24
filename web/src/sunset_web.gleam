@@ -867,7 +867,6 @@ fn incoming_to_message(im: IncomingMessage) -> domain.Message {
     you: sunset.inc_is_self(im),
     pending: False,
     reactions: [],
-    details: domain.NoDetails,
     attachments: attachments,
   )
 }
@@ -890,7 +889,6 @@ pub fn resolve_messages(
       you: m.you,
       pending: m.pending,
       reactions: m.reactions,
-      details: m.details,
       attachments: m.attachments,
     )
   })
