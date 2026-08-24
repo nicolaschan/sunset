@@ -56,7 +56,6 @@ where
     lazy_dangling_ref(&store_factory().await).await;
     iter_filters(&store_factory().await).await;
     subscribe_replay_modes(&store_factory().await).await;
-    subscribe_replay_since_cursor(&store_factory().await).await;
     subscribe_emits_replaced_event(&store_factory().await).await;
     subscribe_emits_blob_added_event(&store_factory().await).await;
     put_content_emits_blob_added(&store_factory().await).await;
@@ -234,52 +233,6 @@ pub async fn subscribe_replay_modes<S: Store>(store: &S) {
         .unwrap()
         .unwrap();
     assert!(matches!(evt, Event::Inserted(e) if e.name.as_ref() == b"r4"));
-}
-
-/// Test: `Replay::Since(cursor)` emits only entries written after the cursor.
-pub async fn subscribe_replay_since_cursor<S: Store>(store: &S) {
-    use futures::StreamExt;
-    let b = block(b"x");
-    // Two entries before the cursor snapshot.
-    store
-        .insert(entry(&b, b"a", b"r1", 1), Some(b.clone()))
-        .await
-        .unwrap();
-    store
-        .insert(entry(&b, b"a", b"r2", 1), Some(b.clone()))
-        .await
-        .unwrap();
-    let cursor = store.current_cursor().await.unwrap();
-    // Two entries after the cursor snapshot.
-    store
-        .insert(entry(&b, b"a", b"r3", 1), Some(b.clone()))
-        .await
-        .unwrap();
-    store
-        .insert(entry(&b, b"a", b"r4", 1), Some(b.clone()))
-        .await
-        .unwrap();
-
-    let mut s = store
-        .subscribe(Filter::Keyspace(vk(b"a")), Replay::Since(cursor))
-        .await
-        .unwrap();
-
-    // Should replay only r3, r4 (in order).
-    let mut names = vec![];
-    for _ in 0..2 {
-        let evt = tokio::time::timeout(std::time::Duration::from_millis(500), s.next())
-            .await
-            .expect("Since-cursor replay should deliver post-cursor entries")
-            .unwrap()
-            .unwrap();
-        if let Event::Inserted(e) = evt {
-            names.push(e.name.clone());
-        } else {
-            panic!("expected Inserted, got {:?}", evt);
-        }
-    }
-    assert_eq!(names, vec![n(b"r3"), n(b"r4")]);
 }
 
 /// Test: a higher-priority insert emits `Event::Replaced` to active subscribers.

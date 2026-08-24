@@ -66,13 +66,6 @@ impl MemoryStore {
     pub fn with_accept_all() -> Self {
         Self::new(Arc::new(sunset_store::AcceptAllVerifier))
     }
-
-    /// Returns the current cursor (the next-to-be-assigned sequence number;
-    /// `Cursor(0)` on a fresh store).
-    pub async fn current_cursor_now(&self) -> Cursor {
-        let inner = self.inner.lock().await;
-        Cursor(inner.next_sequence)
-    }
 }
 
 #[async_trait(?Send)]
@@ -169,19 +162,19 @@ impl Store for MemoryStore {
         let historical: Vec<sunset_store::Result<Event>> = {
             let inner = self.inner.lock().await;
             self.subscriptions.add(&sub);
-            let mut out: Vec<(u64, Event)> = inner
-                .entries
-                .iter()
-                .filter(|((vk, name), _)| filter.matches(vk, name.as_ref()))
-                .filter(|(_, stored)| match replay {
-                    sunset_store::Replay::None => false,
-                    sunset_store::Replay::All => true,
-                    sunset_store::Replay::Since(c) => stored.sequence >= c.0,
-                })
-                .map(|(_, stored)| (stored.sequence, Event::Inserted(stored.entry.clone())))
-                .collect();
-            out.sort_by_key(|(s, _)| *s);
-            out.into_iter().map(|(_, e)| Ok(e)).collect()
+            match replay {
+                sunset_store::Replay::None => Vec::new(),
+                sunset_store::Replay::All => {
+                    let mut out: Vec<(u64, Event)> = inner
+                        .entries
+                        .iter()
+                        .filter(|((vk, name), _)| filter.matches(vk, name.as_ref()))
+                        .map(|(_, stored)| (stored.sequence, Event::Inserted(stored.entry.clone())))
+                        .collect();
+                    out.sort_by_key(|(s, _)| *s);
+                    out.into_iter().map(|(_, e)| Ok(e)).collect()
+                }
+            }
         };
 
         // Stream historical, then transition to live events from the channel.
@@ -195,7 +188,8 @@ impl Store for MemoryStore {
         Ok(Box::pin(live))
     }
     async fn current_cursor(&self) -> Result<Cursor> {
-        Ok(self.current_cursor_now().await)
+        let inner = self.inner.lock().await;
+        Ok(Cursor(inner.next_sequence))
     }
 
     fn verifier(&self) -> Arc<dyn SignatureVerifier> {
@@ -211,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn new_store_starts_at_cursor_zero() {
         let store = MemoryStore::with_accept_all();
-        assert_eq!(store.current_cursor_now().await, Cursor(0));
+        assert_eq!(store.current_cursor().await.unwrap(), Cursor(0));
     }
 
     #[tokio::test]

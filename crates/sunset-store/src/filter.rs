@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Cursor, Hash, SignedKvEntry, VerifyingKey};
+use crate::types::{Hash, SignedKvEntry, VerifyingKey};
 
 /// Expression of a set of `(verifying_key, name)` pairs of interest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,14 +53,6 @@ pub enum Replay {
     None,
     /// All historical matching entries first, then live updates.
     All,
-    /// Events with sequence `>= cursor`, then live updates.
-    ///
-    /// Cursors are "next-to-be-assigned" sequence numbers (see
-    /// `Store::current_cursor`). A cursor captured at time T thus represents
-    /// the boundary just after every entry written before T; replaying with
-    /// `Since(c)` therefore re-emits entries whose sequence is `>= c.0`,
-    /// which in practice means everything written at or after T.
-    Since(Cursor),
 }
 
 /// Event delivered on a subscription stream.

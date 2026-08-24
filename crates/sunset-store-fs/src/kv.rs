@@ -131,16 +131,6 @@ fn query_entries(
     Ok(out)
 }
 
-/// Collect all entries with `sequence >= cursor`, ordered by `sequence ASC`.
-/// Used for `Replay::Since`; the caller applies the subscription filter.
-pub fn iter_since(conn: &rusqlite::Connection, cursor: Cursor) -> Result<Vec<SignedKvEntry>> {
-    query_entries(
-        conn,
-        "WHERE sequence >= ?1 ORDER BY sequence ASC",
-        params![cursor.0 as i64],
-    )
-}
-
 /// Collect all entries matching `filter` into a `Vec`. Ordered by
 /// `sequence ASC` within each sub-query for determinism in tests.
 pub fn iter_with_filter(

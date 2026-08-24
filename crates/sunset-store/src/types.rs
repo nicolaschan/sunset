@@ -62,7 +62,6 @@ impl VerifyingKey {
 }
 
 /// Opaque cursor; backends maintain a per-store monotonic sequence number.
-/// Consumers persist these and pass them back to `Store::subscribe` for resume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Cursor(pub u64);
 

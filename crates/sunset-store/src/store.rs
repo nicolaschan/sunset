@@ -54,14 +54,11 @@ pub trait Store {
     /// emitted before live updates.
     async fn subscribe<'a>(&'a self, filter: Filter, replay: Replay) -> Result<EventStream<'a>>;
 
-    /// Returns the current monotonic cursor: the next-to-be-assigned sequence
-    /// number. Passing the returned cursor to `subscribe(..., Replay::Since(c))`
-    /// replays entries written at or after the moment this method observed the
-    /// store (the `Since` predicate is `sequence >= c.0`). The absolute starting
-    /// value is backend-specific (memory backends may start at 0; SQLite-backed
-    /// stores start at 1 due to AUTOINCREMENT semantics) — only the *relative*
-    /// ordering is guaranteed: a cursor captured later is strictly greater than
-    /// one captured earlier (assuming intervening inserts).
+    /// Returns the store's write cursor: the next sequence number to be
+    /// assigned. Only the *relative* ordering is meaningful — a cursor read
+    /// later is strictly greater than one read earlier if inserts happened in
+    /// between. The absolute starting value is backend-specific (memory starts
+    /// at 0; SQLite starts at 1 because of AUTOINCREMENT).
     async fn current_cursor(&self) -> Result<Cursor>;
 
     /// The signature verifier this store was constructed with.

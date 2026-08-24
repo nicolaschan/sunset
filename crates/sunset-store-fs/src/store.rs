@@ -164,7 +164,7 @@ impl Store for FsStore {
         // or in the live channel — never both.
         let _w = self.writer_mutex.lock().await;
 
-        let history: Vec<SignedKvEntry> = match &replay {
+        let history: Vec<SignedKvEntry> = match replay {
             Replay::None => Vec::new(),
             Replay::All => self
                 .conn
@@ -176,19 +176,6 @@ impl Store for FsStore {
                 })
                 .await
                 .map_err(unwrap_store_error)?,
-            Replay::Since(cursor) => {
-                let cursor = *cursor;
-                let f = filter.clone();
-                self.conn
-                    .call(move |c| -> std::result::Result<Vec<SignedKvEntry>, Error> {
-                        Ok(kv::iter_since(c, cursor)?
-                            .into_iter()
-                            .filter(|e| f.matches(&e.verifying_key, &e.name))
-                            .collect())
-                    })
-                    .await
-                    .map_err(unwrap_store_error)?
-            }
         };
 
         self.subscriptions.add(&sub);
