@@ -26,8 +26,8 @@ import lustre/element/html
 import lustre/event
 import sunset_web/composer
 import sunset_web/domain.{
-  type ChannelId, type Reaction, type Room, ChannelId, Reaction, Room, RoomId,
-  VoiceModel, VoicePeerStateUI,
+  type ChannelId, type Room, ChannelId, Room, RoomId, VoiceModel,
+  VoicePeerStateUI,
 }
 import sunset_web/markdown
 import sunset_web/scroll_anchor
@@ -91,7 +91,6 @@ pub type RoomState {
     /// timestamp is surfaced in the message-details panel as the
     /// per-recipient delivered-at stamp.
     receipts: Dict(String, Dict(String, Int)),
-    reactions: Dict(String, List(Reaction)),
     current_channel: ChannelId,
     /// Channels the rail draws for this room. Seeded with the default
     /// text channel + the placeholder voice channel; merged with the live
@@ -124,7 +123,6 @@ fn empty_room_state() -> RoomState {
     messages: [],
     members: [],
     receipts: dict.new(),
-    reactions: dict.new(),
     current_channel: domain.default_channel_id(),
     channels: initial_channels(),
     draft: "",
@@ -338,7 +336,6 @@ pub type Msg {
   RemoveAttachment(index: Int)
   ToggleMessageSelected(String)
   ToggleReactionPicker(String)
-  AddReaction(String, String)
   ReactionsChanged(target: String, snapshot: Dict(String, Dict(String, Int)))
   ToggleReactionEmoji(target: String, emoji: String)
   ReactionSent(Result(Nil, String))
@@ -1750,22 +1747,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
         #(RoomState(..state, reacting_to: next), effect.none())
       })
-    AddReaction(id, emoji) ->
-      with_active_room(model, fn(state) {
-        let current = case dict.get(state.reactions, id) {
-          Ok(rs) -> rs
-          Error(_) -> []
-        }
-        let next = toggle_reaction(current, emoji)
-        #(
-          RoomState(
-            ..state,
-            reactions: dict.insert(state.reactions, id, next),
-            reacting_to: None,
-          ),
-          effect.none(),
-        )
-      })
     OpenDetail(id) ->
       with_active_room(model, fn(state) {
         // Opening the details panel pins selection on the same id so the
@@ -1954,11 +1935,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         #(RoomState(..state, draft: new_value), effect.none())
       })
     }
-    // Master's reactions Msg variants — pre-multi-room these were
-    // wired to a Client-level reactions tracker. After multi-room the
-    // tracker needs to be per-OpenRoom (the per-room follow-up), so
-    // these are placeholder no-ops to keep the Msg type exhaustive.
-    // The chip-row UI still works through AddReaction (UI-only).
     ReactionsChanged(target, snapshot) -> #(
       Model(..model, reactions: dict.insert(model.reactions, target, snapshot)),
       effect.none(),
@@ -2379,26 +2355,15 @@ fn room_view_with_state(
   let active_room = room_for(current_name, model.intents, model.rooms)
 
   let self_pubkey_hex = option.map(model.client, fn(c) { client_pubkey_hex(c) })
-  let raw_messages = state.messages
-  // Two reaction sources are layered onto the message list:
-  //   1. `model.reactions[target]` — real reactions from the engine
-  //      tracker (preferred, drives chip counts + by_you).
-  //   2. `state.reactions[message_id]` — UI-only fixture toggle from
-  //      AddReaction. Falls back to this if the engine has nothing
-  //      yet (so the fixture row still pre-renders the seeded chips).
   let messages_with_live_reactions =
-    list.map(raw_messages, fn(m) {
+    list.map(state.messages, fn(m) {
       case dict.get(model.reactions, m.id) {
         Ok(snap) ->
           domain.Message(
             ..m,
             reactions: snapshot_to_reactions(snap, self_pubkey_hex),
           )
-        Error(_) ->
-          case dict.get(state.reactions, m.id) {
-            Ok(rs) -> domain.Message(..m, reactions: rs)
-            Error(_) -> m
-          }
+        Error(_) -> m
       }
     })
 
@@ -3240,47 +3205,6 @@ fn find_message(
 ) -> Option(domain.MessageView) {
   list.find(ms, fn(m) { m.id == id })
   |> option.from_result
-}
-
-/// UI-only per-room reaction toggle. Mirrors the pre-master fixture
-/// behavior: tapping an emoji adds/removes/decrements your reaction
-/// in the per-RoomState `reactions` dict. The real reactions feature
-/// (master's send_reaction / ReactionsChanged) is still a Client-level
-/// global and needs per-OpenRoom migration before this helper can be
-/// dropped. Until then, the per-room AddReaction handler keeps the
-/// chip row interactive without going through the engine.
-fn toggle_reaction(rs: List(Reaction), emoji: String) -> List(Reaction) {
-  case list.find(rs, fn(r) { r.emoji == emoji }) {
-    Error(_) -> [Reaction(emoji: emoji, count: 1, by_you: True), ..rs]
-    Ok(existing) ->
-      case existing.by_you {
-        True -> {
-          let updated_count = existing.count - 1
-          case updated_count {
-            0 -> list.filter(rs, fn(r) { r.emoji != emoji })
-            _ ->
-              list.map(rs, fn(r) {
-                case r.emoji == emoji {
-                  True ->
-                    Reaction(
-                      emoji: r.emoji,
-                      count: updated_count,
-                      by_you: False,
-                    )
-                  False -> r
-                }
-              })
-          }
-        }
-        False ->
-          list.map(rs, fn(r) {
-            case r.emoji == emoji {
-              True -> Reaction(emoji: r.emoji, count: r.count + 1, by_you: True)
-              False -> r
-            }
-          })
-      }
-  }
 }
 
 /// Convert a per-target snapshot dict into the `List(Reaction)` shape
