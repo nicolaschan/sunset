@@ -131,18 +131,13 @@ impl Client {
         let primary = FallbackTransport::new(wt_noise, ws_noise);
 
         let signaler = sunset_core::RelaySignaler::new(identity.clone(), &store);
-        let signaler_dyn: Rc<dyn sunset_sync::Signaler> = signaler.clone();
         let local_peer = PeerId(identity.store_verifying_key());
         let rtc_raw = WebRtcRawTransport::new(
-            signaler_dyn,
+            signaler.clone(),
             local_peer.clone(),
             vec!["stun:stun.l.google.com:19302".into()],
         );
         let rtc_noise_id: Arc<dyn NoiseIdentity> = Arc::new(IdentityNoiseAdapter(identity.clone()));
-        // Outbound dialer half: Noise IK initiator on top of the same
-        // raw transport. The clone shares signaling state via Rc so
-        // outgoing offers/answers/ICE flow through the same signaler
-        // the inbound pump is reading from.
         let rtc_connector = NoiseTransport::new(rtc_raw.clone(), rtc_noise_id.clone());
         let rtc_promote: RtcPromoteFn = {
             let identity = rtc_noise_id.clone();
@@ -155,11 +150,7 @@ impl Client {
                 })
             })
         };
-        // 60 s handshake timeout matches the relay's default and is
-        // generous for a localhost WebRTC handshake (~tens of ms in
-        // practice). Hits only as a backstop against a peer that
-        // signals an Offer but never finishes the data-channel
-        // handshake.
+        // 60 s matches the relay's handshake timeout.
         let rtc =
             SpawningAcceptor::new(rtc_raw, rtc_connector, rtc_promote, Duration::from_secs(60));
 
