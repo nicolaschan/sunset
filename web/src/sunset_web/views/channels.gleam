@@ -399,10 +399,9 @@ fn voice_block(
   on_leave: msg,
   self_in_call: Bool,
 ) -> Element(msg) {
-  let is_live = c.in_call > 0
-  case is_live {
-    False -> idle_voice_row(p, c, on_join)
-    True ->
+  case in_call_members {
+    [] -> idle_voice_row(p, c, on_join)
+    _ ->
       live_voice_block(
         p,
         c,

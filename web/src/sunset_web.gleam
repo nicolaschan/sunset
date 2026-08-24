@@ -135,15 +135,8 @@ fn empty_room_state() -> RoomState {
   )
 }
 
-/// Rail entry for a text channel. `in_call` is a voice-only
-/// decoration, overlaid at render time from the live member list.
 fn text_channel(label: String) -> domain.Channel {
-  domain.Channel(
-    id: ChannelId(label),
-    name: label,
-    kind: domain.TextChannel,
-    in_call: 0,
-  )
+  domain.Channel(id: ChannelId(label), name: label, kind: domain.TextChannel)
 }
 
 /// Initial channel list every room starts with: the default text
@@ -163,7 +156,6 @@ fn initial_channels() -> List(domain.Channel) {
       id: ChannelId("voice"),
       name: "general",
       kind: domain.Voice,
-      in_call: 0,
     ),
   ]
 }
@@ -2673,32 +2665,8 @@ fn room_view_with_state(
   // Use real voice model state: show minibar when user is in call.
   let user_in_call = option.is_some(model.voice.self_in_call)
 
-  // Derive the live in-call count for the voice channel from real
-  // members rather than the rail's stored placeholder, so the rail
-  // shows "live" iff somebody (including self) is actually connected.
-  let live_voice_count =
-    list.fold(members_for_channels, 0, fn(acc, m) {
-      case m.in_call {
-        True -> acc + 1
-        False -> acc
-      }
-    })
-
-  // state.channels is the source of truth for the rail (driven by
-  // observed channels + the always-present default + the voice
-  // placeholder). Overlay the live in_call count onto the voice
-  // entry so the rail's live-roster branch fires only when somebody
-  // is actually connected.
-  let channels_for_view =
-    list.map(state.channels, fn(c) {
-      case c.kind {
-        domain.Voice -> domain.Channel(..c, in_call: live_voice_count)
-        _ -> c
-      }
-    })
-
   let active_voice_channel_name =
-    list.find(channels_for_view, fn(c) { c.kind == domain.Voice })
+    list.find(state.channels, fn(c) { c.kind == domain.Voice })
     |> result.map(fn(c) { c.name })
     |> result.unwrap("general")
 
@@ -2765,7 +2733,7 @@ fn room_view_with_state(
     channels.view(
       palette: palette,
       room: active_room,
-      channels: channels_for_view,
+      channels: state.channels,
       members: members_for_channels,
       voice_peers: model.voice.peers,
       peer_levels: model.voice.peer_levels,

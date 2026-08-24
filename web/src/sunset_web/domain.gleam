@@ -70,7 +70,7 @@ pub type Room {
 }
 
 pub type Channel {
-  Channel(id: ChannelId, name: String, kind: ChannelKind, in_call: Int)
+  Channel(id: ChannelId, name: String, kind: ChannelKind)
 }
 
 pub type Member {
