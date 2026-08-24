@@ -4,8 +4,7 @@
 ////   * `LandingView` — empty state shown at root `/`. The user types a
 ////     room name and submits; we add it to their joined-rooms list and
 ////     navigate.
-////   * `RoomView(name)` — the existing 4-column chat shell rendering
-////     fixture data for the named room.
+////   * `RoomView(name)` — the 4-column chat shell for the named room.
 ////
 //// Routing is anchor-based: the URL fragment (`/#dusk-collective`) is
 //// the source of truth for which room is active. A storage FFI shim
@@ -30,7 +29,6 @@ import sunset_web/domain.{
   type ChannelId, type Reaction, type Room, ChannelId, Reaction, Room, RoomId,
   VoiceModel, VoicePeerStateUI,
 }
-import sunset_web/fixture
 import sunset_web/markdown
 import sunset_web/scroll_anchor
 import sunset_web/storage
@@ -96,7 +94,7 @@ pub type RoomState {
     reactions: Dict(String, List(Reaction)),
     current_channel: ChannelId,
     /// Channels the rail draws for this room. Seeded with the default
-    /// text channel + a fixture voice channel; merged with the live
+    /// text channel + the placeholder voice channel; merged with the live
     /// observed-channel set from the wasm side as `ChannelsObserved`
     /// events arrive. Sort order: default text channel first, then
     /// the rest of the observed text channels alphabetically, then
@@ -139,22 +137,25 @@ fn empty_room_state() -> RoomState {
   )
 }
 
+/// Rail entry for a text channel. `in_call` is a voice-only
+/// decoration, overlaid at render time from the live member list.
+fn text_channel(label: String) -> domain.Channel {
+  domain.Channel(
+    id: ChannelId(label),
+    name: label,
+    kind: domain.TextChannel,
+    in_call: 0,
+  )
+}
+
 /// Initial channel list every room starts with: the default text
 /// channel (always present, even before any traffic is observed) plus
 /// the placeholder voice channel. Voice is out of scope for the
 /// channels-within-rooms PR; we keep the rail entry so the existing
-/// voice flows keep rendering. The id/name match
-/// `fixture.channels()`'s voice entry so the live in_call overlay
-/// (computed from real members in the render path) lines up by id.
+/// voice flows keep rendering.
 fn initial_channels() -> List(domain.Channel) {
   [
-    domain.Channel(
-      id: domain.default_channel_id(),
-      name: domain.default_channel_name,
-      kind: domain.TextChannel,
-      in_call: 0,
-      unread: 0,
-    ),
+    text_channel(domain.default_channel_name),
     domain.Channel(
       // Default voice channel is named "general" in parallel to the
       // default text channel — same room-wide affordance for "the
@@ -165,7 +166,6 @@ fn initial_channels() -> List(domain.Channel) {
       name: "general",
       kind: domain.Voice,
       in_call: 0,
-      unread: 0,
     ),
   ]
 }
@@ -910,52 +910,22 @@ pub fn resolve_messages(
 }
 
 /// Merge a fresh observed-channel snapshot into the rail's existing
-/// channel list. Each observed string becomes (or reuses) a
-/// `TextChannel`; existing per-channel UI state (unread / in_call) is
-/// preserved by id-lookup. The default text channel is always
-/// included even if the snapshot doesn't carry it. Voice channels in
-/// the previous list are kept as-is — voice rail entries don't come
-/// from the wasm side. Output is sorted via `sort_channels`.
+/// channel list. Each observed string becomes a `TextChannel`; the
+/// default text channel is always included even if the snapshot
+/// doesn't carry it. Voice channels in the previous list are kept
+/// as-is — voice rail entries don't come from the wasm side. Output
+/// is sorted via `sort_channels`.
 pub fn merge_observed_channels(
   existing: List(domain.Channel),
   observed: List(String),
 ) -> List(domain.Channel) {
   let voice_existing = list.filter(existing, fn(c) { c.kind == domain.Voice })
-  let observed_text =
-    list.map(observed, fn(label) {
-      let id = ChannelId(label)
-      case list.find(existing, fn(c) { c.id == id }) {
-        Ok(prev) -> prev
-        Error(_) ->
-          domain.Channel(
-            id: id,
-            name: label,
-            kind: domain.TextChannel,
-            in_call: 0,
-            unread: 0,
-          )
-      }
-    })
+  let observed_text = list.map(observed, text_channel)
   let with_default = case
     list.any(observed_text, fn(c) { c.id == domain.default_channel_id() })
   {
     True -> observed_text
-    False -> [
-      // Reuse the existing default-channel record (preserving unread,
-      // etc.) if we already have one in `existing`.
-      case list.find(existing, fn(c) { c.id == domain.default_channel_id() }) {
-        Ok(prev) -> prev
-        Error(_) ->
-          domain.Channel(
-            id: domain.default_channel_id(),
-            name: domain.default_channel_name,
-            kind: domain.TextChannel,
-            in_call: 0,
-            unread: 0,
-          )
-      },
-      ..observed_text
-    ]
+    False -> [text_channel(domain.default_channel_name), ..observed_text]
   }
   sort_channels(list.append(with_default, voice_existing))
 }
@@ -1703,14 +1673,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         _ ->
           with_active_room(model, fn(state) {
             let new_id = ChannelId(trimmed)
-            let new_channel =
-              domain.Channel(
-                id: new_id,
-                name: trimmed,
-                kind: domain.TextChannel,
-                in_call: 0,
-                unread: 0,
-              )
+            let new_channel = text_channel(trimmed)
             let merged = case
               list.any(state.channels, fn(c) { c.id == new_id })
             {
@@ -2411,9 +2374,9 @@ fn room_view_with_state(
   state: RoomState,
 ) -> Element(Msg) {
   let displayed_rooms =
-    resolve_rooms(model.joined_rooms, model.intents, model.rooms)
+    list.map(model.joined_rooms, room_for(_, model.intents, model.rooms))
   let filtered = filter_rooms(displayed_rooms, model.sidebar_search)
-  let active_room = lookup_room(displayed_rooms, current_name, model.intents)
+  let active_room = room_for(current_name, model.intents, model.rooms)
 
   let self_pubkey_hex = option.map(model.client, fn(c) { client_pubkey_hex(c) })
   let raw_messages = state.messages
@@ -3137,26 +3100,20 @@ fn filter_rooms(rs: List(Room), search: String) -> List(Room) {
   }
 }
 
-/// Resolve a list of joined room names to rich Room records. Names
-/// that match a fixture room reuse its mock data; anything else falls
-/// back to a synthetic Room so the rail still renders something useful.
-/// The `online` field on each returned Room is always derived from the
-/// per-room live member list (`rooms` dict) — fixture/synthetic defaults
-/// are placeholders the resolver overwrites.
-fn resolve_rooms(
-  names: List(String),
+/// Rail record for a room name. Every field is derived: `online` from
+/// the live per-room member snapshot (0 when we have none yet), the
+/// status pill from the relay intents.
+fn room_for(
+  name: String,
   intents: Dict(Float, sunset.IntentSnapshot),
   rooms: Dict(String, RoomState),
-) -> List(Room) {
-  let fixture_rooms = fixture.rooms()
-  let conn = relay_status_pill(intents)
-  list.map(names, fn(name) {
-    let online = online_count_for_room(name, rooms)
-    case list.find(fixture_rooms, fn(r) { r.name == name }) {
-      Ok(r) -> Room(..r, status: conn, id: RoomId(name), online: online)
-      Error(_) -> synthetic_room(name, intents, online)
-    }
-  })
+) -> Room {
+  Room(
+    id: RoomId(name),
+    name: name,
+    online: online_count_for_room(name, rooms),
+    status: relay_status_pill(intents),
+  )
 }
 
 fn online_count_for_room(name: String, rooms: Dict(String, RoomState)) -> Int {
@@ -3178,37 +3135,6 @@ pub fn count_online_members(members: List(domain.Member)) -> Int {
       _ -> True
     }
   })
-}
-
-fn lookup_room(
-  rs: List(Room),
-  name: String,
-  intents: Dict(Float, sunset.IntentSnapshot),
-) -> Room {
-  case list.find(rs, fn(r) { r.name == name }) {
-    Ok(r) -> r
-    Error(_) -> synthetic_room(name, intents, 0)
-  }
-}
-
-/// Default Room record for a name we have no fixture entry for. Reads
-/// like a freshly-joined room with no observed activity yet. `online`
-/// is supplied by the caller (derived from live member data); it is
-/// `0` when we have no member snapshot for this room yet.
-fn synthetic_room(
-  name: String,
-  intents: Dict(Float, sunset.IntentSnapshot),
-  online: Int,
-) -> Room {
-  Room(
-    id: RoomId(name),
-    name: name,
-    online: online,
-    in_call: 0,
-    status: relay_status_pill(intents),
-    last_active: "now",
-    unread: 0,
-  )
 }
 
 /// Derive the room-status pill from the supervisor's per-intent
@@ -3425,7 +3351,6 @@ fn map_members(ms: List(sunset.MemberJs)) -> List(domain.Member) {
       relay: connection_mode_to_relay(sunset.mem_connection_mode(m)),
       you: sunset.mem_is_self(m),
       in_call: False,
-      role: domain.NoRole,
       last_heartbeat_ms: sunset.mem_last_heartbeat_ms(m),
       raw_name: raw,
       pubkey: pk,

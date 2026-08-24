@@ -66,25 +66,11 @@ pub type RelayStatus {
 }
 
 pub type Room {
-  Room(
-    id: RoomId,
-    name: String,
-    online: Int,
-    in_call: Int,
-    status: ConnStatus,
-    last_active: String,
-    unread: Int,
-  )
+  Room(id: RoomId, name: String, online: Int, status: ConnStatus)
 }
 
 pub type Channel {
-  Channel(
-    id: ChannelId,
-    name: String,
-    kind: ChannelKind,
-    in_call: Int,
-    unread: Int,
-  )
+  Channel(id: ChannelId, name: String, kind: ChannelKind, in_call: Int)
 }
 
 pub type Member {
@@ -96,7 +82,6 @@ pub type Member {
     relay: RelayStatus,
     you: Bool,
     in_call: Bool,
-    role: RoleOpt,
     /// Unix-ms timestamp of the last app-level presence heartbeat we
     /// received from this peer. `None` for self or peers we have not
     /// heard from. The popover renders age as `now_ms - this`.
@@ -213,11 +198,6 @@ pub type MessageView {
     /// the timeline doesn't have to re-look up the source Message.
     attachments: List(Attachment),
   )
-}
-
-pub type RoleOpt {
-  HasRole(String)
-  NoRole
 }
 
 /// Viewport class derived from `matchMedia("(max-width: 767px)")`.
