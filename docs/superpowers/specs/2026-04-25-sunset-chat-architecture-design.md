@@ -2,7 +2,32 @@
 
 - **Date:** 2026-04-25
 - **Status:** Approved (architecture-level)
+- **Revisions:** 2026-08-24 (store maintenance layer removed — see below)
 - **Scope:** This is the *architecture spec* — the north-star document that subsystem specs reference. It defines component boundaries, cross-cutting concerns, and the things every subsystem must agree on. It deliberately does **not** specify implementation details for any subsystem; those live in their own follow-up specs.
+
+## Revision 2026-08-24 — the store has no maintenance layer
+
+Amends the store-layer passages below, in step with the same-dated revision in
+`2026-04-25-sunset-store-and-sync-design.md`. The store as built has **no TTL
+sweep and no blob garbage collection**, and `ContentBlock.references` is not a
+link between blobs.
+
+Both were specified here, implemented, and never called. The blob GC's mark phase
+walks `ContentBlock.references`, but the only non-empty `references` this system
+produces carries blake3 of a message *plaintext* as a key-derivation input —
+content deliberately never stored — so the walk always stopped at the first hop.
+TTL was inert in both directions: nothing swept, and nothing read `expires_at` to
+decide whether an entry was still valid. The expiry users observe (presence going
+stale) is derived by readers from an entry's own timestamp, not enforced by the
+store.
+
+Stated plainly, because the original text claims the opposite: **storage does
+grow unbounded.** Supersession still replaces an entry in place, so live keys stay
+bounded, but a blob whose entry was superseded, or that no entry ever pointed at,
+is never reclaimed. When reclamation is built it should be a refcount over live
+`entry.value_hash` values; the reference-DAG walk described below is a dead end
+against this data model. `expires_at` survives on the wire as a timestamp
+consumers may interpret, not a promise the store will act on it.
 
 ## Purpose and audience
 
@@ -27,11 +52,11 @@ The store is inspired by [`baybridge`](https://github.com/nicolaschan/baybridge)
 - Ephemeral identities by default; opt-in to a federated handle.
 - Multiple client surfaces sharing one Rust core: web (Gleam, runs from static files on GitHub Pages), native TUI, Minecraft mod (Java loading the Rust core compiled to WebAssembly).
 - Optional relay servers (Docker, same Rust core) for offline message caching and connection signaling, including voice forwarding for peers behind restrictive NAT.
-- A baybridge-style store as a separate, message-agnostic component: signed CRDT KV with priority-based last-write-wins; content-addressed blob store with reference-walked GC; subset-aware replication; clean pruning without tombstones.
+- A baybridge-style store as a separate, message-agnostic component: signed CRDT KV with priority-based last-write-wins; content-addressed blob store; subset-aware replication; removal by supersession only, without tombstones.
 - Subset replication: peers replicate only the data they care about.
 - Voice / real-time as a first-class transport concern (architecturally bound; codec/jitter/mixing detail deferred to a voice subsystem spec).
 - Multi-relay support: clients accept several relay URLs and use them in parallel for redundancy.
-- Sync dashboard exposed by every host that bears a store, surfacing peer connections, replication progress, GC state, and similar.
+- Sync dashboard exposed by every host that bears a store, surfacing peer connections, replication progress, store size, and similar.
 - End-to-end Playwright integration testing across multiple browser instances and a real relay.
 - Cryptographic ground-truth principle: record what actually happened (signed events from each actor); UI defaults are ergonomic, but full provenance is always inspectable.
 
@@ -42,7 +67,7 @@ The store is inspired by [`baybridge`](https://github.com/nicolaschan/baybridge)
 - Deniable authentication. Messages are non-repudiable by design.
 - Federation with non-sunset chat protocols (Matrix, XMPP, IRC).
 - Built-in spam/abuse moderation tooling beyond per-room admin controls.
-- Cryptographic transparency log for the trust server (the baybridge-style store provides a built-in audit trail with built-in pruning, but no Merkle/append-only proof).
+- Cryptographic transparency log for the trust server (the baybridge-style store provides a built-in audit trail, but no Merkle/append-only proof).
 
 ### Architectural constraints
 
@@ -88,8 +113,8 @@ WASM hosts (web client, MC mod) load a single `.wasm` artifact and provide host 
 ├──────────────────────────────────────────────────────────┤
 │ Store layer (`sunset-store`, separate crate)             │
 │   CRDT KV (signed events, last-write-wins by priority,   │
-│   TTL pruning, no tombstones) +                          │
-│   content-addressed blob store (blake3, DAG references)  │
+│   superseded in place, no tombstones) +                  │
+│   content-addressed blob store (blake3)                  │
 │   over a pluggable storage-backend trait                 │
 ├──────────────────────────────────────────────────────────┤
 │ Crypto layer                                             │
@@ -147,7 +172,7 @@ JS in the web client and Java in the MC mod are absolutely minimal. Their job is
 ### Federated signing chain
 
 1. **Master key** held by the trust server (e.g., `example.com`). Published at a well-known URL, fetched over TLS, and cached locally on first contact. Master keys do not have a built-in expiry; rotation is a trust-server subsystem concern.
-2. **Delegated identity key** owned by Alice. Lives in the store as a signed KV entry: `(master_key, "alice") -> {delegation_pubkey, expires_at, lease_metadata, ...}`. ACME-style — Alice must re-prove control to her trust server before `expires_at` to renew. Renewal = a new event with higher priority and pushed-out `expires_at`; the store auto-prunes the previous entry.
+2. **Delegated identity key** owned by Alice. Lives in the store as a signed KV entry: `(master_key, "alice") -> {delegation_pubkey, expires_at, lease_metadata, ...}`. ACME-style — Alice must re-prove control to her trust server before `expires_at` to renew. Renewal = a new event with higher priority and pushed-out `expires_at`; that supersedes the previous entry. Validity is checked by the reader against `expires_at`; the store does not sweep.
 3. **Ephemeral session keys** owned by Alice's device, signed by Alice's delegated key. Used for Noise handshakes and per-message signing.
 
 ### Verification path for an incoming op claiming an identity
@@ -208,23 +233,23 @@ The store is a separate, message-agnostic crate inspired by baybridge but reimpl
 - Entry: `(verifying_key, name) -> {value, priority, expires_at, signature}`.
 - `priority` defaults to the unix timestamp at write time but is set by the caller.
 - Last-write-wins on `(verifying_key, name)` by priority.
-- Optional `expires_at` for TTL-based pruning.
+- Optional `expires_at`, carried for readers to interpret. The store never acts on it (superseded 2026-08-24).
 - A new event with higher priority for the same key **replaces and deletes** the old entry. There are no tombstones.
 - Indexed for two query patterns: by **keyspace** (all names a writer publishes) and by **namespace** (all writers using a name). Plus prefix queries on names (e.g., `room_R/*`).
 
 ### Content-addressed blob store
 
 - `ContentBlock { data: bytes, references: [hash] }`, keyed by `blake3(serialized)`.
-- References form a DAG between blobs.
+- `references` is an application-opaque list of hashes carried with the data. It is not a link into the blob store; the store neither resolves nor traverses it (superseded 2026-08-24).
 - Naturally deduplicated: identical blobs hash to the same key.
-- GC walks the reachable set from KV pointers; unreferenced blobs are reclaimed.
+- Unreferenced blobs are never reclaimed (superseded 2026-08-24).
 
 ### Storage backend trait
 
 `sunset-store` defines a small `StorageBackend` trait surface:
 
 - KV: get / put / delete / range-query (by keyspace, by namespace, by name prefix).
-- Content: get / put / has / iterate-references.
+- Content: get / put / has.
 
 Backend implementations live in their own crates so that hosts only depend on what they need:
 
@@ -232,7 +257,7 @@ Backend implementations live in their own crates so that hosts only depend on wh
 - `sunset-store-indexeddb` — WebAssembly-only; used by the web client when persistence is enabled.
 - `sunset-store-fs` — SQLite for the KV index, filesystem for content blobs. Used by the relay and TUI default.
 
-The store layer's job is *protocol semantics*: signatures, priorities, GC, subset queries. The backend layer's job is *bytes on/off the disk* with platform-appropriate primitives. The split is enforced by the trait boundary.
+The store layer's job is *protocol semantics*: signatures, priorities, subset queries. The backend layer's job is *bytes on/off the disk* with platform-appropriate primitives. The split is enforced by the trait boundary.
 
 ### Subset replication
 
@@ -240,21 +265,20 @@ Peers express their interests as filter sets:
 
 - All entries in keyspace `K` (everything a particular writer publishes).
 - All entries in namespace `N` or with name prefix `P` (everything for a room, everything for a handle).
-- Specific content hashes and their transitive references.
+- Specific content hashes.
 
 Peers gossip their interest sets to neighbors and relays; the replication protocol pushes only matching events. Bloom filters or compressed range encodings keep announcements small. Specific encoding is a sync subsystem-spec choice.
 
-### Garbage collection
+### Removal (superseded 2026-08-24 — was "Garbage collection")
 
-- **KV supersession** is built in: higher-priority writes purge lower-priority entries on insert. This is what gives the store its bounded growth — old data physically disappears as it is overwritten.
-- **TTL expiry**: a background sweep deletes events past `expires_at`.
-- **Content blob GC**: mark-and-sweep walks all KV-reachable hashes through `ContentBlock.references`; unreachable blobs are reclaimed. Sweep cadence and incremental design are storage-subsystem-spec concerns.
+- **KV supersession** is the only removal mechanism: a higher-priority write replaces the lower-priority entry on insert, so the set of live keys stays bounded.
+- **No TTL sweep** and **no blob GC**. Blobs accumulate. Reclaiming them is an open problem; the revision at the top of this file records why the reference-walk design does not fit and what should replace it.
 
 ### Why the store deserves its own crate
 
 - Chat, identity delegations, room state, voice signaling, presence, and read-receipts are all clients of the same KV + blob primitives. Decoupling makes those clients easier to reason about.
 - Replication is subset-aware by default — no peer ever has to download everything.
-- Storage does not grow unbounded. No tombstones. Expired or superseded data physically disappears.
+- No tombstones: superseded data physically disappears as it is overwritten. Blobs, however, accumulate (superseded 2026-08-24).
 - The same store API runs against memory, IndexedDB, sqlite+FS — the persistence policy is a host concern, not a protocol concern.
 - The store can be reused for non-chat applications.
 
@@ -262,7 +286,7 @@ Peers gossip their interest sets to neighbors and relays; the replication protoc
 
 - Concrete SQLite schema for the KV index.
 - IndexedDB transactional layout, quota handling.
-- GC scheduling and incremental sweep design.
+- Blob reclamation: refcounting over live `entry.value_hash` values, and when to run it.
 - Content-blob layout on disk (sharding, fsync policy, compression).
 
 ## Wire envelope and encryption
@@ -314,7 +338,7 @@ The room key derived from `Argon2id(room_name)` is static — it gives metadata 
 
 ### Handshake and routing through the store
 
-- Each peer publishes a **presence entry** at `(peer_key, room_fingerprint) -> AEAD{connection_info, display_name, ...}` with a short TTL, refreshed periodically while online. Insanity-style.
+- Each peer publishes a **presence entry** at `(peer_key, room_fingerprint) -> AEAD{connection_info, display_name, ...}`, refreshed periodically while online; readers treat an entry older than a short window as offline. Insanity-style.
 - Other peers in the room read the fingerprint namespace, find current presence entries, and initiate Noise handshakes. Handshake messages are themselves encrypted CRDT events through the store, so handshakes succeed even when peers are not simultaneously connected.
 - Once a direct P2P connection is established, peers can replicate subsets of the store directly between each other (faster than via a relay) — but the protocol is the same; the relay path remains as fallback.
 - **Bootstrap:** a peer connects to one or more known relay URLs configured per host, gains store access there, and discovers presence entries from the relay's view of the room.
@@ -358,7 +382,7 @@ The trait abstraction exists from day one because the transport stack is expecte
 A relay is a peer with a different participation policy. The protocol is identical to client peers; only configuration differs. Relays have no special trust.
 
 - **Always-online bootstrap.** Clients configure one or more relay URLs. On startup, a client connects to a relay to gain initial store access.
-- **Store cache.** A relay subscribes to configured subsets (e.g., "all rooms my users participate in"). It validates, stores, and serves matching CRDT events to peers requesting them. Honors the same TTL/GC semantics as any peer.
+- **Store cache.** A relay subscribes to configured subsets (e.g., "all rooms my users participate in"). It validates, stores, and serves matching CRDT events to peers requesting them. Its retention semantics are a peer's: supersession only.
 - **Connection signaling.** STUN/TURN-style help: address exchange via presence entries, hole-punching coordination, fallback data relay when direct P2P is impossible.
 - **Voice forwarding.** When peers cannot establish direct P2P, the relay forwards their voice frames. Frames remain end-to-end encrypted (relay cannot read) and signed (relay cannot forge).
 - **Self-hostable.** A user can run their own relay (`docker run sunset-relay`); a TUI client can also act as a relay for its operator's friends behind it.
@@ -463,7 +487,7 @@ sunset/
 - Per-relay sync state (pulling, caught up, errored).
 - Per-room interest sets and replication progress.
 - KV entry count, blob count, total bytes (per backend).
-- GC state: last sweep, expired pruned, blobs reclaimed.
+- Write cursor (entries stored since the store was created).
 - Pending outbound events.
 
 This is a non-optional architectural commitment: every host that bears a store renders this status as a dashboard appropriate to its medium.
@@ -509,9 +533,9 @@ Record what actually happened cryptographically. Surface that to the user. Do no
 
 - **Timestamps.** A sender's claimed timestamp is one signed data point. Receivers publish **read-receipts** as separate signed events containing the timestamp they observed the message arrive. UI default is the sender's claim; expanding "message details" reveals every receiver's reception timestamp plus delegation chain status. Discrepancies become user-visible.
 - **Edits.** Each edit is a signed op referencing the original event hash. UI shows the latest version; expansion reveals the full edit history with each edit's signed timestamp.
-- **Deletes.** Delete ops are signed; the original remains cryptographically recorded until GC. UI surfaces "deleted by sender at T" alongside read-receipts of the delete.
+- **Deletes.** Delete ops are signed; the original remains cryptographically recorded until it is superseded. UI surfaces "deleted by sender at T" alongside read-receipts of the delete.
 - **Membership.** Add/remove ops are signed by an admin. The current member list at any moment is reconstructible from the op DAG. UI surfaces "added by X at T" on hover.
-- **Presence.** Presence entries are signed events with TTL — they *are* the cryptographic claim "I was online at time T."
+- **Presence.** Presence entries are signed events refreshed on a heartbeat, whose staleness readers derive from the entry's own timestamp — they *are* the cryptographic claim "I was online at time T."
 - **Identity.** A handle `alice@example.com` is verifiable through the delegation chain. Default UI shows the display name; expansion reveals the full handle, delegation expiry, and master-key origin.
 
 ### Read-receipts as a first-class op type
@@ -561,7 +585,7 @@ Each of the items below gets its own brainstorm → spec → plan → implement 
 1. **Identity subsystem** — multi-device model, master-key bootstrap trust anchor, Alice's authentication flow to her trust server, default lease duration, `sunset-trust` server protocol.
 2. **Crypto subsystem** — exact Noise pattern, hybrid PQC parameters, group-key rotation strategy on membership change, library choices.
 3. **Sync subsystem** — interest-set encoding, replication wire protocol, anti-entropy strategy, gossip topology, catch-up algorithm.
-4. **Storage subsystems** — SQLite schema for the KV index, IndexedDB transactional layout and quota handling, GC scheduling and incremental sweep, content-blob on-disk layout.
+4. **Storage subsystems** — SQLite schema for the KV index, IndexedDB transactional layout and quota handling, blob reclamation, content-blob on-disk layout.
 5. **Room subsystem** — admin model (single owner / multi-admin / role hierarchy), member-list op semantics, ownership transfer.
 6. **Voice subsystem** — codec selection, jitter buffer, group voice topology (mesh / SFU / hybrid), frame size, signing granularity.
 7. **MC mod subsystem** — WASM runtime choice in the JVM (Chicory / Wasmer / GraalVM), Java host-services impl, target Minecraft versions, distribution channels.

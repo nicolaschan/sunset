@@ -93,14 +93,14 @@ KV entries are tiny and uniform — a few hundred bytes regardless of value size
 
 #### Why this shape
 
-- **Pure content-addressed data.** Garbage collection is uniform — anything reachable from a live KV pointer is alive; everything else is dead.
+- **Pure content-addressed data.** A blob's identity is its bytes, so liveness is a property of the KV index alone: a blob is live iff some entry's `value_hash` names it. (Nothing acts on that today — see Revision 2026-08-24 — but it is what a future refcount would count.)
 - **Deduplication.** A blob shared by many KV entries is stored once. During replication, peers re-sending KV entries don't have to re-send the underlying blobs.
 - **Tamper-evidence.** The signature on a KV entry covers `value_hash`. A malicious relay can't substitute a different ContentBlock without invalidating the signature.
 - **Replication-friendly.** A peer can ship `(SignedKvEntry, ContentBlock)` in one message, or just the entry if it has reason to believe the receiver already has the blob.
 
-#### Note on content-DAG topology
+#### Note on `references`
 
-`ContentBlock.references` form an arbitrary DAG. The store stores blocks and references but does not police what topology consumers build. **Avoiding the leak of message/content structure through the reference graph is an application-layer concern** — sunset-core's chat layer is responsible for choosing a topology (Merkle-style fan-out, padding, batching multiple operations per block) that doesn't expose meaningful structure to relays. The store will faithfully store whatever shape consumers give it.
+`ContentBlock.references` is an application-opaque list of hashes carried alongside `data`. The store neither resolves nor traverses it, and a hash listed there need not name a blob that exists anywhere — sunset-core uses it to carry blake3 of a message *plaintext*, which is deliberately never stored. **If a consumer ever does use it to link blobs, avoiding the leak of message/content structure through the resulting graph is that consumer's concern** — the store faithfully stores whatever shape it is given and reads nothing into it.
 
 ### LWW semantics
 
@@ -116,7 +116,7 @@ Removal is by supersession only. `expires_at` is carried for consumers; the stor
 
 ### Garbage collection
 
-There is none — see Revision 2026-08-24. Per-event atomic insert (see §Atomicity below) means crashes never commit a partial write, so the only blobs that can go unreferenced are ones a caller put and then never pointed an entry at. Those accumulate.
+There is none — see Revision 2026-08-24. Per-event atomic insert (see §Atomicity below) means crashes never commit a partial write, so a blob goes unreferenced only by supersession (its entry was replaced, and no other entry names it) or by a caller putting content it never pointed an entry at. Both accumulate.
 
 ### Trust boundary at the store
 
@@ -246,8 +246,7 @@ CREATE TABLE entries (
     UNIQUE(verifying_key, name)
 );
 
-CREATE INDEX idx_entries_name       ON entries(name);             -- supports both exact-match (Namespace) and prefix queries via LIKE / range
-CREATE INDEX idx_entries_expires_at ON entries(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX idx_entries_name ON entries(name);  -- supports both exact-match (Namespace) and prefix queries via LIKE / range
 ```
 
 `sequence` provides the cursor monotonic ordering. Content blobs live on disk under a sharded directory (`content/ab/cdef...` style) for filesystem performance.

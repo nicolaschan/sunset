@@ -103,8 +103,14 @@ pub struct SignedDatagram {
     pub signature: bytes::Bytes,
 }
 
-/// Content-addressed blob. `references` form a DAG over content blocks;
-/// `hash(self) = blake3(postcard::to_stdvec(self))`.
+/// Content-addressed blob, keyed by `hash(self) = blake3(postcard::to_stdvec(self))`.
+///
+/// `references` is an application-opaque list of hashes carried alongside
+/// `data`. It is **not** a link into the blob store: the store never resolves
+/// or traverses it, and a hash listed here need not name a blob that exists
+/// anywhere. `sunset-core` uses it to carry blake3 of a message's *plaintext*
+/// as a key-derivation input — content that is deliberately never stored.
+/// Do not build reachability or prefetch logic on this field.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentBlock {
     pub data: bytes::Bytes,
