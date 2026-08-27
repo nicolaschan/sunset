@@ -19,6 +19,7 @@ test-hooks = []
 argon2.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+base64 = "0.22"
 blake3.workspace = true
 bytes.workspace = true
 chacha20poly1305.workspace = true
@@ -31,6 +32,7 @@ rand_chacha.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 serde.workspace = true
 sha2.workspace = true
+sunset-image.workspace = true
 sunset-noise.workspace = true
 sunset-store.workspace = true
 sunset-sync.workspace = true
@@ -54,6 +56,10 @@ wasmtimer.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+# Already in the dep tree via sunset-image; used here purely to bake
+# small PNG / JPEG fixtures for the `ImageAttachment::preprocess`
+# integration tests without committing binary blobs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 postcard.workspace = true
 sunset-store = { workspace = true, features = ["test-helpers"] }
 sunset-store-memory.workspace = true

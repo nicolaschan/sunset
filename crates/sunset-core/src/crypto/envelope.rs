@@ -210,19 +210,75 @@ pub enum ReactionAction {
 
 /// An image attached to a `MessageBody::Text` payload. Lives inside the
 /// AEAD plaintext just like the text body. The image bytes are carried
-/// base64-encoded so the same string can flow unchanged from the JS
-/// FileReader, through the wasm boundary, into the encrypted envelope,
-/// and back out as a `<img src="data:...">` attribute on the receiver.
+/// base64-encoded so the same string can flow unchanged from the wasm
+/// boundary into the encrypted envelope and back out as a
+/// `<img src="data:...">` attribute on the receiver.
 ///
-/// `mime_type` is the IANA media type the sender claims (e.g.
-/// `"image/png"`, `"image/jpeg"`, `"image/webp"`, `"image/gif"`).
-/// The core neither validates the claimed type against the bytes nor
-/// enforces a per-image size cap — those are surface-level concerns
-/// the UI applies before composing.
+/// `mime_type` is the IANA media type produced by the preprocessing
+/// pipeline — currently always `"image/jpeg"` for re-encoded inputs,
+/// or `"image/gif"` / `"image/webp"` for formats that pass through
+/// unchanged (see `sunset-image`).
+///
+/// The canonical sender-side constructor is [`Self::preprocess`], which
+/// takes raw file bytes and runs them through
+/// [`sunset_image::preprocess`] before composing the wire form. The
+/// hidden [`Self::raw`] constructor exists for the receive path and
+/// tests; production callers should always go through `preprocess` so
+/// every client (web, future TUI / desktop / Minecraft mod) produces a
+/// consistent normalised payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageAttachment {
     pub mime_type: String,
     pub data_base64: String,
+}
+
+impl ImageAttachment {
+    /// Preprocess raw image bytes (whatever the file picker handed us)
+    /// into a wire-ready attachment using the default
+    /// [`sunset_image::Config`].
+    ///
+    /// Returns an error if the bytes aren't a recognised image format,
+    /// the codec fails, or the input is HEIC/HEIF (currently
+    /// unsupported pending a workspace licence decision — see
+    /// `docs/superpowers/specs/2026-05-13-image-preprocessing-design.md`).
+    /// Callers should surface the error to the user rather than
+    /// silently dropping the attachment.
+    pub fn preprocess(bytes: &[u8]) -> Result<Self, sunset_image::Error> {
+        Self::preprocess_with(bytes, &sunset_image::Config::default())
+    }
+
+    /// Same as [`Self::preprocess`] but with an explicit
+    /// [`sunset_image::Config`]. Production callers should prefer
+    /// [`Self::preprocess`]; this hook exists for tests that need to
+    /// shrink the resize cap to keep fixtures small.
+    pub fn preprocess_with(
+        bytes: &[u8],
+        cfg: &sunset_image::Config,
+    ) -> Result<Self, sunset_image::Error> {
+        use base64::Engine as _;
+        let out = sunset_image::preprocess(bytes, cfg)?;
+        Ok(Self {
+            mime_type: out.mime_type,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&out.bytes),
+        })
+    }
+
+    /// Construct an `ImageAttachment` from already-encoded base64
+    /// bytes and a claimed MIME type. **No preprocessing applied.**
+    ///
+    /// Reserved for the receive path (where the bytes arrive
+    /// preprocessed by the sender already) and for tests that want to
+    /// inject a fixed payload without going through the encoder.
+    /// Production sender code should always go through
+    /// [`Self::preprocess`] so every client produces a consistent
+    /// normalised wire form.
+    #[doc(hidden)]
+    pub fn raw(mime_type: String, data_base64: String) -> Self {
+        Self {
+            mime_type,
+            data_base64,
+        }
+    }
 }
 
 /// Discriminator for the inner plaintext of a chat-room entry. All
@@ -365,6 +421,69 @@ mod tests {
         let bytes = postcard::to_stdvec(&body).unwrap();
         let decoded: MessageBody = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn image_attachment_preprocess_transcodes_png_to_jpeg() {
+        // Minimal RGBA PNG written via `image` (dev-dep -free path:
+        // hand-craft the bytes is too brittle, but `image` here would
+        // pull in the workspace's preprocessing dep tree which we
+        // already use in this crate). We test via a known-good PNG
+        // header + IDAT — using the public `preprocess` API rather
+        // than reaching into sunset-image internals so a future
+        // signature change is caught by this test.
+        let png = png_fixture_2x2();
+        let att = ImageAttachment::preprocess(&png).expect("png must preprocess");
+        assert_eq!(att.mime_type, "image/jpeg");
+        assert!(
+            !att.data_base64.is_empty(),
+            "preprocessed image must carry a non-empty base64 payload"
+        );
+
+        // The base64 must round-trip into bytes that the `image`
+        // crate (via sunset-image's loader) recognises as JPEG.
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&att.data_base64)
+            .expect("base64 round-trip");
+        assert!(
+            raw.starts_with(&[0xff, 0xd8, 0xff]),
+            "preprocessed bytes must start with the JPEG SOI marker"
+        );
+    }
+
+    #[test]
+    fn image_attachment_preprocess_surfaces_heic_unsupported() {
+        // ftyp box + `heic` brand — the sniffer should route this to
+        // the HEIC branch and surface the dedicated error variant.
+        let mut bytes = vec![0u8; 4];
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(&[0; 8]);
+        let err = ImageAttachment::preprocess(&bytes).unwrap_err();
+        assert!(matches!(err, sunset_image::Error::HeicUnsupported));
+    }
+
+    #[test]
+    fn image_attachment_preprocess_rejects_garbage() {
+        let err = ImageAttachment::preprocess(b"this is not an image").unwrap_err();
+        assert!(matches!(err, sunset_image::Error::UnrecognisedFormat));
+    }
+
+    /// Bake a small RGBA PNG via the `image` crate (dev-dep). Used to
+    /// drive [`ImageAttachment::preprocess`] without committing a
+    /// binary blob; the cost of decoding our own fixture is irrelevant
+    /// next to the encode the preprocessor itself does.
+    fn png_fixture_2x2() -> Vec<u8> {
+        use image::{ImageBuffer, ImageEncoder, Rgba};
+        let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(2, 2, |x, y| {
+            Rgba([(x * 100) as u8, (y * 100) as u8, 0x80, 0xff])
+        });
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(buf.as_raw(), 2, 2, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        out
     }
 
     #[test]
